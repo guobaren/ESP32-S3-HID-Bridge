@@ -1,0 +1,6 @@
+{
+  "portName": "COM5",
+  "baudRate": 921600,
+  "suppressLocalInput": false,
+  "reconnectDelayMilliseconds": 1000
+}

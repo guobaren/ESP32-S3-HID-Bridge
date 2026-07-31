@@ -1,0 +1,21 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# ESP-IDF
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# 本机配置
+host/HidBridge.Host/bridge.local.json
+
+# 编辑器与系统文件
+.idea/
+.vs/
+.vscode/
+.DS_Store
+Thumbs.db
