@@ -6,11 +6,12 @@
 
 Windows 主机程序负责：
 
-1. 通过 `WH_KEYBOARD_LL` 和 `WH_MOUSE_LL` 接收全局输入事件。
-2. 维护当前键盘修饰键、普通键和鼠标按钮状态。
-3. 将状态转换成标准 USB HID Boot Keyboard/Mouse 报告。
-4. 通过 USB-to-UART 串口发送给 ESP32-S3。
-5. 在停止转发和退出时发送 `ReleaseAll`。
+1. 通过 `WH_KEYBOARD_LL` 接收全局键盘事件，通过 `WH_MOUSE_LL` 实现可选的本地鼠标输入抑制。
+2. 通过 Windows Raw Input 接收鼠标设备的原生相对位移、按钮和滚轮事件。
+3. 维护当前键盘修饰键、普通键和鼠标按钮状态。
+4. 将状态转换成标准 USB HID Boot Keyboard/Mouse 报告。
+5. 通过 USB-to-UART 串口发送给 ESP32-S3。
+6. 在停止转发和退出时发送 `ReleaseAll`。
 
 主机端不创建 Windows 虚拟设备，也不注入输入，因此不会与目标设备的 HID 枚举混在一起。
 
@@ -34,6 +35,7 @@ USB 侧使用一个 HID Interface 和两个 Report ID：
 - BLE HID 留作可选输出后端，不与第一阶段耦合。
 - 键盘采用 6-key rollover；超过 6 个普通键时只上报最早的 6 个。
 - 鼠标采用相对位移，单帧范围为 `-127..127`，主机端自动拆分大位移。
+- 鼠标移动优先使用 Raw Input 的设备原生相对量，不依赖屏幕指针坐标，因此不受屏幕边缘和 Windows 指针加速影响；绝对坐标类 Raw Input 设备不作为移动来源。
 - 主机与开发板之间暂不做身份认证，因为链路为用户明确连接的本地 USB 串口。
 
 ## 后续演进

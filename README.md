@@ -6,7 +6,7 @@
 
 ```text
 Windows 键盘/鼠标
-        │ 低级输入钩子
+        │ 键鼠低级钩子 + 鼠标 Raw Input
         ▼
 HidBridge.Host
         │ USB-to-UART，二进制帧
@@ -27,6 +27,7 @@ ESP32-S3-DevKitC-1
 ## 当前里程碑
 
 - [x] Windows 全局键盘和鼠标捕获骨架
+- [x] Raw Input 原生相对鼠标移动
 - [x] `Ctrl+Alt+F12` 转发开关
 - [x] 可配置串口和本地输入抑制
 - [x] 带序号、长度与 CRC16 的串口帧
@@ -65,16 +66,19 @@ dotnet run
 
 要求：
 
-- ESP-IDF 5.2 或更高版本
+- 项目内已安装 ESP-IDF 6.0.2，位于 `.esp-idf/`（该目录不提交到 Git）
 - ESP32-S3-DevKitC-1
 - 电脑连接开发板的 `USB-to-UART` 端口
 
 ```powershell
 Set-Location E:\ESP32-S3-HID-Bridge\firmware
+. ..\scripts\Enter-EspIdf.ps1
 idf.py set-target esp32s3
 idf.py build
 idf.py -p COM5 flash
 ```
+
+激活脚本只修改当前 PowerShell 会话；重新打开终端后需要再次执行。
 
 烧录后：
 

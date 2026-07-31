@@ -12,29 +12,32 @@ internal static class NativeMethods
     internal const int WmKeyUp = 0x0101;
     internal const int WmSysKeyDown = 0x0104;
     internal const int WmSysKeyUp = 0x0105;
-
-    internal const int WmMouseMove = 0x0200;
-    internal const int WmLButtonDown = 0x0201;
-    internal const int WmLButtonUp = 0x0202;
-    internal const int WmRButtonDown = 0x0204;
-    internal const int WmRButtonUp = 0x0205;
-    internal const int WmMButtonDown = 0x0207;
-    internal const int WmMButtonUp = 0x0208;
-    internal const int WmMouseWheel = 0x020A;
-    internal const int WmXButtonDown = 0x020B;
-    internal const int WmXButtonUp = 0x020C;
-    internal const int WmMouseHWheel = 0x020E;
+    internal const int WmInput = 0x00FF;
 
     internal const uint LlkhfExtended = 0x01;
+    internal const uint RidInput = 0x10000003;
+    internal const uint RimTypeMouse = 0;
+    internal const uint RidevRemove = 0x00000001;
+    internal const uint RidevInputSink = 0x00000100;
+    internal const ushort GenericDesktopUsagePage = 0x01;
+    internal const ushort MouseUsage = 0x02;
+    internal const ushort MouseMoveAbsolute = 0x01;
+    internal const ushort RawMouseLeftButtonDown = 0x0001;
+    internal const ushort RawMouseLeftButtonUp = 0x0002;
+    internal const ushort RawMouseRightButtonDown = 0x0004;
+    internal const ushort RawMouseRightButtonUp = 0x0008;
+    internal const ushort RawMouseMiddleButtonDown = 0x0010;
+    internal const ushort RawMouseMiddleButtonUp = 0x0020;
+    internal const ushort RawMouseButton4Down = 0x0040;
+    internal const ushort RawMouseButton4Up = 0x0080;
+    internal const ushort RawMouseButton5Down = 0x0100;
+    internal const ushort RawMouseButton5Up = 0x0200;
+    internal const ushort RawMouseWheel = 0x0400;
+    internal const ushort RawMouseHorizontalWheel = 0x0800;
+
+    internal static readonly IntPtr HwndMessage = new(-3);
 
     internal delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
-
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct Point
-    {
-        internal int X;
-        internal int Y;
-    }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct KeyboardHookData
@@ -47,13 +50,43 @@ internal static class NativeMethods
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct MouseHookData
+    internal struct RawInputDevice
     {
-        internal Point Position;
-        internal uint MouseData;
+        internal ushort UsagePage;
+        internal ushort Usage;
         internal uint Flags;
-        internal uint Time;
-        internal UIntPtr ExtraInfo;
+        internal IntPtr Target;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct RawInputHeader
+    {
+        internal uint Type;
+        internal uint Size;
+        internal IntPtr Device;
+        internal IntPtr WParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct RawMouse
+    {
+        internal ushort Flags;
+        internal ushort Reserved;
+        internal uint Buttons;
+        internal uint RawButtons;
+        internal int LastX;
+        internal int LastY;
+        internal uint ExtraInformation;
+
+        internal readonly ushort ButtonFlags => unchecked((ushort)Buttons);
+        internal readonly short ButtonData => unchecked((short)(Buttons >> 16));
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct RawInput
+    {
+        internal RawInputHeader Header;
+        internal RawMouse Mouse;
     }
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -73,6 +106,21 @@ internal static class NativeMethods
         int code,
         IntPtr wParam,
         IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool RegisterRawInputDevices(
+        [In] RawInputDevice[] devices,
+        uint deviceCount,
+        uint deviceSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern uint GetRawInputData(
+        IntPtr rawInput,
+        uint command,
+        IntPtr data,
+        ref uint size,
+        uint headerSize);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     internal static extern IntPtr GetModuleHandle(string? moduleName);

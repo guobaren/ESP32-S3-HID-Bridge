@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Esparrier WebUSB Configuration</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-row">
+                <h1 data-i18n="title">Esparrier Configuration</h1>
+                <div class="header-actions">
+                    <select id="lang-selector" class="lang-selector" title="Language">
+                        <option value="en">English</option>
+                        <option value="zh">中文</option>
+                    </select>
+                    <a href="https://github.com/windoze/esparrier" target="_blank" class="github-link" data-i18n-title="githubRepo" title="GitHub Repository">
+                        <svg viewBox="0 0 16 16" width="24" height="24" fill="currentColor">
+                            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+                        </svg>
+                    </a>
+                </div>
+            </div>
+            <p class="subtitle" data-i18n="subtitle">WebUSB-based device configuration tool</p>
+        </header>
+
+        <section id="browser-warning" class="card warning-card hidden">
+            <h2 data-i18n="browserNotSupported">⚠️ Browser Not Supported</h2>
+            <p id="browser-warning-text" data-i18n="browserWarningDefault">Your browser does not support WebUSB. Please use a Chromium-based browser (Chrome, Edge, Opera, Brave) to use this tool.</p>
+        </section>
+
+        <section id="firmware-warning" class="card warning-card hidden">
+            <h2 data-i18n="firmwareOutdated">⚠️ Firmware Outdated</h2>
+            <p id="firmware-warning-text" data-i18n="firmwareWarningText">Your firmware version is too old to use this configuration tool. Please upgrade to version 0.6.0 or later.</p>
+            <p><a href="https://github.com/windoze/esparrier/releases/latest" target="_blank" data-i18n="downloadLatestFirmware">Download Latest Firmware</a></p>
+        </section>
+
+        <section id="connection-section" class="card">
+            <h2 class="section-header">
+                <span data-i18n="deviceConnection">Device Connection</span>
+                <label class="advanced-toggle">
+                    <input type="checkbox" id="advanced-connection-toggle">
+                    <span data-i18n="advancedSettings">Advanced</span>
+                </label>
+            </h2>
+            <div id="advanced-connection-settings" class="advanced-settings hidden">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="connect-vid" data-i18n="vendorId">Vendor ID (hex)</label>
+                        <input type="text" id="connect-vid" name="connect-vid" maxlength="4" placeholder="0d0a" value="0d0a">
+                    </div>
+                    <div class="form-group">
+                        <label for="connect-pid" data-i18n="productId">Product ID (hex)</label>
+                        <input type="text" id="connect-pid" name="connect-pid" maxlength="4" placeholder="c0de" value="c0de">
+                    </div>
+                </div>
+                <small data-i18n="customVidPidHint">Use custom VID/PID to connect to devices with modified USB identity</small>
+            </div>
+            <div class="connection-status">
+                <span id="status-indicator" class="status-dot disconnected"></span>
+                <span id="status-text" data-i18n="disconnected">Disconnected</span>
+            </div>
+            <div class="button-group button-group-split">
+                <button id="connect-btn" class="btn btn-primary" data-i18n="connectDevice">Connect Device</button>
+                <div class="button-group-right">
+                    <button id="disconnect-btn" class="btn btn-secondary" disabled data-i18n="disconnect">Disconnect</button>
+                    <button id="forget-btn" class="btn btn-danger" disabled data-i18n="disconnectAndForget">Disconnect & Forget</button>
+                </div>
+            </div>
+        </section>
+
+        <section id="device-info-section" class="card hidden">
+            <h2 data-i18n="deviceInformation">Device Information</h2>
+            <div class="info-grid">
+                <div class="info-item">
+                    <label data-i18n="firmwareVersion">Firmware Version</label>
+                    <span id="firmware-version">--</span>
+                </div>
+                <div class="info-item">
+                    <label data-i18n="modelId">Model ID</label>
+                    <span id="model-id">--</span>
+                </div>
+                <div class="info-item">
+                    <label data-i18n="features">Features</label>
+                    <span id="feature-flags">--</span>
+                </div>
+                <div class="info-item">
+                    <label data-i18n="ipAddress">IP Address</label>
+                    <span id="ip-address">--</span>
+                </div>
+                <div class="info-item">
+                    <label data-i18n="serverConnected">Server Connected</label>
+                    <span id="server-connected">--</span>
+                </div>
+                <div class="info-item">
+                    <label data-i18n="active">Active</label>
+                    <span id="device-active">--</span>
+                </div>
+                <div class="info-item">
+                    <label data-i18n="keepAwake">Keep Awake</label>
+                    <span id="keep-awake">--</span>
+                </div>
+            </div>
+            <div class="button-group">
+                <button id="refresh-status-btn" class="btn btn-secondary" data-i18n="refreshStatus">Refresh Status</button>
+                <button id="toggle-awake-btn" class="btn btn-toggle">
+                    <svg class="btn-icon btn-icon-off" viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                        <path d="M12 22q-.825 0-1.412-.587T10 20h4q0 .825-.587 1.413T12 22Zm-4-3v-2h8v2H8Zm.25-3q-1.725-1.025-2.737-2.75T4.5 9.5q0-3.125 2.188-5.312T12 2q3.125 0 5.313 2.188T19.5 9.5q0 2.025-1.012 3.75T15.75 16H8.25Zm.6-2h6.3q1.125-.8 1.738-1.975T17.5 9.5q0-2.3-1.6-3.9T12 4Q9.7 4 8.1 5.6T6.5 9.5q0 1.35.613 2.525T8.85 14Z"/>
+                    </svg>
+                    <svg class="btn-icon btn-icon-on" viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                        <path d="M12 22q-.825 0-1.412-.587T10 20h4q0 .825-.587 1.413T12 22Zm-4-3v-2h8v2H8Zm.25-3q-1.725-1.025-2.737-2.75T4.5 9.5q0-3.125 2.188-5.312T12 2q3.125 0 5.313 2.188T19.5 9.5q0 2.025-1.012 3.75T15.75 16H8.25Z"/>
+                    </svg>
+                    <span data-i18n="keepAwakeOff">Keep Awake: Off</span>
+                </button>
+            </div>
+        </section>
+
+        <section id="ota-section" class="card hidden">
+            <h2 data-i18n="firmwareUpdate">Firmware Update</h2>
+            <div id="ota-not-supported" class="hidden">
+                <p class="warning-text" data-i18n="otaNotSupported">OTA is not supported by this firmware. Please update manually using espflash.</p>
+            </div>
+            <div id="ota-content">
+                <div class="info-grid ota-info">
+                    <div class="info-item">
+                        <label data-i18n="currentVersion">Current Version</label>
+                        <span id="ota-current-version">--</span>
+                    </div>
+                    <div class="info-item">
+                        <label data-i18n="latestVersion">Latest Version</label>
+                        <span id="ota-latest-version">--</span>
+                    </div>
+                </div>
+                <div id="ota-update-available" class="ota-update-info hidden">
+                    <p data-i18n="otaUpdateAvailableInfo">A new firmware version is available. Use the esparrier-config CLI tool to update:</p>
+                    <pre class="code-block">ecc ota</pre>
+                    <p><a href="https://github.com/windoze/esparrier-config" target="_blank" data-i18n="otaToolLink">Get esparrier-config tool</a></p>
+                </div>
+                <div id="ota-up-to-date" class="ota-update-info hidden">
+                    <p class="success-text" data-i18n="otaUpToDate">Your firmware is up to date.</p>
+                </div>
+                <div class="button-group">
+                    <button id="ota-check-btn" class="btn btn-secondary" data-i18n="checkForUpdate">Check for Update</button>
+                </div>
+            </div>
+        </section>
+
+        <section id="config-section" class="card hidden">
+            <h2 data-i18n="configuration">Configuration</h2>
+            <form id="config-form">
+                <fieldset>
+                    <legend data-i18n="networkSettings">Network Settings</legend>
+                    <div class="form-group">
+                        <label for="ssid" class="required" data-i18n="wifiSsid">WiFi SSID</label>
+                        <input type="text" id="ssid" name="ssid" maxlength="32" required data-i18n-placeholder="ssidPlaceholder" placeholder="Enter WiFi network name">
+                    </div>
+                    <div class="form-group">
+                        <label for="password" class="required" data-i18n="wifiPassword">WiFi Password</label>
+                        <div class="password-input-wrapper">
+                            <input type="password" id="password" name="password" maxlength="64" required data-i18n-placeholder="passwordPlaceholder" placeholder="Enter WiFi password">
+                            <button type="button" id="toggle-password-btn" class="password-toggle-btn" data-i18n-title="showPassword" title="Show password">
+                                <svg class="eye-icon eye-open" viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                                    <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+                                </svg>
+                                <svg class="eye-icon eye-closed" viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                                    <path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <small data-i18n="wifiPasswordHint">Required - public WiFi not supported</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="ip_addr" data-i18n="staticIp">Static IP (CIDR, optional)</label>
+                        <input type="text" id="ip_addr" name="ip_addr" maxlength="20" data-i18n-placeholder="staticIpPlaceholder" placeholder="e.g., 192.168.1.100/24">
+                    </div>
+                    <div class="form-group">
+                        <label for="gateway" data-i18n="gateway">Gateway (optional)</label>
+                        <input type="text" id="gateway" name="gateway" maxlength="16" data-i18n-placeholder="gatewayPlaceholder" placeholder="e.g., 192.168.1.1">
+                    </div>
+                </fieldset>
+
+                <fieldset>
+                    <legend data-i18n="barrierServer">Barrier/Deskflow Server</legend>
+                    <div class="form-group">
+                        <label for="server" class="required" data-i18n="serverAddress">Server Address</label>
+                        <input type="text" id="server" name="server" maxlength="64" data-i18n-placeholder="serverAddressPlaceholder" placeholder="e.g., 192.168.1.50:24800" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="screen_name" class="required" data-i18n="screenName">Screen Name</label>
+                        <input type="text" id="screen_name" name="screen_name" maxlength="64" required data-i18n-placeholder="screenNamePlaceholder" placeholder="Enter screen name">
+                    </div>
+                </fieldset>
+
+                <fieldset>
+                    <legend data-i18n="screenSettings">Screen Settings</legend>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="screen_width" data-i18n="screenWidth">Screen Width</label>
+                            <input type="number" id="screen_width" name="screen_width" min="640" max="7680" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="screen_height" data-i18n="screenHeight">Screen Height</label>
+                            <input type="number" id="screen_height" name="screen_height" min="480" max="4320" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="flip_wheel" name="flip_wheel">
+                            <span data-i18n="flipMouseWheel">Flip Mouse Wheel Direction</span>
+                        </label>
+                    </div>
+                </fieldset>
+
+                <fieldset>
+                    <legend data-i18n="performanceSettings">Performance Settings</legend>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="polling_rate" data-i18n="pollingRate">Polling Rate (Hz)</label>
+                            <input type="number" id="polling_rate" name="polling_rate" min="50" max="1000" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="jiggle_interval" data-i18n="jiggleInterval">Jiggle Interval (sec)</label>
+                            <input type="number" id="jiggle_interval" name="jiggle_interval" min="0" max="3600" required>
+                            <small data-i18n="jiggleIntervalHint">0 to disable</small>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="brightness" data-i18n="indicatorBrightness">Indicator Brightness</label>
+                        <input type="range" id="brightness" name="brightness" min="0" max="255">
+                        <span id="brightness-value">128</span>
+                    </div>
+                </fieldset>
+
+                <fieldset>
+                    <legend data-i18n="usbHidIdentity">USB HID Identity</legend>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="vid" data-i18n="vendorId">Vendor ID (hex)</label>
+                            <input type="text" id="vid" name="vid" pattern="[0-9a-fA-F]{4}" maxlength="4" placeholder="0d0a">
+                        </div>
+                        <div class="form-group">
+                            <label for="pid" data-i18n="productId">Product ID (hex)</label>
+                            <input type="text" id="pid" name="pid" pattern="[0-9a-fA-F]{4}" maxlength="4" placeholder="c0de">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="manufacturer" data-i18n="manufacturer">Manufacturer</label>
+                        <input type="text" id="manufacturer" name="manufacturer" maxlength="64">
+                    </div>
+                    <div class="form-group">
+                        <label for="product" data-i18n="productName">Product Name</label>
+                        <input type="text" id="product" name="product" maxlength="64">
+                    </div>
+                    <div class="form-group">
+                        <label for="serial_number" data-i18n="serialNumber">Serial Number</label>
+                        <input type="text" id="serial_number" name="serial_number" maxlength="64">
+                    </div>
+                    <div class="form-group" id="webusb-url-group">
+                        <label for="webusb_url" data-i18n="webusbUrl">WebUSB Landing URL (optional)</label>
+                        <input type="url" id="webusb_url" name="webusb_url" maxlength="128" placeholder="https://0d0a.com/esparrier/">
+                        <small data-i18n="webusbUrlHint">Leave empty to disable browser popup on device connect</small>
+                    </div>
+                </fieldset>
+
+                <div class="button-group">
+                    <button type="button" id="read-config-btn" class="btn btn-secondary" data-i18n="readConfig">Read Config</button>
+                    <button type="button" id="write-config-btn" class="btn btn-primary" data-i18n="writeConfig">Write Config</button>
+                    <button type="button" id="reboot-btn" class="btn btn-warning" data-i18n="rebootDevice">Reboot Device</button>
+                </div>
+            </form>
+        </section>
+
+        <section id="log-section" class="card">
+            <h2 data-i18n="log">Log</h2>
+            <div id="log-output" class="log-output"></div>
+            <button id="clear-log-btn" class="btn btn-secondary btn-small" data-i18n="clearLog">Clear Log</button>
+        </section>
+
+        <footer>
+            <p data-i18n="footerText">Esparrier WebUSB Configuration Tool</p>
+            <p><a href="https://github.com/windoze/esparrier" target="_blank" data-i18n="githubRepo">GitHub Repository</a></p>
+        </footer>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="i18n.js"></script>
+    <script src="esparrier.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

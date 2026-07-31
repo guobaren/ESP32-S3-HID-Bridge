@@ -5,10 +5,11 @@
 
 #include "class/hid/hid_device.h"
 #include "esp_log.h"
-#include "esp_tinyusb.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "tinyusb.h"
+#include "tinyusb_default_config.h"
 #include "tusb.h"
 
 #define REPORT_ID_KEYBOARD 1
@@ -143,7 +144,7 @@ esp_err_t hid_output_init(void)
     }
 
     tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG();
-    usb_config.configuration_descriptor = s_configuration_descriptor;
+    usb_config.descriptor.full_speed_config = s_configuration_descriptor;
 
     esp_err_t error = tinyusb_driver_install(&usb_config);
     if (error != ESP_OK) {

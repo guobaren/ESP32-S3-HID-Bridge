@@ -5,6 +5,6 @@ idf_component_register(
         "hid_output.c"
     INCLUDE_DIRS "."
     REQUIRES
-        driver
+        esp_driver_uart
         esp_tinyusb
 )

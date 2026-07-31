@@ -22,10 +22,11 @@ internal sealed class InputForwarder : IDisposable
     private readonly List<byte> _pressedKeys = [];
     private IntPtr _keyboardHook;
     private IntPtr _mouseHook;
+    private RawMouseInputWindow? _rawMouseInput;
     private byte _modifiers;
     private byte _mouseButtons;
-    private NativeMethods.Point _lastMousePosition;
-    private bool _mousePositionInitialized;
+    private int _verticalWheelRemainder;
+    private int _horizontalWheelRemainder;
     private bool _ignoreHotkeyChord;
     private bool _started;
 
@@ -48,6 +49,8 @@ internal sealed class InputForwarder : IDisposable
         {
             return;
         }
+
+        _rawMouseInput = new RawMouseInputWindow(HandleRawMouseInput);
 
         IntPtr module = NativeMethods.GetModuleHandle(null);
         _keyboardHook = NativeMethods.SetWindowsHookEx(
@@ -93,6 +96,8 @@ internal sealed class InputForwarder : IDisposable
             _mouseHook = IntPtr.Zero;
         }
 
+        _rawMouseInput?.Dispose();
+        _rawMouseInput = null;
         _started = false;
     }
 
@@ -176,79 +181,11 @@ internal sealed class InputForwarder : IDisposable
             return NativeMethods.CallNextHookEx(_mouseHook, code, wParam, lParam);
         }
 
-        NativeMethods.MouseHookData data =
-            Marshal.PtrToStructure<NativeMethods.MouseHookData>(lParam);
-        int message = unchecked((int)wParam);
-
-        if (!_mousePositionInitialized)
+        // 低级钩子只负责可选的本地抑制。移动、按钮和滚轮统一由
+        // Raw Input 按设备事件顺序处理，避免两条输入路径之间状态错序。
+        if (ForwardingEnabled && _suppressLocalInput)
         {
-            _lastMousePosition = data.Position;
-            _mousePositionInitialized = true;
-        }
-
-        int deltaX = 0;
-        int deltaY = 0;
-        int wheel = 0;
-        int pan = 0;
-        bool shouldSend = false;
-
-        switch (message)
-        {
-            case NativeMethods.WmMouseMove:
-                deltaX = data.Position.X - _lastMousePosition.X;
-                deltaY = data.Position.Y - _lastMousePosition.Y;
-                _lastMousePosition = data.Position;
-                shouldSend = deltaX != 0 || deltaY != 0;
-                break;
-            case NativeMethods.WmLButtonDown:
-                _mouseButtons |= LeftButton;
-                shouldSend = true;
-                break;
-            case NativeMethods.WmLButtonUp:
-                _mouseButtons &= unchecked((byte)~LeftButton);
-                shouldSend = true;
-                break;
-            case NativeMethods.WmRButtonDown:
-                _mouseButtons |= RightButton;
-                shouldSend = true;
-                break;
-            case NativeMethods.WmRButtonUp:
-                _mouseButtons &= unchecked((byte)~RightButton);
-                shouldSend = true;
-                break;
-            case NativeMethods.WmMButtonDown:
-                _mouseButtons |= MiddleButton;
-                shouldSend = true;
-                break;
-            case NativeMethods.WmMButtonUp:
-                _mouseButtons &= unchecked((byte)~MiddleButton);
-                shouldSend = true;
-                break;
-            case NativeMethods.WmXButtonDown:
-                _mouseButtons |= GetXButton(data.MouseData);
-                shouldSend = true;
-                break;
-            case NativeMethods.WmXButtonUp:
-                _mouseButtons &= unchecked((byte)~GetXButton(data.MouseData));
-                shouldSend = true;
-                break;
-            case NativeMethods.WmMouseWheel:
-                wheel = GetWheelDelta(data.MouseData);
-                shouldSend = true;
-                break;
-            case NativeMethods.WmMouseHWheel:
-                pan = GetWheelDelta(data.MouseData);
-                shouldSend = true;
-                break;
-        }
-
-        if (ForwardingEnabled && shouldSend)
-        {
-            SendMouseReports(deltaX, deltaY, wheel, pan);
-            if (_suppressLocalInput)
-            {
-                return (IntPtr)1;
-            }
+            return (IntPtr)1;
         }
 
         return NativeMethods.CallNextHookEx(_mouseHook, code, wParam, lParam);
@@ -297,7 +234,6 @@ internal sealed class InputForwarder : IDisposable
 
         ReleaseAll();
         ForwardingEnabled = enabled;
-        _mousePositionInitialized = false;
         ForwardingChanged?.Invoke(this, enabled);
     }
 
@@ -306,8 +242,61 @@ internal sealed class InputForwarder : IDisposable
         _pressedKeys.Clear();
         _modifiers = 0;
         _mouseButtons = 0;
-        _mousePositionInitialized = false;
+        _verticalWheelRemainder = 0;
+        _horizontalWheelRemainder = 0;
         _transport.Send(MessageType.ReleaseAll, ReadOnlySpan<byte>.Empty);
+    }
+
+    private void HandleRawMouseInput(NativeMethods.RawMouse input)
+    {
+        if (!ForwardingEnabled)
+        {
+            return;
+        }
+
+        ushort flags = input.ButtonFlags;
+        UpdateMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, LeftButton);
+        UpdateMouseButton(flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, RightButton);
+        UpdateMouseButton(flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, MiddleButton);
+        UpdateMouseButton(flags, NativeMethods.RawMouseButton4Down, NativeMethods.RawMouseButton4Up, BackButton);
+        UpdateMouseButton(flags, NativeMethods.RawMouseButton5Down, NativeMethods.RawMouseButton5Up, ForwardButton);
+
+        int wheel = 0;
+        int pan = 0;
+        if ((flags & NativeMethods.RawMouseWheel) != 0)
+        {
+            wheel = ConsumeWheelDelta(input.ButtonData, ref _verticalWheelRemainder);
+        }
+        else if ((flags & NativeMethods.RawMouseHorizontalWheel) != 0)
+        {
+            pan = ConsumeWheelDelta(input.ButtonData, ref _horizontalWheelRemainder);
+        }
+
+        bool hasButtonChange = (flags & 0x03FF) != 0;
+        if (input.LastX != 0 || input.LastY != 0 || wheel != 0 || pan != 0 || hasButtonChange)
+        {
+            SendMouseReports(input.LastX, input.LastY, wheel, pan);
+        }
+    }
+
+    private void UpdateMouseButton(ushort flags, ushort downFlag, ushort upFlag, byte button)
+    {
+        if ((flags & downFlag) != 0)
+        {
+            _mouseButtons |= button;
+        }
+        if ((flags & upFlag) != 0)
+        {
+            _mouseButtons &= unchecked((byte)~button);
+        }
+    }
+
+    private static int ConsumeWheelDelta(short delta, ref int remainder)
+    {
+        int total = remainder + delta;
+        int steps = total / 120;
+        remainder = total % 120;
+        return steps;
     }
 
     private void SendKeyboardReport()
@@ -344,18 +333,6 @@ internal sealed class InputForwarder : IDisposable
             pan -= stepPan;
         }
         while (deltaX != 0 || deltaY != 0 || wheel != 0 || pan != 0);
-    }
-
-    private static int GetWheelDelta(uint mouseData)
-    {
-        short raw = unchecked((short)(mouseData >> 16));
-        return Math.Clamp(raw / 120, -127, 127);
-    }
-
-    private static byte GetXButton(uint mouseData)
-    {
-        ushort button = (ushort)(mouseData >> 16);
-        return button == 1 ? BackButton : ForwardButton;
     }
 
     public void Dispose()

@@ -21,7 +21,7 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | 值 | 名称 | Payload |
 |---:|---|---|
 | `0x01` | KeyboardReport | 标准 8 字节 Boot Keyboard Report |
-| `0x02` | MouseReport | `buttons, x, y, wheel, pan` |
+| `0x02` | MouseReport | `buttons, x, y, wheel, pan`；后四项均为有符号 8 位整数，`x/y` 表示相对位移 |
 | `0x03` | ReleaseAll | 空 |
 | `0x04` | Ping | 可选任意数据 |
 

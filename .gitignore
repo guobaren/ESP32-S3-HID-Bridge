@@ -5,6 +5,7 @@
 *.suo
 
 # ESP-IDF
+/.esp-idf/
 firmware/build/
 firmware/managed_components/
 firmware/sdkconfig

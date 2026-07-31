@@ -1,0 +1,860 @@
+/**
+ * Esparrier WebUSB Communication Library
+ *
+ * This library provides a JavaScript interface to communicate with
+ * Esparrier devices via WebUSB using the vendor-specific bulk interface.
+ *
+ * Protocol Commands:
+ * - 's' - Get State (returns device status)
+ * - 'r' - Read Config (reads configuration from flash)
+ * - 'w' <blocks> - Write Config (receives config in 64-byte blocks)
+ * - 'c' - Commit Config (writes config to flash and reboots)
+ * - 'k' <bool> - Keep Awake (prevent device sleep)
+ * - 'b' - Reboot (trigger software reset)
+ */
+
+const ESPARRIER_VID = 0x0d0a;
+const ESPARRIER_PID = 0xc0de;
+
+// Vendor interface class
+const VENDOR_CLASS = 0xFF;
+const VENDOR_SUBCLASS = 0x0D;
+const VENDOR_PROTOCOL = 0x0A;
+
+// Commands
+const CMD_GET_STATE = 's'.charCodeAt(0);
+const CMD_READ_CONFIG = 'r'.charCodeAt(0);
+const CMD_WRITE_CONFIG = 'w'.charCodeAt(0);
+const CMD_COMMIT_CONFIG = 'c'.charCodeAt(0);
+const CMD_KEEP_AWAKE = 'k'.charCodeAt(0);
+const CMD_REBOOT = 'b'.charCodeAt(0);
+const CMD_OTA_START = 'O'.charCodeAt(0);
+const CMD_OTA_DATA = 'D'.charCodeAt(0);
+const CMD_OTA_ABORT = 'A'.charCodeAt(0);
+const CMD_OTA_STATUS = 'P'.charCodeAt(0);
+
+// Responses
+const RESP_STATE = 's'.charCodeAt(0);
+const RESP_CONFIG = 'r'.charCodeAt(0);
+const RESP_OK = 'o'.charCodeAt(0);
+const RESP_ERROR = 'e'.charCodeAt(0);
+const RESP_OTA_PROGRESS = 'P'.charCodeAt(0);
+const RESP_OTA_COMPLETE = 'C'.charCodeAt(0);
+
+// Error codes
+const ERR_ENDPOINT = 'e'.charCodeAt(0);
+const ERR_TIMEOUT = 't'.charCodeAt(0);
+const ERR_INVALID_CONFIG = 'i'.charCodeAt(0);
+const ERR_UNKNOWN_COMMAND = 'u'.charCodeAt(0);
+const ERR_OTA = 'O'.charCodeAt(0);
+
+// Feature flags
+const FEATURE_LED = 0b00000001;
+const FEATURE_SMARTLED = 0b00000010;
+const FEATURE_GRAPHICS = 0b00000100;
+const FEATURE_OTA = 0b01000000;
+const FEATURE_CLIPBOARD = 0b10000000;
+
+// Model IDs
+const MODEL_NAMES = {
+    0: 'Generic',
+    1: 'M5Atom S3 Lite',
+    2: 'M5Atom S3',
+    3: 'M5Atom S3R',
+    4: 'DevKitC-1.0',
+    5: 'DevKitC-1.1',
+    6: 'XIAO ESP32S3',
+    7: 'ESP32-S3-ETH',
+    255: 'Generic ESP32-S3'
+};
+
+class EsparrierDevice {
+    constructor() {
+        this.device = null;
+        this.interfaceNumber = null;
+        this.endpointIn = null;
+        this.endpointOut = null;
+        this.onDisconnect = null;
+    }
+
+    /**
+     * Check if WebUSB is supported in this browser
+     */
+    static isSupported() {
+        return 'usb' in navigator;
+    }
+
+    /**
+     * Request and connect to an Esparrier device
+     * @param {number} [customVid] - Optional custom Vendor ID
+     * @param {number} [customPid] - Optional custom Product ID
+     */
+    async connect(customVid, customPid) {
+        if (!EsparrierDevice.isSupported()) {
+            throw new Error('WebUSB is not supported in this browser');
+        }
+
+        // Use custom VID/PID if provided, otherwise use defaults
+        const vid = customVid !== undefined ? customVid : ESPARRIER_VID;
+        const pid = customPid !== undefined ? customPid : ESPARRIER_PID;
+
+        // Build filters based on whether custom VID/PID is specified
+        const filters = [{ vendorId: vid, productId: pid }];
+
+        // Only include vendor interface class fallback when using default VID/PID
+        if (customVid === undefined && customPid === undefined) {
+            filters.push({
+                classCode: VENDOR_CLASS,
+                subclassCode: VENDOR_SUBCLASS,
+                protocolCode: VENDOR_PROTOCOL
+            });
+        }
+
+        // Request device with filters
+        this.device = await navigator.usb.requestDevice({ filters });
+
+        await this._openAndClaim();
+    }
+
+    /**
+     * Connect to an already paired device without user interaction
+     * @param {USBDevice} usbDevice - A previously paired USB device
+     */
+    async connectToDevice(usbDevice) {
+        if (!EsparrierDevice.isSupported()) {
+            throw new Error('WebUSB is not supported in this browser');
+        }
+
+        this.device = usbDevice;
+        await this._openAndClaim();
+    }
+
+    /**
+     * Get list of already paired Esparrier devices
+     * @param {number} [customVid] - Optional custom Vendor ID to filter
+     * @param {number} [customPid] - Optional custom Product ID to filter
+     * @returns {Promise<USBDevice[]>} Array of paired devices
+     */
+    static async getPairedDevices(customVid, customPid) {
+        if (!EsparrierDevice.isSupported()) {
+            return [];
+        }
+
+        const devices = await navigator.usb.getDevices();
+
+        // Filter by VID/PID if specified, otherwise return devices matching default or with vendor interface
+        return devices.filter(device => {
+            // Check VID/PID match
+            const vid = customVid !== undefined ? customVid : ESPARRIER_VID;
+            const pid = customPid !== undefined ? customPid : ESPARRIER_PID;
+
+            if (device.vendorId === vid && device.productId === pid) {
+                return true;
+            }
+
+            // Also check for vendor interface class
+            if (device.configuration) {
+                for (const iface of device.configuration.interfaces) {
+                    for (const alt of iface.alternates) {
+                        if (alt.interfaceClass === VENDOR_CLASS &&
+                            alt.interfaceSubclass === VENDOR_SUBCLASS &&
+                            alt.interfaceProtocol === VENDOR_PROTOCOL) {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        });
+    }
+
+    /**
+     * Internal method to open device and claim interface
+     */
+    async _openAndClaim() {
+        await this.device.open();
+
+        // Find the vendor-specific interface
+        for (const config of this.device.configurations) {
+            for (const iface of config.interfaces) {
+                for (const alt of iface.alternates) {
+                    if (alt.interfaceClass === VENDOR_CLASS &&
+                        alt.interfaceSubclass === VENDOR_SUBCLASS &&
+                        alt.interfaceProtocol === VENDOR_PROTOCOL) {
+                        this.interfaceNumber = iface.interfaceNumber;
+
+                        // Find endpoints
+                        for (const ep of alt.endpoints) {
+                            if (ep.direction === 'in') {
+                                this.endpointIn = ep.endpointNumber;
+                            } else if (ep.direction === 'out') {
+                                this.endpointOut = ep.endpointNumber;
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (this.interfaceNumber !== null) break;
+            }
+            if (this.interfaceNumber !== null) break;
+        }
+
+        if (this.interfaceNumber === null) {
+            await this.device.close();
+            throw new Error('Vendor interface not found on device');
+        }
+
+        // Select configuration and claim interface
+        if (this.device.configuration === null) {
+            await this.device.selectConfiguration(1);
+        }
+
+        await this.device.claimInterface(this.interfaceNumber);
+
+        // Set up disconnect handler
+        navigator.usb.addEventListener('disconnect', (event) => {
+            if (event.device === this.device) {
+                this.device = null;
+                this.interfaceNumber = null;
+                this.endpointIn = null;
+                this.endpointOut = null;
+                if (this.onDisconnect) {
+                    this.onDisconnect();
+                }
+            }
+        });
+
+        return true;
+    }
+
+    /**
+     * Disconnect from the device
+     */
+    async disconnect() {
+        if (this.device) {
+            try {
+                await this.device.releaseInterface(this.interfaceNumber);
+                await this.device.close();
+            } catch (e) {
+                // Ignore errors during disconnect
+            }
+            this.device = null;
+            this.interfaceNumber = null;
+            this.endpointIn = null;
+            this.endpointOut = null;
+        }
+    }
+
+    /**
+     * Disconnect and forget the device (revoke permission)
+     */
+    async forget() {
+        const deviceToForget = this.device;
+        await this.disconnect();
+        if (deviceToForget) {
+            await deviceToForget.forget();
+        }
+    }
+
+    /**
+     * Check if connected to a device
+     */
+    isConnected() {
+        return this.device !== null && this.device.opened;
+    }
+
+    /**
+     * Send a command and receive response
+     */
+    async sendCommand(data) {
+        if (!this.isConnected()) {
+            throw new Error('Not connected to device');
+        }
+
+        // Send command
+        await this.device.transferOut(this.endpointOut, new Uint8Array(data));
+
+        // Receive response
+        const result = await this.device.transferIn(this.endpointIn, 64);
+        return new Uint8Array(result.data.buffer);
+    }
+
+    /**
+     * Send data without expecting a response
+     */
+    async sendData(data) {
+        if (!this.isConnected()) {
+            throw new Error('Not connected to device');
+        }
+        await this.device.transferOut(this.endpointOut, new Uint8Array(data));
+    }
+
+    /**
+     * Receive data from the device
+     */
+    async receiveData() {
+        if (!this.isConnected()) {
+            throw new Error('Not connected to device');
+        }
+        const result = await this.device.transferIn(this.endpointIn, 64);
+        return new Uint8Array(result.data.buffer);
+    }
+
+    /**
+     * Parse error response
+     */
+    parseError(errorCode) {
+        switch (errorCode) {
+            case ERR_ENDPOINT: return 'Endpoint error';
+            case ERR_TIMEOUT: return 'Timeout';
+            case ERR_INVALID_CONFIG: return 'Invalid configuration';
+            case ERR_UNKNOWN_COMMAND: return 'Unknown command';
+            default: return `Unknown error (${String.fromCharCode(errorCode)})`;
+        }
+    }
+
+    /**
+     * Get device running state
+     */
+    async getState() {
+        const response = await this.sendCommand([CMD_GET_STATE]);
+
+        if (response[0] !== RESP_STATE) {
+            if (response[0] === RESP_ERROR) {
+                throw new Error(this.parseError(response[1]));
+            }
+            throw new Error('Unexpected response');
+        }
+
+        // Parse running state (13 bytes after response code)
+        const state = {
+            versionMajor: response[1],
+            versionMinor: response[2],
+            versionPatch: response[3],
+            featureFlags: response[4],
+            ipAddress: null,
+            serverConnected: response[10] !== 0,
+            active: response[11] !== 0,
+            keepAwake: response[12] !== 0,
+            modelId: response[13]
+        };
+
+        // Parse IP address if present
+        if (response[5] !== 0 || response[6] !== 0 || response[7] !== 0 || response[8] !== 0) {
+            state.ipAddress = {
+                octets: [response[5], response[6], response[7], response[8]],
+                prefixLen: response[9]
+            };
+        }
+
+        // Add derived fields
+        state.version = `${state.versionMajor}.${state.versionMinor}.${state.versionPatch}`;
+        state.modelName = MODEL_NAMES[state.modelId] || `Unknown (${state.modelId})`;
+        state.features = [];
+        if (state.featureFlags & FEATURE_LED) state.features.push('LED');
+        if (state.featureFlags & FEATURE_SMARTLED) state.features.push('SmartLED');
+        if (state.featureFlags & FEATURE_GRAPHICS) state.features.push('Graphics');
+        if (state.featureFlags & FEATURE_OTA) state.features.push('OTA');
+        if (state.featureFlags & FEATURE_CLIPBOARD) state.features.push('Clipboard');
+        state.hasOta = (state.featureFlags & FEATURE_OTA) !== 0;
+
+        if (state.ipAddress) {
+            state.ipAddressStr = `${state.ipAddress.octets.join('.')}/${state.ipAddress.prefixLen}`;
+        } else {
+            state.ipAddressStr = 'Not assigned';
+        }
+
+        return state;
+    }
+
+    /**
+     * Read configuration from device
+     */
+    async readConfig() {
+        const response = await this.sendCommand([CMD_READ_CONFIG]);
+
+        if (response[0] !== RESP_CONFIG) {
+            if (response[0] === RESP_ERROR) {
+                throw new Error(this.parseError(response[1]));
+            }
+            throw new Error('Unexpected response');
+        }
+
+        const blockCount = response[1];
+        const configData = new Uint8Array(blockCount * 64);
+
+        // Receive all blocks
+        for (let i = 0; i < blockCount; i++) {
+            const block = await this.receiveData();
+            configData.set(block, i * 64);
+        }
+
+        // Find end of JSON (null terminator or invalid UTF-8)
+        let jsonEnd = configData.length;
+        for (let i = 0; i < configData.length; i++) {
+            if (configData[i] === 0 || configData[i] > 0xF4) {
+                jsonEnd = i;
+                break;
+            }
+        }
+
+        // Parse JSON
+        const jsonStr = new TextDecoder().decode(configData.subarray(0, jsonEnd));
+        return JSON.parse(jsonStr);
+    }
+
+    /**
+     * Write configuration to device (does not commit)
+     */
+    async writeConfig(config) {
+        // Serialize config to JSON
+        const jsonStr = JSON.stringify(config);
+        const jsonBytes = new TextEncoder().encode(jsonStr);
+
+        // Calculate block count
+        const blockCount = Math.ceil(jsonBytes.length / 64);
+
+        if (blockCount > 64) { // Max 4096 bytes
+            throw new Error('Configuration too large');
+        }
+
+        // Send write command (device will immediately start receiving blocks)
+        await this.sendData([CMD_WRITE_CONFIG, blockCount]);
+
+        // Send config blocks
+        for (let i = 0; i < blockCount; i++) {
+            const block = new Uint8Array(64);
+            const start = i * 64;
+            const end = Math.min(start + 64, jsonBytes.length);
+            block.set(jsonBytes.subarray(start, end));
+            await this.sendData(block);
+        }
+
+        // Receive validation response after all blocks are sent
+        const validationResponse = await this.receiveData();
+
+        if (validationResponse[0] !== RESP_OK) {
+            if (validationResponse[0] === RESP_ERROR) {
+                throw new Error(this.parseError(validationResponse[1]));
+            }
+            throw new Error('Configuration validation failed');
+        }
+
+        return true;
+    }
+
+    /**
+     * Commit written configuration (writes to flash and reboots)
+     */
+    async commitConfig() {
+        const response = await this.sendCommand([CMD_COMMIT_CONFIG]);
+
+        if (response[0] !== RESP_OK) {
+            if (response[0] === RESP_ERROR) {
+                throw new Error(this.parseError(response[1]));
+            }
+            throw new Error('Commit failed');
+        }
+
+        // Device will reboot, connection will be lost
+        return true;
+    }
+
+    /**
+     * Set keep awake mode
+     */
+    async setKeepAwake(enabled) {
+        const response = await this.sendCommand([CMD_KEEP_AWAKE, enabled ? 1 : 0]);
+
+        if (response[0] !== RESP_OK) {
+            if (response[0] === RESP_ERROR) {
+                throw new Error(this.parseError(response[1]));
+            }
+            throw new Error('Failed to set keep awake');
+        }
+
+        return true;
+    }
+
+    /**
+     * Reboot the device
+     */
+    async reboot() {
+        const response = await this.sendCommand([CMD_REBOOT]);
+
+        if (response[0] !== RESP_OK) {
+            if (response[0] === RESP_ERROR) {
+                throw new Error(this.parseError(response[1]));
+            }
+            throw new Error('Reboot command failed');
+        }
+
+        // Device will reboot, connection will be lost
+        return true;
+    }
+
+    /**
+     * Parse OTA error response
+     */
+    parseOtaError(errorCode) {
+        switch (errorCode) {
+            case 'a'.charCodeAt(0): return 'OTA already in progress';
+            case 'n'.charCodeAt(0): return 'OTA not started';
+            case 'i'.charCodeAt(0): return 'OTA initialization failed';
+            case 'w'.charCodeAt(0): return 'OTA write failed';
+            case 'c'.charCodeAt(0): return 'CRC mismatch';
+            case 'f'.charCodeAt(0): return 'OTA flush failed';
+            case 's'.charCodeAt(0): return 'Invalid firmware size';
+            case 'p'.charCodeAt(0): return 'OTA partition not found';
+            default: return `Unknown OTA error (${String.fromCharCode(errorCode)})`;
+        }
+    }
+
+    /**
+     * Calculate CRC32 checksum (IEEE 802.3 polynomial)
+     * Matches the firmware's CRC32 implementation
+     */
+    static crc32(data) {
+        let crc = 0xFFFFFFFF;
+        for (let i = 0; i < data.length; i++) {
+            crc ^= data[i];
+            for (let j = 0; j < 8; j++) {
+                if (crc & 1) {
+                    crc = (crc >>> 1) ^ 0xEDB88320;
+                } else {
+                    crc >>>= 1;
+                }
+            }
+        }
+        return (~crc) >>> 0;
+    }
+
+    /**
+     * Upload firmware via OTA
+     * @param {Uint8Array} firmware - Firmware binary data
+     * @param {function} [onProgress] - Progress callback (received, total)
+     * @returns {Promise<boolean>} - True if OTA completed successfully
+     */
+    async uploadOta(firmware, onProgress) {
+        const MAX_SIZE = 0x100000; // 1MB
+        const CHUNK_SIZE = 4096;
+
+        if (firmware.length === 0 || firmware.length > MAX_SIZE) {
+            throw new Error(`Invalid firmware size: ${firmware.length} (max ${MAX_SIZE} bytes)`);
+        }
+
+        // Calculate CRC32
+        const crc = EsparrierDevice.crc32(firmware);
+
+        // Send OTA start command: 'O' + size(4B LE) + crc(4B LE)
+        const startCmd = new Uint8Array(9);
+        startCmd[0] = CMD_OTA_START;
+        const sizeView = new DataView(startCmd.buffer);
+        sizeView.setUint32(1, firmware.length, true); // Little endian
+        sizeView.setUint32(5, crc, true);
+
+        await this.sendData(startCmd);
+        const startResponse = await this.receiveData();
+
+        if (startResponse[0] === RESP_ERROR) {
+            if (startResponse[1] === ERR_OTA && startResponse.length >= 3) {
+                throw new Error(this.parseOtaError(startResponse[2]));
+            }
+            throw new Error(this.parseError(startResponse[1]));
+        }
+        if (startResponse[0] !== RESP_OK) {
+            throw new Error('Failed to start OTA');
+        }
+
+        // Send firmware in chunks
+        let sent = 0;
+        for (let offset = 0; offset < firmware.length; offset += CHUNK_SIZE) {
+            const chunk = firmware.subarray(offset, Math.min(offset + CHUNK_SIZE, firmware.length));
+            const packets = Math.ceil(chunk.length / 64);
+
+            // Send OTA data command: 'D' + packets(1B)
+            await this.sendData([CMD_OTA_DATA, packets]);
+
+            // Send data packets (64 bytes each)
+            for (let i = 0; i < packets; i++) {
+                const packet = new Uint8Array(64);
+                const packetStart = i * 64;
+                const packetEnd = Math.min(packetStart + 64, chunk.length);
+                packet.set(chunk.subarray(packetStart, packetEnd));
+                await this.sendData(packet);
+            }
+
+            sent += chunk.length;
+            if (onProgress) {
+                onProgress(sent, firmware.length);
+            }
+
+            // Receive response
+            const response = await this.receiveData();
+
+            if (response[0] === RESP_OTA_COMPLETE) {
+                // OTA completed successfully, device will reboot
+                return true;
+            } else if (response[0] === RESP_OTA_PROGRESS) {
+                // Progress response, continue
+            } else if (response[0] === RESP_OK) {
+                // OK response, continue
+            } else if (response[0] === RESP_ERROR) {
+                if (response[1] === ERR_OTA && response.length >= 3) {
+                    throw new Error(this.parseOtaError(response[2]));
+                }
+                throw new Error(this.parseError(response[1]));
+            } else {
+                throw new Error('Unexpected OTA response');
+            }
+        }
+
+        // If we reach here, something went wrong
+        throw new Error('OTA did not complete as expected');
+    }
+
+    /**
+     * Abort an in-progress OTA update
+     */
+    async abortOta() {
+        const response = await this.sendCommand([CMD_OTA_ABORT]);
+
+        if (response[0] !== RESP_OK) {
+            if (response[0] === RESP_ERROR) {
+                throw new Error(this.parseError(response[1]));
+            }
+            throw new Error('Failed to abort OTA');
+        }
+
+        return true;
+    }
+
+    /**
+     * Get device info from USB descriptors
+     */
+    getDeviceInfo() {
+        if (!this.device) return null;
+
+        return {
+            vendorId: this.device.vendorId.toString(16).padStart(4, '0'),
+            productId: this.device.productId.toString(16).padStart(4, '0'),
+            manufacturerName: this.device.manufacturerName,
+            productName: this.device.productName,
+            serialNumber: this.device.serialNumber
+        };
+    }
+}
+
+/**
+ * GitHub Release Helper for OTA firmware downloads
+ */
+const GITHUB_API_BASE = 'https://api.github.com/repos/windoze/esparrier/releases';
+
+// Model ID to firmware asset name mapping
+const MODEL_ASSET_NAMES = {
+    1: 'm5atoms3-lite',
+    2: 'm5atoms3',
+    3: 'm5atoms3r',
+    4: 'devkitc-1_0',
+    5: 'devkitc-1_1',
+    6: 'xiao-esp32s3',
+    7: 'esp32-s3-eth',
+    255: 'generic'
+};
+
+/**
+ * Get firmware release info from GitHub
+ * Uses /releases/latest to get tag, then /releases/tags/{tag} for full asset list
+ * @param {number} modelId - Device model ID
+ * @returns {Promise<{version: string, tagName: string, asset: Object}>}
+ */
+async function getFirmwareReleaseInfo(modelId) {
+    const modelName = MODEL_ASSET_NAMES[modelId];
+    if (!modelName) {
+        throw new Error(`Unknown model ID: ${modelId}`);
+    }
+
+    // First, get the latest release to find the tag name
+    const latestResponse = await fetch(`${GITHUB_API_BASE}/latest`, {
+        headers: { 'Accept': 'application/vnd.github.v3+json' }
+    });
+
+    if (!latestResponse.ok) {
+        throw new Error(`Failed to fetch latest release: ${latestResponse.status}`);
+    }
+
+    const latestRelease = await latestResponse.json();
+    const tagName = latestRelease.tag_name;
+
+    // Then fetch the full release by tag to get all assets
+    const releaseResponse = await fetch(`${GITHUB_API_BASE}/tags/${tagName}`, {
+        headers: { 'Accept': 'application/vnd.github.v3+json' }
+    });
+
+    if (!releaseResponse.ok) {
+        throw new Error(`Failed to fetch release ${tagName}: ${releaseResponse.status}`);
+    }
+
+    const release = await releaseResponse.json();
+
+    // Find the asset for this model
+    const assetPrefix = `esparrier-${modelName}-v`;
+    const asset = release.assets.find(a =>
+        a.name.startsWith(assetPrefix) && a.name.endsWith('.tar.gz')
+    );
+
+    if (!asset) {
+        throw new Error(`No firmware found for model '${modelName}' in release ${tagName}`);
+    }
+
+    // Parse version from tag (e.g., "v0.7.0" -> "0.7.0")
+    const version = tagName.startsWith('v') ? tagName.substring(1) : tagName;
+
+    return {
+        version,
+        tagName,
+        asset: {
+            id: asset.id,
+            name: asset.name,
+            size: asset.size,
+            // Use API URL for downloading to avoid CORS issues
+            downloadUrl: `https://api.github.com/repos/windoze/esparrier/releases/assets/${asset.id}`
+        }
+    };
+}
+
+/**
+ * Download firmware tarball from GitHub
+ * Uses GitHub API with Accept: application/octet-stream to avoid CORS issues
+ * @param {string} downloadUrl - Asset API URL (https://api.github.com/repos/.../releases/assets/{id})
+ * @param {function} [onProgress] - Progress callback (downloaded, total)
+ * @returns {Promise<Uint8Array>} - Tarball data
+ */
+async function downloadFirmwareTarball(downloadUrl, onProgress) {
+    // Use GitHub API with octet-stream accept header to download asset
+    // This avoids CORS issues that occur with browser_download_url
+    const response = await fetch(downloadUrl, {
+        headers: {
+            'Accept': 'application/octet-stream'
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error(`Failed to download firmware: ${response.status}`);
+    }
+
+    const contentLength = parseInt(response.headers.get('content-length') || '0');
+    const reader = response.body.getReader();
+    const chunks = [];
+    let downloaded = 0;
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        chunks.push(value);
+        downloaded += value.length;
+
+        if (onProgress && contentLength > 0) {
+            onProgress(downloaded, contentLength);
+        }
+    }
+
+    // Combine chunks
+    const tarball = new Uint8Array(downloaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+        tarball.set(chunk, offset);
+        offset += chunk.length;
+    }
+
+    return tarball;
+}
+
+/**
+ * Extract firmware .bin file from a tar.gz archive
+ * Requires pako library for gzip decompression
+ * @param {Uint8Array} tarballData - Gzipped tar archive data
+ * @returns {Uint8Array} - Firmware binary data
+ */
+function extractFirmwareFromTarball(tarballData) {
+    // Check if pako is available
+    if (typeof pako === 'undefined') {
+        throw new Error('pako library is required for tar.gz extraction');
+    }
+
+    // Decompress gzip
+    let tarData;
+    try {
+        tarData = pako.ungzip(tarballData);
+    } catch (e) {
+        throw new Error(`Failed to decompress firmware archive: ${e.message}`);
+    }
+
+    // Parse tar archive and find the .bin file
+    let offset = 0;
+    while (offset < tarData.length) {
+        // Read tar header (512 bytes)
+        if (offset + 512 > tarData.length) break;
+
+        const header = tarData.subarray(offset, offset + 512);
+
+        // Check for end of archive (two zero blocks)
+        if (header.every(b => b === 0)) break;
+
+        // Extract filename (100 bytes, null-terminated)
+        let filenameEnd = 0;
+        for (let i = 0; i < 100 && header[i] !== 0; i++) {
+            filenameEnd = i + 1;
+        }
+        const filename = new TextDecoder().decode(header.subarray(0, filenameEnd));
+
+        // Extract file size (octal string at offset 124, 12 bytes)
+        const sizeStr = new TextDecoder().decode(header.subarray(124, 136)).trim();
+        const fileSize = parseInt(sizeStr, 8) || 0;
+
+        // Move past header
+        offset += 512;
+
+        // Check if this is the firmware .bin file (not bootloader or partition table)
+        if (filename.endsWith('.bin') &&
+            !filename.includes('bootloader') &&
+            !filename.includes('partition')) {
+            // Extract file data
+            const firmware = tarData.subarray(offset, offset + fileSize);
+            return new Uint8Array(firmware);
+        }
+
+        // Move to next file (tar files are padded to 512-byte blocks)
+        offset += Math.ceil(fileSize / 512) * 512;
+    }
+
+    throw new Error('No firmware .bin file found in the archive');
+}
+
+/**
+ * Compare semantic versions
+ * @param {string} v1 - Version string (e.g., "0.7.0")
+ * @param {string} v2 - Version string
+ * @returns {number} - Negative if v1 < v2, positive if v1 > v2, 0 if equal
+ */
+function compareVersions(v1, v2) {
+    const parts1 = v1.split('.').map(Number);
+    const parts2 = v2.split('.').map(Number);
+
+    for (let i = 0; i < 3; i++) {
+        const p1 = parts1[i] || 0;
+        const p2 = parts2[i] || 0;
+        if (p1 !== p2) return p1 - p2;
+    }
+    return 0;
+}
+
+// Export for use in other scripts
+window.EsparrierDevice = EsparrierDevice;
+window.getFirmwareReleaseInfo = getFirmwareReleaseInfo;
+window.downloadFirmwareTarball = downloadFirmwareTarball;
+window.extractFirmwareFromTarball = extractFirmwareFromTarball;
+window.compareVersions = compareVersions;
+window.MODEL_ASSET_NAMES = MODEL_ASSET_NAMES;

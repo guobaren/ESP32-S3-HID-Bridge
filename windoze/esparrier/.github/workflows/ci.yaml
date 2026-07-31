@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - "**/README.md"
+      - "**/README.*.md"
+      - "**/*.example"
+      - "/.vscode/**"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  rust-checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        models:
+          [
+            "generic",
+            "m5atoms3-lite",
+            "m5atoms3",
+            "m5atoms3r",
+            "xiao-esp32s3",
+            "devkitc-1_0",
+            "devkitc-1_1",
+            "esp32-s3-eth",
+          ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          version: "1.89.0"
+          buildtargets: esp32
+          ldproxy: false
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install libudev-dev libusb-dev wget unzip
+          wget 'https://github.com/esp-rs/espflash/releases/download/v4.0.1/cargo-espflash-x86_64-unknown-linux-musl.zip'
+          unzip cargo-espflash-x86_64-unknown-linux-musl.zip
+          mv cargo-espflash ~/.cargo/bin/
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check --color always
+      - name: Run clippy
+        run: cargo clippy --release --features=${{ matrix.models }} --workspace -- -D warnings
+      - name: Build binary
+        run: |
+          if [ "${{ matrix.models }}" = "generic" ]; then
+            PARTITION_TABLE="partitions_single_app.csv"
+          else
+            PARTITION_TABLE="partitions_ota.csv"
+          fi
+          cargo espflash save-image --chip esp32s3 --release --features ${{ matrix.models }} --partition-table $PARTITION_TABLE esparrier-${{ matrix.models }}.bin
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.models }}
+          path: ./*.bin
