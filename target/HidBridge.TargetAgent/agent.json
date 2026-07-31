@@ -1,0 +1,6 @@
+{
+  "listenAddress": "0.0.0.0",
+  "port": 24814,
+  "presharedKey": "在 agent.local.json 中填写至少16字节的随机密钥",
+  "leaseTimeoutMilliseconds": 1500
+}

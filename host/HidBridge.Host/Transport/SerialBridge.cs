@@ -1,35 +1,46 @@
 using System.IO.Ports;
-using HidBridge.Host.Protocol;
+using HidBridge.Protocol;
 
 namespace HidBridge.Host.Transport;
 
-internal sealed class SerialBridge : IDisposable
+internal sealed class SerialBridge : IBridgeTransport
 {
     private readonly BridgeOptions _options;
     private readonly FrameCodec _codec = new();
     private readonly object _sync = new();
+    private readonly System.Threading.Timer _heartbeatTimer;
     private SerialPort? _port;
     private DateTime _nextConnectAttemptUtc;
+    private bool _sessionStarted;
+    private bool _disposed;
 
     public SerialBridge(BridgeOptions options)
     {
         _options = options;
+        _heartbeatTimer = new System.Threading.Timer(
+            _ => Send(MessageType.Ping, ReadOnlySpan<byte>.Empty),
+            null,
+            TimeSpan.Zero,
+            TimeSpan.FromMilliseconds(options.HeartbeatIntervalMilliseconds));
     }
 
     public void Send(MessageType type, ReadOnlySpan<byte> payload)
     {
-        byte[] frame = _codec.Encode(type, payload);
-
         lock (_sync)
         {
-            if (!EnsureConnected())
+            if (_disposed || !EnsureConnected())
             {
                 return;
             }
 
             try
             {
-                _port!.Write(frame, 0, frame.Length);
+                if (!_sessionStarted)
+                {
+                    WriteFrame(_codec.Encode(MessageType.SessionStart, ReadOnlySpan<byte>.Empty));
+                    _sessionStarted = true;
+                }
+                WriteFrame(_codec.Encode(type, payload));
             }
             catch (Exception exception) when (
                 exception is IOException or InvalidOperationException or UnauthorizedAccessException)
@@ -39,6 +50,8 @@ internal sealed class SerialBridge : IDisposable
             }
         }
     }
+
+    private void WriteFrame(byte[] frame) => _port!.Write(frame, 0, frame.Length);
 
     private bool EnsureConnected()
     {
@@ -90,13 +103,16 @@ internal sealed class SerialBridge : IDisposable
         finally
         {
             _port = null;
+            _sessionStarted = false;
         }
     }
 
     public void Dispose()
     {
+        _heartbeatTimer.Dispose();
         lock (_sync)
         {
+            _disposed = true;
             ClosePort();
         }
     }

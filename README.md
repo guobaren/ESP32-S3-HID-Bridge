@@ -33,10 +33,28 @@ ESP32-S3-DevKitC-1
 - [x] 带序号、长度与 CRC16 的串口帧
 - [x] ESP-IDF UART 接收与流式协议解析
 - [x] 单 HID 接口、双 Report ID 的 USB 键盘/鼠标描述符
+- [x] 链路心跳、输入租约、断连超时检测与自动 `ReleaseAll`
+- [x] 电脑到开发板的认证加密 Wi-Fi 输入通道
+- [x] SoftAP 网页配网、NVS 凭据保存和 BOOT 长按重新配网
+- [x] 开发板到 Windows 目标 Agent 的认证加密 Wi-Fi 输出通道
+- [x] 开发板到目标设备的 BLE HID 键盘/鼠标输出
 - [ ] 在实物 ESP32-S3-DevKitC-1 上完成首次烧录验证
 - [ ] 增加串口自动发现和设备握手
 - [ ] 增加托盘界面与配置页
-- [ ] 可选 BLE HID 输出
+
+## 计划中的连接方式
+
+后续将把输入传输与目标输出拆分为可组合的后端：
+
+| 方向 | 连接方式 | 目标定位 |
+|---|---|---|
+| 电脑 → 开发板 | USB-to-UART | 当前默认输入通道 |
+| 电脑 → 开发板 | Wi-Fi | 已实现预共享密钥认证、AES-256-GCM 加密和防重放计数器 |
+| 开发板 → 目标设备 | USB HID | 当前默认输出通道，可用于无需安装配套程序的目标设备 |
+| 开发板 → 目标设备 | Wi-Fi | 已实现 Windows Target Agent；不作为通用 HID |
+| 开发板 → 目标设备 | BLE HID | 已实现标准 BLE 键盘和相对鼠标报告 |
+
+所有输入通道都必须提供心跳或连接租约。当前活动输入通道断开、超时或切换时，开发板必须释放全部键盘按键和鼠标按钮，之后才能接受新的输入会话。
 
 ## 快速开始
 
@@ -79,6 +97,8 @@ idf.py -p COM5 flash
 ```
 
 激活脚本只修改当前 PowerShell 会话；重新打开终端后需要再次执行。
+
+Wi-Fi、BLE 和目标 Agent 的配置步骤见 [docs/configuration.md](docs/configuration.md)。首次烧录后可通过临时 SoftAP 网页设置 Wi-Fi；SSID 和密码保存在开发板 NVS，不需要为更换网络重新编译。预共享密钥仍只写入被 Git 忽略的 `firmware/sdkconfig`、`bridge.local.json` 和 `agent.local.json`，不要写入仓库文件。
 
 烧录后：
 

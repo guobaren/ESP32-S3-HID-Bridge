@@ -1,3 +1,5 @@
 <Solution>
+  <Project Path="shared/HidBridge.Protocol/HidBridge.Protocol.csproj" />
   <Project Path="host/HidBridge.Host/HidBridge.Host.csproj" />
+  <Project Path="target/HidBridge.TargetAgent/HidBridge.TargetAgent.csproj" />
 </Solution>

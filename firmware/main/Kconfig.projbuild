@@ -1,0 +1,90 @@
+menu "HID Bridge"
+
+config HID_BRIDGE_LEASE_TIMEOUT_MS
+    int "输入租约超时（毫秒）"
+    range 500 10000
+    default 1500
+
+config HID_BRIDGE_WIFI_ENABLE
+    bool "启用 Wi-Fi"
+    default y
+
+if HID_BRIDGE_WIFI_ENABLE
+
+config HID_BRIDGE_WIFI_SSID
+    string "首次启动回退 Wi-Fi SSID（NVS 中无凭据时使用）"
+    default ""
+
+config HID_BRIDGE_WIFI_PASSWORD
+    string "首次启动回退 Wi-Fi 密码"
+    default ""
+
+config HID_BRIDGE_PROVISIONING_ENABLE
+    bool "启用 SoftAP 网页配网"
+    default y
+
+if HID_BRIDGE_PROVISIONING_ENABLE
+
+config HID_BRIDGE_PROVISIONING_AP_PASSWORD
+    string "配网热点密码（留空表示开放热点，非空时至少 8 字节）"
+    default "hidbridge"
+
+config HID_BRIDGE_PROVISIONING_FALLBACK_SECONDS
+    int "连接失败后进入配网模式（秒）"
+    range 5 300
+    default 30
+
+config HID_BRIDGE_PROVISIONING_BUTTON_GPIO
+    int "长按进入配网模式的 GPIO"
+    range 0 48
+    default 0
+
+config HID_BRIDGE_PROVISIONING_BUTTON_HOLD_SECONDS
+    int "进入配网模式所需长按时间（秒）"
+    range 2 15
+    default 5
+
+endif
+
+config HID_BRIDGE_WIFI_INPUT_ENABLE
+    bool "允许电脑通过 Wi-Fi 输入"
+    default y
+
+config HID_BRIDGE_WIFI_INPUT_PORT
+    int "Wi-Fi 输入端口"
+    range 1 65535
+    default 24813
+
+config HID_BRIDGE_WIFI_INPUT_PSK
+    string "Wi-Fi 输入预共享密钥（至少 16 字节）"
+    default ""
+
+config HID_BRIDGE_WIFI_TARGET_ENABLE
+    bool "通过 Wi-Fi 输出到目标 Agent"
+    default n
+
+config HID_BRIDGE_WIFI_TARGET_HOST
+    string "目标 Agent IPv4 地址"
+    default "192.168.1.51"
+
+config HID_BRIDGE_WIFI_TARGET_PORT
+    int "目标 Agent 端口"
+    range 1 65535
+    default 24814
+
+config HID_BRIDGE_WIFI_TARGET_PSK
+    string "目标 Agent 预共享密钥（至少 16 字节）"
+    default ""
+
+endif
+
+config HID_BRIDGE_BLE_ENABLE
+    bool "启用 BLE HID 输出"
+    default y
+
+config HID_BRIDGE_BLE_DEVICE_NAME
+    string "BLE HID 设备名称"
+    default "HidBridge Keyboard Mouse"
+    depends on HID_BRIDGE_BLE_ENABLE
+
+endmenu

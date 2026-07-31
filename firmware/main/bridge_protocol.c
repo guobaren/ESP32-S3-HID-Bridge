@@ -116,3 +116,33 @@ uint16_t bridge_crc16_ccitt(const uint8_t *data, size_t length)
     }
     return crc;
 }
+
+esp_err_t bridge_frame_serialize(
+    const bridge_frame_t *frame,
+    uint8_t *output,
+    size_t output_capacity,
+    size_t *output_length)
+{
+    if (frame == NULL || output == NULL || output_length == NULL ||
+        frame->payload_length > BRIDGE_MAX_PAYLOAD) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t length = 9 + frame->payload_length;
+    if (output_capacity < length) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    output[0] = 0xA5;
+    output[1] = 0x5A;
+    output[2] = frame->version;
+    output[3] = (uint8_t)frame->type;
+    output[4] = (uint8_t)frame->sequence;
+    output[5] = (uint8_t)(frame->sequence >> 8);
+    output[6] = frame->payload_length;
+    memcpy(output + 7, frame->payload, frame->payload_length);
+    uint16_t crc = bridge_crc16_ccitt(output + 2, 5 + frame->payload_length);
+    output[7 + frame->payload_length] = (uint8_t)crc;
+    output[8 + frame->payload_length] = (uint8_t)(crc >> 8);
+    *output_length = length;
+    return ESP_OK;
+}

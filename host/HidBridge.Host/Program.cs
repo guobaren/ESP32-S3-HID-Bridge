@@ -1,6 +1,6 @@
 using HidBridge.Host.Input;
-using HidBridge.Host.Protocol;
 using HidBridge.Host.Transport;
+using HidBridge.Protocol;
 
 namespace HidBridge.Host;
 
@@ -12,7 +12,11 @@ internal static class Program
         ApplicationConfiguration.Initialize();
 
         BridgeOptions options = BridgeOptions.Load();
-        using SerialBridge transport = new(options);
+        using IBridgeTransport transport = options.Transport.Equals(
+            "wifi",
+            StringComparison.OrdinalIgnoreCase)
+            ? new NetworkBridge(options)
+            : new SerialBridge(options);
         using InputForwarder input = new(transport, options.SuppressLocalInput);
 
         Console.CancelKeyPress += (_, eventArgs) =>
@@ -30,7 +34,9 @@ internal static class Program
                 : "键鼠转发已停止。");
         };
 
-        Console.WriteLine($"目标串口：{options.PortName} @ {options.BaudRate}");
+        Console.WriteLine(options.Transport.Equals("wifi", StringComparison.OrdinalIgnoreCase)
+            ? $"开发板网络地址：{options.WiFiHost}:{options.WiFiPort}"
+            : $"目标串口：{options.PortName} @ {options.BaudRate}");
         Console.WriteLine("Ctrl+Alt+F12：切换转发；Ctrl+Alt+F11：退出。");
 
         input.Start();

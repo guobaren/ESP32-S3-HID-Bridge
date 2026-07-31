@@ -2,13 +2,18 @@
 #include <stdint.h>
 
 #include "bridge_protocol.h"
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "hid_output.h"
+#include "input_session.h"
+#include "nvs_flash.h"
+#include "output_router.h"
+#include "wifi_input.h"
+#include "wifi_manager.h"
 
 #define BRIDGE_UART UART_NUM_0
 #define BRIDGE_UART_BAUD_RATE 921600
@@ -20,15 +25,7 @@ static const char *TAG = "hid_bridge";
 static void on_bridge_frame(const bridge_frame_t *frame, void *context)
 {
     (void)context;
-
-    if (frame->type == BRIDGE_MESSAGE_PING) {
-        return;
-    }
-
-    esp_err_t error = hid_output_submit(frame);
-    if (error != ESP_OK && error != ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGW(TAG, "丢弃 HID 帧，错误：%s", esp_err_to_name(error));
-    }
+    input_session_handle(BRIDGE_INPUT_UART, frame);
 }
 
 static void uart_receiver_task(void *argument)
@@ -84,10 +81,68 @@ static esp_err_t configure_uart(void)
     return ESP_OK;
 }
 
+#if CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
+static void provisioning_button_task(void *argument)
+{
+    (void)argument;
+    const gpio_num_t button_gpio = (gpio_num_t)CONFIG_HID_BRIDGE_PROVISIONING_BUTTON_GPIO;
+    const TickType_t hold_time =
+        pdMS_TO_TICKS(CONFIG_HID_BRIDGE_PROVISIONING_BUTTON_HOLD_SECONDS * 1000);
+    gpio_config_t config = {
+        .pin_bit_mask = 1ULL << button_gpio,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+
+    TickType_t pressed_since = 0;
+    bool triggered = false;
+    while (true) {
+        bool pressed = gpio_get_level(button_gpio) == 0;
+        if (!pressed) {
+            pressed_since = 0;
+            triggered = false;
+        } else if (pressed_since == 0) {
+            pressed_since = xTaskGetTickCount();
+        } else if (!triggered && xTaskGetTickCount() - pressed_since >= hold_time) {
+            triggered = true;
+            input_session_release_all();
+            esp_err_t result = wifi_manager_start_provisioning();
+            if (result == ESP_OK) {
+                ESP_LOGW(TAG, "检测到长按 BOOT，已进入网页配网模式");
+            } else {
+                ESP_LOGE(TAG, "进入网页配网模式失败：%s", esp_err_to_name(result));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+#endif
+
 void app_main(void)
 {
-    ESP_ERROR_CHECK(hid_output_init());
+    esp_err_t nvs_result = nvs_flash_init();
+    if (nvs_result == ESP_ERR_NVS_NO_FREE_PAGES || nvs_result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    } else {
+        ESP_ERROR_CHECK(nvs_result);
+    }
+
+    esp_err_t wifi_result = wifi_manager_init();
+    if (wifi_result != ESP_OK && wifi_result != ESP_ERR_NOT_SUPPORTED) {
+        ESP_ERROR_CHECK(wifi_result);
+    }
+    ESP_ERROR_CHECK(output_router_init());
+    ESP_ERROR_CHECK(input_session_init());
     ESP_ERROR_CHECK(configure_uart());
+    wifi_result = wifi_input_start();
+    if (wifi_result != ESP_OK && wifi_result != ESP_ERR_NOT_SUPPORTED &&
+        wifi_result != ESP_ERR_INVALID_ARG) {
+        ESP_ERROR_CHECK(wifi_result);
+    }
 
     BaseType_t created = xTaskCreate(
         uart_receiver_task,
@@ -97,6 +152,17 @@ void app_main(void)
         9,
         NULL);
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+
+#if CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
+    created = xTaskCreate(
+        provisioning_button_task,
+        "provision_button",
+        3072,
+        NULL,
+        5,
+        NULL);
+    ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+#endif
 
     ESP_LOGI(TAG, "ESP32-S3 HID Bridge 已启动");
 }

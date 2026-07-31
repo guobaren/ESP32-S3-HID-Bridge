@@ -4,24 +4,17 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <UseWindowsForms>true</UseWindowsForms>
-    <AssemblyName>HidBridge.Host</AssemblyName>
-    <RootNamespace>HidBridge.Host</RootNamespace>
   </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="System.IO.Ports" Version="10.0.0" />
-  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\shared\HidBridge.Protocol\HidBridge.Protocol.csproj" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="bridge.json">
+    <None Update="agent.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Update="bridge.local.json" Condition="Exists('bridge.local.json')">
+    <None Update="agent.local.json" Condition="Exists('agent.local.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

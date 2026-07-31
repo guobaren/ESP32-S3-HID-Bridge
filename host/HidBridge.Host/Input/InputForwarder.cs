@@ -1,7 +1,7 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-using HidBridge.Host.Protocol;
 using HidBridge.Host.Transport;
+using HidBridge.Protocol;
 
 namespace HidBridge.Host.Input;
 
@@ -15,7 +15,7 @@ internal sealed class InputForwarder : IDisposable
     private const byte BackButton = 1 << 3;
     private const byte ForwardButton = 1 << 4;
 
-    private readonly SerialBridge _transport;
+    private readonly IBridgeTransport _transport;
     private readonly bool _suppressLocalInput;
     private readonly NativeMethods.HookProc _keyboardProc;
     private readonly NativeMethods.HookProc _mouseProc;
@@ -30,7 +30,7 @@ internal sealed class InputForwarder : IDisposable
     private bool _ignoreHotkeyChord;
     private bool _started;
 
-    internal InputForwarder(SerialBridge transport, bool suppressLocalInput)
+    internal InputForwarder(IBridgeTransport transport, bool suppressLocalInput)
     {
         _transport = transport;
         _suppressLocalInput = suppressLocalInput;

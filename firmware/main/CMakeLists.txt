@@ -1,10 +1,29 @@
 idf_component_register(
     SRCS
         "app_main.c"
+        "ble_output.c"
         "bridge_protocol.c"
+        "esp_hid_gap.c"
         "hid_output.c"
+        "input_session.c"
+        "output_router.c"
+        "secure_channel.c"
+        "wifi_input.c"
+        "wifi_manager.c"
+        "wifi_provisioning.c"
+        "wifi_target_output.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_driver_uart
+        esp_driver_gpio
+        esp_event
+        esp_hid
+        esp_http_server
+        esp_netif
         esp_tinyusb
+        esp_wifi
+        lwip
+        mbedtls
+        nvs_flash
+        bt
 )
