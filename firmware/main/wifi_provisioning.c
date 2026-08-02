@@ -35,16 +35,23 @@ static const char s_index_html[] =
     "h1{font-size:24px;margin-top:0}label{display:block;margin:16px 0 6px}"
     "select,input,button{box-sizing:border-box;width:100%;padding:12px;border-radius:8px;border:1px solid #4b5563;font-size:16px}"
     "select,input{background:#111827;color:#fff}button{margin-top:18px;background:#22c55e;color:#052e16;border:0;font-weight:700}"
+    ".scan-row{display:flex;gap:8px}.scan-row select{flex:1}.scan-row button{width:auto;margin:0;background:#374151;color:#fff;white-space:nowrap}"
     "button:disabled{opacity:.55}.muted{color:#9ca3af;font-size:14px}.status{min-height:24px;margin-top:14px}"
     "</style></head><body><main><h1>HID Bridge Wi-Fi 配置</h1>"
     "<p class=muted>选择新的 2.4 GHz 网络。保存后开发板会自动连接并关闭此临时热点。</p>"
-    "<form id=f><label for=s>Wi-Fi 网络</label><input id=s name=ssid list=n maxlength=32 required placeholder='正在扫描，也可手动输入'><datalist id=n></datalist>"
+    "<form id=f><label for=n>扫描到的 Wi-Fi 网络</label><div class=scan-row><select id=n><option value=''>正在扫描…</option></select><button id=r type=button>重新扫描</button></div>"
+    "<label for=s>网络名称（SSID）</label><input id=s name=ssid maxlength=32 required placeholder='选择上方网络，或在此手动输入'>"
     "<label for=p>Wi-Fi 密码</label><input id=p name=password type=password maxlength=63 autocomplete=current-password placeholder='开放网络请留空'>"
     "<button id=b>保存并连接</button><div class=status id=m></div></form>"
-    "<script>const s=document.querySelector('#s'),n=document.querySelector('#n'),m=document.querySelector('#m'),b=document.querySelector('#b');"
-    "async function scan(){try{let r=await fetch('/api/networks'),a=await r.json();n.innerHTML='';"
-    "a.forEach(x=>{let o=document.createElement('option');o.value=x.ssid;o.label=x.rssi+' dBm'+(x.open?' 开放':'');n.append(o)});"
-    "if(!a.length)m.textContent='未扫描到网络，可手动输入 SSID。'}catch(e){m.textContent='扫描失败，可手动输入 SSID。'}}scan();"
+    "<script>const s=document.querySelector('#s'),n=document.querySelector('#n'),m=document.querySelector('#m'),b=document.querySelector('#b'),r=document.querySelector('#r');"
+    "n.onchange=()=>{if(n.value)s.value=n.value};r.onclick=()=>scan();"
+    "async function scan(){let c=new AbortController(),t=setTimeout(()=>c.abort(),15000);r.disabled=true;n.disabled=true;n.innerHTML='<option value=\"\">正在扫描…</option>';m.textContent='正在扫描附近的 2.4 GHz 网络…';"
+    "try{let q=await fetch('/api/networks',{cache:'no-store',signal:c.signal});if(!q.ok)throw new Error(await q.text());let a=await q.json();n.innerHTML='';"
+    "let d=document.createElement('option');d.value='';d.textContent=a.length?'请选择网络':'未扫描到网络';n.append(d);"
+    "a.forEach(x=>{let o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+'（'+x.rssi+' dBm'+(x.open?'，开放网络':'')+'）';n.append(o)});"
+    "m.textContent=a.length?'已扫描到 '+a.length+' 个网络。请选择，或手动输入 SSID。':'未扫描到网络，可手动输入 SSID。'}"
+    "catch(e){n.innerHTML='<option value=\"\">扫描失败</option>';m.textContent=e.name==='AbortError'?'扫描超时，请点击重新扫描，或手动输入 SSID。':'扫描失败：'+(e.message||'未知错误')+'。也可手动输入 SSID。'}"
+    "finally{clearTimeout(t);r.disabled=false;n.disabled=false}}scan();"
     "document.querySelector('#f').onsubmit=async e=>{e.preventDefault();b.disabled=true;m.textContent='正在保存并连接…';"
     "try{let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))});"
     "m.textContent=await r.text();if(!r.ok){b.disabled=false;return}for(let i=0;i<12;i++){await new Promise(x=>setTimeout(x,1000));"
@@ -107,7 +114,12 @@ static esp_err_t networks_handler(httpd_req_t *request)
     }
 
     uint16_t count = 0;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_scan_get_ap_num(&count));
+    result = esp_wifi_scan_get_ap_num(&count);
+    if (result != ESP_OK) {
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        httpd_resp_set_type(request, "text/plain; charset=utf-8");
+        return httpd_resp_send(request, "无法读取 Wi-Fi 扫描结果", HTTPD_RESP_USE_STRLEN);
+    }
     if (count > MAX_SCAN_RESULTS) {
         count = MAX_SCAN_RESULTS;
     }

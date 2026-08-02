@@ -5,7 +5,7 @@
 
 #include "esp_err.h"
 
-#define BRIDGE_PROTOCOL_VERSION 1
+#define BRIDGE_PROTOCOL_VERSION 2
 #define BRIDGE_MAX_PAYLOAD 64
 
 typedef enum {

@@ -15,10 +15,10 @@ internal sealed class InputForwarder : IDisposable
     private const byte BackButton = 1 << 3;
     private const byte ForwardButton = 1 << 4;
 
-    private readonly IBridgeTransport _transport;
     private readonly bool _suppressLocalInput;
     private readonly NativeMethods.HookProc _keyboardProc;
     private readonly NativeMethods.HookProc _mouseProc;
+    private readonly MouseReportPump _mouseReportPump;
     private readonly List<byte> _pressedKeys = [];
     private IntPtr _keyboardHook;
     private IntPtr _mouseHook;
@@ -32,13 +32,13 @@ internal sealed class InputForwarder : IDisposable
 
     internal InputForwarder(IBridgeTransport transport, bool suppressLocalInput)
     {
-        _transport = transport;
         _suppressLocalInput = suppressLocalInput;
         _keyboardProc = KeyboardCallback;
         _mouseProc = MouseCallback;
+        _mouseReportPump = new MouseReportPump(transport);
     }
 
-    internal bool ForwardingEnabled { get; private set; }
+    internal bool ForwardingEnabled => _mouseReportPump.Enabled;
 
     internal event EventHandler<bool>? ForwardingChanged;
     internal event EventHandler? ExitRequested;
@@ -75,14 +75,7 @@ internal sealed class InputForwarder : IDisposable
 
     internal void Stop()
     {
-        if (ForwardingEnabled)
-        {
-            SetForwarding(false);
-        }
-        else
-        {
-            ReleaseAll();
-        }
+        SetForwarding(false, true);
 
         if (_keyboardHook != IntPtr.Zero)
         {
@@ -128,14 +121,13 @@ internal sealed class InputForwarder : IDisposable
         if (isToggleHotkey || isExitHotkey)
         {
             _ignoreHotkeyChord = true;
-            ReleaseAll();
-
             if (isToggleHotkey)
             {
                 SetForwarding(!ForwardingEnabled);
             }
             else
             {
+                SetForwarding(false, true);
                 ExitRequested?.Invoke(this, EventArgs.Empty);
             }
 
@@ -225,26 +217,25 @@ internal sealed class InputForwarder : IDisposable
         }
     }
 
-    private void SetForwarding(bool enabled)
+    private void SetForwarding(bool enabled, bool forceRelease = false)
     {
-        if (ForwardingEnabled == enabled)
+        if (!forceRelease && ForwardingEnabled == enabled)
         {
             return;
         }
 
-        ReleaseAll();
-        ForwardingEnabled = enabled;
+        ClearInputState();
+        _mouseReportPump.ResetAndSendRelease(enabled);
         ForwardingChanged?.Invoke(this, enabled);
     }
 
-    private void ReleaseAll()
+    private void ClearInputState()
     {
         _pressedKeys.Clear();
         _modifiers = 0;
         _mouseButtons = 0;
         _verticalWheelRemainder = 0;
         _horizontalWheelRemainder = 0;
-        _transport.Send(MessageType.ReleaseAll, ReadOnlySpan<byte>.Empty);
     }
 
     private void HandleRawMouseInput(NativeMethods.RawMouse input)
@@ -255,6 +246,7 @@ internal sealed class InputForwarder : IDisposable
         }
 
         ushort flags = input.ButtonFlags;
+        byte previousButtons = _mouseButtons;
         UpdateMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, LeftButton);
         UpdateMouseButton(flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, RightButton);
         UpdateMouseButton(flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, MiddleButton);
@@ -272,10 +264,16 @@ internal sealed class InputForwarder : IDisposable
             pan = ConsumeWheelDelta(input.ButtonData, ref _horizontalWheelRemainder);
         }
 
-        bool hasButtonChange = (flags & 0x03FF) != 0;
+        bool hasButtonChange = previousButtons != _mouseButtons;
         if (input.LastX != 0 || input.LastY != 0 || wheel != 0 || pan != 0 || hasButtonChange)
         {
-            SendMouseReports(input.LastX, input.LastY, wheel, pan);
+            _mouseReportPump.Accumulate(
+                _mouseButtons,
+                hasButtonChange,
+                input.LastX,
+                input.LastY,
+                wheel,
+                pan);
         }
     }
 
@@ -309,34 +307,12 @@ internal sealed class InputForwarder : IDisposable
             report[index + 2] = _pressedKeys[index];
         }
 
-        _transport.Send(MessageType.KeyboardReport, report);
-    }
-
-    private void SendMouseReports(int deltaX, int deltaY, int wheel, int pan)
-    {
-        Span<byte> report = stackalloc byte[5];
-        do
-        {
-            int stepX = Math.Clamp(deltaX, -127, 127);
-            int stepY = Math.Clamp(deltaY, -127, 127);
-            int stepWheel = Math.Clamp(wheel, -127, 127);
-            int stepPan = Math.Clamp(pan, -127, 127);
-            report[0] = _mouseButtons;
-            report[1] = unchecked((byte)(sbyte)stepX);
-            report[2] = unchecked((byte)(sbyte)stepY);
-            report[3] = unchecked((byte)(sbyte)stepWheel);
-            report[4] = unchecked((byte)(sbyte)stepPan);
-            _transport.Send(MessageType.MouseReport, report);
-            deltaX -= stepX;
-            deltaY -= stepY;
-            wheel -= stepWheel;
-            pan -= stepPan;
-        }
-        while (deltaX != 0 || deltaY != 0 || wheel != 0 || pan != 0);
+        _mouseReportPump.SendKeyboard(report);
     }
 
     public void Dispose()
     {
         Stop();
+        _mouseReportPump.Dispose();
     }
 }

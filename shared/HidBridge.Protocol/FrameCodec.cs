@@ -4,7 +4,7 @@ namespace HidBridge.Protocol;
 
 public sealed class FrameCodec
 {
-    public const byte Version = 1;
+    public const byte Version = 2;
     public const int MaximumPayloadLength = 64;
     private ushort _sequence;
 

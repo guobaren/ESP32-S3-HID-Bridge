@@ -36,12 +36,25 @@ static void uart_receiver_task(void *argument)
     bridge_parser_init(&parser, on_bridge_frame, NULL);
 
     while (true) {
-        const int received = uart_read_bytes(
+        int received = uart_read_bytes(
             BRIDGE_UART,
             buffer,
-            sizeof(buffer),
-            pdMS_TO_TICKS(100));
+            1,
+            portMAX_DELAY);
         if (received > 0) {
+            size_t buffered = 0;
+            if (uart_get_buffered_data_len(BRIDGE_UART, &buffered) == ESP_OK && buffered > 0) {
+                size_t remaining = sizeof(buffer) - (size_t)received;
+                size_t drain_length = buffered < remaining ? buffered : remaining;
+                int drained = uart_read_bytes(
+                    BRIDGE_UART,
+                    buffer + received,
+                    drain_length,
+                    0);
+                if (drained > 0) {
+                    received += drained;
+                }
+            }
             bridge_parser_feed(&parser, buffer, (size_t)received);
         }
     }

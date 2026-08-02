@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using HidBridge.Protocol;
 
 namespace HidBridge.TargetAgent;
 
@@ -67,12 +68,12 @@ internal sealed class WindowsInputInjector
 
     internal void ApplyMouseReport(ReadOnlySpan<byte> report)
     {
-        if (report.Length != 5)
+        if (!MouseReportCodec.TryDecode(report, out MouseReport mouse))
         {
             return;
         }
 
-        byte buttons = report[0];
+        byte buttons = mouse.Buttons;
         SendButtonChange(0x01, buttons, MouseeventfLeftdown, MouseeventfLeftup, 0);
         SendButtonChange(0x02, buttons, MouseeventfRightdown, MouseeventfRightup, 0);
         SendButtonChange(0x04, buttons, MouseeventfMiddledown, MouseeventfMiddleup, 0);
@@ -80,10 +81,10 @@ internal sealed class WindowsInputInjector
         SendButtonChange(0x10, buttons, MouseeventfXdown, MouseeventfXup, Xbutton2);
         _mouseButtons = buttons;
 
-        int x = unchecked((sbyte)report[1]);
-        int y = unchecked((sbyte)report[2]);
-        int wheel = unchecked((sbyte)report[3]);
-        int horizontalWheel = unchecked((sbyte)report[4]);
+        int x = mouse.X;
+        int y = mouse.Y;
+        int wheel = mouse.Wheel;
+        int horizontalWheel = mouse.Pan;
         if (x != 0 || y != 0)
         {
             SendMouse(MouseeventfMove, 0, x, y);
