@@ -20,6 +20,7 @@
 #include "nimble/nimble_port.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs_adv.h"
+#include "services/gap/ble_svc_gap.h"
 #include "nimble/ble.h"
 #include "host/ble_sm.h"
 #else
@@ -748,10 +749,11 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
 
 extern void ble_hid_task_start_up(void);
 static struct ble_hs_adv_fields fields;
+static struct ble_hs_adv_fields scan_response_fields;
+static ble_uuid16_t hid_service_uuid = BLE_UUID16_INIT(GATT_SVR_SVC_HID_UUID);
 
 esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
 {
-    ble_uuid16_t *uuid16, *uuid16_1;
     /**
      *  Set the advertisement data included in our advertisements:
      *     o Flags (indicates advertisement type and other general info).
@@ -769,7 +771,7 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
     fields.flags = BLE_HS_ADV_F_DISC_GEN |
                    BLE_HS_ADV_F_BREDR_UNSUP;
 
-    fields.appearance = ESP_HID_APPEARANCE_GENERIC;
+    fields.appearance = appearance;
     fields.appearance_is_present = 1;
 
     /* Indicate that the TX power level field should be included; have the
@@ -779,18 +781,24 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
-    fields.name = (uint8_t *)device_name;
-    fields.name_len = strlen(device_name);
-    fields.name_is_complete = 1;
-
-    uuid16 = (ble_uuid16_t *)malloc(sizeof(ble_uuid16_t));
-    uuid16_1 = (ble_uuid16_t[]) {
-        BLE_UUID16_INIT(GATT_SVR_SVC_HID_UUID)
-    };
-    memcpy(uuid16, uuid16_1, sizeof(ble_uuid16_t));
-    fields.uuids16 = uuid16;
+    fields.uuids16 = &hid_service_uuid;
     fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
+
+    /*
+     * 名称、HID UUID、外观和发射功率无法同时装入 31 字节广播包。
+     * 主广播保留 HID 服务，完整名称改由扫描响应提供。
+     */
+    memset(&scan_response_fields, 0, sizeof(scan_response_fields));
+    scan_response_fields.name = (uint8_t *)device_name;
+    scan_response_fields.name_len = strlen(device_name);
+    scan_response_fields.name_is_complete = 1;
+
+    int rc = ble_svc_gap_device_name_set(device_name);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "error setting GAP device name; rc=%d\n", rc);
+        return rc;
+    }
 
     /* Initialize the security configuration */
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_DISP_ONLY;
@@ -820,8 +828,11 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         break;
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
-
-        return 0;
+        rc = esp_hid_ble_gap_adv_start();
+        if (rc != ESP_OK) {
+            ESP_LOGE(TAG, "restart advertising failed; rc=%d", rc);
+        }
+        return rc;
     case BLE_GAP_EVENT_CONN_UPDATE:
         /* The central has updated the connection parameters. */
         ESP_LOGI(TAG, "connection updated; status=%d",
@@ -936,6 +947,11 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
     rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         MODLOG_DFLT(ERROR, "error setting advertisement data; rc=%d\n", rc);
+        return rc;
+    }
+    rc = ble_gap_adv_rsp_set_fields(&scan_response_fields);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "error setting scan response data; rc=%d\n", rc);
         return rc;
     }
     /* Begin advertising. */

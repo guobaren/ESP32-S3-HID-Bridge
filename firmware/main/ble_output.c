@@ -78,8 +78,7 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
         break;
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
-        ESP_LOGI(TAG, "BLE HID 已断开，重新广播");
-        esp_hid_ble_gap_adv_start();
+        ESP_LOGI(TAG, "BLE HID 已断开");
         break;
     default:
         break;
