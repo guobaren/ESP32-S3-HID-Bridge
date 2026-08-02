@@ -5,6 +5,23 @@ config HID_BRIDGE_LEASE_TIMEOUT_MS
     range 500 10000
     default 1500
 
+config HID_BRIDGE_STATUS_LED_ENABLE
+    bool "启用 RGB 状态指示灯"
+    default y
+    help
+        USB HID 已连接时显示绿灯，BLE HID 已连接时显示蓝灯；两者均未连接时红灯闪烁。
+
+if HID_BRIDGE_STATUS_LED_ENABLE
+
+config HID_BRIDGE_STATUS_LED_GPIO
+    int "RGB 状态指示灯 GPIO"
+    range 0 48
+    default 48
+    help
+        ESP32-S3-DevKitC-1 板载可寻址 RGB 灯默认使用 GPIO48。
+
+endif
+
 config HID_BRIDGE_WIFI_ENABLE
     bool "启用 Wi-Fi"
     default y

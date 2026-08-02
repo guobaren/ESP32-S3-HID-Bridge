@@ -12,6 +12,7 @@
 #include "input_session.h"
 #include "nvs_flash.h"
 #include "output_router.h"
+#include "status_led.h"
 #include "wifi_input.h"
 #include "wifi_manager.h"
 
@@ -148,6 +149,7 @@ void app_main(void)
     if (wifi_result != ESP_OK && wifi_result != ESP_ERR_NOT_SUPPORTED) {
         ESP_ERROR_CHECK(wifi_result);
     }
+    ESP_ERROR_CHECK(status_led_init());
     ESP_ERROR_CHECK(output_router_init());
     ESP_ERROR_CHECK(input_session_init());
     ESP_ERROR_CHECK(configure_uart());

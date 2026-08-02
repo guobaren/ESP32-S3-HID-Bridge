@@ -24,6 +24,8 @@ ESP32-S3-DevKitC-1
 
 官方 ESP32-S3-DevKitC-1 支持两个 USB 端口同时供电。第三方兼容板必须先核对原理图，确认两个端口之间没有不安全的 VBUS 回灌路径。
 
+板载 RGB 状态灯默认使用 GPIO48：USB HID 已被目标设备枚举时亮绿灯，BLE HID 已连接时亮蓝灯，两者均未连接时红灯每 500 ms 闪烁。USB 和 BLE 同时连接时优先显示 USB 的绿灯；兼容板的 RGB 灯接线不同，可在 `menuconfig` 的 `HID Bridge` 菜单修改 GPIO 或关闭该功能。
+
 ## 当前里程碑
 
 - [x] Windows 全局键盘和鼠标捕获骨架

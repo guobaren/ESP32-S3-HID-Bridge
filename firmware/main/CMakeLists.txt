@@ -8,6 +8,7 @@ idf_component_register(
         "input_session.c"
         "output_router.c"
         "secure_channel.c"
+        "status_led.c"
         "wifi_input.c"
         "wifi_manager.c"
         "wifi_provisioning.c"
@@ -24,6 +25,7 @@ idf_component_register(
         esp_tinyusb
         esp_wifi
         lwip
+        led_strip
         mbedtls
         nvs_flash
         bt

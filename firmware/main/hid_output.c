@@ -14,6 +14,7 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tusb.h"
+#include "status_led.h"
 
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE 2
@@ -243,6 +244,16 @@ void tud_hid_set_report_cb(
     (void)report_type;
     (void)buffer;
     (void)buffer_size;
+}
+
+void tud_mount_cb(void)
+{
+    status_led_set_usb_connected(true);
+}
+
+void tud_umount_cb(void)
+{
+    status_led_set_usb_connected(false);
 }
 
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t length)

@@ -9,6 +9,7 @@
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "status_led.h"
 
 static const char *TAG = "ble_output";
 static esp_hidd_dev_t *s_device;
@@ -77,10 +78,12 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
         break;
     case ESP_HIDD_CONNECT_EVENT:
         s_connected = event->connect.status == ESP_OK;
+        status_led_set_ble_connected(s_connected);
         ESP_LOGI(TAG, "BLE HID %s", s_connected ? "已连接" : "连接失败");
         break;
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
+        status_led_set_ble_connected(false);
         ESP_LOGI(TAG, "BLE HID 已断开");
         break;
     default:

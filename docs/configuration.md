@@ -31,6 +31,7 @@ idf.py menuconfig
 - `通过 Wi-Fi 输出到目标 Agent`：需要网络目标端时启用。
 - `目标 Agent IPv4 地址`、端口和独立的预共享密钥。
 - `BLE HID 设备名称`。
+- `启用 RGB 状态指示灯` 和其 GPIO：默认启用并使用 ESP32-S3-DevKitC-1 板载 RGB 灯的 GPIO48。USB HID 已连接时为绿灯，BLE HID 已连接时为蓝灯；两者均未连接时红灯每 500 ms 闪烁。USB 和 BLE 同时连接时，USB 状态优先显示绿灯。
 - 输入租约超时时间，默认 1500 ms。
 
 编译选项保存在被 Git 忽略的 `firmware/sdkconfig`，网页提交的 SSID 和密码由 Wi-Fi 驱动保存到开发板 NVS。项目使用适配 2 MiB Flash 的单应用分区表；启用 USB、Wi-Fi、BLE 和网页配网后仍保留约一半应用空间。
