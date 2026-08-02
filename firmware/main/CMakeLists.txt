@@ -6,6 +6,7 @@ idf_component_register(
         "esp_hid_gap.c"
         "hid_output.c"
         "input_session.c"
+        "output_mode_selector.c"
         "output_router.c"
         "secure_channel.c"
         "status_led.c"

@@ -7,4 +7,6 @@ public enum MessageType : byte
     ReleaseAll = 0x03,
     Ping = 0x04,
     SessionStart = 0x05,
+    DeviceProbe = 0x06,
+    DeviceHello = 0x07,
 }

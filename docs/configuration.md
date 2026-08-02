@@ -2,11 +2,13 @@
 
 ## 输出组合
 
-固件可以同时向以下后端发送同一份键鼠状态：
+固件支持以下输出后端：
 
-- USB HID：始终启用。
+- USB HID：始终启用，连接后可作为 USB 复合键鼠。
 - BLE HID：默认编译启用，设备名可配置。
 - Wi-Fi Target Agent：默认关闭，需要目标 Windows 设备运行配套程序。
+
+USB HID 与 BLE HID 首个建立连接的后端取得输出锁；后连接后端不会收到键鼠报告。活动后端断开后，已在线后端才会接管，接管前发送 `ReleaseAll`。Wi-Fi Target Agent 按自身安全连接状态工作。
 
 电脑到开发板只能有一个活动输入租约。串口或 Wi-Fi 会话断开、超过租约时间或被另一会话替换时，开发板会向全部输出后端发送 `ReleaseAll`。
 
@@ -15,7 +17,7 @@
 进入 ESP-IDF 环境后打开项目配置：
 
 ```powershell
-Set-Location E:\ESP32-S3-HID-Bridge\firmware
+Set-Location D:\ESP32-S3-HID-Bridge\firmware
 . ..\scripts\Enter-EspIdf.ps1
 idf.py menuconfig
 ```
@@ -31,7 +33,7 @@ idf.py menuconfig
 - `通过 Wi-Fi 输出到目标 Agent`：需要网络目标端时启用。
 - `目标 Agent IPv4 地址`、端口和独立的预共享密钥。
 - `BLE HID 设备名称`。
-- `启用 RGB 状态指示灯` 和其 GPIO：默认启用并使用 ESP32-S3-DevKitC-1 板载 RGB 灯的 GPIO48。USB HID 已连接时为绿灯，BLE HID 已连接时为蓝灯；两者均未连接时红灯每 500 ms 闪烁。USB 和 BLE 同时连接时，USB 状态优先显示绿灯。
+- `启用 RGB 状态指示灯` 和其 GPIO：默认启用并使用 ESP32-S3-DevKitC-1 板载 RGB 灯的 GPIO48。USB HID 已连接时为绿灯，BLE HID 已连接时为蓝灯；两者均未连接时红灯每 500 ms 闪烁。USB 和 BLE 同时连接时，USB 状态优先显示绿灯，但输出仍按首连接锁定规则执行。
 - 输入租约超时时间，默认 1500 ms。
 
 编译选项保存在被 Git 忽略的 `firmware/sdkconfig`，网页提交的 SSID 和密码由 Wi-Fi 驱动保存到开发板 NVS。项目使用适配 2 MiB Flash 的单应用分区表；启用 USB、Wi-Fi、BLE 和网页配网后仍保留约一半应用空间。
@@ -59,13 +61,15 @@ idf.py menuconfig
 
 ## 电脑通过串口连接开发板
 
-复制主机配置：
+默认配置使用 `"portName": "auto"`。主机枚举当前 COM 口并完成随机数握手，只有返回有效 `DeviceHello` 的设备才会被连接；USB 重新插入后即使 COM 编号改变，也会重新发现。
+
+需要固定串口时再复制本机配置：
 
 ```powershell
 Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.json
 ```
 
-保持 `transport` 为 `serial`，设置实际 `portName`。主机会在连接后发送 `SessionStart`，并每 500 ms 发送一次心跳。
+保持 `transport` 为 `serial`，把 `portName` 改为例如 `COM3`。固定串口模式不执行自动扫描。主机会在连接后发送 `SessionStart`，并每 500 ms 发送一次心跳。
 
 ## 电脑通过 Wi-Fi 连接开发板
 
@@ -77,13 +81,12 @@ Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.j
   "wiFiHost": "192.168.1.50",
   "wiFiPort": 24813,
   "networkPresharedKey": "替换为与固件 Wi-Fi 输入配置一致的随机密钥",
-  "suppressLocalInput": false,
   "reconnectDelayMilliseconds": 1000,
   "heartbeatIntervalMilliseconds": 500
 }
 ```
 
-网络通道使用双向挑战认证、AES-256-GCM、独立会话随机数和严格递增计数器。认证失败、数据被篡改或检测到重放时会立即断开。
+同步开启时主机端会强制拦截本机键鼠输入，HOME/END 保留为控制键；同步关闭后恢复本机输入。网络通道使用双向挑战认证、AES-256-GCM、独立会话随机数和严格递增计数器。认证失败、数据被篡改或检测到重放时会立即断开。
 
 ## 开发板通过 Wi-Fi 连接 Windows 目标设备
 
@@ -100,6 +103,8 @@ dotnet run --project .\target\HidBridge.TargetAgent\HidBridge.TargetAgent.csproj
 
 ## BLE HID
 
-BLE 使用 NimBLE、配对和绑定机制，对外提供同一报告映射中的键盘 Report ID 1 与相对鼠标 Report ID 2。烧录后在目标设备的蓝牙设置中搜索配置的设备名并完成配对。
+BLE 使用 NimBLE、Just Works 配对和绑定机制，对外提供同一报告映射中的键盘 Report ID 1 与相对鼠标 Report ID 2。设备没有屏幕和输入键盘，因此不会显示或要求输入配对码；烧录后在目标设备的蓝牙设置中搜索配置的设备名并确认配对即可。
 
-清除开发板 NVS 会同时删除网页保存的 Wi-Fi、BLE 绑定信息和 Wi-Fi 驱动状态；下次启动会自动回到配网模式。
+如果手机曾经尝试连接使用配对码的旧固件，先在手机蓝牙设置中忽略/取消配对 `HidBridge Keyboard Mouse`，关闭再打开蓝牙，然后重新搜索。当前固件没有启用 NimBLE 绑定持久化，开发板重启后如无法自动重连，需要在手机端忽略旧记录后重新配对。
+
+清除开发板 NVS 会删除网页保存的 Wi-Fi 和 Wi-Fi 驱动状态；下次启动会自动回到配网模式。

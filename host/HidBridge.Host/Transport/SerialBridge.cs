@@ -68,27 +68,74 @@ internal sealed class SerialBridge : IBridgeTransport
         _nextConnectAttemptUtc = DateTime.UtcNow.AddMilliseconds(
             Math.Max(100, _options.ReconnectDelayMilliseconds));
 
-        try
+        bool automatic = IsAutomaticPort(_options.PortName);
+        string[] candidates = automatic
+            ? SerialPort.GetPortNames()
+                .OrderBy(GetPortNumber)
+                .ThenBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .ToArray()
+            : [_options.PortName];
+        if (candidates.Length == 0)
         {
-            _port = new SerialPort(_options.PortName, _options.BaudRate, Parity.None, 8, StopBits.One)
-            {
-                Handshake = Handshake.None,
-                DtrEnable = false,
-                RtsEnable = false,
-                WriteTimeout = 250,
-            };
-            _port.Open();
-            Console.WriteLine($"已连接 {_options.PortName}。");
-            return true;
-        }
-        catch (Exception exception) when (
-            exception is IOException or InvalidOperationException or UnauthorizedAccessException)
-        {
-            Console.Error.WriteLine($"暂时无法连接 {_options.PortName}：{exception.Message}");
-            ClosePort();
+            Console.Error.WriteLine("暂未发现可用串口，等待设备连接。");
             return false;
         }
+
+        if (automatic)
+        {
+            Console.WriteLine($"正在探测串口：{string.Join("、", candidates)}");
+        }
+
+        foreach (string portName in candidates)
+        {
+            SerialPort? candidate = null;
+            try
+            {
+                candidate = CreatePort(portName);
+                candidate.Open();
+                if (automatic && !SerialDeviceProbe.Probe(candidate, _codec))
+                {
+                    Console.WriteLine($"{portName} 未返回 HID Bridge 握手，已忽略。");
+                    candidate.Dispose();
+                    continue;
+                }
+
+                _port = candidate;
+                Console.WriteLine(automatic
+                    ? $"已自动发现并连接 {portName}。"
+                    : $"已连接 {portName}。");
+                return true;
+            }
+            catch (Exception exception) when (
+                exception is IOException or InvalidOperationException or UnauthorizedAccessException or
+                    TimeoutException or ArgumentException)
+            {
+                Console.Error.WriteLine($"暂时无法使用 {portName}：{exception.Message}");
+                candidate?.Dispose();
+            }
+        }
+
+        return false;
     }
+
+    private SerialPort CreatePort(string portName) =>
+        new(portName, _options.BaudRate, Parity.None, 8, StopBits.One)
+        {
+            Handshake = Handshake.None,
+            DtrEnable = false,
+            RtsEnable = false,
+            ReadTimeout = 100,
+            WriteTimeout = 250,
+        };
+
+    private static bool IsAutomaticPort(string? portName) =>
+        string.IsNullOrWhiteSpace(portName) || portName.Equals("auto", StringComparison.OrdinalIgnoreCase);
+
+    private static int GetPortNumber(string portName) =>
+        portName.StartsWith("COM", StringComparison.OrdinalIgnoreCase) &&
+        int.TryParse(portName.AsSpan(3), out int number)
+            ? number
+            : int.MaxValue;
 
     private void ClosePort()
     {

@@ -9,9 +9,12 @@
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "output_router.h"
 #include "status_led.h"
 
 static const char *TAG = "ble_output";
+#define FIXED_BATTERY_LEVEL 100
+
 static esp_hidd_dev_t *s_device;
 static volatile bool s_connected;
 
@@ -79,11 +82,13 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
     case ESP_HIDD_CONNECT_EVENT:
         s_connected = event->connect.status == ESP_OK;
         status_led_set_ble_connected(s_connected);
+        output_router_set_connected(OUTPUT_MODE_BLE, s_connected);
         ESP_LOGI(TAG, "BLE HID %s", s_connected ? "已连接" : "连接失败");
         break;
     case ESP_HIDD_DISCONNECT_EVENT:
         s_connected = false;
         status_led_set_ble_connected(false);
+        output_router_set_connected(OUTPUT_MODE_BLE, false);
         ESP_LOGI(TAG, "BLE HID 已断开");
         break;
     default:
@@ -108,6 +113,10 @@ esp_err_t ble_output_init(void)
         esp_hidd_dev_init(&s_config, ESP_HID_TRANSPORT_BLE, hidd_event_callback, &s_device),
         TAG,
         "初始化 BLE HID 失败");
+    ESP_RETURN_ON_ERROR(
+        esp_hidd_dev_battery_set(s_device, FIXED_BATTERY_LEVEL),
+        TAG,
+        "设置 BLE 固定电量失败");
     ble_store_config_init();
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     nimble_port_freertos_init(ble_host_task);

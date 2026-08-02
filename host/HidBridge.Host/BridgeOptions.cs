@@ -5,12 +5,11 @@ namespace HidBridge.Host;
 internal sealed class BridgeOptions
 {
     public string Transport { get; init; } = "serial";
-    public string PortName { get; init; } = "COM5";
+    public string PortName { get; init; } = "auto";
     public int BaudRate { get; init; } = 921600;
     public string WiFiHost { get; init; } = "192.168.1.50";
     public int WiFiPort { get; init; } = 24813;
     public string NetworkPresharedKey { get; init; } = string.Empty;
-    public bool SuppressLocalInput { get; init; }
     public int ReconnectDelayMilliseconds { get; init; } = 1000;
     public int HeartbeatIntervalMilliseconds { get; init; } = 500;
 

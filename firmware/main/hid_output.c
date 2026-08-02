@@ -14,6 +14,7 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tusb.h"
+#include "output_router.h"
 #include "status_led.h"
 
 #define REPORT_ID_KEYBOARD 1
@@ -246,14 +247,19 @@ void tud_hid_set_report_cb(
     (void)buffer_size;
 }
 
-void tud_mount_cb(void)
+static void usb_event_callback(tinyusb_event_t *event, void *argument)
 {
-    status_led_set_usb_connected(true);
-}
-
-void tud_umount_cb(void)
-{
-    status_led_set_usb_connected(false);
+    (void)argument;
+    if (event == NULL) {
+        return;
+    }
+    if (event->id == TINYUSB_EVENT_ATTACHED) {
+        status_led_set_usb_connected(true);
+        output_router_set_connected(OUTPUT_MODE_USB, true);
+    } else if (event->id == TINYUSB_EVENT_DETACHED) {
+        status_led_set_usb_connected(false);
+        output_router_set_connected(OUTPUT_MODE_USB, false);
+    }
 }
 
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t length)
@@ -576,7 +582,7 @@ esp_err_t hid_output_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG();
+    tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG(usb_event_callback);
     usb_config.descriptor.full_speed_config = s_configuration_descriptor;
 
     esp_err_t error = tinyusb_driver_install(&usb_config);
@@ -684,6 +690,7 @@ esp_err_t hid_output_submit(const bridge_frame_t *frame)
         s_mouse.pending_pan = 0;
         s_mouse.received_buttons = 0;
         s_mouse.release_pending = true;
+        s_last_motion_completion_time_us = 0;
         portEXIT_CRITICAL(&s_mouse_lock);
     } else {
         return ESP_ERR_NOT_SUPPORTED;

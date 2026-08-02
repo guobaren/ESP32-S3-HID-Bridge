@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace HidBridge.Host.Input;
 
@@ -16,6 +17,7 @@ internal static class NativeMethods
 
     internal const uint LlkhfExtended = 0x01;
     internal const uint RidInput = 0x10000003;
+    internal const uint RidiDeviceName = 0x20000007;
     internal const uint RimTypeMouse = 0;
     internal const uint RidevRemove = 0x00000001;
     internal const uint RidevInputSink = 0x00000100;
@@ -89,6 +91,15 @@ internal static class NativeMethods
         internal RawMouse Mouse;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ClipRect
+    {
+        internal int Left;
+        internal int Top;
+        internal int Right;
+        internal int Bottom;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern IntPtr SetWindowsHookEx(
         int idHook,
@@ -109,6 +120,18 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ClipCursor(ref ClipRect rect);
+
+    [DllImport("user32.dll", EntryPoint = "ClipCursor", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ReleaseCursorClip(IntPtr rect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool RegisterRawInputDevices(
         [In] RawInputDevice[] devices,
         uint deviceCount,
@@ -121,6 +144,13 @@ internal static class NativeMethods
         IntPtr data,
         ref uint size,
         uint headerSize);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern uint GetRawInputDeviceInfo(
+        IntPtr device,
+        uint command,
+        StringBuilder? data,
+        ref uint size);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     internal static extern IntPtr GetModuleHandle(string? moduleName);

@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "bridge_protocol.h"
 #include "driver/gpio.h"
@@ -20,12 +21,55 @@
 #define BRIDGE_UART_BAUD_RATE 921600
 #define UART_RX_BUFFER_SIZE 4096
 #define UART_READ_CHUNK_SIZE 256
+#define DEVICE_PROBE_NONCE_LENGTH 8
+
+static const uint8_t DEVICE_HELLO_SIGNATURE[] = {'H', 'I', 'D', 'B', 'R', 'D', 'G', '2'};
 
 static const char *TAG = "hid_bridge";
+
+static void send_device_hello(const bridge_frame_t *probe)
+{
+    if (probe->payload_length != DEVICE_PROBE_NONCE_LENGTH) {
+        return;
+    }
+
+    bridge_frame_t hello = {
+        .version = BRIDGE_PROTOCOL_VERSION,
+        .type = BRIDGE_MESSAGE_DEVICE_HELLO,
+        .sequence = probe->sequence,
+        .payload_length = sizeof(DEVICE_HELLO_SIGNATURE) + DEVICE_PROBE_NONCE_LENGTH,
+    };
+    memcpy(hello.payload, DEVICE_HELLO_SIGNATURE, sizeof(DEVICE_HELLO_SIGNATURE));
+    memcpy(
+        hello.payload + sizeof(DEVICE_HELLO_SIGNATURE),
+        probe->payload,
+        DEVICE_PROBE_NONCE_LENGTH);
+
+    uint8_t serialized[9 + BRIDGE_MAX_PAYLOAD];
+    size_t serialized_length = 0;
+    esp_err_t result = bridge_frame_serialize(
+        &hello,
+        serialized,
+        sizeof(serialized),
+        &serialized_length);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "设备发现响应编码失败：%s", esp_err_to_name(result));
+        return;
+    }
+
+    int written = uart_write_bytes(BRIDGE_UART, serialized, serialized_length);
+    if (written != (int)serialized_length) {
+        ESP_LOGW(TAG, "设备发现响应发送不完整：%d/%u", written, (unsigned)serialized_length);
+    }
+}
 
 static void on_bridge_frame(const bridge_frame_t *frame, void *context)
 {
     (void)context;
+    if (frame->type == BRIDGE_MESSAGE_DEVICE_PROBE) {
+        send_device_hello(frame);
+        return;
+    }
     input_session_handle(BRIDGE_INPUT_UART, frame);
 }
 

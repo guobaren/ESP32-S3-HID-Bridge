@@ -10,17 +10,20 @@ Windows 主机程序负责：
 2. 通过 Windows Raw Input 接收鼠标设备的原生相对位移、按钮和滚轮事件。
 3. 维护当前键盘修饰键、普通键和鼠标按钮状态。
 4. 以 500 Hz 上限累计 Raw Input 位移，将状态转换成 USB HID 键盘/鼠标报告。
-5. 通过 USB-to-UART 串口发送给 ESP32-S3。
+5. 自动枚举 USB-to-UART 串口，通过 `DeviceProbe/DeviceHello` 握手确认 ESP32-S3 后发送数据。
 6. 在停止转发和退出时发送 `ReleaseAll`。
 
 主机端不创建 Windows 虚拟设备，也不注入输入，因此不会与目标设备的 HID 枚举混在一起。
 
 ### ESP32-S3 固件
 
-固件同时承担两个互相独立的传输角色：
+固件同时承担输入接收和多后端输出角色：
 
 - UART 接收端：从板载 USB-UART 桥读取主机帧。
 - USB Device 端：通过 ESP32-S3 内置 USB PHY 对外暴露 HID。
+- BLE HID 端：通过 NimBLE 对外暴露复合键鼠。
+- Wi-Fi 输入/Target Agent 端：使用项目安全通道传输。
+- USB HID 与 BLE HID 采用首连接锁定；活动输出断开后才允许已在线后端接管。
 
 USB 侧使用一个 HID Interface 和两个 Report ID：
 
@@ -29,10 +32,9 @@ USB 侧使用一个 HID Interface 和两个 Report ID：
 | 1 | Boot Keyboard | 8 字节 |
 | 2 | 16 位相对坐标 Mouse | 7 字节 |
 
-## 第一阶段边界
+## 当前实现边界
 
-- 目标输出先实现 USB HID。
-- BLE HID 留作可选输出后端，不与第一阶段耦合。
+- USB HID、BLE HID 和 Wi-Fi Target Agent 均已实现；USB/BLE 的真实目标设备顺序验收仍需补齐。
 - 键盘采用 6-key rollover；超过 6 个普通键时只上报最早的 6 个。
 - 鼠标 X/Y 采用有符号 16 位相对位移，单帧范围为 `-32768..32767`。主机端累计高轮询率 Raw Input，并以 500 Hz 上限发送，避免逐采样排队。
 - 固件以 64 位累计器保存尚未送达 USB 的鼠标位移；鼠标移动允许合并，键盘和鼠标按钮转换使用独立可靠队列。
@@ -77,7 +79,8 @@ USB 侧使用一个 HID Interface 和两个 Report ID：
 
 ### 电脑到开发板
 
-- 保留 USB-to-UART 作为低延迟、无需网络配置的默认通道。
+- 保留 USB-to-UART 作为低延迟、无需网络配置的默认通道；主机默认自动发现，固定串口可配置覆盖。
+- 自动发现只接受带正确 CRC、序号、签名和随机数的 `DeviceHello`，不能绕过 Windows 对 CH340 等 USB-UART 桥的驱动要求。
 - Wi-Fi 输入使用项目原生安全通道，包含预共享密钥双向认证、AES-256-GCM 和重放保护。
 - Wi-Fi 服务拒绝未认证连接，不开放匿名键鼠控制接口。
 - Wi-Fi SSID 和密码由 SoftAP captive portal 写入 NVS；无凭据、连接失败或长按 BOOT 时进入配网模式，连接成功后关闭临时热点。
@@ -90,9 +93,9 @@ USB 侧使用一个 HID Interface 和两个 Report ID：
 - Wi-Fi Agent 输出通过同一安全通道连接 Windows 目标端，并由 `SendInput` 注入当前用户会话。
 - Wi-Fi Agent 不属于标准 HID，无法覆盖 BIOS、系统登录前界面或不能安装配套程序的设备。
 
-在上述传输与输出后端稳定后，再增加：
+在上述传输与输出后端完成真实设备验收后，再增加：
 
-- USB HID、BLE HID 与 Wi-Fi Agent 的可配置输出策略。
+- USB HID、BLE HID 与 Wi-Fi Agent 的持久化输出策略。
 - 多配置文件与目标设备切换。
 - 媒体键和 Consumer Control。
 - 键盘 NKRO 报告。

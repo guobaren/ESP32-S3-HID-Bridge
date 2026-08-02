@@ -1,11 +1,10 @@
 {
   "transport": "serial",
-  "portName": "COM5",
+  "portName": "auto",
   "baudRate": 921600,
   "wiFiHost": "192.168.1.50",
   "wiFiPort": 24813,
   "networkPresharedKey": "在 bridge.local.json 中填写至少16字节的随机密钥",
-  "suppressLocalInput": false,
   "reconnectDelayMilliseconds": 1000,
   "heartbeatIntervalMilliseconds": 500
 }

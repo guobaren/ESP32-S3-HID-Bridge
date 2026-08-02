@@ -1,11 +1,17 @@
 using System.Collections.Concurrent;
 using HidBridge.Host.Input;
 using HidBridge.Host.Transport;
+using HidBridge.Host.Ui;
 using HidBridge.Protocol;
 
 CheckMouseReportCodec();
 CheckMouseAggregation();
-Console.WriteLine("全部主机鼠标检查通过。");
+CheckSerialDiscoveryProtocol();
+CheckInputSuppressionPolicy();
+CheckCursorLockGeometry();
+CheckUiLogWriter();
+CheckWindowLayout();
+Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、串口握手、输入独占策略和窗口布局。");
 
 static void CheckMouseReportCodec()
 {
@@ -83,6 +89,110 @@ static void CheckMouseAggregation()
     pump.Accumulate(0, false, 100, 100, 0, 0);
     Thread.Sleep(10);
     Require(transport.MouseReports().Length == countAfterStop, "停止转发后不得继续发送鼠标报告");
+}
+
+static void CheckSerialDiscoveryProtocol()
+{
+    byte[] nonce = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87];
+    FrameCodec probeCodec = new();
+    byte[] probe = SerialDeviceProbe.CreateProbe(probeCodec, nonce, out ushort probeSequence);
+    Require(FrameCodec.TryDecode(probe, out BridgeFrame decodedProbe), "设备探测帧应能解码");
+    Require(decodedProbe.Type == MessageType.DeviceProbe, "设备探测帧类型不正确");
+    Require(decodedProbe.Sequence == probeSequence, "设备探测序号不一致");
+    Require(decodedProbe.Payload.SequenceEqual(nonce), "设备探测随机数不一致");
+
+    byte[] helloPayload = "HIDBRDG2"u8.ToArray().Concat(nonce).ToArray();
+    FrameCodec helloCodec = new();
+    byte[] hello = helloCodec.Encode(MessageType.DeviceHello, helloPayload);
+    byte[] noisyInput = "ESP-ROM:esp32s3\r\n"u8.ToArray().Concat(hello).ToArray();
+    Require(
+        SerialDeviceProbe.TryMatchHello(noisyInput, probeSequence, nonce),
+        "应能跳过串口日志并识别设备响应");
+    Require(
+        !SerialDeviceProbe.TryMatchHello(noisyInput.AsSpan(0, noisyInput.Length - 1), probeSequence, nonce),
+        "不完整设备响应不得被接受");
+
+    byte[] wrongNonce = nonce.ToArray();
+    wrongNonce[0] ^= 0xFF;
+    Require(
+        !SerialDeviceProbe.TryMatchHello(noisyInput, probeSequence, wrongNonce),
+        "随机数不匹配的响应不得被接受");
+}
+
+static void CheckInputSuppressionPolicy()
+{
+    Require(!InputForwarder.ShouldSuppressKeyboard(false, false, false), "同步关闭时普通键盘输入不得拦截");
+    Require(InputForwarder.ShouldSuppressKeyboard(true, false, false), "同步开启时普通键盘输入必须拦截");
+    Require(!InputForwarder.ShouldSuppressKeyboard(true, true, false), "从关闭状态开启同步时，控制快捷键释放必须交还本机");
+    Require(InputForwarder.ShouldSuppressKeyboard(false, true, true), "从开启状态关闭同步时，控制快捷键释放必须继续拦截");
+    Require(!InputForwarder.ShouldSuppressMouse(false), "同步关闭时鼠标不得拦截");
+    Require(InputForwarder.ShouldSuppressMouse(true), "同步开启时鼠标必须拦截");
+}
+
+static void CheckCursorLockGeometry()
+{
+    NativeMethods.ClipRect rect = MouseCursorLock.CalculateClipRect(new System.Drawing.Point(321, 654));
+    Require(rect.Left == 321 && rect.Top == 654, "鼠标锁定矩形左上角不正确");
+    Require(rect.Right == 322 && rect.Bottom == 655, "鼠标锁定矩形必须限制为一个像素");
+}
+
+static void CheckUiLogWriter()
+{
+    UiLogTextWriter writer = new();
+    List<string> actual = [];
+    writer.WriteLine("启动前日志");
+    writer.Attach(actual.Add);
+    writer.Write("运行中");
+    writer.WriteLine("日志");
+    Require(actual.SequenceEqual(["启动前日志", "运行中日志"]), "UI 日志缓存或按行输出不符合预期");
+}
+
+static void CheckWindowLayout()
+{
+    Exception? failure = null;
+    Thread thread = new(() =>
+    {
+        try
+        {
+            RecordingTransport transport = new();
+            using InputForwarder input = new(transport);
+            using BridgeMainForm form = new(input, "测试端点");
+            _ = form.Handle;
+            form.PerformLayout();
+            double upperRatio = form.MainSplit.SplitterDistance / (double)form.ClientSize.Height;
+            Require(upperRatio is >= 0.45 and <= 0.55, "窗口上半区必须约占客户区一半");
+            Require(form.LogTextBox.Multiline && form.LogTextBox.ReadOnly, "日志栏必须为只读多行文本框");
+            Require(!form.LogTextBox.WordWrap && form.LogTextBox.ScrollBars == ScrollBars.Both, "日志栏必须支持完整选择和双向滚动");
+            form.AppendLog("可复制日志检查");
+            Require(form.LogTextBox.Text.Contains("可复制日志检查", StringComparison.Ordinal), "日志内容未实际写入窗口文本框");
+            string allText = string.Join("\n", EnumerateControls(form).Select(control => control.Text));
+            Require(allText.Contains("HOME", StringComparison.Ordinal), "界面未显示同步快捷键");
+            Require(allText.Contains("END", StringComparison.Ordinal), "界面未显示结束快捷键");
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    if (failure is not null)
+    {
+        throw new InvalidOperationException("窗口布局检查失败", failure);
+    }
+}
+
+static IEnumerable<Control> EnumerateControls(Control root)
+{
+    foreach (Control control in root.Controls)
+    {
+        yield return control;
+        foreach (Control descendant in EnumerateControls(control))
+        {
+            yield return descendant;
+        }
+    }
 }
 
 static void Require(bool condition, string message)

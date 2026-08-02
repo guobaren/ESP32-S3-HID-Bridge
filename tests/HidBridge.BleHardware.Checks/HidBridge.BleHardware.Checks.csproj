@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="10.0.0" />
     <ProjectReference Include="..\..\host\HidBridge.Host\HidBridge.Host.csproj" />
     <ProjectReference Include="..\..\shared\HidBridge.Protocol\HidBridge.Protocol.csproj" />
   </ItemGroup>

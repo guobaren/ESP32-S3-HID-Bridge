@@ -19,6 +19,7 @@
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
 #include "host/ble_gap.h"
+#include "host/ble_hs_id.h"
 #include "host/ble_hs_adv.h"
 #include "services/gap/ble_svc_gap.h"
 #include "nimble/ble.h"
@@ -28,6 +29,42 @@
 #endif
 
 static const char *TAG = "ESP_HID_GAP";
+
+#if CONFIG_BT_NIMBLE_ENABLED
+static uint16_t s_active_connection_handle;
+static uint32_t s_connection_generation;
+
+static void request_narrow_connection_interval(void *argument)
+{
+    const struct ble_gap_upd_params params = {
+        .itvl_min = BLE_GAP_CONN_ITVL_MS(7.5),
+        .itvl_max = BLE_GAP_CONN_ITVL_MS(10),
+        .latency = 0,
+        .supervision_timeout = BLE_GAP_SUPERVISION_TIMEOUT_MS(5000),
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+    uint32_t generation = (uint32_t)(uintptr_t)argument;
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    for (int attempt = 1; attempt <= 30; attempt++) {
+        if (generation != s_connection_generation) {
+            break;
+        }
+        int rc = ble_gap_update_params(s_active_connection_handle, &params);
+        if (rc == 0) {
+            ESP_LOGI(TAG, "requested delayed connection interval 7.5-10 ms; attempt=%d", attempt);
+            break;
+        }
+        if (rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "delayed narrow connection update failed; rc=%d attempt=%d", rc, attempt);
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vTaskDelete(NULL);
+}
+#endif
 
 // uncomment to print all devices that were seen during a scan
 #define GAP_DBG_PRINTF(...) //printf(__VA_ARGS__)
@@ -801,9 +838,10 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
     }
 
     /* Initialize the security configuration */
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_DISP_ONLY;
+    /* 设备没有屏幕或输入键盘，使用 Just Works，手机端无需输入配对码。 */
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
-    ble_hs_cfg.sm_mitm = 1;
+    ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_sc = 1;
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ID | BLE_SM_PAIR_KEY_DIST_ENC;
     ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ID | BLE_SM_PAIR_KEY_DIST_ENC;
@@ -816,6 +854,14 @@ static int
 nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
 {
     struct ble_gap_conn_desc desc;
+    const struct ble_gap_upd_params low_latency_params = {
+        .itvl_min = BLE_GAP_CONN_ITVL_MS(7.5),
+        .itvl_max = BLE_GAP_CONN_ITVL_MS(15),
+        .latency = 0,
+        .supervision_timeout = BLE_GAP_SUPERVISION_TIMEOUT_MS(5000),
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
     int rc;
 
     switch (event->type) {
@@ -824,9 +870,34 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "connection %s; status=%d",
                 event->connect.status == 0 ? "established" : "failed",
                 event->connect.status);
+        if (event->connect.status == 0) {
+            s_active_connection_handle = event->connect.conn_handle;
+            uint32_t generation = ++s_connection_generation;
+            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+            if (rc == 0) {
+                ESP_LOGI(TAG, "connection parameters: interval=%" PRIu32
+                         " us latency=%u timeout=%u ms",
+                         (uint32_t)desc.conn_itvl * 1250,
+                         desc.conn_latency,
+                         desc.supervision_timeout * 10);
+            }
+
+            rc = ble_gap_update_params(event->connect.conn_handle,
+                                       &low_latency_params);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "low-latency connection update failed; rc=%d", rc);
+            } else {
+                ESP_LOGI(TAG, "requested connection interval 7.5-15 ms, latency=0");
+            }
+            if (xTaskCreate(request_narrow_connection_interval,
+                            "ble_conn_narrow", 3072,
+                            (void *)(uintptr_t)generation, 5, NULL) != pdPASS) {
+                ESP_LOGW(TAG, "create delayed narrow connection task failed");
+            }
+        }
         return 0;
-        break;
     case BLE_GAP_EVENT_DISCONNECT:
+        ++s_connection_generation;
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
         rc = esp_hid_ble_gap_adv_start();
         if (rc != ESP_OK) {
@@ -837,6 +908,18 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         /* The central has updated the connection parameters. */
         ESP_LOGI(TAG, "connection updated; status=%d",
                 event->conn_update.status);
+        if (event->conn_update.status == 0) {
+            rc = ble_gap_conn_find(event->conn_update.conn_handle, &desc);
+            if (rc == 0) {
+                ESP_LOGI(TAG, "negotiated connection parameters: interval=%" PRIu32
+                         " us latency=%u timeout=%u ms",
+                         (uint32_t)desc.conn_itvl * 1250,
+                         desc.conn_latency,
+                         desc.supervision_timeout * 10);
+            } else {
+                ESP_LOGW(TAG, "read negotiated connection parameters failed; rc=%d", rc);
+            }
+        }
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -939,10 +1022,29 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
 }
 esp_err_t esp_hid_ble_gap_adv_start(void)
 {
+    static bool random_address_set;
     int rc;
+    uint8_t random_address[BLE_DEV_ADDR_LEN];
     struct ble_gap_adv_params adv_params;
-    /* maximum possible duration for hid device(180s) */
-    int32_t adv_duration_ms = 180000;
+    if (!random_address_set) {
+        rc = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, random_address, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "read public BLE address failed; rc=%d", rc);
+            return rc;
+        }
+        /* 保留芯片地址的唯一部分，并设置静态随机地址规定的高两位。 */
+        random_address[5] = (random_address[5] & 0x3f) | 0xc0;
+        random_address[0] ^= 0x08;
+        rc = ble_hs_id_set_rnd(random_address);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "set static random BLE address failed; rc=%d", rc);
+            return rc;
+        }
+        random_address_set = true;
+        ESP_LOGI(TAG, "static random BLE address: %02x:%02x:%02x:%02x:%02x:%02x",
+                 random_address[5], random_address[4], random_address[3],
+                 random_address[2], random_address[1], random_address[0]);
+    }
 
     rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
@@ -960,7 +1062,7 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
     adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(30);/* Recommended interval 30ms to 50ms */
     adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(50);
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, adv_duration_ms,
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
                            &adv_params, nimble_hid_gap_event, NULL);
     if (rc != 0) {
         MODLOG_DFLT(ERROR, "error enabling advertisement; rc=%d\n", rc);

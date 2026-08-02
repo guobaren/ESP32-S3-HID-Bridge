@@ -14,6 +14,8 @@ typedef enum {
     BRIDGE_MESSAGE_RELEASE_ALL = 0x03,
     BRIDGE_MESSAGE_PING = 0x04,
     BRIDGE_MESSAGE_SESSION_START = 0x05,
+    BRIDGE_MESSAGE_DEVICE_PROBE = 0x06,
+    BRIDGE_MESSAGE_DEVICE_HELLO = 0x07,
 } bridge_message_type_t;
 
 typedef struct {

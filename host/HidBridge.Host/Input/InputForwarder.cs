@@ -7,15 +7,14 @@ namespace HidBridge.Host.Input;
 
 internal sealed class InputForwarder : IDisposable
 {
-    private const uint VkF11 = 0x7A;
-    private const uint VkF12 = 0x7B;
+    private const uint VkEnd = 0x23;
+    private const uint VkHome = 0x24;
     private const byte LeftButton = 1 << 0;
     private const byte RightButton = 1 << 1;
     private const byte MiddleButton = 1 << 2;
     private const byte BackButton = 1 << 3;
     private const byte ForwardButton = 1 << 4;
 
-    private readonly bool _suppressLocalInput;
     private readonly NativeMethods.HookProc _keyboardProc;
     private readonly NativeMethods.HookProc _mouseProc;
     private readonly MouseReportPump _mouseReportPump;
@@ -28,11 +27,11 @@ internal sealed class InputForwarder : IDisposable
     private int _verticalWheelRemainder;
     private int _horizontalWheelRemainder;
     private bool _ignoreHotkeyChord;
+    private uint _ignoredHotkeyKey;
     private bool _started;
 
-    internal InputForwarder(IBridgeTransport transport, bool suppressLocalInput)
+    internal InputForwarder(IBridgeTransport transport)
     {
-        _suppressLocalInput = suppressLocalInput;
         _keyboardProc = KeyboardCallback;
         _mouseProc = MouseCallback;
         _mouseReportPump = new MouseReportPump(transport);
@@ -43,6 +42,8 @@ internal sealed class InputForwarder : IDisposable
     internal event EventHandler<bool>? ForwardingChanged;
     internal event EventHandler? ExitRequested;
 
+    internal void DisableForwarding() => SetForwarding(false, true);
+
     internal void Start()
     {
         if (_started)
@@ -50,7 +51,7 @@ internal sealed class InputForwarder : IDisposable
             return;
         }
 
-        _rawMouseInput = new RawMouseInputWindow(HandleRawMouseInput);
+        _rawMouseInput = new RawMouseInputWindow((_, input) => HandleRawMouseInput(input));
 
         IntPtr module = NativeMethods.GetModuleHandle(null);
         _keyboardHook = NativeMethods.SetWindowsHookEx(
@@ -75,6 +76,11 @@ internal sealed class InputForwarder : IDisposable
 
     internal void Stop()
     {
+        if (!_started && _keyboardHook == IntPtr.Zero && _mouseHook == IntPtr.Zero && _rawMouseInput is null)
+        {
+            return;
+        }
+
         SetForwarding(false, true);
 
         if (_keyboardHook != IntPtr.Zero)
@@ -113,14 +119,13 @@ internal sealed class InputForwarder : IDisposable
             Marshal.PtrToStructure<NativeMethods.KeyboardHookData>(lParam);
         uint virtualKey = data.VirtualKey;
 
-        bool ctrlDown = (_modifiers & ((1 << 0) | (1 << 4))) != 0;
-        bool altDown = (_modifiers & ((1 << 2) | (1 << 6))) != 0;
-        bool isToggleHotkey = isDown && virtualKey == VkF12 && ctrlDown && altDown;
-        bool isExitHotkey = isDown && virtualKey == VkF11 && ctrlDown && altDown;
+        bool isToggleHotkey = isDown && virtualKey == VkHome;
+        bool isExitHotkey = isDown && virtualKey == VkEnd;
 
         if (isToggleHotkey || isExitHotkey)
         {
             _ignoreHotkeyChord = true;
+            _ignoredHotkeyKey = virtualKey;
             if (isToggleHotkey)
             {
                 SetForwarding(!ForwardingEnabled);
@@ -131,22 +136,18 @@ internal sealed class InputForwarder : IDisposable
                 ExitRequested?.Invoke(this, EventArgs.Empty);
             }
 
-            return IntPtr.Zero;
+            return (IntPtr)1;
         }
 
         if (_ignoreHotkeyChord)
         {
-            if (isUp && virtualKey is 0xA2 or 0xA3 or 0xA4 or 0xA5)
+            if (isUp && virtualKey == _ignoredHotkeyKey)
             {
-                bool releasingCtrl = virtualKey is 0xA2 or 0xA3;
-                bool releasingAlt = virtualKey is 0xA4 or 0xA5;
-                if (releasingCtrl || releasingAlt)
-                {
-                    _ignoreHotkeyChord = false;
-                }
+                _ignoreHotkeyChord = false;
+                _ignoredHotkeyKey = 0;
             }
 
-            return IntPtr.Zero;
+            return (IntPtr)1;
         }
 
         UpdateKeyboardState(
@@ -156,11 +157,13 @@ internal sealed class InputForwarder : IDisposable
 
         if (ForwardingEnabled)
         {
+            // 修饰键在按下事件到达时立即发送，避免 Ctrl/Alt 组合出现首个按键延迟。
             SendKeyboardReport();
-            if (_suppressLocalInput)
-            {
-                return (IntPtr)1;
-            }
+        }
+
+        if (ShouldSuppressKeyboard(ForwardingEnabled, false, false))
+        {
+            return (IntPtr)1;
         }
 
         return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
@@ -175,7 +178,7 @@ internal sealed class InputForwarder : IDisposable
 
         // 低级钩子只负责可选的本地抑制。移动、按钮和滚轮统一由
         // Raw Input 按设备事件顺序处理，避免两条输入路径之间状态错序。
-        if (ForwardingEnabled && _suppressLocalInput)
+        if (ShouldSuppressMouse(ForwardingEnabled))
         {
             return (IntPtr)1;
         }
@@ -245,6 +248,7 @@ internal sealed class InputForwarder : IDisposable
             return;
         }
 
+
         ushort flags = input.ButtonFlags;
         byte previousButtons = _mouseButtons;
         UpdateMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, LeftButton);
@@ -296,6 +300,15 @@ internal sealed class InputForwarder : IDisposable
         remainder = total % 120;
         return steps;
     }
+
+    internal static bool ShouldSuppressKeyboard(
+        bool forwardingEnabled,
+        bool handlingControlHotkey,
+        bool hotkeyStartedWhileForwarding) =>
+        handlingControlHotkey ? hotkeyStartedWhileForwarding : forwardingEnabled;
+
+    internal static bool ShouldSuppressMouse(bool forwardingEnabled) => forwardingEnabled;
+
 
     private void SendKeyboardReport()
     {

@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace HidBridge.Host.Input;
 
@@ -8,10 +9,10 @@ namespace HidBridge.Host.Input;
 /// </summary>
 internal sealed class RawMouseInputWindow : NativeWindow, IDisposable
 {
-    private readonly Action<NativeMethods.RawMouse> _inputHandler;
+    private readonly Action<IntPtr, NativeMethods.RawMouse> _inputHandler;
     private bool _registered;
 
-    internal RawMouseInputWindow(Action<NativeMethods.RawMouse> inputHandler)
+    internal RawMouseInputWindow(Action<IntPtr, NativeMethods.RawMouse> inputHandler)
     {
         _inputHandler = inputHandler;
 
@@ -98,12 +99,34 @@ internal sealed class RawMouseInputWindow : NativeWindow, IDisposable
                 input.Mouse.LastY = 0;
             }
 
-            _inputHandler(input.Mouse);
+            _inputHandler(input.Header.Device, input.Mouse);
         }
         finally
         {
             Marshal.FreeHGlobal(buffer);
         }
+    }
+
+    internal static string GetDeviceName(IntPtr device)
+    {
+        uint size = 0;
+        uint result = NativeMethods.GetRawInputDeviceInfo(
+            device,
+            NativeMethods.RidiDeviceName,
+            null,
+            ref size);
+        if (result == uint.MaxValue || size == 0)
+        {
+            return string.Empty;
+        }
+
+        StringBuilder name = new((int)size);
+        result = NativeMethods.GetRawInputDeviceInfo(
+            device,
+            NativeMethods.RidiDeviceName,
+            name,
+            ref size);
+        return result == uint.MaxValue ? string.Empty : name.ToString();
     }
 
     public void Dispose()
