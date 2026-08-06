@@ -1,14 +1,10 @@
 #pragma once
 
-#include <stdbool.h>
-
 #include "esp_err.h"
+#include "output_mode_selector.h"
 
 /** 初始化板载可寻址 RGB 状态指示灯。 */
 esp_err_t status_led_init(void);
 
-/** 更新 USB HID 是否已被目标设备枚举。 */
-void status_led_set_usb_connected(bool connected);
-
-/** 更新 BLE HID 是否已连接。 */
-void status_led_set_ble_connected(bool connected);
+/** 根据当前真正接收键鼠报告的活动输出更新灯色。 */
+void status_led_set_active_mode(output_mode_t mode);

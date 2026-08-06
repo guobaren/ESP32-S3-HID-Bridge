@@ -9,7 +9,7 @@ config HID_BRIDGE_STATUS_LED_ENABLE
     bool "启用 RGB 状态指示灯"
     default y
     help
-        USB HID 已连接时显示绿灯，BLE HID 已连接时显示蓝灯；两者均未连接时红灯闪烁。
+        按当前活动输出显示：USB HID 为绿灯，BLE HID 为蓝灯；无活动输出时红灯闪烁。
 
 if HID_BRIDGE_STATUS_LED_ENABLE
 

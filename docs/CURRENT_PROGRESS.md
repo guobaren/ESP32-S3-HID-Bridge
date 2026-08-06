@@ -24,11 +24,11 @@
 
 ### ESP32-S3 固件
 
-- UART0 接收 USB-to-UART 主机帧，使用流式 Magic、长度和 CRC16 解析。
+- UART0 与原生 USB CDC 均可接收主机帧，共用 Magic、长度和 CRC16 流式协议解析；CDC 与 HID 组成同一个原生 USB 复合设备。
 - 收到合法 `DeviceProbe` 时返回 `DeviceHello`，不申请输入租约，也不产生 HID 输出。
-- 支持复合 USB HID 键盘和鼠标，USB 端使用独立 Report ID。
+- 支持原生 USB `CDC + HID` 复合设备；CDC 接收 EXE 数据，HID 键盘和鼠标使用独立 Report ID。
 - 支持 BLE HID 复合键盘和相对鼠标，电池电量固定报告为 100%。
-- USB HID 与 BLE HID 使用输出模式选择器：首个真实建立连接的后端取得锁，后连接后端不接收报告；活动后端断开后，已在线后端才能安全接管，接管前发送 `ReleaseAll`。
+- USB HID 与 BLE HID 使用输出模式选择器：BLE 完成加密并真正可发送后优先接管；BLE 断开后回退 USB，切换前后发送 `ReleaseAll`。
 - 支持输入会话、心跳、租约超时、断开释放和 Wi-Fi 安全输入/输出通道。
 - 已补充 Espressif `led_strip` 组件依赖，并将 TinyUSB mount/unmount 处理改为官方事件回调，完整链接已通过。
 
@@ -40,7 +40,7 @@
 | 主机格式检查 | 无格式差异 | `dotnet format --verify-no-changes` 通过 | 通过 |
 | 主机协议/聚合检查 | 编解码、500 Hz、按钮顺序和停止后不发送正确 | 检查程序全部通过 | 通过 |
 | 自动发现单元检查 | 正确响应接受，截断/错误随机数拒绝 | 全部断言通过 | 通过 |
-| 固件输出模式状态测试 | USB 先、BLE 先、断开接管顺序正确 | C 状态序列测试通过 | 通过 |
+| 固件输出模式状态测试 | BLE 就绪后接管 USB、USB 不抢占 BLE、BLE 断开回退 USB | C 状态序列测试通过 | 通过 |
 | 固件完整构建 | 编译、链接和分区检查通过 | 应用约 1.01 MiB，分区剩余约 48% | 通过 |
 | 实物烧录 | 写入并校验固件 | ESP32-S3 Flash 写入和哈希校验通过 | 通过 |
 | 无 JSON 主机实测 | 自动扫描、握手、连接和退出 | 实际发现当前开发板，退出码为 0 | 通过 |
@@ -63,22 +63,22 @@
 USB 输出模式：
 
 ```text
-电脑 ──USB-to-UART──> ESP32-S3 ──原生 USB HID──> 手机/目标设备
+电脑 ──USB-to-UART 或原生 USB CDC──> ESP32-S3 ──原生 USB HID──> 手机/目标设备
 ```
 
 BLE 输出模式：
 
 ```text
-电脑 ──USB-to-UART──> ESP32-S3 ──BLE HID──> 手机/目标电脑
+电脑 ──USB-to-UART 或原生 USB CDC──> ESP32-S3 ──BLE HID──> 手机/目标电脑
 ```
 
 主机端默认不需要 JSON。若使用发布的自包含 EXE，可直接运行；若需要固定 COM 口或 Wi-Fi 参数，再创建 `bridge.local.json`。
 
 ## 尚未完成或需要继续验收
 
-1. 用真实 USB 目标设备分别验证 USB 先连接、BLE 先连接、后连接被忽略和断开后的安全接管；逐项核对键盘按键、鼠标按钮和移动报告。
-2. 真实拔出/重新插入 USB-to-UART，确认 COM 编号变化后主机自动重新扫描并恢复；恢复期间不得继续发送旧会话输入。
-3. 在未安装 CH340 驱动的全新 Windows 电脑上验证驱动边界。自动发现不能绕过操作系统未创建 COM 设备这一前提。
+1. 烧录本版固件后真实验证：USB 已在线时 BLE 就绪应切换蓝灯并接管输出，BLE 断开后应恢复绿灯和 USB 输出；逐项核对键盘按键、鼠标按钮、移动报告与两端 `ReleaseAll`。
+2. 烧录后连接原生 `ESP32-S3 USB`，确认 Windows 同时枚举 HID 和 CDC COM，主机 EXE 自动握手，并实际把键鼠数据从 CDC 输入转发到 BLE。
+3. 分别拔插 USB-to-UART 和原生 USB CDC，确认 COM 编号变化后主机自动重新扫描并恢复；恢复期间不得继续发送旧会话输入。
 4. 最新固件重新运行 `tests/hardware/mouse_20ms_check.py`，保留期望值、固件统计和实际完成值。
 5. 真实桌面验证窗口版 HOME/END、鼠标裁剪解除和对端 ReleaseAll。
 

@@ -17,8 +17,8 @@ typedef struct {
 /**
  * 更新输出连接状态并返回当前活动模式。
  *
- * 无活动模式时，首个连接成功的模式取得锁；活动模式断开后，如果另一
- * 模式仍然在线，则立即由另一模式接管，否则回到等待首个连接的状态。
+ * BLE HID 在完成加密并真正可发送后优先于 USB HID；BLE 断开时若 USB
+ * 仍在线则回退到 USB，否则回到无活动输出状态。
  */
 output_mode_t output_mode_selector_set_connected(
     output_mode_selector_t *selector,

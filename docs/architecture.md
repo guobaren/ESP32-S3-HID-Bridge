@@ -10,7 +10,7 @@ Windows 主机程序负责：
 2. 通过 Windows Raw Input 接收鼠标设备的原生相对位移、按钮和滚轮事件。
 3. 维护当前键盘修饰键、普通键和鼠标按钮状态。
 4. 以 500 Hz 上限累计 Raw Input 位移，将状态转换成 USB HID 键盘/鼠标报告。
-5. 自动枚举 USB-to-UART 串口，通过 `DeviceProbe/DeviceHello` 握手确认 ESP32-S3 后发送数据。
+5. 自动枚举 Windows COM 口，通过 `DeviceProbe/DeviceHello` 握手确认 ESP32-S3；板载 USB-to-UART 与原生 USB CDC 使用同一协议。
 6. 在停止转发和退出时发送 `ReleaseAll`。
 
 主机端不创建 Windows 虚拟设备，也不注入输入，因此不会与目标设备的 HID 枚举混在一起。
@@ -20,10 +20,11 @@ Windows 主机程序负责：
 固件同时承担输入接收和多后端输出角色：
 
 - UART 接收端：从板载 USB-UART 桥读取主机帧。
-- USB Device 端：通过 ESP32-S3 内置 USB PHY 对外暴露 HID。
+- 原生 USB CDC 接收端：通过 ESP32-S3 内置 USB PHY 接收与 UART 相同的主机帧。
+- USB Device 端：同一原生 USB 设备以 `CDC + HID` 复合设备枚举，HID 负责 USB 输出。
 - BLE HID 端：通过 NimBLE 对外暴露复合键鼠。
 - Wi-Fi 输入/Target Agent 端：使用项目安全通道传输。
-- USB HID 与 BLE HID 采用首连接锁定；活动输出断开后才允许已在线后端接管。
+- USB HID 与 BLE HID 采用 BLE 优先策略；BLE 完成加密后可接管仍在线的 USB，BLE 断开后回退 USB，切换时双向释放输入状态。
 
 USB 侧使用一个 HID Interface 和两个 Report ID：
 
@@ -79,8 +80,8 @@ USB 侧使用一个 HID Interface 和两个 Report ID：
 
 ### 电脑到开发板
 
-- 保留 USB-to-UART 作为低延迟、无需网络配置的默认通道；主机默认自动发现，固定串口可配置覆盖。
-- 自动发现只接受带正确 CRC、序号、签名和随机数的 `DeviceHello`，不能绕过 Windows 对 CH340 等 USB-UART 桥的驱动要求。
+- USB-to-UART 与原生 USB CDC 都是低延迟、无需网络配置的输入通道；主机默认自动发现，固定 COM 口可配置覆盖。
+- 自动发现只接受带正确 CRC、序号、签名和随机数的 `DeviceHello`。CH340 路径仍依赖 USB-UART 驱动；原生 USB CDC 则由复合设备中的 CDC 接口提供 COM 口。
 - Wi-Fi 输入使用项目原生安全通道，包含预共享密钥双向认证、AES-256-GCM 和重放保护。
 - Wi-Fi 服务拒绝未认证连接，不开放匿名键鼠控制接口。
 - Wi-Fi SSID 和密码由 SoftAP captive portal 写入 NVS；无凭据、连接失败或长按 BOOT 时进入配网模式，连接成功后关闭临时热点。

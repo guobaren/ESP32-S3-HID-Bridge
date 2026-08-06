@@ -1,6 +1,6 @@
 # ESP32-S3 HID Bridge
 
-把 Windows 电脑现有的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的复合 HID 键鼠设备，输出到手机、平板、嵌入式设备或其他项目。当前支持 USB HID、BLE HID 和 Wi-Fi Target Agent 三种输出后端；输入默认使用板载 USB-to-UART 串口。
+把 Windows 电脑现有的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的复合 HID 键鼠设备，输出到手机、平板、嵌入式设备或其他项目。当前支持 USB HID、BLE HID 和 Wi-Fi Target Agent 三种输出后端；主机输入可使用板载 USB-to-UART、原生 USB CDC 或 Wi-Fi。
 
 ## 数据路径
 
@@ -9,24 +9,26 @@ Windows 键盘/鼠标
         │ 键鼠低级钩子 + 鼠标 Raw Input
         ▼
 HidBridge.Host
-        │ USB-to-UART，自动发现与二进制帧握手
+        │ USB-to-UART 或原生 USB CDC，自动发现与二进制帧握手
         ▼
 ESP32-S3-DevKitC-1
-        ├─ 原生 USB OTG，复合 HID ──> USB 目标设备
+        ├─ 原生 USB OTG，CDC + 复合 HID ──> 主机输入 / USB 目标设备
         ├─ BLE HID ────────────────> 手机/电脑
         └─ Wi-Fi Agent ────────────> Windows 目标端
 ```
 
-开发板同时使用两个接口：
+开发板支持两种有线主机输入方式：
 
-- `USB-to-UART` 接电脑，接收主机端生成的 HID 报告。
-- `ESP32-S3 USB` 接目标设备，对外枚举为复合 USB HID 键盘和鼠标。
+- `USB-to-UART` 接电脑，通过 CH340 COM 口接收主机端生成的 HID 报告。
+- `ESP32-S3 USB` 接电脑时枚举为 `CDC + HID` 复合设备；CDC COM 口接收同一套二进制协议，HID 接口仍可作为 USB 输出。
 
-USB HID 与 BLE HID 同时连接时，首个真正建立连接的后端取得输出锁；另一个后端仍可连接但不会收到报告。活动后端断开后，已在线的另一后端才会安全接管，并在接管前发送 `ReleaseAll`。
+因此只使用一根原生 USB 线，也可以让 `HidBridge.Host` 通过自动发现的 CDC COM 口把本机键鼠送入开发板，再由 BLE HID 输出到另一台设备。若原生 USB 枚举后仍没有 COM 口，应先确认已烧录包含 CDC 的本版固件，并检查 Windows 设备枚举状态。
+
+USB HID 与 BLE HID 同时可用时，已完成加密且真正可发送的 BLE HID 优先取得输出；BLE 断开后自动安全回退到 USB HID。切换前后都会执行 `ReleaseAll`，避免目标设备卡键。
 
 官方 ESP32-S3-DevKitC-1 支持两个 USB 端口同时供电。第三方兼容板必须先核对原理图，确认两个端口之间没有不安全的 VBUS 回灌路径。
 
-板载 RGB 状态灯默认使用 GPIO48：USB HID 已被目标设备枚举时亮绿灯，BLE HID 已连接时亮蓝灯，两者均未连接时红灯每 500 ms 闪烁。USB 和 BLE 同时连接时优先显示 USB 的绿灯；兼容板的 RGB 灯接线不同，可在 `menuconfig` 的 `HID Bridge` 菜单修改 GPIO 或关闭该功能。
+板载 RGB 状态灯默认使用 GPIO48，并显示“当前真正接收键鼠报告的活动输出”：USB HID 为绿灯，BLE HID 为蓝灯，无活动输出时红灯每 500 ms 闪烁。USB 与 BLE 同时在线且 BLE 已就绪时显示蓝灯；兼容板的 RGB 灯接线不同，可在 `menuconfig` 的 `HID Bridge` 菜单修改 GPIO 或关闭该功能。
 
 ## 当前里程碑
 
@@ -36,8 +38,8 @@ USB HID 与 BLE HID 同时连接时，首个真正建立连接的后端取得输
 - [x] `HOME` 转发开关
 - [x] 可配置串口与同步状态下的本机输入拦截
 - [x] 带序号、长度与 CRC16 的串口帧
-- [x] ESP-IDF UART 接收与流式协议解析
-- [x] 单 HID 接口、双 Report ID 的 USB 键盘/鼠标描述符
+- [x] ESP-IDF UART 与原生 USB CDC 接收，共用流式协议解析
+- [x] 原生 USB CDC + HID 复合设备，HID 使用双 Report ID 键盘/鼠标描述符
 - [x] 链路心跳、输入租约、断连超时检测与自动 `ReleaseAll`
 - [x] 电脑到开发板的认证加密 Wi-Fi 输入通道
 - [x] SoftAP 网页配网、NVS 凭据保存和 BOOT 长按重新配网
@@ -47,7 +49,7 @@ USB HID 与 BLE HID 同时连接时，首个真正建立连接的后端取得输
 - [x] 串口自动发现、随机数设备握手与重连逻辑
 - [x] 无 JSON 自包含 Windows 捕获 EXE
 - [x] 带预共享密钥的局域网 UDP 模拟鼠标输入与主机实时日志落盘
-- [x] BLE/USB 输出后端首连接锁定与安全接管逻辑
+- [x] BLE 优先、USB 回退的输出选择与安全接管逻辑
 - [ ] 增加托盘界面与配置页
 
 ## 计划中的连接方式
@@ -56,7 +58,8 @@ USB HID 与 BLE HID 同时连接时，首个真正建立连接的后端取得输
 
 | 方向 | 连接方式 | 目标定位 |
 |---|---|---|
-| 电脑 → 开发板 | USB-to-UART | 当前默认输入通道 |
+| 电脑 → 开发板 | USB-to-UART | 已实现，CH340 COM 输入通道 |
+| 电脑 → 开发板 | 原生 USB CDC | 已实现，与 UART 使用同一协议和主机自动发现 |
 | 电脑 → 开发板 | Wi-Fi | 已实现预共享密钥认证、AES-256-GCM 加密和防重放计数器 |
 | 开发板 → 目标设备 | USB HID | 当前默认输出通道，可用于无需安装配套程序的目标设备 |
 | 开发板 → 目标设备 | Wi-Fi | 已实现 Windows Target Agent；不作为通用 HID |
@@ -94,7 +97,7 @@ Copy-Item bridge.json bridge.local.json
 
 - 项目内已安装 ESP-IDF 6.0.2，位于 `.esp-idf/`（该目录不提交到 Git）
 - ESP32-S3-DevKitC-1
-- 电脑连接开发板的 `USB-to-UART` 端口
+- 电脑连接开发板的 `USB-to-UART` 或原生 `ESP32-S3 USB` 端口
 
 ```powershell
 Set-Location D:\ESP32-S3-HID-Bridge\firmware
@@ -108,12 +111,12 @@ idf.py -p <实际串口> flash
 
 Wi-Fi、BLE 和目标 Agent 的配置步骤见 [docs/configuration.md](docs/configuration.md)。首次烧录后可通过临时 SoftAP 网页设置 Wi-Fi；SSID 和密码保存在开发板 NVS，不需要为更换网络重新编译。预共享密钥仍只写入被 Git 忽略的 `firmware/sdkconfig`、`bridge.local.json` 和 `agent.local.json`，不要写入仓库文件。
 
-烧录后：
+烧录后可任选输入连接方式：
 
-1. 保持 `USB-to-UART` 端口连接电脑。
-2. 用数据线把 `ESP32-S3 USB` 原生 USB 端口连接目标设备。
-3. 启动主机端；默认会自动发现开发板，不需要填写 COM 号。
-4. 按 `HOME` 开始转发。
+- **USB-to-UART 输入**：保持 `USB-to-UART` 端口连接输入电脑；如果目标使用 USB HID，再把 `ESP32-S3 USB` 原生口连接目标设备。
+- **原生 USB CDC 输入 + BLE 输出**：只把 `ESP32-S3 USB` 原生口连接输入电脑，确认 Windows 同时枚举 CDC COM 与 HID；BLE 配对完成后，输入电脑的数据经 CDC 进入开发板并从 BLE 输出到目标设备。请先等待 BLE 就绪且状态灯变蓝，再按 `HOME` 开始转发；BLE 尚未就绪时会按回退策略使用同一根线上的 USB HID，可能把输入送回输入电脑。
+
+随后启动主机端；默认会自动发现正确的 COM 口，不需要填写端口号。按 `HOME` 开始转发。
 
 主机端也可以发布为自包含单 EXE。发布目录中的 `bridge.json` 不是必需的；删除所有 JSON 后，程序仍会使用自动发现模式。若需要固定端口或 Wi-Fi 参数，再创建 `bridge.local.json`。
 

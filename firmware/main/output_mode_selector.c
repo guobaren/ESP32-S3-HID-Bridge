@@ -28,16 +28,17 @@ output_mode_t output_mode_selector_set_connected(
     }
     *flag = connected;
 
-    if (connected && selector->active_mode == OUTPUT_MODE_NONE) {
-        selector->active_mode = mode;
-    } else if (!connected && selector->active_mode == mode) {
-        if (mode != OUTPUT_MODE_USB && selector->usb_connected) {
-            selector->active_mode = OUTPUT_MODE_USB;
-        } else if (mode != OUTPUT_MODE_BLE && selector->ble_connected) {
-            selector->active_mode = OUTPUT_MODE_BLE;
-        } else {
-            selector->active_mode = OUTPUT_MODE_NONE;
-        }
+    /*
+     * BLE 只有在加密完成、HID 真正可发送后才会被标记为 connected。
+     * 因此 BLE 就绪时优先使用 BLE；这样原生 USB 即使仍接着供电或已枚举，
+     * 也不会阻止用户切换到 BLE。BLE 断开后再安全回退到 USB。
+     */
+    if (selector->ble_connected) {
+        selector->active_mode = OUTPUT_MODE_BLE;
+    } else if (selector->usb_connected) {
+        selector->active_mode = OUTPUT_MODE_USB;
+    } else {
+        selector->active_mode = OUTPUT_MODE_NONE;
     }
 
     return selector->active_mode;

@@ -16,8 +16,7 @@
 static const char *TAG = "status_led";
 static led_strip_handle_t s_strip;
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool s_usb_connected;
-static bool s_ble_connected;
+static output_mode_t s_active_mode;
 
 static void set_color(uint8_t red, uint8_t green, uint8_t blue)
 {
@@ -33,18 +32,16 @@ static void status_led_task(void *argument)
     bool red_visible = true;
 
     while (true) {
-        bool usb_connected;
-        bool ble_connected;
+        output_mode_t active_mode;
         portENTER_CRITICAL(&s_state_lock);
-        usb_connected = s_usb_connected;
-        ble_connected = s_ble_connected;
+        active_mode = s_active_mode;
         portEXIT_CRITICAL(&s_state_lock);
 
-        if (usb_connected) {
+        if (active_mode == OUTPUT_MODE_USB) {
             set_color(0, 32, 0);
             red_visible = true;
             last_blink_change = xTaskGetTickCount();
-        } else if (ble_connected) {
+        } else if (active_mode == OUTPUT_MODE_BLE) {
             set_color(0, 0, 32);
             red_visible = true;
             last_blink_change = xTaskGetTickCount();
@@ -91,24 +88,13 @@ esp_err_t status_led_init(void)
 #endif
 }
 
-void status_led_set_usb_connected(bool connected)
+void status_led_set_active_mode(output_mode_t mode)
 {
 #if CONFIG_HID_BRIDGE_STATUS_LED_ENABLE
     portENTER_CRITICAL(&s_state_lock);
-    s_usb_connected = connected;
+    s_active_mode = mode;
     portEXIT_CRITICAL(&s_state_lock);
 #else
-    (void)connected;
-#endif
-}
-
-void status_led_set_ble_connected(bool connected)
-{
-#if CONFIG_HID_BRIDGE_STATUS_LED_ENABLE
-    portENTER_CRITICAL(&s_state_lock);
-    s_ble_connected = connected;
-    portEXIT_CRITICAL(&s_state_lock);
-#else
-    (void)connected;
+    (void)mode;
 #endif
 }

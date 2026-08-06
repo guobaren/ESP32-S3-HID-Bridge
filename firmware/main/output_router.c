@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "hid_output.h"
+#include "status_led.h"
 #include "wifi_target_output.h"
 
 static const char *TAG = "output_router";
@@ -108,10 +109,30 @@ void output_router_set_connected(output_mode_t mode, bool connected)
     output_mode_t previous_mode = s_selector.active_mode;
     output_mode_t active_mode = output_mode_selector_set_connected(&s_selector, mode, connected);
     if (active_mode != previous_mode) {
-        /* 接管前先让新目标回到中立状态，避免继承旧会话的卡键状态。 */
+        /*
+         * BLE 可在 USB 仍在线时主动接管。切换前先释放旧目标，避免旧目标
+         * 留下卡键或按住的鼠标按钮；新目标收到下一帧前也会先 ReleaseAll。
+         */
+        if (previous_mode != OUTPUT_MODE_NONE) {
+            bridge_frame_t release_frame = {
+                .version = BRIDGE_PROTOCOL_VERSION,
+                .type = BRIDGE_MESSAGE_RELEASE_ALL,
+                .payload_length = 0,
+            };
+            esp_err_t release_result = submit_to_mode(previous_mode, &release_frame);
+            if (release_result != ESP_OK && release_result != ESP_ERR_NOT_SUPPORTED) {
+                ESP_LOGW(
+                    TAG,
+                    "切换输出前释放 %s 失败：%s",
+                    mode_name(previous_mode),
+                    esp_err_to_name(release_result));
+            }
+        }
         s_release_pending = active_mode != OUTPUT_MODE_NONE;
     }
     xSemaphoreGive(s_mode_mutex);
+
+    status_led_set_active_mode(active_mode);
 
     if (active_mode != previous_mode) {
         ESP_LOGI(
@@ -122,7 +143,7 @@ void output_router_set_connected(output_mode_t mode, bool connected)
             mode_name(mode),
             connected ? "已连接" : "已断开");
     } else if (connected && active_mode != mode) {
-        ESP_LOGI(TAG, "%s 已连接，但当前锁定 %s，忽略该连接的输出", mode_name(mode), mode_name(active_mode));
+        ESP_LOGI(TAG, "%s 已连接，但当前活动输出为 %s，不向该连接发送报告", mode_name(mode), mode_name(active_mode));
     }
 }
 

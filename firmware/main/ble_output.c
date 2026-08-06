@@ -16,7 +16,6 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "output_router.h"
-#include "status_led.h"
 
 #if CONFIG_HID_BRIDGE_BLE_ENABLE && !CONFIG_BT_NIMBLE_NVS_PERSIST
 #error "BLE HID bonding requires CONFIG_BT_NIMBLE_NVS_PERSIST"
@@ -103,7 +102,6 @@ static void ble_output_set_connected(bool connected, const char *reason)
 {
     bool changed = s_connected != connected;
     s_connected = connected;
-    status_led_set_ble_connected(connected);
     output_router_set_connected(OUTPUT_MODE_BLE, connected);
     if (changed) {
         ESP_LOGI(TAG, "BLE HID %s（%s）", connected ? "已就绪" : "已断开", reason);

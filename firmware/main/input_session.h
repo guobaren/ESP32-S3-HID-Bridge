@@ -6,6 +6,7 @@ typedef enum {
     BRIDGE_INPUT_NONE = 0,
     BRIDGE_INPUT_UART = 1,
     BRIDGE_INPUT_WIFI = 2,
+    BRIDGE_INPUT_USB_CDC = 3,
 } bridge_input_source_t;
 
 esp_err_t input_session_init(void);

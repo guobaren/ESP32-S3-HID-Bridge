@@ -5,6 +5,7 @@
 #include "bridge_protocol.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "device_discovery.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -21,10 +22,6 @@
 #define BRIDGE_UART_BAUD_RATE 921600
 #define UART_RX_BUFFER_SIZE 4096
 #define UART_READ_CHUNK_SIZE 256
-#define DEVICE_PROBE_NONCE_LENGTH 8
-
-static const uint8_t DEVICE_HELLO_SIGNATURE[] = {'H', 'I', 'D', 'B', 'R', 'D', 'G', '2'};
-
 static const char *TAG = "hid_bridge";
 
 static void send_device_hello(const bridge_frame_t *probe)
@@ -33,22 +30,10 @@ static void send_device_hello(const bridge_frame_t *probe)
         return;
     }
 
-    bridge_frame_t hello = {
-        .version = BRIDGE_PROTOCOL_VERSION,
-        .type = BRIDGE_MESSAGE_DEVICE_HELLO,
-        .sequence = probe->sequence,
-        .payload_length = sizeof(DEVICE_HELLO_SIGNATURE) + DEVICE_PROBE_NONCE_LENGTH,
-    };
-    memcpy(hello.payload, DEVICE_HELLO_SIGNATURE, sizeof(DEVICE_HELLO_SIGNATURE));
-    memcpy(
-        hello.payload + sizeof(DEVICE_HELLO_SIGNATURE),
-        probe->payload,
-        DEVICE_PROBE_NONCE_LENGTH);
-
     uint8_t serialized[9 + BRIDGE_MAX_PAYLOAD];
     size_t serialized_length = 0;
-    esp_err_t result = bridge_frame_serialize(
-        &hello,
+    esp_err_t result = device_discovery_serialize_hello(
+        probe,
         serialized,
         sizeof(serialized),
         &serialized_length);

@@ -15,15 +15,20 @@
 #include "tinyusb_default_config.h"
 #include "tusb.h"
 #include "output_router.h"
-#include "status_led.h"
+#include "usb_cdc_input.h"
 
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE 2
 #define MOUSE_REPORT_LENGTH 7
 #define CONTROL_QUEUE_LENGTH 32
-#define USB_INTERFACE_COUNT 1
+#define USB_INTERFACE_COUNT 3
+#define USB_HID_INTERFACE 0
+#define USB_CDC_INTERFACE 1
 #define USB_HID_ENDPOINT 0x81
-#define USB_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+#define USB_CDC_NOTIFICATION_ENDPOINT 0x82
+#define USB_CDC_DATA_OUT_ENDPOINT 0x03
+#define USB_CDC_DATA_IN_ENDPOINT 0x83
+#define USB_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
 #define MOUSE_SEND_PERIOD_MS 2
 #define STATISTICS_PERIOD_MS 1000
 #define COMPLETION_LATENCY_BUCKET_COUNT 7
@@ -149,13 +154,21 @@ static const uint8_t s_configuration_descriptor[] = {
         TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP,
         100),
     TUD_HID_DESCRIPTOR(
-        0,
+        USB_HID_INTERFACE,
         0,
         HID_ITF_PROTOCOL_NONE,
         sizeof(s_hid_report_descriptor),
         USB_HID_ENDPOINT,
         16,
         1),
+    TUD_CDC_DESCRIPTOR(
+        USB_CDC_INTERFACE,
+        0,
+        USB_CDC_NOTIFICATION_ENDPOINT,
+        8,
+        USB_CDC_DATA_OUT_ENDPOINT,
+        USB_CDC_DATA_IN_ENDPOINT,
+        64),
 };
 
 static uint64_t absolute_u64(int64_t value)
@@ -254,10 +267,9 @@ static void usb_event_callback(tinyusb_event_t *event, void *argument)
         return;
     }
     if (event->id == TINYUSB_EVENT_ATTACHED) {
-        status_led_set_usb_connected(true);
         output_router_set_connected(OUTPUT_MODE_USB, true);
     } else if (event->id == TINYUSB_EVENT_DETACHED) {
-        status_led_set_usb_connected(false);
+        usb_cdc_input_on_detached();
         output_router_set_connected(OUTPUT_MODE_USB, false);
     }
 }
@@ -591,6 +603,12 @@ esp_err_t hid_output_init(void)
         s_control_queue = NULL;
         vSemaphoreDelete(s_control_mutex);
         s_control_mutex = NULL;
+        return error;
+    }
+
+    error = usb_cdc_input_init();
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "USB CDC 输入初始化失败：%s", esp_err_to_name(error));
         return error;
     }
 
