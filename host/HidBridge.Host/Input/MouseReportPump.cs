@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using HidBridge.Host.Transport;
 using HidBridge.Protocol;
@@ -34,6 +35,9 @@ internal sealed class MouseReportPump : IDisposable
     private long _buttonTransitionCount;
     private long _maxPendingX;
     private long _maxPendingY;
+    private long _lastSubmittedTimestamp;
+    private long _minSubmittedIntervalUs;
+    private long _maxSubmittedIntervalUs;
     private byte _lastSubmittedButtons;
     private DateTime _lastStatisticsUtc = DateTime.UtcNow;
     private bool _enabled;
@@ -199,6 +203,7 @@ internal sealed class MouseReportPump : IDisposable
                         _submittedY += y;
                         _submittedReportCount++;
                         payload = MouseReportCodec.Encode(buttons, x, y, wheel, pan);
+                        RecordSubmittedIntervalLocked(Stopwatch.GetTimestamp());
                     }
 
                     if (DateTime.UtcNow - _lastStatisticsUtc >= StatisticsInterval)
@@ -221,11 +226,30 @@ internal sealed class MouseReportPump : IDisposable
         }
     }
 
+
+    private void RecordSubmittedIntervalLocked(long now)
+    {
+        if (_lastSubmittedTimestamp != 0)
+        {
+            long intervalUs = (now - _lastSubmittedTimestamp) * 1_000_000L / Stopwatch.Frequency;
+            if (_minSubmittedIntervalUs == 0 || intervalUs < _minSubmittedIntervalUs)
+            {
+                _minSubmittedIntervalUs = intervalUs;
+            }
+            if (intervalUs > _maxSubmittedIntervalUs)
+            {
+                _maxSubmittedIntervalUs = intervalUs;
+            }
+        }
+        _lastSubmittedTimestamp = now;
+    }
+
     private string BuildStatisticsLocked() =>
         $"鼠标统计（500 Hz）：原始事件={_rawEventCount}，采集位移=({_capturedX},{_capturedY})，" +
         $"已提交报告={_submittedReportCount}，已提交位移=({_submittedX},{_submittedY})，" +
         $"待发送=({_pendingX},{_pendingY})，按钮转换={_buttonTransitionCount}，" +
-        $"按钮待发送={_buttonStates.Count}，最大积压=({_maxPendingX},{_maxPendingY})";
+        $"按钮待发送={_buttonStates.Count}，最大积压=({_maxPendingX},{_maxPendingY})，" +
+        $"提交间隔us=({_minSubmittedIntervalUs}..{_maxSubmittedIntervalUs})";
 
     private void LogDiscardedPendingLocked()
     {
@@ -253,6 +277,9 @@ internal sealed class MouseReportPump : IDisposable
         _buttonTransitionCount = 0;
         _maxPendingX = 0;
         _maxPendingY = 0;
+        _lastSubmittedTimestamp = 0;
+        _minSubmittedIntervalUs = 0;
+        _maxSubmittedIntervalUs = 0;
         _lastSubmittedButtons = 0;
         _buttonStates.Clear();
     }

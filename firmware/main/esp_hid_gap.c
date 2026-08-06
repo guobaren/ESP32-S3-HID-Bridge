@@ -31,8 +31,58 @@
 static const char *TAG = "ESP_HID_GAP";
 
 #if CONFIG_BT_NIMBLE_ENABLED
-static uint16_t s_active_connection_handle;
+static uint16_t s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint32_t s_connection_generation;
+static uint32_t s_connection_update_scheduled_generation;
+
+static void log_connection_parameters(const char *phase, uint16_t conn_handle)
+{
+    struct ble_gap_conn_desc desc;
+    int rc = ble_gap_conn_find(conn_handle, &desc);
+    if (rc != 0) {
+        ESP_LOGW(TAG,
+                 "BLE connection parameters unavailable: phase=%s conn_handle=%u rc=%d",
+                 phase, conn_handle, rc);
+        return;
+    }
+
+    uint32_t interval_us = (uint32_t)desc.conn_itvl * 1250U;
+    uint32_t rate_milli_hz = interval_us == 0
+                                 ? 0
+                                 : (uint32_t)(1000000000ULL / interval_us);
+    ESP_LOGI(TAG,
+             "BLE connection parameters: phase=%s conn_handle=%u "
+             "interval=%" PRIu32 " us rate=%" PRIu32 ".%03" PRIu32
+             " Hz latency=%u timeout=%u ms",
+             phase,
+             conn_handle,
+             interval_us,
+             rate_milli_hz / 1000U,
+             rate_milli_hz % 1000U,
+             desc.conn_latency,
+             desc.supervision_timeout * 10);
+}
+
+static void verify_low_latency_connection_parameters(const struct ble_gap_conn_desc *desc)
+{
+    const uint16_t target_min = BLE_GAP_CONN_ITVL_MS(7.5);
+    const uint16_t target_max = BLE_GAP_CONN_ITVL_MS(10);
+    uint32_t interval_us = (uint32_t)desc->conn_itvl * 1250U;
+
+    if (desc->conn_itvl >= target_min && desc->conn_itvl <= target_max &&
+        desc->conn_latency == 0) {
+        ESP_LOGI(TAG,
+                 "low-latency connection parameters confirmed: interval=%" PRIu32
+                 " us latency=0",
+                 interval_us);
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "negotiated connection parameters outside target 7.5-10 ms, latency=0: "
+             "interval=%" PRIu32 " us latency=%u",
+             interval_us, desc->conn_latency);
+}
 
 static void request_narrow_connection_interval(void *argument)
 {
@@ -48,21 +98,55 @@ static void request_narrow_connection_interval(void *argument)
 
     vTaskDelay(pdMS_TO_TICKS(500));
     for (int attempt = 1; attempt <= 30; attempt++) {
-        if (generation != s_connection_generation) {
+        if (generation != s_connection_generation ||
+            s_active_connection_handle == BLE_HS_CONN_HANDLE_NONE) {
             break;
         }
         int rc = ble_gap_update_params(s_active_connection_handle, &params);
         if (rc == 0) {
-            ESP_LOGI(TAG, "requested delayed connection interval 7.5-10 ms; attempt=%d", attempt);
+            ESP_LOGI(TAG,
+                     "submitted delayed connection interval 7.5-10 ms, latency=0; "
+                     "attempt=%d generation=%" PRIu32,
+                     attempt, generation);
             break;
         }
         if (rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG, "delayed narrow connection update failed; rc=%d attempt=%d", rc, attempt);
+            ESP_LOGW(TAG,
+                     "delayed narrow connection update failed; rc=%d attempt=%d "
+                     "generation=%" PRIu32,
+                     rc, attempt, generation);
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     vTaskDelete(NULL);
+}
+
+static void schedule_narrow_connection_interval(uint32_t generation, const char *source)
+{
+    if (s_connection_update_scheduled_generation == generation) {
+        ESP_LOGI(TAG,
+                 "skip duplicate low-latency connection update; source=%s "
+                 "generation=%" PRIu32,
+                 source, generation);
+        return;
+    }
+
+    s_connection_update_scheduled_generation = generation;
+    if (xTaskCreate(request_narrow_connection_interval,
+                    "ble_conn_narrow", 3072,
+                    (void *)(uintptr_t)generation, 5, NULL) != pdPASS) {
+        s_connection_update_scheduled_generation = 0;
+        ESP_LOGW(TAG,
+                 "create delayed narrow connection task failed; source=%s "
+                 "generation=%" PRIu32,
+                 source, generation);
+        return;
+    }
+    ESP_LOGI(TAG,
+             "scheduled low-latency connection update; source=%s "
+             "target=7.5-10 ms latency=0 generation=%" PRIu32,
+             source, generation);
 }
 #endif
 
@@ -554,11 +638,13 @@ static esp_err_t start_bt_scan(uint32_t seconds)
 }
 #endif
 
+extern void ble_hid_task_start_up(void);
+extern void ble_hid_task_shut_down(void);
+
 #if CONFIG_BT_BLE_ENABLED
 /*
  * BLE GAP
  * */
-extern void ble_hid_task_start_up(void);
 static void ble_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
@@ -837,17 +923,55 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
         return rc;
     }
 
-    /* Initialize the security configuration */
-    /* 设备没有屏幕或输入键盘，使用 Just Works，手机端无需输入配对码。 */
+    /*
+     * 初始化 BLE 安全参数。
+     *
+     * 这是一个没有屏幕、没有输入键盘的 HID 外设，只能使用 Just Works，
+     * 不能要求 Windows 输入 PIN 或确认数值比较。Windows 自带 BLE HID
+     * 配对路径对 Secure Connections 的无输入设备兼容性并不一致；先使用
+     * 蓝牙规范允许的 legacy Just Works，并保留 bonding 以便 HID 后续连接
+     * 复用密钥。这样不会引入 MITM 要求，也不会触发不存在的 passkey 流程。
+     */
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_sc = 0;
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ID | BLE_SM_PAIR_KEY_DIST_ENC;
-    ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ID | BLE_SM_PAIR_KEY_DIST_ENC;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ID | BLE_SM_PAIR_KEY_DIST_ENC;
 
     return ESP_OK;
 
+}
+
+static int nimble_restart_advertising_if_idle(const char *reason)
+{
+    struct ble_gap_conn_desc desc;
+    if (s_active_connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+        int find_rc = ble_gap_conn_find(s_active_connection_handle, &desc);
+        if (find_rc == 0) {
+            ESP_LOGI(TAG,
+                     "skip advertising restart (%s): active conn_handle=%u",
+                     reason, s_active_connection_handle);
+            return 0;
+        }
+        ESP_LOGW(TAG,
+                 "clearing stale conn_handle=%u before advertising restart (%s); rc=%d",
+                 s_active_connection_handle, reason, find_rc);
+        s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+
+    if (ble_gap_adv_active()) {
+        ESP_LOGI(TAG, "advertising already active (%s)", reason);
+        return 0;
+    }
+
+    int rc = esp_hid_ble_gap_adv_start();
+    if (rc == 0) {
+        ESP_LOGI(TAG, "advertising restarted (%s)", reason);
+    } else {
+        ESP_LOGE(TAG, "advertising restart failed (%s); rc=%d", reason, rc);
+    }
+    return rc;
 }
 
 static int
@@ -856,7 +980,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
     struct ble_gap_conn_desc desc;
     const struct ble_gap_upd_params low_latency_params = {
         .itvl_min = BLE_GAP_CONN_ITVL_MS(7.5),
-        .itvl_max = BLE_GAP_CONN_ITVL_MS(15),
+        .itvl_max = BLE_GAP_CONN_ITVL_MS(10),
         .latency = 0,
         .supervision_timeout = BLE_GAP_SUPERVISION_TIMEOUT_MS(5000),
         .min_ce_len = 0,
@@ -866,44 +990,68 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
 
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
-        /* A new connection was established or a connection attempt failed. */
-        ESP_LOGI(TAG, "connection %s; status=%d",
-                event->connect.status == 0 ? "established" : "failed",
-                event->connect.status);
-        if (event->connect.status == 0) {
-            s_active_connection_handle = event->connect.conn_handle;
-            uint32_t generation = ++s_connection_generation;
-            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-            if (rc == 0) {
-                ESP_LOGI(TAG, "connection parameters: interval=%" PRIu32
-                         " us latency=%u timeout=%u ms",
-                         (uint32_t)desc.conn_itvl * 1250,
-                         desc.conn_latency,
-                         desc.supervision_timeout * 10);
-            }
-
-            rc = ble_gap_update_params(event->connect.conn_handle,
-                                       &low_latency_params);
-            if (rc != 0) {
-                ESP_LOGW(TAG, "low-latency connection update failed; rc=%d", rc);
-            } else {
-                ESP_LOGI(TAG, "requested connection interval 7.5-15 ms, latency=0");
-            }
-            if (xTaskCreate(request_narrow_connection_interval,
-                            "ble_conn_narrow", 3072,
-                            (void *)(uintptr_t)generation, 5, NULL) != pdPASS) {
-                ESP_LOGW(TAG, "create delayed narrow connection task failed");
-            }
+        /*
+         * On the ESP-IDF NimBLE peripheral path this event can carry the
+         * remote-feature exchange status. A non-zero value does not always
+         * mean that the ACL connection was removed, so verify the handle.
+         */
+        rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+        if (rc != 0) {
+            ESP_LOGW(TAG,
+                     "connection failed; status=%d conn_handle=%u is not active; rc=%d",
+                     event->connect.status, event->connect.conn_handle, rc);
+            ++s_connection_generation;
+            s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+            ble_hid_task_shut_down();
+            nimble_restart_advertising_if_idle("connection attempt failed");
+            return 0;
         }
+        if (event->connect.status == 0) {
+            ESP_LOGI(TAG, "connection established; status=0 conn_handle=%u",
+                     event->connect.conn_handle);
+        } else {
+            ESP_LOGW(TAG,
+                     "connection active despite non-zero status=%d; conn_handle=%u",
+                     event->connect.status, event->connect.conn_handle);
+        }
+
+        s_active_connection_handle = event->connect.conn_handle;
+        uint32_t generation = ++s_connection_generation;
+        log_connection_parameters("connect_event_initial", event->connect.conn_handle);
+
+        /*
+         * status=26/19 can accompany a still-present ACL on this NimBLE
+         * peripheral path.  Do not immediately send a connection-parameter
+         * update in that ambiguous state: Windows may terminate the link
+         * while service discovery/encryption is still completing.  The HID
+         * path only needs the existing negotiated parameters to reconnect;
+         * prioritize completing encryption and subscriptions first.
+         */
+        if (event->connect.status != 0) {
+            ESP_LOGI(TAG,
+                     "skip low-latency connection update until encryption; "
+                     "connect_status=%d",
+                     event->connect.status);
+            return 0;
+        }
+
+        rc = ble_gap_update_params(event->connect.conn_handle,
+                                   &low_latency_params);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "low-latency connection update failed; rc=%d", rc);
+        } else {
+            ESP_LOGI(TAG,
+                     "submitted connection interval 7.5-10 ms, latency=0; source=connect_event");
+        }
+        schedule_narrow_connection_interval(generation, "connect_event");
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
         ++s_connection_generation;
+        s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
-        rc = esp_hid_ble_gap_adv_start();
-        if (rc != ESP_OK) {
-            ESP_LOGE(TAG, "restart advertising failed; rc=%d", rc);
-        }
-        return rc;
+        ble_hid_task_shut_down();
+        nimble_restart_advertising_if_idle("connection disconnected");
+        return 0;
     case BLE_GAP_EVENT_CONN_UPDATE:
         /* The central has updated the connection parameters. */
         ESP_LOGI(TAG, "connection updated; status=%d",
@@ -911,11 +1059,8 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         if (event->conn_update.status == 0) {
             rc = ble_gap_conn_find(event->conn_update.conn_handle, &desc);
             if (rc == 0) {
-                ESP_LOGI(TAG, "negotiated connection parameters: interval=%" PRIu32
-                         " us latency=%u timeout=%u ms",
-                         (uint32_t)desc.conn_itvl * 1250,
-                         desc.conn_latency,
-                         desc.supervision_timeout * 10);
+                log_connection_parameters("conn_update_final", event->conn_update.conn_handle);
+                verify_low_latency_connection_parameters(&desc);
             } else {
                 ESP_LOGW(TAG, "read negotiated connection parameters failed; rc=%d", rc);
             }
@@ -925,6 +1070,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_ADV_COMPLETE:
         ESP_LOGI(TAG, "advertise complete; reason=%d",
                 event->adv_complete.reason);
+        nimble_restart_advertising_if_idle("advertising completed");
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -953,9 +1099,32 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         if (event->enc_change.status == 0) {
             rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
             assert(rc == 0);
+            log_connection_parameters("encryption_current", event->enc_change.conn_handle);
+            schedule_narrow_connection_interval(s_connection_generation, "encryption_complete");
             ble_hid_task_start_up();
         } else {
-            ESP_LOGW(TAG, "encryption failed; waiting for disconnect/retry");
+            ble_hid_task_shut_down();
+            /*
+             * ENC_CHANGE.status 使用的是 NimBLE Host 状态码，而不是原始
+             * HCI 错误码。特别是 BLE_HS_ENOTCONN == 7 只表示该事件到达
+             * 时 ACL 已经消失，不能据此删除仍可能有效的持久化 bond，
+             * 也不能再次 terminate 一个已经不存在的连接。
+             *
+             * 旧逻辑会在每次冷启动重连竞争中删除本端 bond，导致中心端
+             * 仍持有旧密钥时反复连接/断开。这里统一等待 DISCONNECT 和
+             * 广播恢复；只有 BLE_GAP_EVENT_REPEAT_PAIRING 明确要求重新
+             * 配对时才删除旧 bond。
+             */
+            if (event->enc_change.status == BLE_HS_ENOTCONN) {
+                ESP_LOGW(TAG,
+                         "encryption change arrived after connection loss; "
+                         "status=%d (BLE_HS_ENOTCONN), preserve bond and wait for disconnect",
+                         event->enc_change.status);
+            } else {
+                ESP_LOGW(TAG,
+                         "encryption failed; status=%d, preserve bond and wait for disconnect",
+                         event->enc_change.status);
+            }
         }
         return 0;
 

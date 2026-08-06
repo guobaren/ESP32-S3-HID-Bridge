@@ -6,5 +6,12 @@
   "wiFiPort": 24813,
   "networkPresharedKey": "在 bridge.local.json 中填写至少16字节的随机密钥",
   "reconnectDelayMilliseconds": 1000,
-  "heartbeatIntervalMilliseconds": 500
+  "heartbeatIntervalMilliseconds": 500,
+  "deviceLogPath": "artifacts/host-serial-{timestamp}.log",
+  "showDeviceLogInUi": false,
+  "hostLogPath": "artifacts/host-runtime-{timestamp}.log",
+  "remoteInputEnabled": false,
+  "remoteInputBindAddress": "0.0.0.0",
+  "remoteInputPort": 24814,
+  "remoteInputPresharedKey": ""
 }

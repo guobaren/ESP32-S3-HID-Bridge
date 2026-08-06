@@ -1,11 +1,31 @@
+using System.Diagnostics;
 using System.IO.Ports;
+using System.Text;
 using HidBridge.Protocol;
 
 namespace HidBridge.Host.Transport;
 
 internal sealed class SerialBridge : IBridgeTransport
 {
+    private const int TraceFlushIntervalMilliseconds = 500;
+    private static readonly string[] ReducedLogMarkers =
+    [
+        "BLE connection parameters",
+        "connection interval",
+        "low-latency",
+        "CONNECT",
+        "DISCONNECT",
+        "encryption",
+        "BLE HID",
+        "BLE鼠标统计",
+        "鼠标统计",
+        "USB诊断",
+        "输入统计",
+        "advertising restarted",
+    ];
+
     private readonly BridgeOptions _options;
+    private readonly RuntimeLogSettings _logSettings;
     private readonly FrameCodec _codec = new();
     private readonly object _sync = new();
     private readonly System.Threading.Timer _heartbeatTimer;
@@ -13,10 +33,15 @@ internal sealed class SerialBridge : IBridgeTransport
     private DateTime _nextConnectAttemptUtc;
     private bool _sessionStarted;
     private bool _disposed;
+    private CancellationTokenSource? _traceCancellation;
+    private Task? _traceTask;
+    private StreamWriter? _traceWriter;
+    private long _nextTraceFlushTimestamp;
 
-    public SerialBridge(BridgeOptions options)
+    public SerialBridge(BridgeOptions options, RuntimeLogSettings logSettings)
     {
         _options = options;
+        _logSettings = logSettings;
         _heartbeatTimer = new System.Threading.Timer(
             _ => Send(MessageType.Ping, ReadOnlySpan<byte>.Empty),
             null,
@@ -101,6 +126,7 @@ internal sealed class SerialBridge : IBridgeTransport
                 }
 
                 _port = candidate;
+                StartDeviceTrace(candidate, portName);
                 Console.WriteLine(automatic
                     ? $"已自动发现并连接 {portName}。"
                     : $"已连接 {portName}。");
@@ -116,6 +142,259 @@ internal sealed class SerialBridge : IBridgeTransport
         }
 
         return false;
+    }
+
+    private void StartDeviceTrace(SerialPort port, string portName)
+    {
+        if (string.IsNullOrWhiteSpace(_options.DeviceLogPath))
+        {
+            return;
+        }
+
+        try
+        {
+            string template = _options.DeviceLogPath;
+            string relativePath = template.Replace("{timestamp}", DateTime.Now.ToString("yyyyMMdd-HHmmss"),
+                StringComparison.OrdinalIgnoreCase);
+            string path = Path.IsPathRooted(relativePath)
+                ? relativePath
+                : Path.Combine(Environment.CurrentDirectory, relativePath);
+            string? directory = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            _traceWriter = new StreamWriter(path, append: false, new UTF8Encoding(false))
+            {
+                AutoFlush = false,
+            };
+            _nextTraceFlushTimestamp = Stopwatch.GetTimestamp() +
+                                       Stopwatch.Frequency * TraceFlushIntervalMilliseconds / 1000;
+            _traceCancellation = new CancellationTokenSource();
+            CancellationToken cancellation = _traceCancellation.Token;
+            _traceTask = Task.Run(() => TraceDeviceOutput(port, portName, cancellation), cancellation);
+            Console.WriteLine(
+                $"设备日志已启用（缓冲写入，模式={(_logSettings.FullLoggingEnabled ? "完整诊断" : "精简高性能")}）：{path}");
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            Console.Error.WriteLine($"设备日志创建失败：{exception.Message}");
+            _traceWriter = null;
+        }
+    }
+
+    private void TraceDeviceOutput(SerialPort port, string portName, CancellationToken cancellation)
+    {
+        byte[] buffer = new byte[1024];
+        char[] textBuffer = new char[2048];
+        Decoder decoder = Encoding.UTF8.GetDecoder();
+        StringBuilder pending = new();
+        try
+        {
+            while (!cancellation.IsCancellationRequested)
+            {
+                int available;
+                try
+                {
+                    available = port.IsOpen ? port.BytesToRead : 0;
+                }
+                catch (InvalidOperationException)
+                {
+                    break;
+                }
+
+                if (available <= 0)
+                {
+                    FlushDeviceTraceIfDue();
+                    Thread.Sleep(10);
+                    continue;
+                }
+
+                int read = port.Read(buffer, 0, Math.Min(buffer.Length, available));
+                if (read <= 0)
+                {
+                    continue;
+                }
+
+                int charCount = decoder.GetChars(buffer, 0, read, textBuffer, 0, flush: false);
+                pending.Append(textBuffer, 0, charCount);
+                while (true)
+                {
+                    int newline = pending.ToString().IndexOf('\n');
+                    if (newline < 0)
+                    {
+                        break;
+                    }
+
+                    string line = pending.ToString(0, newline).TrimEnd('\r');
+                    pending.Remove(0, newline + 1);
+                    if (!string.IsNullOrWhiteSpace(line))
+                    {
+                        WriteDeviceTraceLine(portName, line);
+                    }
+                }
+                FlushDeviceTraceIfDue();
+            }
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException or TimeoutException)
+        {
+            if (!cancellation.IsCancellationRequested)
+            {
+                Console.Error.WriteLine($"设备日志读取停止：{exception.Message}");
+            }
+        }
+        finally
+        {
+            if (pending.Length > 0)
+            {
+                string line = pending.ToString().Trim();
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    WriteDeviceTraceLine(portName, line);
+                }
+            }
+            FlushDeviceTraceIfDue(force: true);
+        }
+    }
+
+    private void WriteDeviceTraceLine(string portName, string line)
+    {
+        StreamWriter? writer = _traceWriter;
+        if (writer is null)
+        {
+            return;
+        }
+
+        bool fullLogging = _logSettings.FullLoggingEnabled;
+        if (!ShouldPersistDeviceLog(fullLogging, line))
+        {
+            return;
+        }
+
+        string stamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{portName}] {line}";
+        try
+        {
+            writer.WriteLine(stamped);
+            if (ShouldMirrorDeviceLog(fullLogging, line))
+            {
+                Console.WriteLine($"[设备] {line}");
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // 关闭串口时允许日志线程退出。
+        }
+        catch (IOException)
+        {
+            // 日志文件不可用时不影响 HID 转发。
+        }
+    }
+
+
+    internal static bool ShouldMirrorDeviceLog(bool fullLogging, string line) =>
+        fullLogging && IsEspIdfLogLine(line);
+
+    internal static bool ShouldPersistDeviceLog(bool fullLogging, string line)
+    {
+        if (fullLogging)
+        {
+            return true;
+        }
+
+        if (line.StartsWith("E (", StringComparison.Ordinal) ||
+            line.StartsWith("W (", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (!line.StartsWith("I (", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        foreach (string marker in ReducedLogMarkers)
+        {
+            if (line.Contains(marker, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsEspIdfLogLine(string line) =>
+        line.StartsWith("I (", StringComparison.Ordinal) ||
+        line.StartsWith("W (", StringComparison.Ordinal) ||
+        line.StartsWith("E (", StringComparison.Ordinal) ||
+        line.StartsWith("D (", StringComparison.Ordinal) ||
+        line.StartsWith("V (", StringComparison.Ordinal);
+
+    private void FlushDeviceTraceIfDue(bool force = false)
+    {
+        StreamWriter? writer = _traceWriter;
+        if (writer is null)
+        {
+            return;
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        if (!force && now < _nextTraceFlushTimestamp)
+        {
+            return;
+        }
+
+        try
+        {
+            writer.Flush();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 关闭串口时允许日志线程退出。
+        }
+        catch (IOException)
+        {
+            // 日志文件不可用时不影响 HID 转发。
+        }
+        finally
+        {
+            _nextTraceFlushTimestamp = now +
+                                       Stopwatch.Frequency * TraceFlushIntervalMilliseconds / 1000;
+        }
+    }
+
+    private void StopDeviceTrace()
+    {
+        CancellationTokenSource? cancellation = _traceCancellation;
+        _traceCancellation = null;
+        if (cancellation is not null)
+        {
+            cancellation.Cancel();
+        }
+
+        try
+        {
+            _traceTask?.Wait(500);
+        }
+        catch (AggregateException)
+        {
+            // 端口关闭期间的读取异常不应阻止重连。
+        }
+        finally
+        {
+            _traceTask = null;
+            cancellation?.Dispose();
+            try
+            {
+                FlushDeviceTraceIfDue(force: true);
+                _traceWriter?.Dispose();
+            }
+            catch (IOException)
+            {
+                // 日志关闭失败不应阻止串口重连。
+            }
+            _traceWriter = null;
+        }
     }
 
     private SerialPort CreatePort(string portName) =>
@@ -139,6 +418,7 @@ internal sealed class SerialBridge : IBridgeTransport
 
     private void ClosePort()
     {
+        StopDeviceTrace();
         try
         {
             _port?.Dispose();

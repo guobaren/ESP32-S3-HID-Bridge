@@ -44,6 +44,25 @@ internal sealed class InputForwarder : IDisposable
 
     internal void DisableForwarding() => SetForwarding(false, true);
 
+    internal void SetForwardingEnabled(bool enabled) => SetForwarding(enabled);
+
+    internal bool TryInjectMouseMovement(int deltaX, int deltaY, int wheel = 0, int pan = 0)
+    {
+        if (!ForwardingEnabled)
+        {
+            return false;
+        }
+
+        _mouseReportPump.Accumulate(
+            _mouseButtons,
+            buttonsChanged: false,
+            deltaX,
+            deltaY,
+            wheel,
+            pan);
+        return true;
+    }
+
     internal void Start()
     {
         if (_started)

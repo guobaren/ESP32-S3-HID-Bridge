@@ -12,6 +12,13 @@ internal sealed class BridgeOptions
     public string NetworkPresharedKey { get; init; } = string.Empty;
     public int ReconnectDelayMilliseconds { get; init; } = 1000;
     public int HeartbeatIntervalMilliseconds { get; init; } = 500;
+    public string DeviceLogPath { get; init; } = "artifacts/host-serial-{timestamp}.log";
+    public bool ShowDeviceLogInUi { get; init; }
+    public string HostLogPath { get; init; } = "artifacts/host-runtime-{timestamp}.log";
+    public bool RemoteInputEnabled { get; init; }
+    public string RemoteInputBindAddress { get; init; } = "0.0.0.0";
+    public int RemoteInputPort { get; init; } = 24814;
+    public string RemoteInputPresharedKey { get; init; } = string.Empty;
 
     public static BridgeOptions Load()
     {
@@ -42,6 +49,16 @@ internal sealed class BridgeOptions
             System.Text.Encoding.UTF8.GetByteCount(options.NetworkPresharedKey) < 16)
         {
             throw new InvalidDataException("使用 Wi-Fi 时，networkPresharedKey 至少需要 16 个 UTF-8 字节。");
+        }
+        if (options.RemoteInputPort is < 1 or > 65535)
+        {
+            throw new InvalidDataException("remoteInputPort 必须在 1..65535 范围内。");
+        }
+        if (options.RemoteInputEnabled &&
+            System.Text.Encoding.UTF8.GetByteCount(options.RemoteInputPresharedKey) < 16)
+        {
+            throw new InvalidDataException(
+                "启用局域网模拟输入时，remoteInputPresharedKey 至少需要 16 个 UTF-8 字节。");
         }
 
         return options;

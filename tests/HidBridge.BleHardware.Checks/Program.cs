@@ -183,9 +183,7 @@ static void ReadLogs(
     ConcurrentQueue<string> lines)
 {
     Regex regex = new(
-        @"接收=(?<received>\d+) 位移=\((?<receivedX>-?\d+),(?<receivedY>-?\d+)\).*" +
-        @"提交=(?<submitted>\d+) 位移=\((?<submittedX>-?\d+),(?<submittedY>-?\d+)\).*" +
-        @"完成=(?<completed>\d+) 位移=\((?<completedX>-?\d+),(?<completedY>-?\d+)\)",
+        @"BLE鼠标统计：发送=(?<received>\d+) 位移=\((?<receivedX>-?\d+),(?<receivedY>-?\d+)\)",
         RegexOptions.Compiled);
     while (!cancellation.IsCancellationRequested)
     {

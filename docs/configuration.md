@@ -70,6 +70,42 @@ Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.j
 ```
 
 保持 `transport` 为 `serial`，把 `portName` 改为例如 `COM3`。固定串口模式不执行自动扫描。主机会在连接后发送 `SessionStart`，并每 500 ms 发送一次心跳。
+主机与 `idf.py monitor` 不能同时打开同一个 COM 口；主机程序会复用自己的串口读取设备日志，并按 `deviceLogPath` 写入日志文件。默认配置为 `artifacts/host-serial-{timestamp}.log`，设备文件采用约 500 ms 的缓冲刷新，避免每条 BLE notify 诊断都触发同步磁盘刷新。窗口日志标题栏提供“精简日志（高性能）/完整日志（排障）”下拉框：精简模式只保留连接参数、周期统计、警告和错误，不把普通 ESP-IDF Info/Debug/Verbose 日志写入设备日志或镜像到窗口；完整模式从切换时开始保存全部设备串口行，并把 ESP-IDF 分级日志批量镜像到窗口。`showDeviceLogInUi` 用作启动默认值：`false` 默认进入精简模式，`true` 默认进入完整模式。运行时切换不改写 JSON；将 `deviceLogPath` 设为空字符串可完全关闭设备日志读取。
+
+为降低完整日志模式对输入线程的干扰，后台日志采用约 50 ms 的 UI 批量刷新，不再为每一行单独执行一次 `BeginInvoke`；窗口可见日志约在 50 万字符后滚动裁剪，避免长时间运行导致 WinForms 文本框无限增长。完整模式仍会增加串口解析、磁盘写入和窗口绘制负载，只应在采集诊断数据时临时启用。
+
+## 主机 EXE 的局域网模拟鼠标接口
+
+主机 EXE 可选开启 UDP 模拟输入监听。该入口只把相对移动和滚轮增量注入现有的 500 Hz 鼠标报告链路；它不会直接移动运行主机上的 Windows 光标。只有按 `HOME` 开启同步后命令才会被转发，同步关闭、窗口关闭或程序退出仍会执行 `ReleaseAll` 并解除鼠标锁定。
+
+在被 Git 忽略的 `bridge.local.json` 中增加：
+
+```json
+{
+  "remoteInputEnabled": true,
+  "remoteInputBindAddress": "0.0.0.0",
+  "remoteInputPort": 24814,
+  "remoteInputPresharedKey": "替换为至少16字节的随机密钥",
+  "hostLogPath": "artifacts/host-runtime-{timestamp}.log"
+}
+```
+
+- `remoteInputBindAddress` 为 `0.0.0.0` 时监听全部 IPv4 网卡；只做本机测试可填 `127.0.0.1`。
+- `remoteInputPresharedKey` 至少 16 个 UTF-8 字节；每个数据报都必须携带相同的 `token`。
+- Windows 防火墙需要允许主机 EXE 的 UDP 入站端口。不要把该端口暴露到公网。
+- 单个 UTF-8 JSON 数据报格式：`{"token":"...","dx":12,"dy":-4,"wheel":0,"pan":0}`。`dx/dy` 范围为 `-32768..32767`，`wheel/pan` 范围为 `-128..127`，四个增量不能全为零。
+
+项目提供发送示例：
+
+```powershell
+.\tools\send-remote-mouse.ps1 `
+  -HostAddress 192.168.1.20 `
+  -Port 24814 `
+  -PresharedKey '替换为相同随机密钥' `
+  -Dx 25 -Dy -10
+```
+
+主机窗口日志与 `Console.Out/Console.Error` 会按行实时追加到 `hostLogPath`；默认文件名为 `artifacts/host-runtime-{timestamp}.log`。设备日志由窗口下拉框控制：默认“精简日志（高性能）”，需要采集原始串口细节时临时切换到“完整日志（排障）”。
 
 ## 电脑通过 Wi-Fi 连接开发板
 
@@ -105,6 +141,6 @@ dotnet run --project .\target\HidBridge.TargetAgent\HidBridge.TargetAgent.csproj
 
 BLE 使用 NimBLE、Just Works 配对和绑定机制，对外提供同一报告映射中的键盘 Report ID 1 与相对鼠标 Report ID 2。设备没有屏幕和输入键盘，因此不会显示或要求输入配对码；烧录后在目标设备的蓝牙设置中搜索配置的设备名并确认配对即可。
 
-如果手机曾经尝试连接使用配对码的旧固件，先在手机蓝牙设置中忽略/取消配对 `HidBridge Keyboard Mouse`，关闭再打开蓝牙，然后重新搜索。当前固件没有启用 NimBLE 绑定持久化，开发板重启后如无法自动重连，需要在手机端忽略旧记录后重新配对。
+固件已启用 NimBLE 绑定密钥 NVS 持久化，完成一次成功配对后，开发板正常重启会继续使用同一组 LTK/IRK 自动重连。升级自未持久化绑定密钥的旧固件时，目标设备仍可能保存开发板已丢失的旧 LTK；此时系统界面会在“已配对”和“已连接”之间反复切换。需要在目标设备删除/忽略 `HidBridge Keyboard Mouse`，关闭再打开蓝牙后重新配对一次。
 
-清除开发板 NVS 会删除网页保存的 Wi-Fi 和 Wi-Fi 驱动状态；下次启动会自动回到配网模式。
+清除开发板 NVS 会同时删除 BLE 绑定密钥、网页保存的 Wi-Fi 和 Wi-Fi 驱动状态；下次启动会自动回到配网模式，并且所有目标设备都需要删除旧配对后重新配对。

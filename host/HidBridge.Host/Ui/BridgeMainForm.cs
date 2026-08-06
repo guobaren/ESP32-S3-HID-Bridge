@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Runtime.InteropServices;
 using HidBridge.Host.Input;
 
 namespace HidBridge.Host.Ui;
@@ -6,17 +7,35 @@ namespace HidBridge.Host.Ui;
 internal sealed class BridgeMainForm : Form
 {
     private readonly InputForwarder _input;
+    private readonly RuntimeLogSettings _logSettings;
     private readonly MouseCursorLock _cursorLock = new();
     private readonly MouseCaptureSurface _captureSurface;
     private readonly Label _statusLabel;
     private readonly TextBox _logTextBox;
+    private readonly ComboBox _logModeComboBox;
+    private readonly System.Windows.Forms.Timer _logFlushTimer;
     private readonly SplitContainer _split;
     private readonly List<string> _pendingLogs = [];
+    private const int EmGetFirstVisibleLine = 0x00CE;
+    private const int EmLineScroll = 0x00B6;
+    private const int MaxVisibleLogCharacters = 500_000;
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int SendMessage(
+        IntPtr hWnd,
+        int message,
+        IntPtr wParam,
+        IntPtr lParam);
+
     private bool _closing;
 
-    internal BridgeMainForm(InputForwarder input, string endpointDescription)
+    internal BridgeMainForm(
+        InputForwarder input,
+        string endpointDescription,
+        RuntimeLogSettings? logSettings = null)
     {
         _input = input;
+        _logSettings = logSettings ?? new RuntimeLogSettings(RuntimeLogMode.Reduced);
         Text = "ESP32-S3 HID Bridge - 同步已关闭";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(760, 560);
@@ -107,19 +126,44 @@ internal sealed class BridgeMainForm : Form
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
-            Text = "运行日志（可选择并复制）",
+            Text = "运行日志（可选择、复制；滚动到上方后暂停自动跟随）",
             ForeColor = Color.FromArgb(58, 72, 92),
+        };
+        _logModeComboBox = new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            AccessibleName = "日志输出模式",
+        };
+        _logModeComboBox.Items.AddRange(["精简日志（高性能）", "完整日志（排障）"]);
+        _logModeComboBox.SelectedIndex = _logSettings.FullLoggingEnabled ? 1 : 0;
+        _logModeComboBox.SelectedIndexChanged += (_, _) =>
+        {
+            RuntimeLogMode mode = _logModeComboBox.SelectedIndex == 1
+                ? RuntimeLogMode.Full
+                : RuntimeLogMode.Reduced;
+            if (_logSettings.SetMode(mode))
+            {
+                AppendLog(mode == RuntimeLogMode.Full
+                    ? "日志模式已切换为完整诊断；设备原始日志将写入文件并镜像到窗口，可能降低高频输入性能。"
+                    : "日志模式已切换为精简高性能；仅保留连接参数、统计、警告和错误等关键设备日志。");
+            }
         };
         TableLayoutPanel logPanel = new()
         {
             Dock = DockStyle.Fill,
             RowCount = 2,
+            ColumnCount = 2,
             Padding = new Padding(10, 7, 10, 10),
         };
-        logPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
+        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+        logPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         logPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         logPanel.Controls.Add(logLabel, 0, 0);
+        logPanel.Controls.Add(_logModeComboBox, 1, 0);
         logPanel.Controls.Add(_logTextBox, 0, 1);
+        logPanel.SetColumnSpan(_logTextBox, 2);
 
         _split = new SplitContainer
         {
@@ -132,6 +176,10 @@ internal sealed class BridgeMainForm : Form
         _split.Panel2.Controls.Add(logPanel);
         Controls.Add(_split);
         ApplySplitLayout();
+
+        _logFlushTimer = new System.Windows.Forms.Timer { Interval = 50 };
+        _logFlushTimer.Tick += (_, _) => FlushPendingLogs();
+        _logFlushTimer.Start();
 
         _input.ForwardingChanged += InputOnForwardingChanged;
         _input.ExitRequested += InputOnExitRequested;
@@ -146,12 +194,15 @@ internal sealed class BridgeMainForm : Form
         FormClosing += (_, _) =>
         {
             _closing = true;
+            _logFlushTimer.Stop();
+            FlushPendingLogs();
             _cursorLock.Release();
             _input.Stop();
         };
     }
 
     internal TextBox LogTextBox => _logTextBox;
+    internal ComboBox LogModeComboBox => _logModeComboBox;
     internal MouseCaptureSurface CaptureSurface => _captureSurface;
     internal SplitContainer MainSplit => _split;
 
@@ -169,12 +220,9 @@ internal sealed class BridgeMainForm : Form
 
         if (InvokeRequired)
         {
-            try
+            lock (_pendingLogs)
             {
-                BeginInvoke((Action)(() => AppendLogToTextBox(line)));
-            }
-            catch (InvalidOperationException)
-            {
+                _pendingLogs.Add(line);
             }
             return;
         }
@@ -191,21 +239,121 @@ internal sealed class BridgeMainForm : Form
             pending = _pendingLogs.ToArray();
             _pendingLogs.Clear();
         }
-        foreach (string line in pending)
-        {
-            AppendLogToTextBox(line);
-        }
+        AppendLogBatch(pending);
     }
 
-    private void AppendLogToTextBox(string line)
+    private void FlushPendingLogs()
     {
-        if (_logTextBox.IsDisposed)
+        if (IsDisposed || !IsHandleCreated)
         {
             return;
         }
-        _logTextBox.AppendText(line + Environment.NewLine);
-        _logTextBox.SelectionStart = _logTextBox.TextLength;
-        _logTextBox.ScrollToCaret();
+
+        string[] pending;
+        lock (_pendingLogs)
+        {
+            if (_pendingLogs.Count == 0)
+            {
+                return;
+            }
+            pending = _pendingLogs.ToArray();
+            _pendingLogs.Clear();
+        }
+        AppendLogBatch(pending);
+    }
+
+    private void AppendLogToTextBox(string line) => AppendLogBatch([line]);
+
+    private void AppendLogBatch(IReadOnlyList<string> lines)
+    {
+        if (_logTextBox.IsDisposed || lines.Count == 0)
+        {
+            return;
+        }
+
+        bool followLatest = ShouldFollowLatestLog();
+        int selectionStart = _logTextBox.SelectionStart;
+        int selectionLength = _logTextBox.SelectionLength;
+        int firstVisibleLine = GetFirstVisibleLine();
+        _logTextBox.AppendText(string.Join(Environment.NewLine, lines) + Environment.NewLine);
+        TrimVisibleLogIfNeeded(followLatest);
+
+        if (followLatest)
+        {
+            _logTextBox.SelectionStart = _logTextBox.TextLength;
+            _logTextBox.SelectionLength = 0;
+            _logTextBox.ScrollToCaret();
+            return;
+        }
+
+        // AppendText 可能自行把原生 TextBox 滚动到末尾；仅恢复选区仍会让用户
+        // 看到的历史位置跳变，因此同时恢复 EM_GETFIRSTVISIBLELINE 对应的首行。
+        int restoredStart = Math.Min(selectionStart, _logTextBox.TextLength);
+        _logTextBox.SelectionStart = restoredStart;
+        _logTextBox.SelectionLength = Math.Min(
+            selectionLength,
+            _logTextBox.TextLength - restoredStart);
+        RestoreFirstVisibleLine(firstVisibleLine);
+    }
+
+
+    private void TrimVisibleLogIfNeeded(bool followLatest)
+    {
+        int excess = _logTextBox.TextLength - MaxVisibleLogCharacters;
+        if (!followLatest || excess <= 0)
+        {
+            return;
+        }
+
+        int cutAt = _logTextBox.Text.IndexOf('\n', excess);
+        if (cutAt < 0)
+        {
+            return;
+        }
+
+        _logTextBox.Select(0, cutAt + 1);
+        _logTextBox.SelectedText = string.Empty;
+    }
+
+    private int GetFirstVisibleLine()
+    {
+        return SendMessage(
+            _logTextBox.Handle,
+            EmGetFirstVisibleLine,
+            IntPtr.Zero,
+            IntPtr.Zero);
+    }
+
+    private void RestoreFirstVisibleLine(int firstVisibleLine)
+    {
+        if (firstVisibleLine < 0)
+        {
+            return;
+        }
+
+        int currentFirstVisibleLine = GetFirstVisibleLine();
+        int lineDelta = firstVisibleLine - currentFirstVisibleLine;
+        if (lineDelta != 0)
+        {
+            SendMessage(
+                _logTextBox.Handle,
+                EmLineScroll,
+                IntPtr.Zero,
+                new IntPtr(lineDelta));
+        }
+    }
+
+    private bool ShouldFollowLatestLog()
+    {
+        if (_logTextBox.SelectionLength > 0 || _logTextBox.TextLength == 0)
+        {
+            return _logTextBox.SelectionLength == 0;
+        }
+
+        int lastCharacterIndex = _logTextBox.TextLength - 1;
+        Point lastCharacterPosition = _logTextBox.GetPositionFromCharIndex(lastCharacterIndex);
+        int visibleBottom = _logTextBox.ClientSize.Height - _logTextBox.Font.Height + 4;
+        return lastCharacterPosition.Y <= visibleBottom;
     }
 
     private void ApplySplitLayout()
