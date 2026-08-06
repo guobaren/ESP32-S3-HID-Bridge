@@ -6,11 +6,11 @@
 
 - USB HID：始终启用，连接后可作为 USB 复合键鼠。
 - BLE HID：默认编译启用，设备名可配置。
-- Wi-Fi Target Agent：默认关闭，需要目标 Windows 设备运行配套程序。
+- Wi-Fi Target Agent：实现代码保留，当前统一运行时开关关闭，不创建网络连接或输出任务。
 
-USB HID 与 BLE HID 同时在线时，完成加密且真正可发送的 BLE HID 优先接收键鼠报告；BLE 断开后自动回退到 USB HID。切换旧目标和新目标时都会执行 `ReleaseAll`。Wi-Fi Target Agent 按自身安全连接状态工作。
+USB HID 与 BLE HID 同时在线时，完成加密且真正可发送的 BLE HID 优先接收键鼠报告；BLE 断开后自动回退到 USB HID。切换旧目标和新目标时都会执行 `ReleaseAll`。当前不会向 Wi-Fi Target Agent 镜像报告。
 
-电脑到开发板只能有一个活动输入租约。串口或 Wi-Fi 会话断开、超过租约时间或被另一会话替换时，开发板会向全部输出后端发送 `ReleaseAll`。
+电脑到开发板只能有一个活动输入租约。USB-to-UART 或原生 USB CDC 会话断开、超过租约时间或被另一会话替换时，开发板会向当前 USB/BLE 输出后端发送 `ReleaseAll`。Wi-Fi 输入代码保留但当前不启动。
 
 ## 配置开发板
 
@@ -22,7 +22,7 @@ Set-Location D:\ESP32-S3-HID-Bridge\firmware
 idf.py menuconfig
 ```
 
-在 `HID Bridge` 菜单配置：
+在 `HID Bridge` 菜单配置。当前交付配置中的 Wi-Fi 统一运行入口被 `firmware/main/runtime_features.h` 关闭，因此下列 Wi-Fi 项仅作为保留实现说明：
 
 - `Wi-Fi SSID` 和 `Wi-Fi 密码`：仅作为可选的首次启动回退值，通常留空并使用网页配网。
 - `启用 SoftAP 网页配网`：默认启用。
@@ -36,11 +36,13 @@ idf.py menuconfig
 - `启用 RGB 状态指示灯` 和其 GPIO：默认启用并使用 ESP32-S3-DevKitC-1 板载 RGB 灯的 GPIO48。灯色按当前活动输出显示，而不是按是否插入 USB 线显示：USB HID 为绿灯，BLE HID 为蓝灯，无活动输出时红灯每 500 ms 闪烁。USB 与 BLE 同时在线且 BLE 已就绪时显示蓝灯。
 - 输入租约超时时间，默认 1500 ms。
 
-编译选项保存在被 Git 忽略的 `firmware/sdkconfig`，网页提交的 SSID 和密码由 Wi-Fi 驱动保存到开发板 NVS。项目使用适配 2 MiB Flash 的单应用分区表；启用 USB、Wi-Fi、BLE 和网页配网后仍保留约一半应用空间。
+编译选项保存在被 Git 忽略的 `firmware/sdkconfig`。当前镜像不启动 Wi-Fi、SoftAP 配网或 Target Agent；项目仍保留相关实现和配置项，后续恢复时必须同步打开统一运行时开关并重新进行安全与真实链路验收。
 
-## SoftAP 网页配网
+## SoftAP 网页配网（保留实现，当前禁用）
 
-不需要在每次更换 Wi-Fi 时重新构建或烧录。以下任一条件会进入配网模式：
+> 当前构建不会启动 SoftAP，也不会响应 BOOT 长按进入配网。以下内容仅说明未来重新启用 Wi-Fi 运行入口后的既有流程。
+
+重新启用后，不需要在每次更换 Wi-Fi 时重新构建或烧录。以下任一条件会进入配网模式：
 
 - NVS 中没有保存过 Wi-Fi。
 - 已保存的网络连续 30 秒无法连接。
@@ -107,9 +109,11 @@ Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.j
 
 主机窗口日志与 `Console.Out/Console.Error` 会按行实时追加到 `hostLogPath`；默认文件名为 `artifacts/host-runtime-{timestamp}.log`。设备日志由窗口下拉框控制：默认“精简日志（高性能）”，需要采集原始串口细节时临时切换到“完整日志（排障）”。
 
-## 电脑通过 Wi-Fi 连接开发板
+## 电脑通过 Wi-Fi 连接开发板（保留实现，当前禁用）
 
-在 `bridge.local.json` 中设置：
+> 当前主机端会拒绝 `transport=wifi`。以下配置仅供未来恢复该功能时参考。
+
+恢复运行入口后，在 `bridge.local.json` 中设置：
 
 ```json
 {
@@ -124,9 +128,11 @@ Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.j
 
 同步开启时主机端会强制拦截本机键鼠输入，HOME/END 保留为控制键；同步关闭后恢复本机输入。网络通道使用双向挑战认证、AES-256-GCM、独立会话随机数和严格递增计数器。认证失败、数据被篡改或检测到重放时会立即断开。
 
-## 开发板通过 Wi-Fi 连接 Windows 目标设备
+## 开发板通过 Wi-Fi 连接 Windows 目标设备（保留实现，当前禁用）
 
-在目标 Windows 设备上复制配置：
+> 当前固件不会初始化或连接 Target Agent。以下步骤仅供未来恢复该输出后端时参考。
+
+恢复运行入口后，在目标 Windows 设备上复制配置：
 
 ```powershell
 Copy-Item .\target\HidBridge.TargetAgent\agent.json .\target\HidBridge.TargetAgent\agent.local.json
@@ -143,7 +149,7 @@ BLE 使用 NimBLE、Just Works 配对和绑定机制，对外提供同一报告�
 
 固件已启用 NimBLE 绑定密钥 NVS 持久化，完成一次成功配对后，开发板正常重启会继续使用同一组 LTK/IRK 自动重连。升级自未持久化绑定密钥的旧固件时，目标设备仍可能保存开发板已丢失的旧 LTK；此时系统界面会在“已配对”和“已连接”之间反复切换。需要在目标设备删除/忽略 `HidBridge Keyboard Mouse`，关闭再打开蓝牙后重新配对一次。
 
-清除开发板 NVS 会同时删除 BLE 绑定密钥、网页保存的 Wi-Fi 和 Wi-Fi 驱动状态；下次启动会自动回到配网模式，并且所有目标设备都需要删除旧配对后重新配对。
+清除开发板 NVS 会同时删除 BLE 绑定密钥及历史 Wi-Fi 数据。当前 Wi-Fi/SoftAP 入口关闭，因此重启后不会进入配网模式；BLE 目标设备仍需要删除旧配对后重新配对。
 
 
 ## 原生 USB CDC 输入

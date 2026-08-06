@@ -14,6 +14,7 @@
 #include "input_session.h"
 #include "nvs_flash.h"
 #include "output_router.h"
+#include "runtime_features.h"
 #include "status_led.h"
 #include "wifi_input.h"
 #include "wifi_manager.h"
@@ -124,7 +125,8 @@ static esp_err_t configure_uart(void)
     return ESP_OK;
 }
 
-#if CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
+#if HID_BRIDGE_WIFI_RUNTIME_ENABLED && CONFIG_HID_BRIDGE_WIFI_ENABLE && \
+    CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
 static void provisioning_button_task(void *argument)
 {
     (void)argument;
@@ -174,19 +176,23 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_result);
     }
 
+#if HID_BRIDGE_WIFI_RUNTIME_ENABLED
     esp_err_t wifi_result = wifi_manager_init();
     if (wifi_result != ESP_OK && wifi_result != ESP_ERR_NOT_SUPPORTED) {
         ESP_ERROR_CHECK(wifi_result);
     }
+#endif
     ESP_ERROR_CHECK(status_led_init());
     ESP_ERROR_CHECK(output_router_init());
     ESP_ERROR_CHECK(input_session_init());
     ESP_ERROR_CHECK(configure_uart());
+#if HID_BRIDGE_WIFI_RUNTIME_ENABLED
     wifi_result = wifi_input_start();
     if (wifi_result != ESP_OK && wifi_result != ESP_ERR_NOT_SUPPORTED &&
         wifi_result != ESP_ERR_INVALID_ARG) {
         ESP_ERROR_CHECK(wifi_result);
     }
+#endif
 
     BaseType_t created = xTaskCreate(
         uart_receiver_task,
@@ -197,7 +203,8 @@ void app_main(void)
         NULL);
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
-#if CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
+#if HID_BRIDGE_WIFI_RUNTIME_ENABLED && CONFIG_HID_BRIDGE_WIFI_ENABLE && \
+    CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
     created = xTaskCreate(
         provisioning_button_task,
         "provision_button",
@@ -208,5 +215,6 @@ void app_main(void)
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 #endif
 
+    ESP_LOGI(TAG, "运行模式：USB-to-UART/原生 USB CDC 输入，USB/BLE HID 输出；Wi-Fi 输入/输出代码已保留但暂不启用");
     ESP_LOGI(TAG, "ESP32-S3 HID Bridge 已启动");
 }

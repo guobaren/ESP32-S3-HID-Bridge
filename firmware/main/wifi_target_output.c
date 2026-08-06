@@ -11,6 +11,8 @@
 #include "secure_channel.h"
 #include "wifi_manager.h"
 
+#if CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_WIFI_TARGET_ENABLE
+
 #define OUTPUT_QUEUE_LENGTH 32
 #define HEARTBEAT_INTERVAL_MS 500
 
@@ -114,6 +116,8 @@ static void __attribute__((unused)) wifi_target_task(void *context)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
+#endif  // CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_WIFI_TARGET_ENABLE
 
 esp_err_t wifi_target_output_init(void)
 {

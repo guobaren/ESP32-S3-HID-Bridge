@@ -51,8 +51,13 @@ esp_err_t output_router_init(void)
     if (ble_result != ESP_OK && ble_result != ESP_ERR_NOT_SUPPORTED) {
         return ble_result;
     }
+#if HID_BRIDGE_WIFI_RUNTIME_ENABLED
+    /* Target Agent 输出实现暂时保留，当前交付配置不创建其任务或网络连接。 */
     esp_err_t wifi_result = wifi_target_output_init();
     return wifi_result == ESP_ERR_NOT_SUPPORTED ? ESP_OK : wifi_result;
+#else
+    return ESP_OK;
+#endif
 }
 
 esp_err_t output_router_submit(const bridge_frame_t *frame)
@@ -92,11 +97,16 @@ esp_err_t output_router_submit(const bridge_frame_t *frame)
         mode_result = submit_to_mode(active_mode, frame);
     }
 
-    esp_err_t wifi_result = wifi_target_output_submit(frame);
     if (mode_result != ESP_OK && mode_result != ESP_ERR_NOT_SUPPORTED) {
         return mode_result;
     }
+#if HID_BRIDGE_WIFI_RUNTIME_ENABLED
+    /* 保留镜像到 Target Agent 的代码路径，当前不向网络输出任何键鼠报告。 */
+    esp_err_t wifi_result = wifi_target_output_submit(frame);
     return wifi_result == ESP_ERR_NOT_SUPPORTED ? ESP_OK : wifi_result;
+#else
+    return ESP_OK;
+#endif
 }
 
 void output_router_set_connected(output_mode_t mode, bool connected)

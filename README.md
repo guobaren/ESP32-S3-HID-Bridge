@@ -1,6 +1,6 @@
 # ESP32-S3 HID Bridge
 
-把 Windows 电脑现有的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的复合 HID 键鼠设备，输出到手机、平板、嵌入式设备或其他项目。当前支持 USB HID、BLE HID 和 Wi-Fi Target Agent 三种输出后端；主机输入可使用板载 USB-to-UART、原生 USB CDC 或 Wi-Fi。
+把 Windows 电脑现有的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的复合 HID 键鼠设备，输出到手机、平板、嵌入式设备或其他项目。当前运行配置支持板载 USB-to-UART 或原生 USB CDC 输入，以及 USB HID 与 BLE HID 输出；Wi-Fi 输入、配网和 Target Agent 输出代码暂时保留但不启用。
 
 ## 数据路径
 
@@ -14,7 +14,6 @@ HidBridge.Host
 ESP32-S3-DevKitC-1
         ├─ 原生 USB OTG，CDC + 复合 HID ──> 主机输入 / USB 目标设备
         ├─ BLE HID ────────────────> 手机/电脑
-        └─ Wi-Fi Agent ────────────> Windows 目标端
 ```
 
 开发板支持两种有线主机输入方式：
@@ -41,9 +40,9 @@ USB HID 与 BLE HID 同时可用时，已完成加密且真正可发送的 BLE H
 - [x] ESP-IDF UART 与原生 USB CDC 接收，共用流式协议解析
 - [x] 原生 USB CDC + HID 复合设备，HID 使用双 Report ID 键盘/鼠标描述符
 - [x] 链路心跳、输入租约、断连超时检测与自动 `ReleaseAll`
-- [x] 电脑到开发板的认证加密 Wi-Fi 输入通道
-- [x] SoftAP 网页配网、NVS 凭据保存和 BOOT 长按重新配网
-- [x] 开发板到 Windows 目标 Agent 的认证加密 Wi-Fi 输出通道
+- [x] 电脑到开发板的认证加密 Wi-Fi 输入代码（当前运行入口暂时禁用）
+- [x] SoftAP 网页配网、NVS 凭据保存和 BOOT 长按重新配网代码（当前运行入口暂时禁用）
+- [x] 开发板到 Windows 目标 Agent 的认证加密 Wi-Fi 输出代码（当前运行入口暂时禁用）
 - [x] 开发板到目标设备的 BLE HID 键盘/鼠标输出
 - [x] 在实物 ESP32-S3-DevKitC-1 上完成固件构建、烧录和 USB-UART 通信验证
 - [x] 串口自动发现、随机数设备握手与重连逻辑
@@ -60,9 +59,9 @@ USB HID 与 BLE HID 同时可用时，已完成加密且真正可发送的 BLE H
 |---|---|---|
 | 电脑 → 开发板 | USB-to-UART | 已实现，CH340 COM 输入通道 |
 | 电脑 → 开发板 | 原生 USB CDC | 已实现，与 UART 使用同一协议和主机自动发现 |
-| 电脑 → 开发板 | Wi-Fi | 已实现预共享密钥认证、AES-256-GCM 加密和防重放计数器 |
+| 电脑 → 开发板 | Wi-Fi | 实现代码保留，当前运行入口暂时禁用 |
 | 开发板 → 目标设备 | USB HID | 当前默认输出通道，可用于无需安装配套程序的目标设备 |
-| 开发板 → 目标设备 | Wi-Fi | 已实现 Windows Target Agent；不作为通用 HID |
+| 开发板 → 目标设备 | Wi-Fi | Target Agent 代码保留，当前运行入口暂时禁用 |
 | 开发板 → 目标设备 | BLE HID | 已实现标准 BLE 键盘和相对鼠标报告 |
 
 所有输入通道都必须提供心跳或连接租约。当前活动输入通道断开、超时或切换时，开发板必须释放全部键盘按键和鼠标按钮，之后才能接受新的输入会话。
@@ -109,7 +108,7 @@ idf.py -p <实际串口> flash
 
 激活脚本只修改当前 PowerShell 会话；重新打开终端后需要再次执行。
 
-Wi-Fi、BLE 和目标 Agent 的配置步骤见 [docs/configuration.md](docs/configuration.md)。首次烧录后可通过临时 SoftAP 网页设置 Wi-Fi；SSID 和密码保存在开发板 NVS，不需要为更换网络重新编译。预共享密钥仍只写入被 Git 忽略的 `firmware/sdkconfig`、`bridge.local.json` 和 `agent.local.json`，不要写入仓库文件。
+当前 BLE、USB CDC、日志及保留的 Wi-Fi 实现说明见 [docs/configuration.md](docs/configuration.md)。当前构建不会启动 Wi-Fi、临时 SoftAP 或 Target Agent 输出；相关配置只作为未来恢复参考。预共享密钥仍只能写入被 Git 忽略的 `firmware/sdkconfig`、`bridge.local.json` 和 `agent.local.json`，不要写入仓库文件。
 
 烧录后可任选输入连接方式：
 
@@ -118,7 +117,7 @@ Wi-Fi、BLE 和目标 Agent 的配置步骤见 [docs/configuration.md](docs/conf
 
 随后启动主机端；默认会自动发现正确的 COM 口，不需要填写端口号。按 `HOME` 开始转发。
 
-主机端也可以发布为自包含单 EXE。发布目录中的 `bridge.json` 不是必需的；删除所有 JSON 后，程序仍会使用自动发现模式。若需要固定端口或 Wi-Fi 参数，再创建 `bridge.local.json`。
+主机 Release 构建会把单文件 `HidBridge.Host.exe` 复制到项目根目录。`bridge.json` 不是必需的；删除所有 JSON 后仍使用串口自动发现。若需要固定端口或调整日志参数，再创建 `bridge.local.json`；`transport=wifi` 当前会被功能闸门拒绝。
 
 ## 安全边界
 

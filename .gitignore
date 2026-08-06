@@ -21,3 +21,5 @@ target/HidBridge.TargetAgent/agent.local.json
 .vscode/
 .DS_Store
 Thumbs.db
+/HidBridge.Host.exe
+/bridge.local.json

@@ -14,6 +14,8 @@
 #include "lwip/inet.h"
 #include "wifi_provisioning.h"
 
+#if CONFIG_HID_BRIDGE_WIFI_ENABLE
+
 static const char *TAG = "wifi_manager";
 static const EventBits_t CONNECTED_BIT = BIT0;
 static EventGroupHandle_t s_event_group;
@@ -62,6 +64,7 @@ static void wifi_event_handler(void *argument, esp_event_base_t base, int32_t id
     }
 }
 
+#if CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
 static void wifi_manager_task(void *argument)
 {
     (void)argument;
@@ -94,6 +97,9 @@ static void wifi_manager_task(void *argument)
         }
     }
 }
+#endif  // CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
+
+#endif  // CONFIG_HID_BRIDGE_WIFI_ENABLE
 
 esp_err_t wifi_manager_apply_credentials(const char *ssid, const char *password)
 {
@@ -244,6 +250,7 @@ esp_err_t wifi_manager_init(void)
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "启动 Wi-Fi 失败");
     s_disconnected_since = xTaskGetTickCount();
 
+#if CONFIG_HID_BRIDGE_PROVISIONING_ENABLE
     BaseType_t created = xTaskCreate(wifi_manager_task, "wifi_manager", 4096, NULL, 5, NULL);
     if (created != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -251,32 +258,50 @@ esp_err_t wifi_manager_init(void)
     if (!s_has_credentials) {
         return wifi_manager_start_provisioning();
     }
+#endif
     return ESP_OK;
 #endif
 }
 
 bool wifi_manager_wait_connected(TickType_t timeout)
 {
+#if !CONFIG_HID_BRIDGE_WIFI_ENABLE
+    (void)timeout;
+    return false;
+#else
     if (!s_initialized || s_event_group == NULL) {
         return false;
     }
     EventBits_t bits = xEventGroupWaitBits(s_event_group, CONNECTED_BIT, pdFALSE, pdTRUE, timeout);
     return (bits & CONNECTED_BIT) != 0;
+#endif
 }
 
 bool wifi_manager_is_configured(void)
 {
+#if !CONFIG_HID_BRIDGE_WIFI_ENABLE
+    return false;
+#else
     return s_initialized;
+#endif
 }
 
 bool wifi_manager_is_connected(void)
 {
+#if !CONFIG_HID_BRIDGE_WIFI_ENABLE
+    return false;
+#else
     return s_event_group != NULL && (xEventGroupGetBits(s_event_group) & CONNECTED_BIT) != 0;
+#endif
 }
 
 bool wifi_manager_is_provisioning(void)
 {
+#if !CONFIG_HID_BRIDGE_WIFI_ENABLE
+    return false;
+#else
     return s_provisioning;
+#endif
 }
 
 esp_err_t wifi_manager_get_ip(char *buffer, size_t buffer_size)
@@ -284,10 +309,15 @@ esp_err_t wifi_manager_get_ip(char *buffer, size_t buffer_size)
     if (buffer == NULL || buffer_size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+#if !CONFIG_HID_BRIDGE_WIFI_ENABLE
+    buffer[0] = '\0';
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     if (!wifi_manager_is_connected() || s_ip_address[0] == '\0') {
         buffer[0] = '\0';
         return ESP_ERR_INVALID_STATE;
     }
     strlcpy(buffer, s_ip_address, buffer_size);
     return ESP_OK;
+#endif
 }

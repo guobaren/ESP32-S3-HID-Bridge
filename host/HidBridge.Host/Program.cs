@@ -29,6 +29,8 @@ internal static class Program
             SimulationOptions simulationOptions = SimulationOptions.Parse(args);
             transport = simulationOptions.Enabled
                 ? new NoopBridgeTransport()
+                // Wi-Fi 开发板输入实现暂时保留。BridgeOptions.Validate 当前会阻止该分支启用；
+                // 后续完成真实链路验收后，只需开放统一功能开关，不需要恢复被删除的代码。
                 : options.Transport.Equals("wifi", StringComparison.OrdinalIgnoreCase)
                     ? new NetworkBridge(options)
                     : new SerialBridge(options, logSettings);

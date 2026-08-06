@@ -23,8 +23,12 @@ config HID_BRIDGE_STATUS_LED_GPIO
 endif
 
 config HID_BRIDGE_WIFI_ENABLE
-    bool "启用 Wi-Fi"
-    default y
+    bool "启用 Wi-Fi（当前运行入口暂时禁用）"
+    default n
+    help
+        Wi-Fi 输入、SoftAP 配网和 Target Agent 输出代码仍保留，但当前交付配置
+        只使用 USB-to-UART 或原生 USB CDC 输入，以及 USB/BLE HID 输出。恢复前还需要同步开放
+        runtime_features.h 中的统一运行时开关并完成真实链路验收。
 
 if HID_BRIDGE_WIFI_ENABLE
 

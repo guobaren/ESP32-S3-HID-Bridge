@@ -11,6 +11,8 @@
 #include "secure_channel.h"
 #include "wifi_manager.h"
 
+#if CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_WIFI_INPUT_ENABLE
+
 static const char *TAG = "wifi_input";
 
 static void parser_callback(const bridge_frame_t *frame, void *context)
@@ -87,6 +89,8 @@ static void wifi_input_task(void *context)
         ESP_LOGI(TAG, "Wi-Fi 输入客户端已断开");
     }
 }
+
+#endif  // CONFIG_HID_BRIDGE_WIFI_ENABLE && CONFIG_HID_BRIDGE_WIFI_INPUT_ENABLE
 
 esp_err_t wifi_input_start(void)
 {

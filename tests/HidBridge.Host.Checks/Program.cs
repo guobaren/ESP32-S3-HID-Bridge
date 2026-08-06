@@ -12,13 +12,14 @@ using HidBridge.Protocol;
 CheckMouseReportCodec();
 CheckMouseAggregation();
 CheckSerialDiscoveryProtocol();
+CheckWiFiBoardTransportDisabled();
 CheckDeviceLogPolicy();
 CheckInputSuppressionPolicy();
 CheckCursorLockGeometry();
 CheckUiLogWriter();
 CheckRemoteInputUdpPath();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、串口握手、可切换日志策略、输入独占策略、UDP 模拟输入、实时日志和窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 模拟输入、实时日志和窗口布局。");
 
 static void CheckMouseReportCodec()
 {
@@ -124,6 +125,30 @@ static void CheckSerialDiscoveryProtocol()
     Require(
         !SerialDeviceProbe.TryMatchHello(noisyInput, probeSequence, wrongNonce),
         "随机数不匹配的响应不得被接受");
+}
+
+static void CheckWiFiBoardTransportDisabled()
+{
+    BridgeOptions.Validate(new BridgeOptions { Transport = "serial" });
+
+    bool rejected = false;
+    try
+    {
+        BridgeOptions.Validate(new BridgeOptions
+        {
+            Transport = "wifi",
+            NetworkPresharedKey = "1234567890123456",
+        });
+    }
+    catch (InvalidDataException exception) when (exception.Message.Contains("暂未启用", StringComparison.Ordinal))
+    {
+        rejected = true;
+    }
+
+    if (!rejected)
+    {
+        throw new InvalidOperationException("Wi-Fi 开发板输入入口没有被明确的临时闸门阻止。");
+    }
 }
 
 static void CheckDeviceLogPolicy()

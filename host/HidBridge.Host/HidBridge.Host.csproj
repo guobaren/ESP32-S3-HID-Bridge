@@ -7,6 +7,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>HidBridge.Host</AssemblyName>
     <RootNamespace>HidBridge.Host</RootNamespace>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>
@@ -26,4 +27,22 @@
       <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </None>
   </ItemGroup>
+
+  <PropertyGroup>
+    <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..\'))</RepositoryRoot>
+    <RootExecutablePublishDir>$(BaseIntermediateOutputPath)root-executable\$(Configuration)\</RootExecutablePublishDir>
+  </PropertyGroup>
+
+  <Target Name="PublishRootExecutable"
+          AfterTargets="Build"
+          Condition="'$(Configuration)' == 'Release' and '$(BuildingRootExecutable)' != 'true' and '$(DesignTimeBuild)' != 'true'">
+    <MSBuild Projects="$(MSBuildProjectFullPath)"
+             Targets="Publish"
+             BuildInParallel="false"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=false;PublishSingleFile=true;PublishDir=$(RootExecutablePublishDir);BuildingRootExecutable=true" />
+    <Copy SourceFiles="$(RootExecutablePublishDir)$(AssemblyName).exe"
+          DestinationFiles="$(RepositoryRoot)$(AssemblyName).exe"
+          SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="根目录 EXE：$(RepositoryRoot)$(AssemblyName).exe" />
+  </Target>
 </Project>
