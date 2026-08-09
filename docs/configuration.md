@@ -78,24 +78,29 @@ Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.j
 
 ## 主机 EXE 的局域网模拟鼠标接口
 
-主机 EXE 可选开启 UDP 模拟输入监听。该入口只把相对移动和滚轮增量注入现有的 500 Hz 鼠标报告链路；它不会直接移动运行主机上的 Windows 光标。只有按 `HOME` 开启同步后命令才会被转发，同步关闭、窗口关闭或程序退出仍会执行 `ReleaseAll` 并解除鼠标锁定。
+主机 EXE 默认开启 UDP 模拟输入监听，默认地址为 `0.0.0.0:24814`。该入口只把相对移动和滚轮增量注入现有的 500 Hz 鼠标报告链路；它不会直接移动运行主机上的 Windows 光标。只有按 `HOME` 开启同步后命令才会被转发，同步关闭、窗口关闭或程序退出仍会执行 `ReleaseAll` 并解除鼠标锁定。
 
-在被 Git 忽略的 `bridge.local.json` 中增加：
+如需覆盖默认监听地址或端口，在被 Git 忽略的 `bridge.local.json` 中设置：
 
 ```json
 {
-  "remoteInputEnabled": true,
-  "remoteInputBindAddress": "0.0.0.0",
+  "remoteInputBindAddress": "127.0.0.1",
   "remoteInputPort": 24814,
-  "remoteInputPresharedKey": "替换为至少16字节的随机密钥",
   "hostLogPath": "artifacts/host-runtime-{timestamp}.log"
 }
 ```
 
 - `remoteInputBindAddress` 为 `0.0.0.0` 时监听全部 IPv4 网卡；只做本机测试可填 `127.0.0.1`。
-- `remoteInputPresharedKey` 至少 16 个 UTF-8 字节；每个数据报都必须携带相同的 `token`。
-- Windows 防火墙需要允许主机 EXE 的 UDP 入站端口。不要把该端口暴露到公网。
-- 单个 UTF-8 JSON 数据报格式：`{"token":"...","dx":12,"dy":-4,"wheel":0,"pan":0}`。`dx/dy` 范围为 `-32768..32767`，`wheel/pan` 范围为 `-128..127`，四个增量不能全为零。
+- 不再校验预共享密钥，也不要求 `token` 字段；旧调用方即使继续携带 `token`，该未知字段也会被忽略。
+- 默认监听全部 IPv4 网卡且无身份认证。Windows 防火墙应限制可信来源；不要把该端口暴露到公网。
+- 单个 UTF-8 JSON 数据报格式：`{"dx":12,"dy":-4,"wheel":0,"pan":0}`。`dx/dy` 范围为 `-32768..32767`，`wheel/pan` 范围为 `-128..127`，四个增量不能全为零。
+- 主机会统计前一个 100 ms 窗口内接受的 UDP 命令数，并以每窗 50 个主机发送槽为目标拆分后续命令。例如前窗接受 10 条，下一窗的每条命令会拆成 5 份，在连续的 2 ms 发送槽中逐份提交。
+- 拆分采用整数余数分配，X/Y/滚轮各轴的拆分结果之和严格等于原命令；第一个尚无历史速率的 100 ms 窗口直接发送。输入速率变化时，下一窗口自动采用新的统计值。
+- 平滑队列通常最多保留约 200 ms 的发送份数；输入突增超过容量时，尾部命令会合并而不是无限积压，总位移仍保留，但过载期间无法保证每个 UDP 数据报都有独立报告。
+- 该功能只处理 UDP 输入；实体鼠标仍直接进入原有 500 Hz 聚合路径。关闭 `HOME`、断线或退出会清空尚未发送的平滑队列并执行 `ReleaseAll`。
+- BLE 输出仍受固件 10 ms 发送节拍限制：主机的 2 ms 分片会在开发板上按 10 ms 合并，因此 BLE 最终最多约 10 个报告/100 ms，但会保持主机平滑后的时间分布和总位移。USB HID 不经过该 BLE 合并层。
+
+D:\ESP32-S3-HID-Bridge\tools\send-remote-mouse.ps1 只是可选的命令行示例客户端，不是接口运行依赖。主机 EXE 只接收 UDP 数据报；任何支持 UDP 的软件都可以直接向主机地址和端口发送相同的 UTF-8 JSON。连续高频发送时应复用同一个 UDP socket，避免每条移动命令都重新创建连接对象。
 
 项目提供发送示例：
 
@@ -103,9 +108,19 @@ Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.j
 .\tools\send-remote-mouse.ps1 `
   -HostAddress 192.168.1.20 `
   -Port 24814 `
-  -PresharedKey '替换为相同随机密钥' `
   -Dx 25 -Dy -10
 ```
+
+## 鼠标移动记录与分析图
+
+在 `HOME` 同步开启期间，同时按住鼠标左键和右键即可开始记录。记录点位于主机 500 Hz `MouseReport` 的实际提交边界，因此触发后由实体鼠标和 UDP 接口产生、并实际提交给传输层的移动报告都会进入同一份记录。
+
+- 只记录 `x` 或 `y` 非零的移动报告；按钮变化但 `x/y` 全零的报告不计为样本。
+- `x`、`y` 保留实际发送报告中的正负号，因此分析图可以区分左右和上下方向。
+- 左右键全部松开后开始 3 秒倒计时；倒计时内重新按下任一左右键会继续同一份记录。
+- 松开超过 3 秒后自动停止，在新窗口中显示分析图：左侧为 X 有符号值，时间顺序轴竖直并向上增加，负值在零轴左侧、正值在右侧；右侧为 Y 有符号值，时间顺序从左向右增加，负值在零轴下方、正值在上方。
+- 图表不做平均、平滑或分桶降采样，按照发送顺序连接每一个原始 X/Y 样本；样本数明显多于图表像素时，多个原始点会显示在相同或相邻像素中。
+- 分析图同时保存到主机 EXE 目录下的 `artifacts/mouse-movement-{timestamp}.png`。
 
 主机窗口日志与 `Console.Out/Console.Error` 会按行实时追加到 `hostLogPath`；默认文件名为 `artifacts/host-runtime-{timestamp}.log`。设备日志由窗口下拉框控制：默认“精简日志（高性能）”，需要采集原始串口细节时临时切换到“完整日志（排障）”。
 

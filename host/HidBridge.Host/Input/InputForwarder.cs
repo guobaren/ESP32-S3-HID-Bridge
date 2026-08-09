@@ -41,6 +41,16 @@ internal sealed class InputForwarder : IDisposable
 
     internal event EventHandler<bool>? ForwardingChanged;
     internal event EventHandler? ExitRequested;
+    internal event Action? MovementRecordingStarted
+    {
+        add => _mouseReportPump.MovementRecordingStarted += value;
+        remove => _mouseReportPump.MovementRecordingStarted -= value;
+    }
+    internal event Action<MouseMovementRecording>? MovementRecordingCompleted
+    {
+        add => _mouseReportPump.MovementRecordingCompleted += value;
+        remove => _mouseReportPump.MovementRecordingCompleted -= value;
+    }
 
     internal void DisableForwarding() => SetForwarding(false, true);
 
@@ -53,13 +63,7 @@ internal sealed class InputForwarder : IDisposable
             return false;
         }
 
-        _mouseReportPump.Accumulate(
-            _mouseButtons,
-            buttonsChanged: false,
-            deltaX,
-            deltaY,
-            wheel,
-            pan);
+        _mouseReportPump.AccumulateRemote(deltaX, deltaY, wheel, pan);
         return true;
     }
 

@@ -47,7 +47,9 @@ USB HID 与 BLE HID 同时可用时，已完成加密且真正可发送的 BLE H
 - [x] 在实物 ESP32-S3-DevKitC-1 上完成固件构建、烧录和 USB-UART 通信验证
 - [x] 串口自动发现、随机数设备握手与重连逻辑
 - [x] 无 JSON 自包含 Windows 捕获 EXE
-- [x] 带预共享密钥的局域网 UDP 模拟鼠标输入与主机实时日志落盘
+- [x] 默认启用、无身份认证的局域网 UDP 模拟鼠标输入与主机实时日志落盘
+- [x] UDP 输入按前一个 100 ms 接收速率自适应拆分，在 500 Hz 主机发送节拍上平滑输出并保持总位移
+- [x] 左右键同时按下触发实际发送位移记录，松开 3 秒后显示并保存带正负方向的 X/Y 原始样本折线图
 - [x] BLE 优先、USB 回退的输出选择与安全接管逻辑
 - [ ] 增加托盘界面与配置页
 
@@ -108,7 +110,7 @@ idf.py -p <实际串口> flash
 
 激活脚本只修改当前 PowerShell 会话；重新打开终端后需要再次执行。
 
-当前 BLE、USB CDC、日志及保留的 Wi-Fi 实现说明见 [docs/configuration.md](docs/configuration.md)。当前构建不会启动 Wi-Fi、临时 SoftAP 或 Target Agent 输出；相关配置只作为未来恢复参考。预共享密钥仍只能写入被 Git 忽略的 `firmware/sdkconfig`、`bridge.local.json` 和 `agent.local.json`，不要写入仓库文件。
+当前 BLE、USB CDC、日志及保留的 Wi-Fi 实现说明见 [docs/configuration.md](docs/configuration.md)。当前构建不会启动 Wi-Fi、临时 SoftAP 或 Target Agent 输出；相关配置只作为未来恢复参考。Wi-Fi 输入与 Target Agent 的预共享密钥仍只能写入被 Git 忽略的 `firmware/sdkconfig`、`bridge.local.json` 和 `agent.local.json`，不要写入仓库文件。
 
 烧录后可任选输入连接方式：
 
@@ -121,7 +123,7 @@ idf.py -p <实际串口> flash
 
 ## 安全边界
 
-- 局域网 UDP 模拟鼠标入口默认关闭；启用时必须设置至少 16 字节的独立预共享密钥，并仅在可信局域网开放对应防火墙端口。
+- 局域网 UDP 模拟鼠标入口默认开启，且不做身份认证；默认监听 `0.0.0.0:24814`。仅应在受信任网络使用；如需缩小暴露面，请改为 `127.0.0.1` 或通过防火墙限制来源。
 - 模拟入口只接受相对移动和滚轮增量，且仅在 `HOME` 同步开启时进入现有 HID 转发链路。
 - 主机程序退出、串口断开或切换转发状态时必须发送 `ReleaseAll`，防止目标设备卡键。
 - HOME/END 始终由主机端优先处理；停止转发、串口断开或程序退出时会发送 `ReleaseAll`。

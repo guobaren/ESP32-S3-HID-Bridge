@@ -19,6 +19,8 @@ internal sealed class MouseReportPump : IDisposable
     private readonly IBridgeTransport _transport;
     private readonly object _stateLock = new();
     private readonly object _sendLock = new();
+    private readonly MouseMovementRecorder _movementRecorder;
+    private readonly UdpMouseSmoother _udpMouseSmoother = new();
     private readonly Queue<byte> _buttonStates = [];
     private readonly Thread _senderThread;
     private readonly IntPtr _waitableTimer;
@@ -43,9 +45,15 @@ internal sealed class MouseReportPump : IDisposable
     private bool _enabled;
     private bool _disposed;
 
-    internal MouseReportPump(IBridgeTransport transport)
+    internal event Action? MovementRecordingStarted;
+    internal event Action<MouseMovementRecording>? MovementRecordingCompleted;
+
+    internal MouseReportPump(
+        IBridgeTransport transport,
+        MouseMovementRecorder? movementRecorder = null)
     {
         _transport = transport;
+        _movementRecorder = movementRecorder ?? new MouseMovementRecorder();
         _waitableTimer = CreateWaitableTimerEx(
             IntPtr.Zero,
             null,
@@ -149,6 +157,7 @@ internal sealed class MouseReportPump : IDisposable
             }
 
             _transport.Send(MessageType.ReleaseAll, ReadOnlySpan<byte>.Empty);
+            _movementRecorder.ObserveReleaseAll(DateTime.UtcNow);
 
             lock (_stateLock)
             {
@@ -169,20 +178,60 @@ internal sealed class MouseReportPump : IDisposable
                     return;
                 }
             }
+            MouseMovementRecording? completed = _movementRecorder.TryComplete(DateTime.UtcNow);
+            if (completed is not null)
+            {
+                NotifyRecordingCompleted(completed);
+            }
             SendPendingReport();
+        }
+    }
+
+    internal void AccumulateRemote(
+        int deltaX,
+        int deltaY,
+        int wheel,
+        int pan,
+        DateTime? utcNow = null)
+    {
+        lock (_stateLock)
+        {
+            if (!_enabled || _disposed)
+            {
+                return;
+            }
+
+            _rawEventCount++;
+            _capturedX += deltaX;
+            _capturedY += deltaY;
+            _udpMouseSmoother.Enqueue(
+                new MouseDelta(deltaX, deltaY, wheel, pan),
+                utcNow ?? DateTime.UtcNow);
         }
     }
 
     private void SendPendingReport()
     {
         string? statistics = null;
+        bool recordingStarted = false;
         lock (_sendLock)
         {
             byte[]? payload = null;
+            MouseReport submittedReport = default;
             lock (_stateLock)
             {
                 if (_enabled && !_disposed)
                 {
+                    if (_udpMouseSmoother.TryDequeue(out MouseDelta remoteDelta))
+                    {
+                        _pendingX += remoteDelta.X;
+                        _pendingY += remoteDelta.Y;
+                        _pendingWheel += remoteDelta.Wheel;
+                        _pendingPan += remoteDelta.Pan;
+                        _maxPendingX = Math.Max(_maxPendingX, Math.Abs(_pendingX));
+                        _maxPendingY = Math.Max(_maxPendingY, Math.Abs(_pendingY));
+                    }
+
                     bool hasButtonTransition = _buttonStates.Count > 0;
                     byte buttons = hasButtonTransition
                         ? _buttonStates.Dequeue()
@@ -203,6 +252,7 @@ internal sealed class MouseReportPump : IDisposable
                         _submittedY += y;
                         _submittedReportCount++;
                         payload = MouseReportCodec.Encode(buttons, x, y, wheel, pan);
+                        submittedReport = new MouseReport(buttons, x, y, wheel, pan);
                         RecordSubmittedIntervalLocked(Stopwatch.GetTimestamp());
                     }
 
@@ -217,12 +267,47 @@ internal sealed class MouseReportPump : IDisposable
             if (payload is not null)
             {
                 _transport.Send(MessageType.MouseReport, payload);
+                _movementRecorder.ObserveReport(
+                    submittedReport.Buttons,
+                    submittedReport.X,
+                    submittedReport.Y,
+                    DateTime.UtcNow,
+                    out recordingStarted);
             }
+        }
+
+        if (recordingStarted)
+        {
+            NotifyRecordingStarted();
         }
 
         if (statistics is not null)
         {
             Console.WriteLine(statistics);
+        }
+    }
+
+    private void NotifyRecordingStarted()
+    {
+        try
+        {
+            MovementRecordingStarted?.Invoke();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"通知鼠标移动记录开始失败：{exception.Message}");
+        }
+    }
+
+    private void NotifyRecordingCompleted(MouseMovementRecording recording)
+    {
+        try
+        {
+            MovementRecordingCompleted?.Invoke(recording);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"通知鼠标移动记录完成失败：{exception.Message}");
         }
     }
 
@@ -244,12 +329,17 @@ internal sealed class MouseReportPump : IDisposable
         _lastSubmittedTimestamp = now;
     }
 
-    private string BuildStatisticsLocked() =>
-        $"鼠标统计（500 Hz）：原始事件={_rawEventCount}，采集位移=({_capturedX},{_capturedY})，" +
+    private string BuildStatisticsLocked()
+    {
+        UdpMouseSmootherStatistics udp = _udpMouseSmoother.GetStatistics();
+        return $"鼠标统计（500 Hz）：原始事件={_rawEventCount}，采集位移=({_capturedX},{_capturedY})，" +
         $"已提交报告={_submittedReportCount}，已提交位移=({_submittedX},{_submittedY})，" +
         $"待发送=({_pendingX},{_pendingY})，按钮转换={_buttonTransitionCount}，" +
         $"按钮待发送={_buttonStates.Count}，最大积压=({_maxPendingX},{_maxPendingY})，" +
-        $"提交间隔us=({_minSubmittedIntervalUs}..{_maxSubmittedIntervalUs})";
+        $"提交间隔us=({_minSubmittedIntervalUs}..{_maxSubmittedIntervalUs})，" +
+        $"UDP前窗={udp.LastWindowPackets}/100ms，参考={udp.ReferencePacketsPerWindow}/100ms，" +
+        $"平滑待发送={udp.PendingParts}，过载合并={udp.OverflowMerges}";
+    }
 
     private void LogDiscardedPendingLocked()
     {
@@ -282,6 +372,7 @@ internal sealed class MouseReportPump : IDisposable
         _maxSubmittedIntervalUs = 0;
         _lastSubmittedButtons = 0;
         _buttonStates.Clear();
+        _udpMouseSmoother.Reset();
     }
 
     public void Dispose()

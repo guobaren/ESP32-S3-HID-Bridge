@@ -19,10 +19,10 @@ internal sealed class BridgeOptions
     public string DeviceLogPath { get; init; } = "artifacts/host-serial-{timestamp}.log";
     public bool ShowDeviceLogInUi { get; init; }
     public string HostLogPath { get; init; } = "artifacts/host-runtime-{timestamp}.log";
-    public bool RemoteInputEnabled { get; init; }
+    // 默认监听 UDP 模拟鼠标命令。该接口不做身份认证，仅应部署在受信任网络。
+    public bool RemoteInputEnabled { get; init; } = true;
     public string RemoteInputBindAddress { get; init; } = "0.0.0.0";
     public int RemoteInputPort { get; init; } = 24814;
-    public string RemoteInputPresharedKey { get; init; } = string.Empty;
 
     public static BridgeOptions Load()
     {
@@ -69,12 +69,6 @@ internal sealed class BridgeOptions
         if (options.RemoteInputPort is < 1 or > 65535)
         {
             throw new InvalidDataException("remoteInputPort 必须在 1..65535 范围内。");
-        }
-        if (options.RemoteInputEnabled &&
-            System.Text.Encoding.UTF8.GetByteCount(options.RemoteInputPresharedKey) < 16)
-        {
-            throw new InvalidDataException(
-                "启用局域网模拟输入时，remoteInputPresharedKey 至少需要 16 个 UTF-8 字节。");
         }
     }
 }

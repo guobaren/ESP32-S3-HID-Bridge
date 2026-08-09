@@ -40,7 +40,6 @@ internal static class Program
                 remoteInput = new RemoteInputServer(
                     options.RemoteInputBindAddress,
                     options.RemoteInputPort,
-                    options.RemoteInputPresharedKey,
                     command => input.TryInjectMouseMovement(
                         command.DeltaX,
                         command.DeltaY,

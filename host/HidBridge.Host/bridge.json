@@ -10,8 +10,7 @@
   "deviceLogPath": "artifacts/host-serial-{timestamp}.log",
   "showDeviceLogInUi": false,
   "hostLogPath": "artifacts/host-runtime-{timestamp}.log",
-  "remoteInputEnabled": false,
+  "remoteInputEnabled": true,
   "remoteInputBindAddress": "0.0.0.0",
-  "remoteInputPort": 24814,
-  "remoteInputPresharedKey": ""
+  "remoteInputPort": 24814
 }

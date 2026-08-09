@@ -1,7 +1,5 @@
 using System.Net;
 using System.Net.Sockets;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 
 namespace HidBridge.Host.RemoteInput;
@@ -12,7 +10,6 @@ internal sealed class RemoteInputServer : IDisposable
 {
     private const int MaximumDatagramBytes = 4096;
     private readonly UdpClient _udp;
-    private readonly string _presharedKey;
     private readonly Func<RemoteMouseCommand, bool> _commandHandler;
     private readonly CancellationTokenSource _cancellation = new();
     private Task? _receiveTask;
@@ -25,12 +22,10 @@ internal sealed class RemoteInputServer : IDisposable
     internal RemoteInputServer(
         string bindAddress,
         int port,
-        string presharedKey,
         Func<RemoteMouseCommand, bool> commandHandler)
     {
         IPAddress address = ResolveBindAddress(bindAddress);
         _udp = new UdpClient(new IPEndPoint(address, port));
-        _presharedKey = presharedKey;
         _commandHandler = commandHandler;
     }
 
@@ -44,7 +39,9 @@ internal sealed class RemoteInputServer : IDisposable
             return;
         }
 
-        Console.WriteLine($"局域网模拟输入已监听 UDP {GetLocalEndpoint()}；仅在 HOME 同步开启时转发。");
+        Console.WriteLine(
+            $"局域网模拟输入已监听 UDP {GetLocalEndpoint()}；" +
+            "仅在 HOME 同步开启时转发，100 ms 自适应平滑已启用。");
         _receiveTask = Task.Run(ReceiveLoopAsync);
     }
 
@@ -65,7 +62,6 @@ internal sealed class RemoteInputServer : IDisposable
 
                 if (!RemoteMouseCommandParser.TryParse(
                         result.Buffer,
-                        _presharedKey,
                         out RemoteMouseCommand command,
                         out string error))
                 {
@@ -169,7 +165,6 @@ internal static class RemoteMouseCommandParser
 {
     private sealed class CommandDto
     {
-        public string? Token { get; init; }
         public int Dx { get; init; }
         public int Dy { get; init; }
         public int Wheel { get; init; }
@@ -178,7 +173,6 @@ internal static class RemoteMouseCommandParser
 
     internal static bool TryParse(
         ReadOnlySpan<byte> payload,
-        string expectedPresharedKey,
         out RemoteMouseCommand command,
         out string error)
     {
@@ -192,11 +186,6 @@ internal static class RemoteMouseCommandParser
             if (dto is null)
             {
                 error = "JSON 内容为空";
-                return false;
-            }
-            if (!TokenEquals(dto.Token, expectedPresharedKey))
-            {
-                error = "预共享密钥不匹配";
                 return false;
             }
             if (dto.Dx is < short.MinValue or > short.MaxValue ||
@@ -225,13 +214,5 @@ internal static class RemoteMouseCommandParser
             error = $"JSON 无效：{exception.Message}";
             return false;
         }
-    }
-
-    private static bool TokenEquals(string? actual, string expected)
-    {
-        byte[] actualBytes = Encoding.UTF8.GetBytes(actual ?? string.Empty);
-        byte[] expectedBytes = Encoding.UTF8.GetBytes(expected);
-        return actualBytes.Length == expectedBytes.Length &&
-               CryptographicOperations.FixedTimeEquals(actualBytes, expectedBytes);
     }
 }

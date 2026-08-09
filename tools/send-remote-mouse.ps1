@@ -4,9 +4,6 @@ param(
 
     [int]$Port = 24814,
 
-    [Parameter(Mandatory = $true)]
-    [string]$PresharedKey,
-
     [ValidateRange(-32768, 32767)]
     [int]$Dx = 0,
 
@@ -26,7 +23,6 @@ if ($Dx -eq 0 -and $Dy -eq 0 -and $Wheel -eq 0 -and $Pan -eq 0) {
 }
 
 $payload = [ordered]@{
-    token = $PresharedKey
     dx = $Dx
     dy = $Dy
     wheel = $Wheel

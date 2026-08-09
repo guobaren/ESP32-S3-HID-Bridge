@@ -94,7 +94,7 @@ internal sealed class BridgeMainForm : Form
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
-            Text = "同步开启后，其他键鼠输入仅发送到对端",
+            Text = "左右键同按开始记录；全部松开 3 秒后生成分析图",
             ForeColor = Color.FromArgb(92, 105, 124),
         }, 0, 0);
         endingBar.Controls.Add(new Label
@@ -183,6 +183,8 @@ internal sealed class BridgeMainForm : Form
 
         _input.ForwardingChanged += InputOnForwardingChanged;
         _input.ExitRequested += InputOnExitRequested;
+        _input.MovementRecordingStarted += InputOnMovementRecordingStarted;
+        _input.MovementRecordingCompleted += InputOnMovementRecordingCompleted;
         Resize += (_, _) =>
         {
             ApplySplitLayout();
@@ -197,6 +199,8 @@ internal sealed class BridgeMainForm : Form
             _logFlushTimer.Stop();
             FlushPendingLogs();
             _cursorLock.Release();
+            _input.MovementRecordingStarted -= InputOnMovementRecordingStarted;
+            _input.MovementRecordingCompleted -= InputOnMovementRecordingCompleted;
             _input.Stop();
         };
     }
@@ -407,6 +411,42 @@ internal sealed class BridgeMainForm : Form
             return;
         }
         Close();
+    }
+
+    private void InputOnMovementRecordingStarted()
+    {
+        if (_closing || IsDisposed)
+        {
+            return;
+        }
+        if (InvokeRequired)
+        {
+            BeginInvoke((Action)InputOnMovementRecordingStarted);
+            return;
+        }
+
+        AppendLog("检测到鼠标左右键同时按下，开始记录实际发出的有符号 X/Y 移动命令。");
+    }
+
+    private void InputOnMovementRecordingCompleted(MouseMovementRecording recording)
+    {
+        if (_closing || IsDisposed)
+        {
+            return;
+        }
+        if (InvokeRequired)
+        {
+            BeginInvoke((Action)(() => InputOnMovementRecordingCompleted(recording)));
+            return;
+        }
+
+        MouseMovementAnalysisForm analysisForm = new(recording);
+        analysisForm.Show(this);
+        AppendLog(
+            $"左右键已松开超过 3 秒，鼠标移动记录完成：样本={recording.SampleCount}，" +
+            (analysisForm.SavedImagePath is null
+                ? "分析图已显示但保存失败。"
+                : $"分析图={analysisForm.SavedImagePath}"));
     }
 
     private void ApplyCursorLock()
