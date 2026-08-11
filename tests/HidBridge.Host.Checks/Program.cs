@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Text;
 using HidBridge.Host;
 using HidBridge.Host.Automation;
+using HidBridge.Host.FirmwareUpdate;
 using HidBridge.Host.Input;
 using HidBridge.Host.RemoteInput;
 using HidBridge.Host.Transport;
@@ -25,12 +26,14 @@ CheckInputSuppressionPolicy();
 CheckCursorLockGeometry();
 CheckUiLogWriter();
 CheckRemoteInputUdpPath();
+CheckFirmwareUpdateApiPolicy();
+CheckFirmwareUpdateApiLoopback();
 CheckAutomationProfilesAndRuntime();
 CheckAutomationRemoteOutput();
 CheckLocalMouseTriggersReachLua();
 CheckTriggerForwardingIntegration();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、UDP 平滑开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、UDP 平滑开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、本机固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
 
 static void CheckMouseReportCodec()
 {
@@ -741,6 +744,92 @@ static void CheckRemoteInputUdpPath()
     Require(transport.MouseReports().Length == reportCount, "同步关闭后 UDP 模拟输入不得继续发送鼠标报告");
 }
 
+static void CheckFirmwareUpdateApiPolicy()
+{
+    Require(!new AutomationSettings().FirmwareUpdateApiEnabled, "本机固件刷写接口必须默认关闭");
+    BridgeOptions options = new();
+    Require(options.FirmwareUpdateApiPort == 24815, "本机固件刷写接口默认端口应为 24815");
+    BridgeOptions.Validate(options);
+    FirmwareFlashPlan plan = FirmwareFlashPlan.Load(options);
+    Require(plan.Images.Count == 3, "固件刷写计划必须包含三段镜像");
+    Require(
+        plan.Images.Select(image => image.Offset).SequenceEqual([0L, 0x8000L, 0x10000L]),
+        "固件刷写计划偏移必须为 0x0、0x8000、0x10000");
+    Require(plan.Images.All(image => File.Exists(image.Path) && image.Sha256.Length == 64), "固件镜像路径或 SHA-256 无效");
+    Require(File.Exists(plan.EsptoolPath), "固件刷写计划未定位到项目内 esptool.exe");
+    Require(plan.Before == "default-reset" && plan.After == "hard-reset", "esptool 5 复位参数未规范化为连字符形式");
+    string summary = FirmwareFlashService.FormatVerificationSummary(plan.Images, 3, hardReset: true);
+    Require(plan.Images.All(image => summary.Contains($"{image.OffsetArgument}={image.Sha256}", StringComparison.Ordinal)), "刷写最终摘要缺少三段 SHA-256");
+    Require(summary.Contains("设备校验=3/3", StringComparison.Ordinal) && summary.EndsWith("RTS复位=完成", StringComparison.Ordinal), "刷写最终摘要缺少校验或复位结果");
+
+    string validRequest =
+        "POST /api/v1/firmware/flash HTTP/1.1\r\n" +
+        "Host: 127.0.0.1:24815\r\n" +
+        $"{FirmwareUpdateApiServer.ConfirmationHeaderName}: {FirmwareUpdateApiServer.ConfirmationHeaderValue}\r\n" +
+        "Content-Length: 0\r\n\r\n";
+    Require(
+        FirmwareUpdateApiServer.TryParseRequest(
+            validRequest,
+            out string method,
+            out string path,
+            out Dictionary<string, string> headers),
+        "合法固件刷写 HTTP 请求应能解析");
+    Require(method == "POST" && path == "/api/v1/firmware/flash", "固件刷写请求方法或路径解析错误");
+    Require(
+        headers.TryGetValue(FirmwareUpdateApiServer.ConfirmationHeaderName, out string? confirmation) &&
+        confirmation == FirmwareUpdateApiServer.ConfirmationHeaderValue,
+        "固件刷写确认请求头解析错误");
+    Require(
+        !FirmwareUpdateApiServer.TryParseRequest(
+            "DELETE /api/v1/firmware/flash HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            out _,
+            out _,
+            out _),
+        "固件刷写接口必须拒绝 GET/POST 以外的方法");
+}
+
+static void CheckFirmwareUpdateApiLoopback()
+{
+    int started = 0;
+    FirmwareFlashSnapshot snapshot = new(
+        "loopback-check",
+        "idle",
+        "test",
+        null,
+        null,
+        null,
+        null);
+    bool TryStart(out FirmwareFlashSnapshot current)
+    {
+        Interlocked.Increment(ref started);
+        current = snapshot with { State = "running" };
+        return true;
+    }
+
+    using FirmwareUpdateApiServer server = new(0, () => snapshot, TryStart);
+    Require(server.ListenAddress.Equals(System.Net.IPAddress.Loopback), "固件刷写 API 必须固定绑定 IPv4 Loopback");
+    server.SetEnabled(true);
+    Require(server.Enabled && server.Port > 0, "固件刷写 API 未在临时 Loopback 端口启动");
+    using HttpClient client = new() { BaseAddress = new Uri($"http://127.0.0.1:{server.Port}") };
+
+    HttpResponseMessage statusResponse = client.GetAsync("/api/v1/firmware/status").GetAwaiter().GetResult();
+    Require(statusResponse.StatusCode == System.Net.HttpStatusCode.OK, "固件刷写状态接口未返回 200");
+    string statusJson = statusResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+    Require(statusJson.Contains("\"state\":\"idle\"", StringComparison.Ordinal), "固件刷写状态响应内容不正确");
+
+    HttpResponseMessage rejected = client.PostAsync("/api/v1/firmware/flash", null).GetAwaiter().GetResult();
+    Require(rejected.StatusCode == System.Net.HttpStatusCode.Forbidden, "缺少确认头的刷写请求必须返回 403");
+    Require(started == 0, "缺少确认头时不得调用刷写任务");
+
+    using HttpRequestMessage request = new(HttpMethod.Post, "/api/v1/firmware/flash");
+    request.Headers.Add(FirmwareUpdateApiServer.ConfirmationHeaderName, FirmwareUpdateApiServer.ConfirmationHeaderValue);
+    HttpResponseMessage accepted = client.Send(request);
+    Require(accepted.StatusCode == System.Net.HttpStatusCode.Accepted, "合法刷写请求未返回 202");
+    Require(started == 1, "合法刷写请求必须且只能启动一次任务");
+    server.SetEnabled(false);
+    Require(!server.Enabled, "设置关闭后固件刷写 API 必须停止监听");
+}
+
 static void CheckAutomationProfilesAndRuntime()
 {
     string root = Path.Combine(Path.GetTempPath(), $"hidbridge-automation-{Guid.NewGuid():N}");
@@ -985,6 +1074,8 @@ static void CheckWindowLayout()
             Require(form.SettingsPage.MinimizeToTrayCheckBox.Checked == automation.Settings.MinimizeToTray, "设置页最小化到托盘状态未从配置加载");
             Require(form.SettingsPage.CloseToTrayCheckBox.Checked == automation.Settings.CloseToTray, "设置页关闭到托盘状态未从配置加载");
             Require(form.SettingsPage.GenerateMovementAnalysisImageCheckBox.Checked == automation.Settings.GenerateMovementAnalysisImage, "设置页分析图片开关状态未从配置加载");
+            Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Checked, "本机固件刷写接口默认必须关闭");
+            Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Enabled, "无串口刷写服务时设置页接口开关必须禁用");
             automation.Settings.GenerateMovementAnalysisImage = false;
             form.ProcessMovementRecordingForChecks(new MouseMovementRecording(
                 DateTime.UtcNow.AddSeconds(-1), DateTime.UtcNow, [3], [-2]));
@@ -1069,6 +1160,7 @@ static void CheckWindowLayout()
             Require(allText.Contains("模拟 UDP", StringComparison.Ordinal), "界面未显示模拟 UDP 开关");
             Require(allText.Contains("UDP 平滑", StringComparison.Ordinal), "界面未显示 UDP 平滑开关");
             Require(allText.Contains("左右键同按", StringComparison.Ordinal), "界面未提示鼠标移动记录触发方式");
+            Require(allText.Contains("本机固件刷写接口", StringComparison.Ordinal), "设置页未显示本机固件刷写接口开关");
             Require(allText.Contains("暂停自动跟随", StringComparison.Ordinal), "日志栏未提示滚动到上方后暂停自动跟随");
             CheckDarkSurfaceTextContrast(form);
             string artifactDirectory = Path.Combine(Environment.CurrentDirectory, "artifacts");
@@ -1082,7 +1174,7 @@ static void CheckWindowLayout()
             RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-lua-settings-update.png"));
             form.MainTabs.SelectedIndex = 3;
             RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-settings.png"));
-            Console.WriteLine("四页 UI 检查：设置已从宏页迁出；Lua 页含新增/删除配置；设置页含启动、托盘和分析图片四项开关。");
+            Console.WriteLine("四页 UI 检查：设置已从宏页迁出；Lua 页含新增/删除配置；设置页含启动、托盘、分析图片和本机固件刷写接口开关。");
             Directory.Delete(automationDirectory, true);
         }
         catch (Exception exception)

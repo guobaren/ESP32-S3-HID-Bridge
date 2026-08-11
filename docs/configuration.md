@@ -1,5 +1,7 @@
 # 连接与安全配置
 
+固件刷写接口的启用方法、PowerShell 调用和安全边界见 [`firmware-update-api.md`](firmware-update-api.md)。该接口固定监听本机 Loopback，设置页开关默认关闭。
+
 ## 输出组合
 
 固件支持以下输出后端：

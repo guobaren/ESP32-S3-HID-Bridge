@@ -54,6 +54,12 @@ static SemaphoreHandle_t s_mouse_mutex;
 static TaskHandle_t s_mouse_sender_task;
 
 #define BLE_MOUSE_SEND_INTERVAL_MS 10
+#define BLE_MOUSE_SEND_TASK_PRIORITY 10
+#if CONFIG_FREERTOS_UNICORE
+#define BLE_MOUSE_SEND_TASK_CORE tskNO_AFFINITY
+#else
+#define BLE_MOUSE_SEND_TASK_CORE 1
+#endif
 // X/Y 在 HID 报告中是有符号 16 位，取消过小的 16 单位人工上限。
 // 这样一次 BLE 报告可以承载普通大范围移动，避免因拆成大量 16 单位报告而产生明显积压延迟。
 #define BLE_MOUSE_MAX_MOTION_PER_REPORT INT16_MAX
@@ -342,6 +348,12 @@ esp_err_t ble_output_init(void)
     ESP_LOGE(TAG, "BLE 输出已启用，但 NimBLE 未启用");
     return ESP_ERR_INVALID_STATE;
 #else
+    /*
+     * NimBLE Info 会为每次 notify 生成串口文本。连续鼠标移动时，这些同步日志
+     * 会与 UART 输入及 10 ms 发送任务争用 CPU/日志锁；连接与性能诊断由本项目
+     * 的 ESP_HID_GAP、NIMBLE_HIDD 和 ble_output 周期统计保留。
+     */
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
     ESP_RETURN_ON_ERROR(esp_hid_gap_init(HIDD_BLE_MODE), TAG, "初始化 BLE GAP 失败");
     ESP_RETURN_ON_ERROR(
         esp_hid_ble_gap_adv_init(ESP_HID_APPEARANCE_KEYBOARD, s_config.device_name),
@@ -363,10 +375,27 @@ esp_err_t ble_output_init(void)
         return ESP_ERR_NO_MEM;
     }
     nimble_port_freertos_init(ble_host_task);
-    if (xTaskCreate(ble_mouse_sender_task, "ble_mouse_tx", 3072, NULL, 5, &s_mouse_sender_task) != pdPASS) {
+    /*
+     * UART 生产者优先级为 9；发送者若维持旧优先级 5，会在连续高频输入下被
+     * 延迟数十到数百毫秒。固定到应用核并提高一级，保证每 10 ms 先消费一次
+     * 合并位移，再让 UART 继续灌入新报告。
+     */
+    if (xTaskCreatePinnedToCore(
+            ble_mouse_sender_task,
+            "ble_mouse_tx",
+            3072,
+            NULL,
+            BLE_MOUSE_SEND_TASK_PRIORITY,
+            &s_mouse_sender_task,
+            BLE_MOUSE_SEND_TASK_CORE) != pdPASS) {
         ESP_LOGE(TAG, "无法创建 BLE 鼠标发送任务");
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG,
+             "BLE 鼠标发送任务：周期=%d ms 优先级=%d Core=%d",
+             BLE_MOUSE_SEND_INTERVAL_MS,
+             BLE_MOUSE_SEND_TASK_PRIORITY,
+             BLE_MOUSE_SEND_TASK_CORE);
     if (xTaskCreate(ble_statistics_task, "ble_stats", 3072, NULL, 1, NULL) != pdPASS) {
         ESP_LOGE(TAG, "无法创建 BLE 鼠标统计任务");
         return ESP_ERR_NO_MEM;

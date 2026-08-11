@@ -12,6 +12,7 @@ Windows 主机程序负责：
 4. 以 500 Hz 上限累计 Raw Input 位移，将状态转换成 USB HID 键盘/鼠标报告。
 5. 自动枚举 Windows COM 口，通过 `DeviceProbe/DeviceHello` 握手确认 ESP32-S3；板载 USB-to-UART 与原生 USB CDC 使用同一协议。
 6. 在停止转发和退出时发送 `ReleaseAll`。
+7. 可选启用仅绑定 `127.0.0.1` 的固件刷写 API；刷写时暂时释放串口，完成后自动恢复。
 
 主机端不创建 Windows 虚拟设备，也不注入输入，因此不会与目标设备的 HID 枚举混在一起。
 
@@ -35,7 +36,7 @@ HID-only 模式使用一个 HID Interface 和两个 Report ID：
 
 ## 当前实现边界
 
-- USB HID、BLE HID 和 Wi-Fi Target Agent 均已实现；USB/BLE 的真实目标设备顺序验收仍需补齐。
+- USB HID、BLE HID 和 Wi-Fi Target Agent 均已实现；当前 USB/BLE 切换由用户真实验收通过。
 - 键盘采用 6-key rollover；超过 6 个普通键时只上报最早的 6 个。
 - 鼠标 X/Y 采用有符号 16 位相对位移，单帧范围为 `-32768..32767`。主机端累计高轮询率 Raw Input，并以 500 Hz 上限发送，避免逐采样排队。
 - 固件以 64 位累计器保存尚未送达 USB 的鼠标位移；鼠标移动允许合并，键盘和鼠标按钮转换使用独立可靠队列。

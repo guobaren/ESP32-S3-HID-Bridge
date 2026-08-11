@@ -39,6 +39,7 @@ static ble_addr_t s_last_bonded_peer_addr;
 static bool s_has_last_bonded_peer;
 static bool s_initial_advertising_started;
 static unsigned int s_directed_reconnect_bursts_remaining;
+static bool s_skip_next_directed_reconnect_request;
 
 static void log_connection_parameters(const char *phase, uint16_t conn_handle)
 {
@@ -1063,6 +1064,15 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
                      rc);
             ++s_connection_generation;
             ble_hid_task_shut_down();
+            if (esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
+                    event->connect.status)) {
+                s_directed_reconnect_bursts_remaining = 0;
+                s_skip_next_directed_reconnect_request = connection_handle_is_active;
+                ESP_LOGW(TAG,
+                         "directed reconnect attempt failed; fall back to undirected advertising; "
+                         "status=%d",
+                         event->connect.status);
+            }
             if (connection_handle_is_active) {
                 s_active_connection_handle = event->connect.conn_handle;
                 int terminate_rc = ble_gap_terminate(
@@ -1087,6 +1097,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
             }
             return 0;
         }
+        s_skip_next_directed_reconnect_request = false;
         s_directed_reconnect_bursts_remaining = 0;
         if (event->connect.status == 0) {
             ESP_LOGI(TAG, "connection established; status=0 conn_handle=%u",
@@ -1132,7 +1143,15 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
         ble_hid_task_shut_down();
-        nimble_request_directed_reconnect();
+        if (s_skip_next_directed_reconnect_request) {
+            s_skip_next_directed_reconnect_request = false;
+            s_directed_reconnect_bursts_remaining = 0;
+            ESP_LOGI(TAG,
+                     "skip directed reconnect rearm after rejected connection; "
+                     "use undirected advertising");
+        } else {
+            nimble_request_directed_reconnect();
+        }
         nimble_restart_advertising_if_idle("connection disconnected");
         return 0;
     case BLE_GAP_EVENT_CONN_UPDATE:
@@ -1314,7 +1333,10 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
         nimble_request_directed_reconnect();
     }
 
-    /* 已绑定设备先用数个高占空比定向广播；均超时后自动回落普通广播。 */
+    /*
+     * 已绑定设备在约 30 秒窗口内持续使用高占空比定向广播，覆盖 Windows
+     * 蓝牙控制器重新上电后的慢启动阶段；窗口耗尽后自动回落普通广播。
+     */
     memset(&adv_params, 0, sizeof adv_params);
     bool use_directed = esp_hid_nimble_should_use_directed_reconnect(
         s_has_last_bonded_peer,

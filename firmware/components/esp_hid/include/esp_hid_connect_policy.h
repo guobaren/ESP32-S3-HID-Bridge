@@ -14,7 +14,8 @@ enum {
     ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT = 8,
     ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED = 19,
     ESP_HID_HCI_STATUS_UNSUPPORTED_REMOTE_FEATURE = 26,
-    ESP_HID_DIRECTED_RECONNECT_BURSTS = 4,
+    /* Legacy 高占空比定向广播每轮最多约 1.28 秒；24 轮覆盖约 30 秒。 */
+    ESP_HID_DIRECTED_RECONNECT_BURSTS = 24,
 };
 
 static inline bool esp_hid_nimble_connect_event_is_usable(
@@ -34,4 +35,16 @@ static inline bool esp_hid_nimble_should_use_directed_reconnect(
     unsigned int bursts_remaining)
 {
     return has_bonded_peer && bursts_remaining > 0;
+}
+
+/*
+ * 定向广播已经促成一次连接尝试后，若远端特性交换仍以监督超时或远端终止
+ * 结束，继续重新装填定向广播预算会让 Windows 每约 10 秒重复一次失败连接。
+ * 这两类失败应立即回落普通快速广播，等待中心端以完整广播流程重新发现。
+ */
+static inline bool esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
+    int status)
+{
+    return status == ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT ||
+           status == ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED;
 }

@@ -1,4 +1,6 @@
+using System.Net.Sockets;
 using HidBridge.Host.Automation;
+using HidBridge.Host.FirmwareUpdate;
 using HidBridge.Host.Input;
 using HidBridge.Host.RemoteInput;
 using HidBridge.Host.Transport;
@@ -22,6 +24,8 @@ internal static class Program
         AutomationController? automation = null;
         SimulationLogGenerator? simulation = null;
         RemoteInputServer? remoteInput = null;
+        FirmwareFlashService? firmwareFlash = null;
+        FirmwareUpdateApiServer? firmwareUpdateApi = null;
         try
         {
             BridgeOptions options = BridgeOptions.Load();
@@ -29,13 +33,22 @@ internal static class Program
                 options.ShowDeviceLogInUi ? RuntimeLogMode.Full : RuntimeLogMode.Reduced);
             logWriter.EnableFile(options.HostLogPath);
             SimulationOptions simulationOptions = SimulationOptions.Parse(args);
-            transport = simulationOptions.Enabled
-                ? new NoopBridgeTransport()
+            SerialBridge? serialBridge = null;
+            if (simulationOptions.Enabled)
+            {
+                transport = new NoopBridgeTransport();
+            }
+            else if (options.Transport.Equals("wifi", StringComparison.OrdinalIgnoreCase))
+            {
                 // Wi-Fi 开发板输入实现暂时保留。BridgeOptions.Validate 当前会阻止该分支启用；
                 // 后续完成真实链路验收后，只需开放统一功能开关，不需要恢复被删除的代码。
-                : options.Transport.Equals("wifi", StringComparison.OrdinalIgnoreCase)
-                    ? new NetworkBridge(options)
-                    : new SerialBridge(options, logSettings);
+                transport = new NetworkBridge(options);
+            }
+            else
+            {
+                serialBridge = new SerialBridge(options, logSettings);
+                transport = serialBridge;
+            }
             input = new InputForwarder(transport);
             AutomationProfileStore profileStore = new();
             if (profileStore.TryImportLegacyMouseHubProfiles(@"F:\Mouse hub\profiles"))
@@ -43,6 +56,24 @@ internal static class Program
                 Console.WriteLine("已从 F:\\Mouse hub\\profiles 导入宏、Lua 和配置名称；其他 Mouse hub 设置未启用。");
             }
             automation = new AutomationController(profileStore, input);
+            if (serialBridge is not null)
+            {
+                firmwareFlash = new FirmwareFlashService(options, serialBridge, input);
+                firmwareUpdateApi = new FirmwareUpdateApiServer(options.FirmwareUpdateApiPort, firmwareFlash);
+                if (automation.Settings.FirmwareUpdateApiEnabled)
+                {
+                    try
+                    {
+                        firmwareUpdateApi.SetEnabled(true);
+                    }
+                    catch (Exception exception) when (exception is SocketException or InvalidOperationException)
+                    {
+                        automation.Settings.FirmwareUpdateApiEnabled = false;
+                        automation.SaveSettings();
+                        Console.Error.WriteLine($"本机固件刷写接口启动失败，已恢复为关闭：{exception.Message}");
+                    }
+                }
+            }
             if (options.RemoteInputEnabled)
             {
                 remoteInput = new RemoteInputServer(
@@ -64,7 +95,7 @@ internal static class Program
                         ? $"串口自动发现 @ {options.BaudRate}"
                         : $"串口 {options.PortName} @ {options.BaudRate}";
 
-            using BridgeMainForm form = new(input, automation, endpoint, logSettings);
+            using BridgeMainForm form = new(input, automation, endpoint, logSettings, firmwareUpdateApi);
             logWriter.Attach(form.AppendLog);
             Console.WriteLine($"目标端点：{endpoint}");
             Console.WriteLine($"本地实时日志：{logWriter.FilePath}");
@@ -94,6 +125,8 @@ internal static class Program
         finally
         {
             remoteInput?.Dispose();
+            firmwareUpdateApi?.Dispose();
+            firmwareFlash?.Dispose();
             simulation?.Dispose();
             automation?.Dispose();
             input?.Stop();

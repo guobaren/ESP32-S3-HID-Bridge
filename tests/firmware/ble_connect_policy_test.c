@@ -25,6 +25,16 @@ int main(void)
     assert(esp_hid_nimble_should_use_directed_reconnect(true, 1));
     assert(!esp_hid_nimble_should_use_directed_reconnect(true, 0));
     assert(!esp_hid_nimble_should_use_directed_reconnect(false, 4));
+    assert(ESP_HID_DIRECTED_RECONNECT_BURSTS == 24);
+
+    assert(esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
+        ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT));
+    assert(esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
+        ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED));
+    assert(!esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
+        ESP_HID_NIMBLE_STATUS_SUCCESS));
+    assert(!esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
+        ESP_HID_HCI_STATUS_UNSUPPORTED_REMOTE_FEATURE));
 
     puts("BLE 连接策略测试通过：按 HCI 状态判定连接，并限制定向重连广播次数。");
     return 0;

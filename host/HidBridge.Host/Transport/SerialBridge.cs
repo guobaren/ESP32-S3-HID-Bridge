@@ -32,6 +32,7 @@ internal sealed class SerialBridge : IBridgeTransport
     private SerialPort? _port;
     private DateTime _nextConnectAttemptUtc;
     private bool _sessionStarted;
+    private bool _firmwareUpdateLeaseActive;
     private bool _disposed;
     private CancellationTokenSource? _traceCancellation;
     private Task? _traceTask;
@@ -53,7 +54,7 @@ internal sealed class SerialBridge : IBridgeTransport
     {
         lock (_sync)
         {
-            if (_disposed || !EnsureConnected())
+            if (_disposed || _firmwareUpdateLeaseActive || !EnsureConnected())
             {
                 return;
             }
@@ -80,6 +81,10 @@ internal sealed class SerialBridge : IBridgeTransport
 
     private bool EnsureConnected()
     {
+        if (_firmwareUpdateLeaseActive)
+        {
+            return false;
+        }
         if (_port?.IsOpen == true)
         {
             return true;
@@ -434,6 +439,60 @@ internal sealed class SerialBridge : IBridgeTransport
         }
     }
 
+    internal FirmwareUpdatePortLease AcquireFirmwareUpdatePort()
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_firmwareUpdateLeaseActive)
+            {
+                throw new InvalidOperationException("固件刷写已经占用串口。");
+            }
+            if (!EnsureConnected() || _port?.IsOpen != true)
+            {
+                throw new IOException("未连接到可刷写的 HID Bridge 串口。");
+            }
+
+            string portName = _port.PortName;
+            _firmwareUpdateLeaseActive = true;
+            ClosePort();
+            Console.WriteLine($"已释放 {portName} 给固件刷写任务独占使用。");
+            return new FirmwareUpdatePortLease(this, portName);
+        }
+    }
+
+    internal async Task<bool> WaitForConnectionAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        DateTime deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (_sync)
+            {
+                if (!_disposed && !_firmwareUpdateLeaseActive && EnsureConnected())
+                {
+                    return true;
+                }
+            }
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
+        return false;
+    }
+
+    private void ReleaseFirmwareUpdatePort(string portName)
+    {
+        lock (_sync)
+        {
+            if (!_firmwareUpdateLeaseActive)
+            {
+                return;
+            }
+            _firmwareUpdateLeaseActive = false;
+            _nextConnectAttemptUtc = DateTime.MinValue;
+            Console.WriteLine($"固件刷写已释放 {portName}，控制软件开始恢复连接。");
+        }
+    }
+
     public void Dispose()
     {
         _heartbeatTimer.Dispose();
@@ -442,5 +501,21 @@ internal sealed class SerialBridge : IBridgeTransport
             _disposed = true;
             ClosePort();
         }
+    }
+
+    internal sealed class FirmwareUpdatePortLease : IDisposable
+    {
+        private SerialBridge? _owner;
+
+        internal FirmwareUpdatePortLease(SerialBridge owner, string portName)
+        {
+            _owner = owner;
+            PortName = portName;
+        }
+
+        internal string PortName { get; }
+
+        public void Dispose() =>
+            Interlocked.Exchange(ref _owner, null)?.ReleaseFirmwareUpdatePort(PortName);
     }
 }

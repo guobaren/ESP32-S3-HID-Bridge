@@ -1,6 +1,7 @@
 using System.Drawing;
 using System.Runtime.InteropServices;
 using HidBridge.Host.Automation;
+using HidBridge.Host.FirmwareUpdate;
 using HidBridge.Host.Input;
 
 namespace HidBridge.Host.Ui;
@@ -16,6 +17,7 @@ internal sealed class BridgeMainForm : Form
     private readonly InputForwarder _input;
     private readonly AutomationController _automation;
     private readonly RuntimeLogSettings _logSettings;
+    private readonly FirmwareUpdateApiServer? _firmwareUpdateApi;
     private readonly MouseCursorLock _cursorLock = new();
     private readonly MouseCaptureSurface _captureSurface;
     private readonly Label _statusLabel;
@@ -50,11 +52,13 @@ internal sealed class BridgeMainForm : Form
         InputForwarder input,
         AutomationController automation,
         string endpointDescription,
-        RuntimeLogSettings? logSettings = null)
+        RuntimeLogSettings? logSettings = null,
+        FirmwareUpdateApiServer? firmwareUpdateApi = null)
     {
         _input = input;
         _automation = automation;
         _logSettings = logSettings ?? new RuntimeLogSettings(RuntimeLogMode.Reduced);
+        _firmwareUpdateApi = firmwareUpdateApi;
         Text = "ESP32-S3 HID Bridge - 同步已关闭";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(760, 560);
@@ -282,7 +286,7 @@ internal sealed class BridgeMainForm : Form
 
         _macroPage = new MacroPageControl(_automation);
         _luaPage = new LuaPageControl(_automation);
-        _settingsPage = new SettingsPageControl(_automation);
+        _settingsPage = new SettingsPageControl(_automation, firmwareUpdateApi);
         _tabs = new TabControl
         {
             Dock = DockStyle.Fill,
@@ -558,6 +562,19 @@ internal sealed class BridgeMainForm : Form
 
     private void OnFormClosing(object? sender, FormClosingEventArgs eventArgs)
     {
+        if (_firmwareUpdateApi?.FlashInProgress == true &&
+            eventArgs.CloseReason is CloseReason.UserClosing or CloseReason.ApplicationExitCall)
+        {
+            eventArgs.Cancel = true;
+            _forceClose = false;
+            MessageBox.Show(
+                this,
+                "固件正在刷写，完成前不能退出控制软件。请通过状态接口确认任务结束。",
+                "固件刷写进行中",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
         if (!_forceClose && eventArgs.CloseReason == CloseReason.UserClosing && _automation.Settings.CloseToTray)
         {
             eventArgs.Cancel = true;

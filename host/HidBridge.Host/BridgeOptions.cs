@@ -23,6 +23,10 @@ internal sealed class BridgeOptions
     public bool RemoteInputEnabled { get; init; } = true;
     public string RemoteInputBindAddress { get; init; } = "0.0.0.0";
     public int RemoteInputPort { get; init; } = 24814;
+    public int FirmwareUpdateApiPort { get; init; } = 24815;
+    public string FirmwareProjectRoot { get; init; } = string.Empty;
+    public int FirmwareFlashBaudRate { get; init; } = 460800;
+    public int FirmwareFlashTimeoutSeconds { get; init; } = 180;
 
     public static BridgeOptions Load()
     {
@@ -69,6 +73,18 @@ internal sealed class BridgeOptions
         if (options.RemoteInputPort is < 1 or > 65535)
         {
             throw new InvalidDataException("remoteInputPort 必须在 1..65535 范围内。");
+        }
+        if (options.FirmwareUpdateApiPort is < 1 or > 65535)
+        {
+            throw new InvalidDataException("firmwareUpdateApiPort 必须在 1..65535 范围内。");
+        }
+        if (options.FirmwareFlashBaudRate is < 9600 or > 3_000_000)
+        {
+            throw new InvalidDataException("firmwareFlashBaudRate 必须在 9600..3000000 范围内。");
+        }
+        if (options.FirmwareFlashTimeoutSeconds is < 30 or > 900)
+        {
+            throw new InvalidDataException("firmwareFlashTimeoutSeconds 必须在 30..900 范围内。");
         }
     }
 }
