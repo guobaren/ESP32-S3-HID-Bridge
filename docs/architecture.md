@@ -24,7 +24,7 @@ Windows 主机程序负责：
 - USB Device 端：同一原生 USB 设备以 `CDC + HID` 复合设备枚举，HID 负责 USB 输出。
 - BLE HID 端：通过 NimBLE 对外暴露复合键鼠。
 - Wi-Fi 输入/Target Agent 端：使用项目安全通道传输。
-- USB HID 与 BLE HID 采用 BLE 优先策略；BLE 完成加密后可接管仍在线的 USB，BLE 断开后回退 USB，切换时双向释放输入状态。
+- USB HID 与 BLE HID 采用先连接锁定策略；先连接并成为活动输出的链路保持锁定，后连接的另一链路不得抢占。USB 侧以 HID 端点可发送性作为实际存活条件，连续 100 ms 不可发送即失活，从而覆盖外部供电时 `tud_mounted()` 未随数据线拔出清除的情况；当前活动链路失活后才切换并双向释放输入状态。
 
 USB 侧使用一个 HID Interface 和两个 Report ID：
 

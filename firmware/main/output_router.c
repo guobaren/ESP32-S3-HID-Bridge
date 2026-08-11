@@ -120,8 +120,8 @@ void output_router_set_connected(output_mode_t mode, bool connected)
     output_mode_t active_mode = output_mode_selector_set_connected(&s_selector, mode, connected);
     if (active_mode != previous_mode) {
         /*
-         * BLE 可在 USB 仍在线时主动接管。切换前先释放旧目标，避免旧目标
-         * 留下卡键或按住的鼠标按钮；新目标收到下一帧前也会先 ReleaseAll。
+         * 当前活动链路断开后才切换。切换前先释放旧目标，避免旧目标留下
+         * 卡键或按住的鼠标按钮；新目标收到下一帧前也会先 ReleaseAll。
          */
         if (previous_mode != OUTPUT_MODE_NONE) {
             bridge_frame_t release_frame = {

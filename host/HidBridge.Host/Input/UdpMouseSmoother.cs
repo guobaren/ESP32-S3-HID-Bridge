@@ -6,175 +6,84 @@ internal readonly record struct MouseDelta(long X, long Y, long Wheel, long Pan)
 }
 
 internal readonly record struct UdpMouseSmootherStatistics(
-    int LastWindowPackets,
-    int ReferencePacketsPerWindow,
-    long PendingParts,
-    long OverflowMerges);
+    int SmoothingSlots,
+    int PendingSlots,
+    long EnqueuedCommands,
+    long OverlappingCommands);
 
 internal sealed class UdpMouseSmoother
 {
-    internal const int WindowMilliseconds = 100;
-    internal const int OutputSlotsPerWindow = 50;
-    private const int MaximumPendingParts = OutputSlotsPerWindow * 2;
+    internal const int OutputIntervalMilliseconds = 2;
+    internal const int SmoothingSlots = 10;
+    internal const int MaximumScheduledDelayMilliseconds =
+        OutputIntervalMilliseconds * SmoothingSlots;
 
-    private readonly Queue<MovementSegment> _segments = [];
-    private DateTime _windowStartedUtc;
-    private MovementSegment? _overflowSegment;
-    private int _currentWindowPackets;
-    private int _lastWindowPackets;
-    private int _referencePacketsPerWindow = 1;
-    private int _splitPhase;
-    private long _pendingParts;
-    private long _overflowMerges;
-    private bool _windowInitialized;
-    private bool _hasReferenceWindow;
+    private readonly MouseDelta[] _scheduled = new MouseDelta[SmoothingSlots];
+    private int _nextSlot;
+    private int _distributionPhase;
+    private long _enqueuedCommands;
+    private long _overlappingCommands;
 
-    internal void Enqueue(MouseDelta delta, DateTime utcNow)
+    internal void Enqueue(MouseDelta delta)
     {
         if (delta.IsZero)
         {
             return;
         }
 
-        AdvanceWindow(utcNow);
-        _currentWindowPackets++;
-
-        int parts = CalculatePartsForNextCommand();
-        if (_overflowSegment is not null)
+        bool overlapsExistingPlan = _scheduled.Any(slot => !slot.IsZero);
+        _enqueuedCommands++;
+        if (overlapsExistingPlan)
         {
-            _overflowSegment.Add(delta);
-            _overflowMerges++;
-            return;
+            _overlappingCommands++;
+        }
+        else
+        {
+            _distributionPhase = 0;
         }
 
-        if (_pendingParts + parts > MaximumPendingParts)
+        for (int offset = 0; offset < SmoothingSlots; offset++)
         {
-            _overflowSegment = new MovementSegment(delta, 1);
-            _segments.Enqueue(_overflowSegment);
-            _pendingParts++;
-            return;
+            int slotIndex = (_nextSlot + offset) % SmoothingSlots;
+            MouseDelta current = _scheduled[slotIndex];
+            _scheduled[slotIndex] = new MouseDelta(
+                current.X + Split(delta.X, offset, SmoothingSlots, _distributionPhase),
+                current.Y + Split(delta.Y, offset, SmoothingSlots, _distributionPhase),
+                current.Wheel + Split(delta.Wheel, offset, SmoothingSlots, _distributionPhase),
+                current.Pan + Split(delta.Pan, offset, SmoothingSlots, _distributionPhase));
         }
-
-        _segments.Enqueue(new MovementSegment(delta, parts));
-        _pendingParts += parts;
+        _distributionPhase = (_distributionPhase + 1) % SmoothingSlots;
     }
 
     internal bool TryDequeue(out MouseDelta delta)
     {
-        if (_segments.Count == 0)
-        {
-            delta = default;
-            return false;
-        }
-
-        MovementSegment segment = _segments.Peek();
-        delta = segment.TakeNext();
-        _pendingParts--;
-        if (segment.Completed)
-        {
-            _segments.Dequeue();
-            if (ReferenceEquals(segment, _overflowSegment))
-            {
-                _overflowSegment = null;
-            }
-        }
-        return true;
+        delta = _scheduled[_nextSlot];
+        _scheduled[_nextSlot] = default;
+        _nextSlot = (_nextSlot + 1) % SmoothingSlots;
+        return !delta.IsZero;
     }
 
     internal UdpMouseSmootherStatistics GetStatistics() => new(
-        _lastWindowPackets,
-        _referencePacketsPerWindow,
-        _pendingParts,
-        _overflowMerges);
+        SmoothingSlots,
+        _scheduled.Count(slot => !slot.IsZero),
+        _enqueuedCommands,
+        _overlappingCommands);
 
     internal void Reset()
     {
-        _segments.Clear();
-        _windowStartedUtc = default;
-        _overflowSegment = null;
-        _currentWindowPackets = 0;
-        _lastWindowPackets = 0;
-        _referencePacketsPerWindow = 1;
-        _splitPhase = 0;
-        _pendingParts = 0;
-        _overflowMerges = 0;
-        _windowInitialized = false;
-        _hasReferenceWindow = false;
+        Array.Clear(_scheduled);
+        _nextSlot = 0;
+        _distributionPhase = 0;
+        _enqueuedCommands = 0;
+        _overlappingCommands = 0;
     }
 
-    private void AdvanceWindow(DateTime utcNow)
+    private static long Split(long total, int index, int parts, int phase)
     {
-        if (!_windowInitialized)
-        {
-            _windowStartedUtc = utcNow;
-            _windowInitialized = true;
-            return;
-        }
-
-        long elapsedTicks = utcNow.Ticks - _windowStartedUtc.Ticks;
-        long windowTicks = TimeSpan.FromMilliseconds(WindowMilliseconds).Ticks;
-        if (elapsedTicks < windowTicks)
-        {
-            return;
-        }
-
-        long elapsedWindows = elapsedTicks / windowTicks;
-        _lastWindowPackets = elapsedWindows == 1 ? _currentWindowPackets : 0;
-        _referencePacketsPerWindow = Math.Max(1, _lastWindowPackets);
-        _currentWindowPackets = 0;
-        _splitPhase = 0;
-        _hasReferenceWindow = true;
-        _windowStartedUtc = _windowStartedUtc.AddTicks(elapsedWindows * windowTicks);
-    }
-
-    private int CalculatePartsForNextCommand()
-    {
-        if (!_hasReferenceWindow)
-        {
-            return 1;
-        }
-
-        _splitPhase += OutputSlotsPerWindow;
-        int parts = _splitPhase / _referencePacketsPerWindow;
-        _splitPhase %= _referencePacketsPerWindow;
-        return Math.Clamp(parts, 1, OutputSlotsPerWindow);
-    }
-
-    private sealed class MovementSegment
-    {
-        private MouseDelta _total;
-        private readonly int _parts;
-        private int _index;
-
-        internal MovementSegment(MouseDelta total, int parts)
-        {
-            _total = total;
-            _parts = parts;
-        }
-
-        internal bool Completed => _index == _parts;
-
-        internal void Add(MouseDelta delta)
-        {
-            _total = new MouseDelta(
-                _total.X + delta.X,
-                _total.Y + delta.Y,
-                _total.Wheel + delta.Wheel,
-                _total.Pan + delta.Pan);
-        }
-
-        internal MouseDelta TakeNext()
-        {
-            int previousIndex = _index;
-            _index++;
-            return new MouseDelta(
-                Split(_total.X, previousIndex, _index, _parts),
-                Split(_total.Y, previousIndex, _index, _parts),
-                Split(_total.Wheel, previousIndex, _index, _parts),
-                Split(_total.Pan, previousIndex, _index, _parts));
-        }
-
-        private static long Split(long total, int previousIndex, int currentIndex, int parts) =>
-            total * currentIndex / parts - total * previousIndex / parts;
+        long quotient = total / parts;
+        long remainder = total % parts;
+        int phasedIndex = (index - phase + parts) % parts;
+        long remainderPart = phasedIndex < Math.Abs(remainder) ? Math.Sign(remainder) : 0;
+        return quotient + remainderPart;
     }
 }

@@ -16,6 +16,7 @@
 #include "tusb.h"
 #include "output_router.h"
 #include "usb_cdc_input.h"
+#include "usb_output_liveness.h"
 
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE 2
@@ -30,6 +31,7 @@
 #define USB_CDC_DATA_IN_ENDPOINT 0x83
 #define USB_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
 #define MOUSE_SEND_PERIOD_MS 2
+#define USB_UNAVAILABLE_TIMEOUT_MS 100
 #define STATISTICS_PERIOD_MS 1000
 #define COMPLETION_LATENCY_BUCKET_COUNT 7
 
@@ -99,6 +101,7 @@ static diagnostic_state_t s_diagnostics;
 static UBaseType_t s_control_queue_high_water;
 static int64_t s_mouse_submit_time_us;
 static int64_t s_last_motion_completion_time_us;
+static usb_output_liveness_t s_usb_output_liveness;
 
 static const uint8_t s_hid_report_descriptor[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD)),
@@ -267,10 +270,10 @@ static void usb_event_callback(tinyusb_event_t *event, void *argument)
         return;
     }
     if (event->id == TINYUSB_EVENT_ATTACHED) {
-        output_router_set_connected(OUTPUT_MODE_USB, true);
+        ESP_LOGI(TAG, "TinyUSB 已挂载，等待 HID 端点可发送后再标记 USB 输出在线");
     } else if (event->id == TINYUSB_EVENT_DETACHED) {
         usb_cdc_input_on_detached();
-        output_router_set_connected(OUTPUT_MODE_USB, false);
+        ESP_LOGI(TAG, "TinyUSB 已卸载，等待发送任务确认 USB 输出失活");
     }
 }
 
@@ -527,6 +530,24 @@ static void hid_sender_task(void *argument)
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(MOUSE_SEND_PERIOD_MS));
         bool mounted = tud_mounted();
         bool ready = mounted && tud_hid_ready();
+        usb_output_liveness_event_t liveness_event = usb_output_liveness_update(
+            &s_usb_output_liveness,
+            ready,
+            MOUSE_SEND_PERIOD_MS,
+            USB_UNAVAILABLE_TIMEOUT_MS);
+        if (liveness_event == USB_OUTPUT_LIVENESS_BECAME_AVAILABLE) {
+            ESP_LOGI(TAG, "USB HID 端点可发送，标记 USB 输出在线");
+            output_router_set_connected(OUTPUT_MODE_USB, true);
+        } else if (liveness_event == USB_OUTPUT_LIVENESS_BECAME_UNAVAILABLE) {
+            ESP_LOGW(
+                TAG,
+                "USB HID 连续 %d ms 不可发送（mounted=%d ready=%d），标记 USB 输出离线",
+                USB_UNAVAILABLE_TIMEOUT_MS,
+                mounted,
+                ready);
+            usb_cdc_input_on_detached();
+            output_router_set_connected(OUTPUT_MODE_USB, false);
+        }
         portENTER_CRITICAL(&s_mouse_lock);
         s_diagnostics.sender_ticks++;
         if (mounted) {

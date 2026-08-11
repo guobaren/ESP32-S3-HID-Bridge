@@ -12,7 +12,7 @@ ESP32-S3 ── USB HID 或 BLE HID ──> 目标设备
 ```
 
 - USB-to-UART 与原生 USB CDC 使用同一套自动发现、握手、会话租约和输入协议。
-- BLE 完成加密并可发送后优先作为输出，断开后回退 USB HID。
+- USB HID 与 BLE HID 由先连接并成为活动输出的链路锁定；后连接链路不得抢占。USB HID 连续 100 ms 不可发送时视为失活并切换到仍在线 BLE，解决外部供电时拔线后 `mounted` 状态滞留的问题。USB 活动输出显示绿灯，BLE 活动输出显示蓝灯。
 - BLE 鼠标移动按固定 10 ms 节拍发送最新合并位移。
 - Wi-Fi 输入、SoftAP 配网和 Target Agent Wi-Fi 输出代码仍在仓库中，但当前主机和固件运行入口均关闭。
 - 主机 Release 构建会把 `HidBridge.Host.exe` 复制到项目根目录。

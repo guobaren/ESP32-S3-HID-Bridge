@@ -12,6 +12,7 @@ idf_component_register(
         "secure_channel.c"
         "status_led.c"
         "usb_cdc_input.c"
+        "usb_output_liveness.c"
         "wifi_input.c"
         "wifi_manager.c"
         "wifi_provisioning.c"

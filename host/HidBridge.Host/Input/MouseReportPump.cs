@@ -21,6 +21,7 @@ internal sealed class MouseReportPump : IDisposable
     private readonly object _sendLock = new();
     private readonly MouseMovementRecorder _movementRecorder;
     private readonly UdpMouseSmoother _udpMouseSmoother = new();
+    private readonly SimulatedUdpMouseInput _simulatedUdpInput = new();
     private readonly Queue<byte> _buttonStates = [];
     private readonly Thread _senderThread;
     private readonly IntPtr _waitableTimer;
@@ -42,6 +43,7 @@ internal sealed class MouseReportPump : IDisposable
     private long _maxSubmittedIntervalUs;
     private byte _lastSubmittedButtons;
     private DateTime _lastStatisticsUtc = DateTime.UtcNow;
+    private bool _udpSmoothingEnabled = true;
     private bool _enabled;
     private bool _disposed;
 
@@ -118,14 +120,29 @@ internal sealed class MouseReportPump : IDisposable
             }
 
             _rawEventCount++;
-            _pendingX += deltaX;
-            _pendingY += deltaY;
-            _pendingWheel += wheel;
-            _pendingPan += pan;
             _capturedX += deltaX;
             _capturedY += deltaY;
-            _maxPendingX = Math.Max(_maxPendingX, Math.Abs(_pendingX));
-            _maxPendingY = Math.Max(_maxPendingY, Math.Abs(_pendingY));
+            if (_simulatedUdpInput.Enabled)
+            {
+                if (_simulatedUdpInput.Accumulate(
+                        deltaX,
+                        deltaY,
+                        wheel,
+                        pan,
+                        out MouseDelta immediateDelta))
+                {
+                    RouteUdpDeltaLocked(immediateDelta);
+                }
+            }
+            else
+            {
+                _pendingX += deltaX;
+                _pendingY += deltaY;
+                _pendingWheel += wheel;
+                _pendingPan += pan;
+                _maxPendingX = Math.Max(_maxPendingX, Math.Abs(_pendingX));
+                _maxPendingY = Math.Max(_maxPendingY, Math.Abs(_pendingY));
+            }
             if (buttonsChanged)
             {
                 _buttonStates.Enqueue(buttons);
@@ -187,12 +204,96 @@ internal sealed class MouseReportPump : IDisposable
         }
     }
 
+    internal bool SimulatedUdpInputEnabled
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _simulatedUdpInput.Enabled;
+            }
+        }
+    }
+
+    internal int SimulatedUdpInputFrequencyHz
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _simulatedUdpInput.FrequencyHz;
+            }
+        }
+    }
+
+    internal bool UdpSmoothingEnabled
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _udpSmoothingEnabled;
+            }
+        }
+    }
+
+    internal void ConfigureUdpSmoothing(bool enabled)
+    {
+        lock (_sendLock)
+        {
+            lock (_stateLock)
+            {
+                if (_disposed || _udpSmoothingEnabled == enabled)
+                {
+                    return;
+                }
+
+                if (_enabled)
+                {
+                    Console.WriteLine("同步开启时不能切换 UDP 平滑；请先按 HOME 关闭同步。");
+                    return;
+                }
+
+                _udpMouseSmoother.Reset();
+                _udpSmoothingEnabled = enabled;
+            }
+        }
+    }
+
+    internal void ConfigureSimulatedUdpInput(bool enabled, int frequencyHz)
+    {
+        if (!SimulatedUdpMouseInput.SupportedFrequencies.Contains(frequencyHz))
+        {
+            throw new ArgumentOutOfRangeException(nameof(frequencyHz));
+        }
+
+        lock (_stateLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            bool changed = _simulatedUdpInput.Enabled != enabled ||
+                _simulatedUdpInput.FrequencyHz != frequencyHz;
+            if (!changed)
+            {
+                return;
+            }
+
+            if (_simulatedUdpInput.TryDrain(out MouseDelta pending) && _enabled)
+            {
+                RouteUdpDeltaLocked(pending);
+            }
+            _simulatedUdpInput.Configure(enabled, frequencyHz, Stopwatch.GetTimestamp());
+        }
+    }
+
     internal void AccumulateRemote(
         int deltaX,
         int deltaY,
         int wheel,
-        int pan,
-        DateTime? utcNow = null)
+        int pan)
     {
         lock (_stateLock)
         {
@@ -204,9 +305,7 @@ internal sealed class MouseReportPump : IDisposable
             _rawEventCount++;
             _capturedX += deltaX;
             _capturedY += deltaY;
-            _udpMouseSmoother.Enqueue(
-                new MouseDelta(deltaX, deltaY, wheel, pan),
-                utcNow ?? DateTime.UtcNow);
+            RouteUdpDeltaLocked(new MouseDelta(deltaX, deltaY, wheel, pan));
         }
     }
 
@@ -222,7 +321,14 @@ internal sealed class MouseReportPump : IDisposable
             {
                 if (_enabled && !_disposed)
                 {
-                    if (_udpMouseSmoother.TryDequeue(out MouseDelta remoteDelta))
+                    long nowTimestamp = Stopwatch.GetTimestamp();
+                    if (_simulatedUdpInput.TryFlush(nowTimestamp, out MouseDelta simulatedDelta))
+                    {
+                        RouteUdpDeltaLocked(simulatedDelta);
+                    }
+
+                    if (_udpSmoothingEnabled &&
+                        _udpMouseSmoother.TryDequeue(out MouseDelta remoteDelta))
                     {
                         _pendingX += remoteDelta.X;
                         _pendingY += remoteDelta.Y;
@@ -332,23 +438,60 @@ internal sealed class MouseReportPump : IDisposable
     private string BuildStatisticsLocked()
     {
         UdpMouseSmootherStatistics udp = _udpMouseSmoother.GetStatistics();
+        SimulatedUdpInputStatistics simulated = _simulatedUdpInput.GetStatistics();
         return $"鼠标统计（500 Hz）：原始事件={_rawEventCount}，采集位移=({_capturedX},{_capturedY})，" +
         $"已提交报告={_submittedReportCount}，已提交位移=({_submittedX},{_submittedY})，" +
         $"待发送=({_pendingX},{_pendingY})，按钮转换={_buttonTransitionCount}，" +
         $"按钮待发送={_buttonStates.Count}，最大积压=({_maxPendingX},{_maxPendingY})，" +
         $"提交间隔us=({_minSubmittedIntervalUs}..{_maxSubmittedIntervalUs})，" +
-        $"UDP前窗={udp.LastWindowPackets}/100ms，参考={udp.ReferencePacketsPerWindow}/100ms，" +
-        $"平滑待发送={udp.PendingParts}，过载合并={udp.OverflowMerges}";
+        $"UDP平滑={(_udpSmoothingEnabled ? "开启" : "关闭")}，" +
+        $"UDP平滑窗={udp.SmoothingSlots}槽/{UdpMouseSmoother.MaximumScheduledDelayMilliseconds}ms，" +
+        $"平滑待发送槽={udp.PendingSlots}，接收命令={udp.EnqueuedCommands}，" +
+        $"重叠分摊={udp.OverlappingCommands}，" +
+        $"模拟UDP={(simulated.Enabled ? FormatSimulatedUdpFrequency(simulated.FrequencyHz) : "关闭")}，" +
+        $"模拟待整合=({simulated.PendingX},{simulated.PendingY},{simulated.PendingWheel},{simulated.PendingPan})，" +
+        $"模拟输出桶={simulated.EmittedBuckets}";
     }
+
+    private void RouteUdpDeltaLocked(MouseDelta delta)
+    {
+        if (delta.IsZero)
+        {
+            return;
+        }
+
+        if (_udpSmoothingEnabled)
+        {
+            _udpMouseSmoother.Enqueue(delta);
+            return;
+        }
+
+        _pendingX += delta.X;
+        _pendingY += delta.Y;
+        _pendingWheel += delta.Wheel;
+        _pendingPan += delta.Pan;
+        _maxPendingX = Math.Max(_maxPendingX, Math.Abs(_pendingX));
+        _maxPendingY = Math.Max(_maxPendingY, Math.Abs(_pendingY));
+    }
+
+    private static string FormatSimulatedUdpFrequency(int frequencyHz) =>
+        frequencyHz == SimulatedUdpMouseInput.UnlimitedFrequencyHz
+            ? "无上限"
+            : $"{frequencyHz}Hz";
 
     private void LogDiscardedPendingLocked()
     {
+        SimulatedUdpInputStatistics simulated = _simulatedUdpInput.GetStatistics();
         if (_pendingX != 0 || _pendingY != 0 || _pendingWheel != 0 ||
-            _pendingPan != 0 || _buttonStates.Count != 0)
+            _pendingPan != 0 || _buttonStates.Count != 0 ||
+            simulated.PendingX != 0 || simulated.PendingY != 0 ||
+            simulated.PendingWheel != 0 || simulated.PendingPan != 0)
         {
             Console.WriteLine(
                 $"鼠标会话结束，丢弃未发送状态：位移=({_pendingX},{_pendingY})，" +
-                $"滚轮=({_pendingWheel},{_pendingPan})，按钮转换={_buttonStates.Count}");
+                $"滚轮=({_pendingWheel},{_pendingPan})，" +
+                $"模拟UDP待整合=({simulated.PendingX},{simulated.PendingY},{simulated.PendingWheel},{simulated.PendingPan})，" +
+                $"按钮转换={_buttonStates.Count}");
         }
     }
 
@@ -373,6 +516,7 @@ internal sealed class MouseReportPump : IDisposable
         _lastSubmittedButtons = 0;
         _buttonStates.Clear();
         _udpMouseSmoother.Reset();
+        _simulatedUdpInput.ResetSession(Stopwatch.GetTimestamp());
     }
 
     public void Dispose()

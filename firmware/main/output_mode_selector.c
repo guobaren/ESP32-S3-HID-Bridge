@@ -28,15 +28,22 @@ output_mode_t output_mode_selector_set_connected(
     }
     *flag = connected;
 
+    /* 当前活动链路仍在线时保持锁定，后来连接的链路不得主动抢占。 */
+    if ((selector->active_mode == OUTPUT_MODE_USB && selector->usb_connected) ||
+        (selector->active_mode == OUTPUT_MODE_BLE && selector->ble_connected)) {
+        return selector->active_mode;
+    }
+
     /*
-     * BLE 只有在加密完成、HID 真正可发送后才会被标记为 connected。
-     * 因此 BLE 就绪时优先使用 BLE；这样原生 USB 即使仍接着供电或已枚举，
-     * 也不会阻止用户切换到 BLE。BLE 断开后再安全回退到 USB。
+     * 没有活动链路时，由本次新连接的链路先取得输出；当前链路断开时，
+     * 则切换到仍在线的另一条链路。正常事件序列下不会同时满足两个回退项。
      */
-    if (selector->ble_connected) {
-        selector->active_mode = OUTPUT_MODE_BLE;
+    if (connected) {
+        selector->active_mode = mode;
     } else if (selector->usb_connected) {
         selector->active_mode = OUTPUT_MODE_USB;
+    } else if (selector->ble_connected) {
+        selector->active_mode = OUTPUT_MODE_BLE;
     } else {
         selector->active_mode = OUTPUT_MODE_NONE;
     }

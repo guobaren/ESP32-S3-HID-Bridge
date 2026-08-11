@@ -6,6 +6,12 @@ namespace HidBridge.Host.Ui;
 
 internal sealed class BridgeMainForm : Form
 {
+    private static readonly Color DeepSurfaceColor = Color.FromArgb(24, 31, 42);
+    private static readonly Color PrimaryTextOnDeepSurface = Color.FromArgb(245, 248, 252);
+    private static readonly Color SecondaryTextOnDeepSurface = Color.FromArgb(190, 202, 218);
+    private static readonly Color SuccessTextOnDeepSurface = Color.FromArgb(85, 224, 164);
+    private static readonly Color DangerTextOnDeepSurface = Color.FromArgb(255, 154, 154);
+
     private readonly InputForwarder _input;
     private readonly RuntimeLogSettings _logSettings;
     private readonly MouseCursorLock _cursorLock = new();
@@ -13,6 +19,9 @@ internal sealed class BridgeMainForm : Form
     private readonly Label _statusLabel;
     private readonly TextBox _logTextBox;
     private readonly ComboBox _logModeComboBox;
+    private readonly CheckBox _simulatedUdpCheckBox;
+    private readonly ComboBox _simulatedUdpFrequencyComboBox;
+    private readonly CheckBox _udpSmoothingCheckBox;
     private readonly System.Windows.Forms.Timer _logFlushTimer;
     private readonly SplitContainer _split;
     private readonly List<string> _pendingLogs = [];
@@ -49,7 +58,7 @@ internal sealed class BridgeMainForm : Form
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = true,
             Text = "同步已关闭",
-            ForeColor = Color.FromArgb(76, 88, 106),
+            ForeColor = SecondaryTextOnDeepSurface,
         };
 
         Label endpointLabel = new()
@@ -58,7 +67,76 @@ internal sealed class BridgeMainForm : Form
             TextAlign = ContentAlignment.MiddleRight,
             AutoEllipsis = true,
             Text = endpointDescription,
-            ForeColor = Color.FromArgb(92, 105, 124),
+            ForeColor = SecondaryTextOnDeepSurface,
+        };
+
+        _simulatedUdpCheckBox = new CheckBox
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Text = "模拟 UDP",
+            AccessibleName = "模拟 UDP 输入开关",
+            BackColor = DeepSurfaceColor,
+            ForeColor = PrimaryTextOnDeepSurface,
+            Checked = false,
+            UseVisualStyleBackColor = false,
+        };
+        _simulatedUdpFrequencyComboBox = new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            AccessibleName = "模拟 UDP 输入频率",
+            FormattingEnabled = true,
+            Enabled = false,
+            BackColor = Color.FromArgb(249, 250, 252),
+            ForeColor = Color.FromArgb(38, 47, 61),
+        };
+        _simulatedUdpFrequencyComboBox.Items.AddRange(
+            SimulatedUdpMouseInput.SupportedFrequencies.Cast<object>().ToArray());
+        _simulatedUdpFrequencyComboBox.Format += (_, eventArgs) =>
+        {
+            if (eventArgs.ListItem is int frequencyHz)
+            {
+                eventArgs.Value = FormatSimulatedUdpFrequency(frequencyHz);
+            }
+        };
+        _simulatedUdpFrequencyComboBox.SelectedItem = 100;
+        _udpSmoothingCheckBox = new CheckBox
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Text = "UDP 平滑",
+            AccessibleName = "UDP 平滑功能开关",
+            AccessibleDescription = "请先按 HOME 关闭同步，再切换 UDP 平滑。",
+            Checked = true,
+            BackColor = DeepSurfaceColor,
+            ForeColor = PrimaryTextOnDeepSurface,
+            UseVisualStyleBackColor = false,
+        };
+        _udpSmoothingCheckBox.CheckedChanged += (_, _) =>
+        {
+            _input.ConfigureUdpSmoothing(_udpSmoothingCheckBox.Checked);
+            AppendLog(_udpSmoothingCheckBox.Checked
+                ? "UDP 平滑已开启：真实和模拟 UDP 移动分摊到固定 10 个 2 ms 槽，最大计划尾部 20 ms。"
+                : "UDP 平滑已关闭：真实和模拟 UDP 移动跳过低延迟分摊，直接进入 500 Hz 报告聚合。");
+        };
+        _simulatedUdpCheckBox.CheckedChanged += (_, _) =>
+        {
+            int frequencyHz = GetSelectedSimulatedUdpFrequency();
+            _simulatedUdpFrequencyComboBox.Enabled = _simulatedUdpCheckBox.Checked;
+            _input.ConfigureSimulatedUdpInput(_simulatedUdpCheckBox.Checked, frequencyHz);
+            AppendLog(_simulatedUdpCheckBox.Checked
+                ? $"模拟 UDP 输入已开启：源频率={FormatSimulatedUdpFrequency(frequencyHz)}；移动和滚轮进入 UDP 公共后续链路，按钮保持即时发送。"
+                : "模拟 UDP 输入已关闭：实体鼠标恢复直接进入 500 Hz 聚合链路。");
+        };
+        _simulatedUdpFrequencyComboBox.SelectedIndexChanged += (_, _) =>
+        {
+            int frequencyHz = GetSelectedSimulatedUdpFrequency();
+            _input.ConfigureSimulatedUdpInput(_simulatedUdpCheckBox.Checked, frequencyHz);
+            if (_simulatedUdpCheckBox.Checked)
+            {
+                AppendLog($"模拟 UDP 输入频率已切换为 {FormatSimulatedUdpFrequency(frequencyHz)}。");
+            }
         };
 
         TableLayoutPanel shortcutBar = new()
@@ -66,20 +144,28 @@ internal sealed class BridgeMainForm : Form
             Dock = DockStyle.Top,
             Height = 46,
             Padding = new Padding(14, 4, 14, 4),
-            ColumnCount = 3,
+            ColumnCount = 6,
+            BackColor = DeepSurfaceColor,
+            ForeColor = PrimaryTextOnDeepSurface,
         };
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 14));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 11));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 13));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
         shortcutBar.Controls.Add(_statusLabel, 0, 0);
         shortcutBar.Controls.Add(new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter,
             Text = "HOME：开启 / 关闭同步",
-            ForeColor = Color.FromArgb(58, 72, 92),
+            ForeColor = PrimaryTextOnDeepSurface,
         }, 1, 0);
-        shortcutBar.Controls.Add(endpointLabel, 2, 0);
+        shortcutBar.Controls.Add(_simulatedUdpCheckBox, 2, 0);
+        shortcutBar.Controls.Add(_simulatedUdpFrequencyComboBox, 3, 0);
+        shortcutBar.Controls.Add(_udpSmoothingCheckBox, 4, 0);
+        shortcutBar.Controls.Add(endpointLabel, 5, 0);
 
         TableLayoutPanel endingBar = new()
         {
@@ -87,6 +173,8 @@ internal sealed class BridgeMainForm : Form
             Height = 34,
             Padding = new Padding(14, 0, 14, 4),
             ColumnCount = 2,
+            BackColor = DeepSurfaceColor,
+            ForeColor = SecondaryTextOnDeepSurface,
         };
         endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
         endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
@@ -95,17 +183,22 @@ internal sealed class BridgeMainForm : Form
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             Text = "左右键同按开始记录；全部松开 3 秒后生成分析图",
-            ForeColor = Color.FromArgb(92, 105, 124),
+            ForeColor = SecondaryTextOnDeepSurface,
         }, 0, 0);
         endingBar.Controls.Add(new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleRight,
             Text = "END：结束程序",
-            ForeColor = Color.FromArgb(176, 76, 76),
+            ForeColor = DangerTextOnDeepSurface,
         }, 1, 0);
 
-        Panel capturePanel = new() { Dock = DockStyle.Fill, BackColor = Color.FromArgb(24, 31, 42) };
+        Panel capturePanel = new()
+        {
+            Dock = DockStyle.Fill,
+            BackColor = DeepSurfaceColor,
+            ForeColor = PrimaryTextOnDeepSurface,
+        };
         capturePanel.Controls.Add(_captureSurface);
         capturePanel.Controls.Add(endingBar);
         capturePanel.Controls.Add(shortcutBar);
@@ -207,6 +300,9 @@ internal sealed class BridgeMainForm : Form
 
     internal TextBox LogTextBox => _logTextBox;
     internal ComboBox LogModeComboBox => _logModeComboBox;
+    internal CheckBox SimulatedUdpCheckBox => _simulatedUdpCheckBox;
+    internal ComboBox SimulatedUdpFrequencyComboBox => _simulatedUdpFrequencyComboBox;
+    internal CheckBox UdpSmoothingCheckBox => _udpSmoothingCheckBox;
     internal MouseCaptureSurface CaptureSurface => _captureSurface;
     internal SplitContainer MainSplit => _split;
 
@@ -384,10 +480,13 @@ internal sealed class BridgeMainForm : Form
         }
 
         _captureSurface.Forwarding = enabled;
+        _udpSmoothingCheckBox.Enabled = !enabled;
         _statusLabel.Text = enabled ? "同步已开启" : "同步已关闭";
-        _statusLabel.ForeColor = enabled ? Color.FromArgb(27, 139, 91) : Color.FromArgb(76, 88, 106);
+        _statusLabel.ForeColor = enabled ? SuccessTextOnDeepSurface : SecondaryTextOnDeepSurface;
         Text = enabled ? "ESP32-S3 HID Bridge - 同步已开启" : "ESP32-S3 HID Bridge - 同步已关闭";
-        AppendLog(enabled ? "键鼠同步已开启，鼠标已锁定到上半区中心。" : "键鼠同步已关闭，本机输入已恢复。");
+        AppendLog(enabled
+            ? $"键鼠同步已开启，鼠标已锁定到上半区中心；UDP 平滑={(_input.UdpSmoothingEnabled ? "开启" : "关闭")}，切换前请先按 HOME 关闭同步。"
+            : "键鼠同步已关闭，本机输入已恢复；现在可以切换 UDP 平滑。");
 
         if (enabled)
         {
@@ -412,6 +511,14 @@ internal sealed class BridgeMainForm : Form
         }
         Close();
     }
+
+    private int GetSelectedSimulatedUdpFrequency() =>
+        _simulatedUdpFrequencyComboBox.SelectedItem is int frequencyHz ? frequencyHz : 100;
+
+    private static string FormatSimulatedUdpFrequency(int frequencyHz) =>
+        frequencyHz == SimulatedUdpMouseInput.UnlimitedFrequencyHz
+            ? "无上限"
+            : $"{frequencyHz} Hz";
 
     private void InputOnMovementRecordingStarted()
     {

@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
+using System.Drawing;
 using System.Net.Sockets;
 using System.Text;
 using HidBridge.Host;
@@ -11,6 +12,8 @@ using HidBridge.Protocol;
 
 CheckMouseReportCodec();
 CheckMouseAggregation();
+CheckSimulatedUdpInputAggregation();
+CheckUdpSmoothingSwitch();
 CheckUdpMouseSmoothing();
 CheckMouseMovementRecordingAndChart();
 CheckSerialDiscoveryProtocol();
@@ -21,7 +24,7 @@ CheckCursorLockGeometry();
 CheckUiLogWriter();
 CheckRemoteInputUdpPath();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 模拟输入、实时日志和窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、UDP 平滑开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、实时日志和窗口布局。");
 
 static void CheckMouseReportCodec()
 {
@@ -99,6 +102,208 @@ static void CheckMouseAggregation()
     pump.Accumulate(0, false, 100, 100, 0, 0);
     Thread.Sleep(10);
     Require(transport.MouseReports().Length == countAfterStop, "停止转发后不得继续发送鼠标报告");
+}
+
+static void CheckSimulatedUdpInputAggregation()
+{
+    Require(
+        SimulatedUdpMouseInput.SupportedFrequencies.SequenceEqual([30, 60, 100, 140, 200, 500, 0]),
+        "模拟 UDP 输入频率列表不正确");
+
+    const long timestampFrequency = 1_000_000;
+    foreach (int frequencyHz in SimulatedUdpMouseInput.SupportedFrequencies.Where(value => value > 0))
+    {
+        SimulatedUdpMouseInput aggregator = new(timestampFrequency);
+        aggregator.Configure(true, frequencyHz, nowTimestamp: 0);
+        long intervalTicks = (timestampFrequency + frequencyHz - 1) / frequencyHz;
+        Require(
+            !aggregator.Accumulate(7, -5, 2, -1, out _),
+            $"模拟 UDP {frequencyHz} Hz 不应逐事件立即输出");
+        Require(
+            !aggregator.Accumulate(3, 1, -1, 1, out _),
+            $"模拟 UDP {frequencyHz} Hz 不应逐事件立即输出");
+        Require(
+            !aggregator.TryFlush(intervalTicks - 1, out _),
+            $"模拟 UDP {frequencyHz} Hz 在周期到达前不得提前输出");
+        Require(
+            aggregator.TryFlush(intervalTicks, out MouseDelta bucket),
+            $"模拟 UDP {frequencyHz} Hz 到达周期后未输出整合数据");
+        Require(
+            bucket == new MouseDelta(10, -4, 1, 0),
+            $"模拟 UDP {frequencyHz} Hz 整合后各轴总量不正确：{bucket}");
+        Require(
+            !aggregator.TryFlush(intervalTicks * 2, out _),
+            $"模拟 UDP {frequencyHz} Hz 无新输入时不得产生空数据报");
+    }
+
+    SimulatedUdpMouseInput hundredHz = new(timestampFrequency);
+    hundredHz.Configure(true, 100, nowTimestamp: 0);
+    Require(!hundredHz.Accumulate(1, 2, 0, 0, out _), "模拟 UDP 100 Hz 不应立即输出");
+    Require(!hundredHz.TryFlush(9_999, out _), "模拟 UDP 100 Hz 必须整合完整 10 ms");
+    Require(hundredHz.TryFlush(10_000, out MouseDelta hundredHzBucket), "模拟 UDP 100 Hz 未按 10 ms 输出");
+    Require(hundredHzBucket == new MouseDelta(1, 2, 0, 0), "模拟 UDP 100 Hz 输出数据不正确");
+
+    SimulatedUdpMouseInput unlimited = new(timestampFrequency);
+    unlimited.Configure(true, SimulatedUdpMouseInput.UnlimitedFrequencyHz, nowTimestamp: 0);
+    Require(unlimited.Unlimited, "模拟 UDP 无上限模式状态不正确");
+    Require(
+        unlimited.Accumulate(7, -5, 2, -1, out MouseDelta firstUnlimited) &&
+        firstUnlimited == new MouseDelta(7, -5, 2, -1),
+        $"无上限模式第一条原始事件未立即形成独立命令：{firstUnlimited}");
+    Require(
+        unlimited.Accumulate(3, 1, -1, 1, out MouseDelta secondUnlimited) &&
+        secondUnlimited == new MouseDelta(3, 1, -1, 1),
+        $"无上限模式第二条原始事件未立即形成独立命令：{secondUnlimited}");
+    Require(!unlimited.TryFlush(long.MaxValue, out _), "无上限模式不应等待定时分桶");
+    SimulatedUdpInputStatistics unlimitedStatistics = unlimited.GetStatistics();
+    Require(unlimitedStatistics.EmittedBuckets == 2, "无上限模式应逐事件生成两条模拟 UDP 命令");
+    Require(
+        unlimitedStatistics.PendingX == 0 && unlimitedStatistics.PendingY == 0 &&
+        unlimitedStatistics.PendingWheel == 0 && unlimitedStatistics.PendingPan == 0,
+        "无上限模式不得保留源分桶积压");
+
+    RecordingTransport transport = new();
+    using MouseReportPump pump = new(transport);
+    pump.ConfigureSimulatedUdpInput(true, 100);
+    pump.ResetAndSendRelease(true);
+    Require(pump.SimulatedUdpInputEnabled, "500 Hz 泵未保持模拟 UDP 开关状态");
+    Require(pump.SimulatedUdpInputFrequencyHz == 100, "500 Hz 泵未保持模拟 UDP 频率");
+
+    pump.Accumulate(1, true, 0, 0, 0, 0);
+    DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline && transport.MouseReports().Length < 1)
+    {
+        Thread.Sleep(2);
+    }
+    Require(transport.MouseReports().Length >= 1, "模拟 UDP 模式下按钮报告未送出");
+    Require(
+        transport.MouseReports().FirstOrDefault().Buttons == 1,
+        "模拟 UDP 模式下鼠标按钮必须即时进入报告链路");
+
+    for (int index = 0; index < 10; index++)
+    {
+        pump.Accumulate(1, false, 2, -1, 0, 0);
+    }
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           transport.MouseReports().Sum(report => (long)report.X) < 20)
+    {
+        Thread.Sleep(2);
+    }
+    MouseReport[] actual = transport.MouseReports();
+    Require(actual.Sum(report => (long)report.X) == 20, "模拟 UDP 实际链路 X 总量不守恒");
+    Require(actual.Sum(report => (long)report.Y) == -10, "模拟 UDP 实际链路 Y 总量不守恒");
+
+    pump.ConfigureSimulatedUdpInput(false, 100);
+    Require(!pump.SimulatedUdpInputEnabled, "模拟 UDP 开关关闭后状态不正确");
+    pump.Accumulate(1, false, 5, 3, 0, 0);
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           transport.MouseReports().Sum(report => (long)report.X) < 25)
+    {
+        Thread.Sleep(2);
+    }
+    actual = transport.MouseReports();
+    Require(actual.Sum(report => (long)report.X) == 25, "关闭模拟 UDP 后直接输入 X 未送出");
+    Require(actual.Sum(report => (long)report.Y) == -7, "关闭模拟 UDP 后直接输入 Y 未送出");
+
+    RecordingTransport switchTransport = new();
+    using MouseReportPump switchPump = new(switchTransport);
+    switchPump.ConfigureSimulatedUdpInput(true, 30);
+    switchPump.ResetAndSendRelease(true);
+    switchPump.Accumulate(0, false, 11, -6, 0, 0);
+    switchPump.ConfigureSimulatedUdpInput(true, 200);
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           switchTransport.MouseReports().Sum(report => (long)report.X) < 11)
+    {
+        Thread.Sleep(2);
+    }
+    MouseReport[] switched = switchTransport.MouseReports();
+    Require(switched.Sum(report => (long)report.X) == 11, "切换模拟 UDP 频率时缓冲 X 丢失");
+    Require(switched.Sum(report => (long)report.Y) == -6, "切换模拟 UDP 频率时缓冲 Y 丢失");
+
+    int beforeRealUdp = switched.Length;
+    switchPump.AccumulateRemote(13, 4, 0, 0);
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           switchTransport.MouseReports().Sum(report => (long)report.X) < 24)
+    {
+        Thread.Sleep(2);
+    }
+    switched = switchTransport.MouseReports();
+    Require(switched.Length > beforeRealUdp, "模拟频率设置不应阻止真实 UDP 输入进入公共链路");
+    Require(switched.Sum(report => (long)report.X) == 24, "真实 UDP 与模拟 UDP 公共链路 X 总量不正确");
+    Require(switched.Sum(report => (long)report.Y) == -2, "真实 UDP 与模拟 UDP 公共链路 Y 总量不正确");
+
+    switchPump.ConfigureSimulatedUdpInput(true, 30);
+    switchPump.Accumulate(0, false, 9, 9, 0, 0);
+    switchPump.ResetAndSendRelease(false);
+    long stoppedX = switchTransport.MouseReports().Sum(report => (long)report.X);
+    Thread.Sleep(50);
+    Require(
+        switchTransport.MouseReports().Sum(report => (long)report.X) == stoppedX,
+        "停止同步后不得继续发送模拟 UDP 缓冲移动");
+    Console.WriteLine(
+        "模拟 UDP 输入检查：频率=[30,60,100,140,200,500] Hz 和无上限；" +
+        "100 Hz=10 ms、500 Hz=2 ms；无上限逐原始事件生成命令；" +
+        "频率只影响模拟源，按钮即时发送，真实 UDP 共用后续链路，停止后无残留移动。");
+}
+
+static void CheckUdpSmoothingSwitch()
+{
+    RecordingTransport directTransport = new();
+    using MouseReportPump directPump = new(directTransport);
+    Require(directPump.UdpSmoothingEnabled, "UDP 平滑默认必须开启");
+    directPump.ConfigureUdpSmoothing(false);
+    Require(!directPump.UdpSmoothingEnabled, "UDP 平滑开关关闭后状态不正确");
+    directPump.ResetAndSendRelease(true);
+
+    directPump.AccumulateRemote(37, -19, 2, -1);
+    DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline && directTransport.MouseReports().Length == 0)
+    {
+        Thread.Sleep(2);
+    }
+
+    MouseReport[] direct = directTransport.MouseReports();
+    Require(direct.Length == 1, $"关闭平滑后单条 UDP 命令应直接产生 1 个报告，实际={direct.Length}");
+    Require(direct[0].X == 37, $"关闭平滑后 X 应直接输出 37，实际={direct[0].X}");
+    Require(direct[0].Y == -19, $"关闭平滑后 Y 应直接输出 -19，实际={direct[0].Y}");
+    Require(direct[0].Wheel == 2, $"关闭平滑后 Wheel 应直接输出 2，实际={direct[0].Wheel}");
+    Require(direct[0].Pan == -1, $"关闭平滑后 Pan 应直接输出 -1，实际={direct[0].Pan}");
+
+    directPump.ResetAndSendRelease(false);
+    directPump.ConfigureUdpSmoothing(true);
+    Require(directPump.UdpSmoothingEnabled, "UDP 平滑开关重新开启后状态不正确");
+
+    RecordingTransport preserveTransport = new();
+    using MouseReportPump preservePump = new(preserveTransport);
+    preservePump.ResetAndSendRelease(true);
+    for (int index = 0; index < 10; index++)
+    {
+        preservePump.AccumulateRemote(1, 0, 0, 0);
+    }
+    preservePump.AccumulateRemote(50, 0, 0, 0);
+    preservePump.ConfigureUdpSmoothing(false);
+    Require(preservePump.UdpSmoothingEnabled, "同步开启时不应允许切换 UDP 平滑");
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           preserveTransport.MouseReports().Sum(report => (long)report.X) < 60)
+    {
+        Thread.Sleep(2);
+    }
+    Require(
+        preserveTransport.MouseReports().Sum(report => (long)report.X) == 60,
+        "同步中拒绝切换后，旧平滑队列总位移必须完整输出");
+    preservePump.ResetAndSendRelease(false);
+    preservePump.ConfigureUdpSmoothing(false);
+    Require(!preservePump.UdpSmoothingEnabled, "HOME 关闭后应允许切换 UDP 平滑");
+
+    Console.WriteLine(
+        "UDP 平滑开关检查：默认开启；关闭后单条命令实际直接输出 " +
+        $"X={direct[0].X},Y={direct[0].Y},Wheel={direct[0].Wheel},Pan={direct[0].Pan}；" +
+        "同步中拒绝切换且旧队列 X=60 完整输出，HOME 关闭后可安全切换。");
 }
 
 static void CheckMouseMovementRecordingAndChart()
@@ -228,76 +433,122 @@ static void CheckMouseMovementRecordingAndChart()
 
 static void CheckUdpMouseSmoothing()
 {
-    DateTime start = new(2026, 8, 9, 5, 0, 0, DateTimeKind.Utc);
     UdpMouseSmoother smoother = new();
-
-    for (int index = 0; index < 10; index++)
-    {
-        smoother.Enqueue(new MouseDelta(1, -1, 0, 0), start.AddMilliseconds(index * 9));
-        Require(smoother.TryDequeue(out MouseDelta initial), "首个统计窗 UDP 数据未进入发送队列");
-        Require(initial == new MouseDelta(1, -1, 0, 0), "首个统计窗不应在没有历史速率时改写数据");
-    }
-
-    smoother.Enqueue(new MouseDelta(50, -7, 5, -5), start.AddMilliseconds(101));
+    smoother.Enqueue(new MouseDelta(50, -7, 5, -5));
     UdpMouseSmootherStatistics statistics = smoother.GetStatistics();
-    Require(statistics.LastWindowPackets == 10, "UDP 平滑未统计到前 100 ms 的 10 个数据报");
-    Require(statistics.ReferencePacketsPerWindow == 10, "UDP 平滑参考接收速率不正确");
-    Require(statistics.PendingParts == 5, "10 次/100 ms 时每条后续命令必须拆成 5 份");
+    Require(statistics.SmoothingSlots == 10, "UDP 低延迟平滑窗必须为 10 个 2 ms 槽");
+    Require(statistics.PendingSlots == 10, "首条 UDP 命令必须立即分摊到 10 个发送槽");
 
     List<MouseDelta> parts = [];
-    while (smoother.TryDequeue(out MouseDelta part))
+    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots; index++)
     {
+        Require(smoother.TryDequeue(out MouseDelta part), $"UDP 平滑第 {index + 1} 槽没有输出");
         parts.Add(part);
     }
-    Require(parts.Count == 5, $"UDP 命令拆分份数不正确：{parts.Count}");
-    Require(parts.All(part => part.X == 10), "X=50 拆成 5 份时每份必须为 10");
+    Require(parts[0].X == 5, "首条快速移动不应整包跳变，首槽应仅输出 X=5");
+    Require(parts.All(part => part.X == 5), "X=50 拆成 10 份时每份必须为 5");
     Require(parts.Sum(part => part.X) == 50, "UDP 平滑后的 X 总位移不守恒");
     Require(parts.Sum(part => part.Y) == -7, "UDP 平滑后的负 Y 总位移不守恒");
     Require(parts.Sum(part => part.Wheel) == 5, "UDP 平滑后的滚轮总量不守恒");
     Require(parts.Sum(part => part.Pan) == -5, "UDP 平滑后的负横向滚轮总量不守恒");
+    Require(smoother.GetStatistics().PendingSlots == 0, "10 槽输出后不应残留平滑积压");
 
     smoother.Reset();
     Require(!smoother.TryDequeue(out _), "重置 UDP 平滑器后不得继续发送旧移动");
-    smoother.Enqueue(new MouseDelta(1, 0, 0, 0), start);
-    smoother.Enqueue(new MouseDelta(50, 0, 0, 0), start.AddMilliseconds(101));
-    for (int index = 0; index < 20; index++)
+    smoother.Reset();
+    for (int index = 0; index < 10; index++)
     {
-        smoother.Enqueue(new MouseDelta(50, 0, 0, 0), start.AddMilliseconds(102 + index));
+        smoother.Enqueue(new MouseDelta(1, -1, 0, 0));
+    }
+    List<MouseDelta> smallBurst = [];
+    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots; index++)
+    {
+        Require(smoother.TryDequeue(out MouseDelta smallPart), "10 条小步输入未覆盖全部平滑槽");
+        smallBurst.Add(smallPart);
+    }
+    Require(
+        smallBurst.All(delta => delta.X == 1 && delta.Y == -1),
+        $"10 条小步输入应均匀分散为每槽 (1,-1)，实际={string.Join(";", smallBurst)}");
+
+    smoother.Reset();
+    List<MouseDelta> continuous = [];
+    for (int index = 0; index < 100; index++)
+    {
+        smoother.Enqueue(new MouseDelta(50, -25, 0, 0));
+        Require(smoother.TryDequeue(out MouseDelta output), "连续输入的当前 2 ms 槽没有输出");
+        continuous.Add(output);
+    }
+    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots - 1; index++)
+    {
+        Require(smoother.TryDequeue(out MouseDelta tail), "连续输入停止后的平滑尾部提前中断");
+        continuous.Add(tail);
+    }
+    Require(
+        continuous.Take(10).Select(delta => delta.X).SequenceEqual(
+            [5L, 10L, 15L, 20L, 25L, 30L, 35L, 40L, 45L, 50L]),
+        $"连续移动启动斜坡不正确：{string.Join(',', continuous.Take(10).Select(delta => delta.X))}");
+    Require(
+        continuous.TakeLast(9).Select(delta => delta.X).SequenceEqual(
+            [45L, 40L, 35L, 30L, 25L, 20L, 15L, 10L, 5L]),
+        $"连续移动停止尾部不正确：{string.Join(',', continuous.TakeLast(9).Select(delta => delta.X))}");
+    Require(continuous.Sum(delta => delta.X) == 5_000, "连续输入平滑后的 X 总位移不守恒");
+    Require(continuous.Sum(delta => delta.Y) == -2_500, "连续输入平滑后的 Y 总位移不守恒");
+    Require(smoother.GetStatistics().PendingSlots == 0, "连续输入停止 9 槽后仍有平滑积压");
+
+    smoother.Reset();
+    for (int index = 0; index < 1_000; index++)
+    {
+        smoother.Enqueue(new MouseDelta(10, -10, 0, 0));
     }
     statistics = smoother.GetStatistics();
-    Require(statistics.PendingParts <= 101, "UDP 输入突增时平滑队列没有受到上限约束");
-    Require(statistics.OverflowMerges == 19, "UDP 输入突增时过载命令合并计数不正确");
-    long overloadedTotalX = 0;
-    while (smoother.TryDequeue(out MouseDelta overloadedPart))
+    Require(statistics.PendingSlots == 10, "突发输入只能占用固定 10 个未来槽");
+    Require(statistics.OverlappingCommands == 999, "突发输入重叠分摊计数不正确");
+    long burstX = 0;
+    long burstY = 0;
+    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots; index++)
     {
-        overloadedTotalX += overloadedPart.X;
+        Require(smoother.TryDequeue(out MouseDelta burstPart), "突发输入固定槽提前中断");
+        burstX += burstPart.X;
+        burstY += burstPart.Y;
     }
-    Require(overloadedTotalX == 1051, "UDP 输入过载合并后 X 总位移不守恒");
+    Require(burstX == 10_000 && burstY == -10_000, "突发输入固定槽合并后总位移不守恒");
 
     RecordingTransport transport = new();
     using MouseReportPump pump = new(transport);
     pump.ResetAndSendRelease(true);
-    for (int index = 0; index < 10; index++)
-    {
-        pump.AccumulateRemote(1, -1, 0, 0, start.AddMilliseconds(index * 9));
-    }
-    pump.AccumulateRemote(50, -7, 5, -5, start.AddMilliseconds(101));
+    long injectedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+    pump.AccumulateRemote(50, -10, 5, -5);
     DateTime deadline = DateTime.UtcNow.AddSeconds(2);
-    while (DateTime.UtcNow < deadline && transport.MouseReports().Length < 15)
+    while (DateTime.UtcNow < deadline && transport.MouseReports().Length < 10)
     {
-        Thread.Sleep(5);
+        Thread.Sleep(2);
     }
     MouseReport[] actual = transport.MouseReports();
-    Require(actual.Length == 15, $"500 Hz 实际平滑链路报告数不正确：{actual.Length}");
-    Require(actual.Take(10).All(report => report.X == 1), "首个统计窗的实际报告顺序不正确");
-    Require(actual.Skip(10).All(report => report.X == 10), "实际 500 Hz 链路未把 X=50 分成 5 个 X=10");
-    Require(actual.Sum(report => (long)report.X) == 60, "实际平滑链路 X 总位移不守恒");
-    Require(actual.Sum(report => (long)report.Y) == -17, "实际平滑链路 Y 总位移不守恒");
+    Require(actual.Length == 10, $"500 Hz 实际低延迟平滑链路报告数不正确：{actual.Length}");
+    Require(actual.All(report => report.X == 5), "实际链路未从首条命令开始按 X=5 平滑输出");
+    Require(actual.Sum(report => (long)report.X) == 50, "实际平滑链路 X 总位移不守恒");
+    Require(actual.Sum(report => (long)report.Y) == -10, "实际平滑链路 Y 总位移不守恒");
     Require(actual.Sum(report => (long)report.Wheel) == 5, "实际平滑链路滚轮总量不守恒");
     Require(actual.Sum(report => (long)report.Pan) == -5, "实际平滑链路横向滚轮总量不守恒");
+    long[] actualTimestamps = transport.MouseTimestamps().TakeLast(10).ToArray();
+    double completionMilliseconds =
+        (actualTimestamps[^1] - injectedTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+    double maximumReportGapMilliseconds = actualTimestamps
+        .Zip(actualTimestamps.Skip(1), (previous, current) =>
+            (current - previous) * 1000.0 / System.Diagnostics.Stopwatch.Frequency)
+        .Max();
+    Require(
+        completionMilliseconds < 100,
+        $"实际低延迟平滑尾部超过 100 ms：{completionMilliseconds:F1} ms");
+    Require(
+        maximumReportGapMilliseconds < 50,
+        $"实际低延迟平滑报告出现超过 50 ms 的间隔：{maximumReportGapMilliseconds:F1} ms");
     Console.WriteLine(
-        "UDP 平滑检查：前窗=10 次/100ms，后续命令 (50,-7,5,-5) 拆为 5 份，" +
-        "500 Hz 实际链路输出 15 份，各轴求和与原始命令完全一致。");
+        "UDP 低延迟平滑检查：首条 (50,-7,5,-5) 立即分摊为 10 槽且首槽 X=5；" +
+        "同一泵周期 10 条 (1,-1) 均匀分散为每槽 (1,-1)；" +
+        "连续 100 个输入只保留 9 槽尾部，总量 X=5000/Y=-2500；" +
+        "1000 条突发输入仍固定 10 槽；500 Hz 实际链路输出 10 份且总量守恒，" +
+        $"实际尾部完成={completionMilliseconds:F1} ms，最大报告间隔={maximumReportGapMilliseconds:F1} ms。");
 }
 
 static void CheckSerialDiscoveryProtocol()
@@ -506,6 +757,40 @@ static void CheckWindowLayout()
             form.LogModeComboBox.SelectedIndex = 1;
             Require(form.LogModeComboBox.SelectedIndex == 1, "日志模式必须能切换到完整诊断");
             form.LogModeComboBox.SelectedIndex = 0;
+            Require(!form.SimulatedUdpCheckBox.Checked, "模拟 UDP 开关默认必须关闭");
+            Require(!input.SimulatedUdpInputEnabled, "界面创建后模拟 UDP 状态应默认关闭");
+            Require(!form.SimulatedUdpFrequencyComboBox.Enabled, "模拟 UDP 关闭时频率列表应禁用");
+            Require(
+                form.SimulatedUdpFrequencyComboBox.Items.Cast<int>().SequenceEqual([30, 60, 100, 140, 200, 500, 0]),
+                "模拟 UDP 界面频率列表不正确");
+            Require(
+                form.SimulatedUdpFrequencyComboBox.SelectedItem is 100,
+                "模拟 UDP 默认频率必须为 100 Hz");
+            Require(form.UdpSmoothingCheckBox.Checked, "UDP 平滑开关默认必须开启");
+            Require(input.UdpSmoothingEnabled, "界面创建后 UDP 平滑状态应默认开启");
+            form.UdpSmoothingCheckBox.Checked = false;
+            Require(!input.UdpSmoothingEnabled, "界面开关未关闭 UDP 平滑");
+            form.UdpSmoothingCheckBox.Checked = true;
+            Require(input.UdpSmoothingEnabled, "界面开关未重新开启 UDP 平滑");
+            input.SetForwardingEnabled(true);
+            Require(!form.UdpSmoothingCheckBox.Enabled, "同步开启时 UDP 平滑开关必须禁用");
+            input.SetForwardingEnabled(false);
+            Require(form.UdpSmoothingCheckBox.Enabled, "同步关闭后 UDP 平滑开关必须恢复可用");
+            form.SimulatedUdpCheckBox.Checked = true;
+            Require(input.SimulatedUdpInputEnabled, "界面开关未启用模拟 UDP 输入");
+            Require(form.SimulatedUdpFrequencyComboBox.Enabled, "模拟 UDP 开启时频率列表未启用");
+            form.SimulatedUdpFrequencyComboBox.SelectedItem = 140;
+            Require(input.SimulatedUdpInputFrequencyHz == 140, "界面频率列表未切换到 140 Hz");
+            form.SimulatedUdpFrequencyComboBox.SelectedItem = 500;
+            Require(input.SimulatedUdpInputFrequencyHz == 500, "界面频率列表未切换到 500 Hz");
+            form.SimulatedUdpFrequencyComboBox.SelectedItem = 0;
+            Require(input.SimulatedUdpInputFrequencyHz == 0, "界面频率列表未切换到无上限");
+            Require(
+                form.SimulatedUdpFrequencyComboBox.GetItemText(
+                    form.SimulatedUdpFrequencyComboBox.SelectedItem) == "无上限",
+                "模拟 UDP 无上限选项显示文案不正确");
+            form.SimulatedUdpCheckBox.Checked = false;
+            Require(!input.SimulatedUdpInputEnabled, "界面开关未关闭模拟 UDP 输入");
             form.AppendLog("可复制日志检查");
             Require(form.LogTextBox.Text.Contains("可复制日志检查", StringComparison.Ordinal), "日志内容未实际写入窗口文本框");
             for (int index = 0; index < 160; index++)
@@ -535,8 +820,11 @@ static void CheckWindowLayout()
             string allText = string.Join("\n", EnumerateControls(form).Select(control => control.Text));
             Require(allText.Contains("HOME", StringComparison.Ordinal), "界面未显示同步快捷键");
             Require(allText.Contains("END", StringComparison.Ordinal), "界面未显示结束快捷键");
+            Require(allText.Contains("模拟 UDP", StringComparison.Ordinal), "界面未显示模拟 UDP 开关");
+            Require(allText.Contains("UDP 平滑", StringComparison.Ordinal), "界面未显示 UDP 平滑开关");
             Require(allText.Contains("左右键同按", StringComparison.Ordinal), "界面未提示鼠标移动记录触发方式");
             Require(allText.Contains("暂停自动跟随", StringComparison.Ordinal), "日志栏未提示滚动到上方后暂停自动跟随");
+            CheckDarkSurfaceTextContrast(form);
         }
         catch (Exception exception)
         {
@@ -571,6 +859,100 @@ static IEnumerable<Control> EnumerateControls(Control root)
             yield return descendant;
         }
     }
+}
+
+static void CheckDarkSurfaceTextContrast(BridgeMainForm form)
+{
+    List<(Control Control, Color ForeColor, Color BackColor, double Ratio, string Name)> checkedControls = [];
+    foreach (Control control in EnumerateControls(form))
+    {
+        // ComboBox 的文字可能由下拉项绘制；MouseCaptureSurface 的文字由控件自行绘制，
+        // 两者都不属于本检查的 WinForms 标准文字渲染范围。
+        if (control is ComboBox or MouseCaptureSurface || string.IsNullOrWhiteSpace(control.Text))
+        {
+            continue;
+        }
+
+        Color backColor = GetInheritedColor(control, useBackColor: true);
+        if (RelativeLuminance(backColor) >= 0.2)
+        {
+            continue;
+        }
+
+        Color foreColor = GetInheritedColor(control, useBackColor: false);
+        double ratio = CalculateContrastRatio(foreColor, backColor);
+        string name = GetControlEvidenceName(control);
+        Require(
+            ratio >= 4.5,
+            $"深色背景文字对比度不足：控件={name}，前景={foreColor}，背景={backColor}，对比度={ratio:F2}:1");
+        checkedControls.Add((control, foreColor, backColor, ratio, name));
+    }
+
+    Require(checkedControls.Count > 0, "未找到需要检查的深色背景文字控件");
+    var minimum = checkedControls
+        .OrderBy(item => item.Ratio)
+        .First();
+    string evidence = string.Join(
+        "; ",
+        checkedControls
+            .OrderBy(item => item.Name, StringComparer.Ordinal)
+            .Select(item => $"{item.Name}={item.Ratio:F2}:1"));
+    Console.WriteLine(
+        $"深色背景文字对比度检查：通过；实际最小={minimum.Ratio:F2}:1；控件={minimum.Name}；" +
+        $"前景={minimum.ForeColor}；背景={minimum.BackColor}；全部证据={evidence}");
+}
+
+static Color GetInheritedColor(Control control, bool useBackColor)
+{
+    for (Control? current = control; current is not null; current = current.Parent)
+    {
+        Color color = useBackColor ? current.BackColor : current.ForeColor;
+        if (color != Color.Empty && color != Color.Transparent)
+        {
+            return color;
+        }
+    }
+
+    return useBackColor ? SystemColors.Control : SystemColors.ControlText;
+}
+
+static string GetControlEvidenceName(Control control)
+{
+    if (!string.IsNullOrWhiteSpace(control.Name))
+    {
+        return control.Name;
+    }
+
+    if (!string.IsNullOrWhiteSpace(control.AccessibleName))
+    {
+        return control.AccessibleName;
+    }
+
+    return $"{control.GetType().Name}({control.Text})";
+}
+
+static double CalculateContrastRatio(Color first, Color second)
+{
+    double firstLuminance = RelativeLuminance(first);
+    double secondLuminance = RelativeLuminance(second);
+    double lighter = Math.Max(firstLuminance, secondLuminance);
+    double darker = Math.Min(firstLuminance, secondLuminance);
+    return (lighter + 0.05) / (darker + 0.05);
+}
+
+static double RelativeLuminance(Color color)
+{
+    static double Linearize(byte channel)
+    {
+        double normalized = channel / 255.0;
+        return normalized <= 0.04045
+            ? normalized / 12.92
+            : Math.Pow((normalized + 0.055) / 1.055, 2.4);
+    }
+
+    return 0.2126 * Linearize(color.R) +
+           0.7152 * Linearize(color.G) +
+           0.0722 * Linearize(color.B);
 }
 
 static void Require(bool condition, string message)

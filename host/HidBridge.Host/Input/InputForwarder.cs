@@ -38,6 +38,9 @@ internal sealed class InputForwarder : IDisposable
     }
 
     internal bool ForwardingEnabled => _mouseReportPump.Enabled;
+    internal bool SimulatedUdpInputEnabled => _mouseReportPump.SimulatedUdpInputEnabled;
+    internal int SimulatedUdpInputFrequencyHz => _mouseReportPump.SimulatedUdpInputFrequencyHz;
+    internal bool UdpSmoothingEnabled => _mouseReportPump.UdpSmoothingEnabled;
 
     internal event EventHandler<bool>? ForwardingChanged;
     internal event EventHandler? ExitRequested;
@@ -55,6 +58,12 @@ internal sealed class InputForwarder : IDisposable
     internal void DisableForwarding() => SetForwarding(false, true);
 
     internal void SetForwardingEnabled(bool enabled) => SetForwarding(enabled);
+
+    internal void ConfigureSimulatedUdpInput(bool enabled, int frequencyHz) =>
+        _mouseReportPump.ConfigureSimulatedUdpInput(enabled, frequencyHz);
+
+    internal void ConfigureUdpSmoothing(bool enabled) =>
+        _mouseReportPump.ConfigureUdpSmoothing(enabled);
 
     internal bool TryInjectMouseMovement(int deltaX, int deltaY, int wheel = 0, int pan = 0)
     {
