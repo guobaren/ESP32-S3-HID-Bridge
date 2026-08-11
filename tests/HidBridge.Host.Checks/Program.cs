@@ -1,9 +1,11 @@
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Net.Sockets;
 using System.Text;
 using HidBridge.Host;
+using HidBridge.Host.Automation;
 using HidBridge.Host.Input;
 using HidBridge.Host.RemoteInput;
 using HidBridge.Host.Transport;
@@ -23,8 +25,12 @@ CheckInputSuppressionPolicy();
 CheckCursorLockGeometry();
 CheckUiLogWriter();
 CheckRemoteInputUdpPath();
+CheckAutomationProfilesAndRuntime();
+CheckAutomationRemoteOutput();
+CheckLocalMouseTriggersReachLua();
+CheckTriggerForwardingIntegration();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、UDP 平滑开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、实时日志和窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、UDP 平滑开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
 
 static void CheckMouseReportCodec()
 {
@@ -735,6 +741,222 @@ static void CheckRemoteInputUdpPath()
     Require(transport.MouseReports().Length == reportCount, "同步关闭后 UDP 模拟输入不得继续发送鼠标报告");
 }
 
+static void CheckAutomationProfilesAndRuntime()
+{
+    string root = Path.Combine(Path.GetTempPath(), $"hidbridge-automation-{Guid.NewGuid():N}");
+    string legacy = Path.Combine(root, "legacy");
+    string legacyGlobal = Path.Combine(legacy, "Global");
+    string current = Path.Combine(root, "current");
+    Directory.CreateDirectory(legacyGlobal);
+    try
+    {
+        File.WriteAllText(
+            Path.Combine(legacyGlobal, "profile.json"),
+            """
+            {
+              "apps": ["ignored.exe"],
+              "lua_script_text": "function OnEvent(event, arg) if event == 'pressed' then move(7, -3) end end",
+              "macros": {
+                "侧键测试": { "trigger": "mouse_side1", "mode": "once", "enabled": true }
+              },
+              "device_type": "kmboxNet",
+              "screen_find_color": "#FFFFFF"
+            }
+            """);
+        File.WriteAllText(Path.Combine(legacyGlobal, "侧键测试.txt"), "move(10,-4)\nmouse(1,1)\nmouse(1,0)");
+
+        AutomationProfileStore store = new(current);
+        Require(store.TryImportLegacyMouseHubProfiles(legacy), "首次运行应导入 Mouse hub 的宏和 Lua 配置");
+        Require(!store.TryImportLegacyMouseHubProfiles(legacy), "旧配置导入必须只执行一次");
+        AutomationProfile profile = store.LoadProfile("Global");
+        Require(profile.LuaScriptText.Contains("OnEvent", StringComparison.Ordinal), "旧配置 Lua 文本未导入");
+        Require(profile.Macros.TryGetValue("侧键测试", out MacroDefinition? importedMacro), "旧配置宏元数据未导入");
+        Require(importedMacro!.Trigger == "mouse_side1" && importedMacro.Text.Contains("move(10,-4)", StringComparison.Ordinal), "旧宏触发键或正文未完整导入");
+        AutomationSettings behaviorSettings = store.LoadSettings();
+        behaviorSettings.MinimizeToTray = false;
+        behaviorSettings.CloseToTray = false;
+        behaviorSettings.GenerateMovementAnalysisImage = false;
+        store.SaveSettings(behaviorSettings);
+        AutomationSettings reloadedBehaviorSettings = store.LoadSettings();
+        Require(!reloadedBehaviorSettings.MinimizeToTray && !reloadedBehaviorSettings.CloseToTray && !reloadedBehaviorSettings.GenerateMovementAnalysisImage, "托盘与分析图片设置未持久化");
+
+        ParsedMacro staged = MacroParser.Parse(
+            "[on_press]\nmouse(1,1)\n[while_hold]\nmove(1,2)\n[on_release]\nmouse(1,0)",
+            MacroRunModes.Staged);
+        Require(staged.Errors.Count == 0, "staged 宏解析不应报错");
+        Require(staged.OnPress.Count == 1 && staged.WhileHold.Count == 1 && staged.OnRelease.Count == 1, "staged 宏分段结果不正确");
+        Require(MacroParser.Parse("keypress(home)\nkeypress(end,20)", MacroRunModes.Once).Errors.Count == 0, "HOME/END 不得被宏按键语法禁止");
+        _ = HotkeyDefinition.Parse("home");
+        _ = HotkeyDefinition.Parse("end");
+
+        RecordingAutomationOutput macroOutput = new();
+        ParsedMacro once = MacroParser.Parse(importedMacro.Text, MacroRunModes.Once);
+        using (MacroJob job = new("侧键测试", MacroRunModes.Once, once, macroOutput, _ => { }))
+        {
+            job.OnPressed();
+            Require(SpinWait.SpinUntil(() => macroOutput.Actions.Length >= 3, 1000), "宏未在超时前执行完动作");
+        }
+        Require(macroOutput.Actions.Contains("move:10,-4"), "宏 move 输出与配置不一致");
+        Require(macroOutput.Actions.ContainsSequence("mouse:1:down", "mouse:1:up"), "宏鼠标按下/松开顺序不正确");
+
+        RecordingAutomationOutput luaOutput = new();
+        List<string> luaLogs = [];
+        using LuaScriptRunner lua = new(luaOutput, luaLogs.Add, () => luaLogs.Clear());
+        string luaText = """
+            function OnEvent(event, arg)
+                if event == "pressed" and arg == 4 and IsPressed(4) then
+                    move(7, -3)
+                    mouse(1, 1)
+                    mouse(1, 0)
+                    keypress("a")
+                    randdelay(0)
+                    DebugLog("arg=%d", arg)
+                end
+            end
+            """;
+        (bool luaValid, string luaMessage) = lua.Check(luaText);
+        Require(luaValid, $"Lua 语法检查失败：{luaMessage}");
+        lua.Start(luaText);
+        lua.HandlePhysicalInput(new PhysicalInputEvent(new HashSet<uint> { 0x05 }, 0x05, true));
+        Require(SpinWait.SpinUntil(() => luaOutput.Actions.Length >= 5, 1000), "Lua OnEvent 未在超时前执行动作");
+        lua.Stop();
+        Require(luaOutput.Actions.Contains("move:7,-3"), "Lua move 输出不正确");
+        Require(luaOutput.Actions.ContainsSequence("key:4:down", "key:4:up"), "Lua keypress 省略时长参数时输出不正确");
+        Require(luaLogs.Any(line => line.Contains("arg=4", StringComparison.Ordinal)), "Lua DebugLog 实际输出不正确");
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, true);
+        }
+    }
+}
+
+static void CheckAutomationRemoteOutput()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    input.SetForwardingEnabled(true);
+    input.SetAutomationMouseButton(4, true);
+    input.SendAutomationMouseMove(17, -9);
+    input.SendAutomationWheel(2);
+    input.SetAutomationKey(4, true);
+    input.SetAutomationKey(4, false);
+    input.SetAutomationMouseButton(4, false);
+    Require(SpinWait.SpinUntil(() => transport.MouseReports().Length >= 2, 1000), "自动化对端鼠标报告未在超时前发送");
+
+    MouseReport[] mouseReports = transport.MouseReports();
+    Require(mouseReports.Sum(report => report.X) == 17, "自动化远端 X 位移不守恒");
+    Require(mouseReports.Sum(report => report.Y) == -9, "自动化远端 Y 位移不守恒");
+    Require(mouseReports.Sum(report => report.Wheel) == 2, "自动化远端滚轮输出不正确");
+    Require(mouseReports.Any(report => (report.Buttons & 0x08) != 0), "自动化远端侧键按下未发送");
+    Require(mouseReports.Last().Buttons == 0, "自动化远端侧键松开未发送");
+    byte[][] keyboardReports = transport.KeyboardReports();
+    Require(keyboardReports.Any(report => report.Skip(2).Contains((byte)4)), "自动化远端键盘按下未发送");
+    Require(keyboardReports.Last().All(value => value == 0), "自动化远端键盘松开未发送");
+    input.SetForwardingEnabled(false);
+}
+
+static void CheckLocalMouseTriggersReachLua()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-local-lua-{Guid.NewGuid():N}");
+    try
+    {
+        AutomationProfileStore store = new(directory);
+        AutomationProfile profile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+        profile.LuaScriptText =
+            "function OnEvent(event, arg) DebugLog(\"event=%s arg=%s\", event, tostring(arg)) end";
+        store.SaveProfile(profile);
+
+        RecordingTransport transport = new();
+        using InputForwarder input = new(transport);
+        using AutomationController automation = new(store, input);
+        ConcurrentQueue<string> logs = new();
+        automation.Log += logs.Enqueue;
+        automation.Start();
+
+        Require(!input.ForwardingEnabled, "本机 Lua 触发检查必须在捕获关闭状态运行");
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Down,
+        });
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Up,
+        });
+
+        Require(SpinWait.SpinUntil(
+            () => logs.Any(line => line.Contains("event=pressed arg=4", StringComparison.Ordinal)) &&
+                  logs.Any(line => line.Contains("event=released arg=4", StringComparison.Ordinal)),
+            1000), "捕获关闭时实体鼠标按键未送达 Lua OnEvent/DebugLog");
+        Require(transport.MouseReports().Length == 0, "本机 Lua 触发不得向对端发送实体鼠标报告");
+        Console.WriteLine(
+            "本机 Lua 触发检查：捕获关闭；实际日志包含 event=pressed arg=4 和 event=released arg=4；对端鼠标报告=0。");
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+}
+
+static void CheckTriggerForwardingIntegration()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-trigger-{Guid.NewGuid():N}");
+    try
+    {
+        AutomationProfileStore store = new(directory);
+        AutomationProfile profile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+        profile.Macros["侧键透传"] = new MacroDefinition
+        {
+            Name = "侧键透传",
+            Trigger = "mouse_side1",
+            Mode = MacroRunModes.Once,
+            Enabled = true,
+            Text = "move(23,-11)",
+        };
+        store.SaveProfile(profile);
+
+        RecordingTransport transport = new();
+        using InputForwarder input = new(transport);
+        input.SetForwardingEnabled(true);
+        using AutomationController automation = new(store, input);
+        automation.Start();
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Down,
+        });
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Up,
+        });
+
+        Require(SpinWait.SpinUntil(() =>
+        {
+            MouseReport[] current = transport.MouseReports();
+            int pressedIndex = Array.FindIndex(current, report => (report.Buttons & 0x08) != 0);
+            int releasedIndex = pressedIndex < 0
+                ? -1
+                : Array.FindIndex(current, pressedIndex + 1, report => report.Buttons == 0);
+            return current.Sum(report => report.X) == 23 && releasedIndex > pressedIndex;
+        }, 1000), "未在超时前同时观察到侧键按下、宏位移和侧键松开报告");
+        MouseReport[] reports = transport.MouseReports();
+        Require(reports.Any(report => (report.Buttons & 0x08) != 0), "宏触发侧键本身未透传到对端");
+        Require(reports.Last().Buttons == 0, "宏触发侧键松开未透传到对端");
+        Require(reports.Sum(report => report.X) == 23 && reports.Sum(report => report.Y) == -11, "侧键触发宏的对端位移不正确");
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+}
+
 static void CheckWindowLayout()
 {
     Exception? failure = null;
@@ -742,13 +964,37 @@ static void CheckWindowLayout()
     {
         try
         {
+            string automationDirectory = Path.Combine(Path.GetTempPath(), $"hidbridge-ui-{Guid.NewGuid():N}");
             RecordingTransport transport = new();
             using InputForwarder input = new(transport);
-            using BridgeMainForm form = new(input, "测试端点");
+            AutomationProfileStore store = new(automationDirectory);
+            using AutomationController automation = new(store, input);
+            using BridgeMainForm form = new(input, automation, "测试端点");
             _ = form.Handle;
             form.PerformLayout();
-            double upperRatio = form.MainSplit.SplitterDistance / (double)form.ClientSize.Height;
+            double upperRatio = form.MainSplit.SplitterDistance / (double)form.MainSplit.ClientSize.Height;
             Require(upperRatio is >= 0.45 and <= 0.55, "窗口上半区必须约占客户区一半");
+            Require(form.MainTabs.TabPages.Count == 4, "主窗口必须包含鼠标捕获、宏、Lua、设置四个功能页");
+            Require(form.MainTabs.TabPages.Cast<TabPage>().Select(page => page.Text).SequenceEqual(["鼠标捕获", "宏", "Lua", "设置"]), "四个功能页顺序或名称不正确");
+            Require(form.MacroPage.ProfileComboBox.Items.Count >= 1, "宏页未加载手动配置列表");
+            Require(form.LuaPage.ProfileComboBox.Items.Count >= 1, "Lua 页未加载手动配置列表");
+            Require(form.LuaPage.AddProfileButton.Text == "新增配置" && form.LuaPage.DeleteProfileButton.Text == "删除配置", "Lua 页缺少新增/删除配置按钮");
+            string[] macroPageOptions = EnumerateControls(form.MacroPage).Select(control => control.Text).ToArray();
+            Require(!macroPageOptions.Contains("开机启动") && !macroPageOptions.Contains("最小化到托盘") && !macroPageOptions.Contains("关闭到托盘"), "程序行为设置不得继续显示在宏页");
+            Require(form.SettingsPage.StartOnBootCheckBox.Text.StartsWith("开机启动", StringComparison.Ordinal), "设置页缺少开机启动选项");
+            Require(form.SettingsPage.MinimizeToTrayCheckBox.Checked == automation.Settings.MinimizeToTray, "设置页最小化到托盘状态未从配置加载");
+            Require(form.SettingsPage.CloseToTrayCheckBox.Checked == automation.Settings.CloseToTray, "设置页关闭到托盘状态未从配置加载");
+            Require(form.SettingsPage.GenerateMovementAnalysisImageCheckBox.Checked == automation.Settings.GenerateMovementAnalysisImage, "设置页分析图片开关状态未从配置加载");
+            automation.Settings.GenerateMovementAnalysisImage = false;
+            form.ProcessMovementRecordingForChecks(new MouseMovementRecording(
+                DateTime.UtcNow.AddSeconds(-1), DateTime.UtcNow, [3], [-2]));
+            Require(form.OwnedForms.Length == 0, "关闭分析图片后不得打开分析窗口");
+            Require(form.LogTextBox.Text.Contains("不生成按键情况分析图片", StringComparison.Ordinal), "关闭分析图片后未输出跳过提示");
+            _ = automation.CreateProfile("UI同步检查");
+            automation.SetActiveProfile("UI同步检查");
+            Require(form.MacroPage.ProfileComboBox.Items.Contains("UI同步检查") && form.LuaPage.ProfileComboBox.Items.Contains("UI同步检查"), "Lua 新增配置后宏/Lua 页列表未同步刷新");
+            automation.DeleteProfile("UI同步检查");
+            Require(form.MacroPage.ProfileComboBox.SelectedItem as string == AutomationProfileStore.GlobalProfile && form.LuaPage.ProfileComboBox.SelectedItem as string == AutomationProfileStore.GlobalProfile, "删除活动配置后宏/Lua 页未同步回 Global");
             Require(form.LogTextBox.Multiline && form.LogTextBox.ReadOnly, "日志栏必须为只读多行文本框");
             Require(!form.LogTextBox.WordWrap && form.LogTextBox.ScrollBars == ScrollBars.Both, "日志栏必须支持完整选择和双向滚动");
             Require(form.LogModeComboBox.DropDownStyle == ComboBoxStyle.DropDownList, "日志模式必须使用不可编辑下拉框");
@@ -825,6 +1071,19 @@ static void CheckWindowLayout()
             Require(allText.Contains("左右键同按", StringComparison.Ordinal), "界面未提示鼠标移动记录触发方式");
             Require(allText.Contains("暂停自动跟随", StringComparison.Ordinal), "日志栏未提示滚动到上方后暂停自动跟随");
             CheckDarkSurfaceTextContrast(form);
+            string artifactDirectory = Path.Combine(Environment.CurrentDirectory, "artifacts");
+            Directory.CreateDirectory(artifactDirectory);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-32000, -32000);
+            form.ShowInTaskbar = false;
+            form.Show();
+            Application.DoEvents();
+            form.MainTabs.SelectedIndex = 2;
+            RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-lua-settings-update.png"));
+            form.MainTabs.SelectedIndex = 3;
+            RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-settings.png"));
+            Console.WriteLine("四页 UI 检查：设置已从宏页迁出；Lua 页含新增/删除配置；设置页含启动、托盘和分析图片四项开关。");
+            Directory.Delete(automationDirectory, true);
         }
         catch (Exception exception)
         {
@@ -838,6 +1097,14 @@ static void CheckWindowLayout()
     {
         throw new InvalidOperationException("窗口布局检查失败", failure);
     }
+}
+
+static void RenderControlToPng(Control control, string path)
+{
+    control.PerformLayout();
+    using Bitmap bitmap = new(control.ClientSize.Width, control.ClientSize.Height);
+    control.DrawToBitmap(bitmap, control.ClientRectangle);
+    bitmap.Save(path, ImageFormat.Png);
 }
 
 [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -982,9 +1249,29 @@ internal sealed class RecordingTransport : IBridgeTransport
         .Select(frame => frame.Timestamp)
         .ToArray();
 
+    internal byte[][] KeyboardReports() => _frames
+        .Where(frame => frame.Type == MessageType.KeyboardReport)
+        .Select(frame => frame.Payload)
+        .ToArray();
+
     public void Dispose()
     {
     }
+}
+
+internal sealed class RecordingAutomationOutput : IAutomationOutput
+{
+    private readonly ConcurrentQueue<string> _actions = new();
+
+    public bool IsRemote => false;
+    internal string[] Actions => _actions.ToArray();
+    public Point GetCursorPosition() => new(100, 100);
+    public void MoveRelative(int deltaX, int deltaY) => _actions.Enqueue($"move:{deltaX},{deltaY}");
+    public void MoveAbsolute(int x, int y) => _actions.Enqueue($"moveto:{x},{y}");
+    public void SetMouseButton(int button, bool pressed) => _actions.Enqueue($"mouse:{button}:{(pressed ? "down" : "up")}");
+    public void Wheel(int delta) => _actions.Enqueue($"wheel:{delta}");
+    public void KeyDown(byte hidUsage) => _actions.Enqueue($"key:{hidUsage}:down");
+    public void KeyUp(byte hidUsage) => _actions.Enqueue($"key:{hidUsage}:up");
 }
 
 internal static class EnumerableExtensions

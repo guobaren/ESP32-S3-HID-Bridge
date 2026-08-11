@@ -1,6 +1,6 @@
 # ESP32-S3 HID Bridge
 
-把 Windows 电脑现有的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的复合 HID 键鼠设备，输出到手机、平板、嵌入式设备或其他项目。当前运行配置支持板载 USB-to-UART 或原生 USB CDC 输入，以及 USB HID 与 BLE HID 输出；Wi-Fi 输入、配网和 Target Agent 输出代码暂时保留但不启用。
+把 Windows 电脑现有的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的键盘与相对触摸板 HID，输出到手机、平板、嵌入式设备或其他项目。原生 USB 在启动时根据 UART 协议握手二选一枚举为 CDC-only 或 HID-only；BLE HID 保持可用。Wi-Fi 输入、配网和 Target Agent 输出代码暂时保留但不启用。
 
 ## 数据路径
 
@@ -12,16 +12,16 @@ HidBridge.Host
         │ USB-to-UART 或原生 USB CDC，自动发现与二进制帧握手
         ▼
 ESP32-S3-DevKitC-1
-        ├─ 原生 USB OTG，CDC + 复合 HID ──> 主机输入 / USB 目标设备
+        ├─ 原生 USB OTG，启动时选择 CDC-only 或键盘触摸板 HID-only
         ├─ BLE HID ────────────────> 手机/电脑
 ```
 
 开发板支持两种有线主机输入方式：
 
 - `USB-to-UART` 接电脑，通过 CH340 COM 口接收主机端生成的 HID 报告。
-- `ESP32-S3 USB` 接电脑时枚举为 `CDC + HID` 复合设备；CDC COM 口接收同一套二进制协议，HID 接口仍可作为 USB 输出。
+- `ESP32-S3 USB` 在固件启动后的 1.5 秒内等待 UART 有效协议帧：检测到 UART 时枚举为 `USB Keyboard with Touchpad` HID-only；未检测到时枚举为 `HID Bridge CDC` CDC-only。
 
-因此只使用一根原生 USB 线，也可以让 `HidBridge.Host` 通过自动发现的 CDC COM 口把本机键鼠送入开发板，再由 BLE HID 输出到另一台设备。若原生 USB 枚举后仍没有 COM 口，应先确认已烧录包含 CDC 的本版固件，并检查 Windows 设备枚举状态。
+两种模式使用不同 PID，避免 Windows 缓存错误接口。选择结果保持到下次复位；“UART 已连接”指收到 CRC 正确的桥接协议帧，不代表仅插入一根没有通信的 USB-UART 线。CDC 模式可把原生 USB 作为输入并通过 BLE 输出；HID 模式应通过 CH340/UART 输入，并把原生 USB 接到被控端。
 
 USB HID 与 BLE HID 同时可用时，先连接并成为活动输出的链路会保持锁定；另一链路随后连接不得抢占。USB HID 连续 100 ms 不可发送时会被判定为失活，即使 TinyUSB 的 `mounted` 状态因开发板仍由另一端口供电而没有清除，也会切换到仍在线的 BLE；反向切换同样只在当前活动链路失活后发生。切换前后都会执行 `ReleaseAll`，避免目标设备卡键。
 
@@ -38,7 +38,7 @@ USB HID 与 BLE HID 同时可用时，先连接并成为活动输出的链路会
 - [x] 可配置串口与同步状态下的本机输入拦截
 - [x] 带序号、长度与 CRC16 的串口帧
 - [x] ESP-IDF UART 与原生 USB CDC 接收，共用流式协议解析
-- [x] 原生 USB CDC + HID 复合设备，HID 使用双 Report ID 键盘/鼠标描述符
+- [x] 原生 USB 根据启动期 UART 握手选择 CDC-only 或键盘+相对触摸板 HID-only，使用不同 PID
 - [x] 链路心跳、输入租约、断连超时检测与自动 `ReleaseAll`
 - [x] 电脑到开发板的认证加密 Wi-Fi 输入代码（当前运行入口暂时禁用）
 - [x] SoftAP 网页配网、NVS 凭据保存和 BOOT 长按重新配网代码（当前运行入口暂时禁用）
@@ -62,9 +62,9 @@ USB HID 与 BLE HID 同时可用时，先连接并成为活动输出的链路会
 | 方向 | 连接方式 | 目标定位 |
 |---|---|---|
 | 电脑 → 开发板 | USB-to-UART | 已实现，CH340 COM 输入通道 |
-| 电脑 → 开发板 | 原生 USB CDC | 已实现，与 UART 使用同一协议和主机自动发现 |
+| 电脑 → 开发板 | 原生 USB CDC | 启动期未检测到 UART 协议时启用，与 UART 使用同一协议和主机自动发现 |
 | 电脑 → 开发板 | Wi-Fi | 实现代码保留，当前运行入口暂时禁用 |
-| 开发板 → 目标设备 | USB HID | 当前默认输出通道，可用于无需安装配套程序的目标设备 |
+| 开发板 → 目标设备 | USB HID | 启动期检测到 UART 协议时启用，枚举为键盘与相对触摸板 |
 | 开发板 → 目标设备 | Wi-Fi | Target Agent 代码保留，当前运行入口暂时禁用 |
 | 开发板 → 目标设备 | BLE HID | 已实现标准 BLE 键盘和相对鼠标报告 |
 
@@ -116,8 +116,10 @@ idf.py -p <实际串口> flash
 
 烧录后可任选输入连接方式：
 
-- **USB-to-UART 输入**：保持 `USB-to-UART` 端口连接输入电脑；如果目标使用 USB HID，再把 `ESP32-S3 USB` 原生口连接目标设备。
-- **原生 USB CDC 输入 + BLE 输出**：只把 `ESP32-S3 USB` 原生口连接输入电脑，确认 Windows 同时枚举 CDC COM 与 HID；CDC 只负责输入传输，USB HID 与 BLE HID 的输出由先连接并成为活动输出的链路锁定。若 BLE 先成为活动输出，状态灯为蓝色，之后 USB 连接不会抢占；若 USB 先成为活动输出，状态灯为绿色，之后 BLE 连接不会抢占，需 USB 断开后才会切换到仍在线的 BLE。
+- **USB-to-UART 输入 + 原生 USB HID 输出**：先让主机程序通过 CH340/UART 发送握手，再复位开发板；启动后 1.5 秒内检测到有效 UART 帧时，原生 USB 枚举为 `USB Keyboard with Touchpad`。
+- **原生 USB CDC 输入 + BLE 输出**：启动和复位期间不要让 UART 发送桥接协议；超时后原生 USB 枚举为 `HID Bridge CDC`，随后主机程序可自动发现该 COM 口并通过 BLE 输出。
+
+当前选择只在启动时执行，切换连接方式后需要复位开发板。HID 中的“触摸板”是与现有相对鼠标报告兼容的相对指针，不是 Windows Precision Touchpad，也不提供多点触控手势。
 
 随后启动主机端；默认会自动发现正确的 COM 口，不需要填写端口号。按 `HOME` 开始转发。
 

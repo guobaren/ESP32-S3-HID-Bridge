@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using HidBridge.Host.Automation;
 using HidBridge.Host.Transport;
 using HidBridge.Protocol;
 
@@ -18,16 +19,20 @@ internal sealed class InputForwarder : IDisposable
     private readonly NativeMethods.HookProc _keyboardProc;
     private readonly NativeMethods.HookProc _mouseProc;
     private readonly MouseReportPump _mouseReportPump;
+    private readonly object _inputStateLock = new();
     private readonly List<byte> _pressedKeys = [];
+    private readonly HashSet<byte> _automationPressedKeys = [];
+    private readonly HashSet<uint> _triggerHeldKeys = [];
+    private readonly HashSet<uint> _controlHotkeysDown = [];
     private IntPtr _keyboardHook;
     private IntPtr _mouseHook;
     private RawMouseInputWindow? _rawMouseInput;
     private byte _modifiers;
+    private byte _automationModifiers;
     private byte _mouseButtons;
+    private byte _automationMouseButtons;
     private int _verticalWheelRemainder;
     private int _horizontalWheelRemainder;
-    private bool _ignoreHotkeyChord;
-    private uint _ignoredHotkeyKey;
     private bool _started;
 
     internal InputForwarder(IBridgeTransport transport)
@@ -43,7 +48,9 @@ internal sealed class InputForwarder : IDisposable
     internal bool UdpSmoothingEnabled => _mouseReportPump.UdpSmoothingEnabled;
 
     internal event EventHandler<bool>? ForwardingChanged;
+    internal event Action? ForwardingTransitioning;
     internal event EventHandler? ExitRequested;
+    internal event Action<PhysicalInputEvent>? PhysicalInputChanged;
     internal event Action? MovementRecordingStarted
     {
         add => _mouseReportPump.MovementRecordingStarted += value;
@@ -74,6 +81,98 @@ internal sealed class InputForwarder : IDisposable
 
         _mouseReportPump.AccumulateRemote(deltaX, deltaY, wheel, pan);
         return true;
+    }
+
+    internal void ProcessRawMouseInputForChecks(NativeMethods.RawMouse input) =>
+        HandleRawMouseInput(input);
+
+    internal void SendAutomationMouseMove(int deltaX, int deltaY)
+    {
+        if (!ForwardingEnabled)
+        {
+            return;
+        }
+        byte buttons;
+        lock (_inputStateLock)
+        {
+            buttons = unchecked((byte)(_mouseButtons | _automationMouseButtons));
+        }
+        _mouseReportPump.Accumulate(buttons, false, deltaX, deltaY, 0, 0);
+    }
+
+    internal void SendAutomationWheel(int delta)
+    {
+        if (!ForwardingEnabled)
+        {
+            return;
+        }
+        byte buttons;
+        lock (_inputStateLock)
+        {
+            buttons = unchecked((byte)(_mouseButtons | _automationMouseButtons));
+        }
+        _mouseReportPump.Accumulate(buttons, false, 0, 0, delta, 0);
+    }
+
+    internal void SetAutomationMouseButton(int button, bool pressed)
+    {
+        byte mask = button switch
+        {
+            1 => LeftButton,
+            2 => MiddleButton,
+            3 => RightButton,
+            4 => BackButton,
+            5 => ForwardButton,
+            _ => throw new ArgumentOutOfRangeException(nameof(button), "鼠标按钮必须为 1-5。"),
+        };
+        byte combined;
+        bool changed;
+        lock (_inputStateLock)
+        {
+            byte previous = unchecked((byte)(_mouseButtons | _automationMouseButtons));
+            if (pressed)
+            {
+                _automationMouseButtons |= mask;
+            }
+            else
+            {
+                _automationMouseButtons &= unchecked((byte)~mask);
+            }
+            combined = unchecked((byte)(_mouseButtons | _automationMouseButtons));
+            changed = previous != combined;
+        }
+        if (ForwardingEnabled && changed)
+        {
+            _mouseReportPump.Accumulate(combined, true, 0, 0, 0, 0);
+        }
+    }
+
+    internal void SetAutomationKey(byte hidUsage, bool pressed)
+    {
+        lock (_inputStateLock)
+        {
+            if (hidUsage is >= 224 and <= 231)
+            {
+                byte mask = unchecked((byte)(1 << (hidUsage - 224)));
+                if (pressed)
+                {
+                    _automationModifiers |= mask;
+                }
+                else
+                {
+                    _automationModifiers &= unchecked((byte)~mask);
+                }
+            }
+            else if (pressed)
+            {
+                _automationPressedKeys.Add(hidUsage);
+            }
+            else
+            {
+                _automationPressedKeys.Remove(hidUsage);
+            }
+            SendKeyboardReportLocked();
+        }
     }
 
     internal void Start()
@@ -151,13 +250,26 @@ internal sealed class InputForwarder : IDisposable
             Marshal.PtrToStructure<NativeMethods.KeyboardHookData>(lParam);
         uint virtualKey = data.VirtualKey;
 
+        if ((data.Flags & NativeMethods.LlkhfInjected) != 0)
+        {
+            return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
+        }
+
+        lock (_inputStateLock)
+        {
+            UpdateKeyboardState(virtualKey, (data.Flags & NativeMethods.LlkhfExtended) != 0, isDown);
+        }
+
         bool isToggleHotkey = isDown && virtualKey == VkHome;
         bool isExitHotkey = isDown && virtualKey == VkEnd;
 
         if (isToggleHotkey || isExitHotkey)
         {
-            _ignoreHotkeyChord = true;
-            _ignoredHotkeyKey = virtualKey;
+            _controlHotkeysDown.Add(virtualKey);
+            if (ForwardingEnabled)
+            {
+                SendKeyboardReport();
+            }
             if (isToggleHotkey)
             {
                 SetForwarding(!ForwardingEnabled);
@@ -168,24 +280,19 @@ internal sealed class InputForwarder : IDisposable
                 ExitRequested?.Invoke(this, EventArgs.Empty);
             }
 
+            // HOME 会重建自动化运行时；在切换完成后再发布同一次按下事件，
+            // 使 HOME 宏在新的本机/对端路由上执行，而不是刚启动就被取消。
+            NotifyPhysicalInput(virtualKey, true);
+
             return (IntPtr)1;
         }
 
-        if (_ignoreHotkeyChord)
+        NotifyPhysicalInput(virtualKey, isDown);
+
+        if (isUp && _controlHotkeysDown.Remove(virtualKey))
         {
-            if (isUp && virtualKey == _ignoredHotkeyKey)
-            {
-                _ignoreHotkeyChord = false;
-                _ignoredHotkeyKey = 0;
-            }
-
             return (IntPtr)1;
         }
-
-        UpdateKeyboardState(
-            virtualKey,
-            (data.Flags & NativeMethods.LlkhfExtended) != 0,
-            isDown);
 
         if (ForwardingEnabled)
         {
@@ -259,6 +366,7 @@ internal sealed class InputForwarder : IDisposable
             return;
         }
 
+        ForwardingTransitioning?.Invoke();
         ClearInputState();
         _mouseReportPump.ResetAndSendRelease(enabled);
         ForwardingChanged?.Invoke(this, enabled);
@@ -266,45 +374,60 @@ internal sealed class InputForwarder : IDisposable
 
     private void ClearInputState()
     {
-        _pressedKeys.Clear();
-        _modifiers = 0;
-        _mouseButtons = 0;
-        _verticalWheelRemainder = 0;
-        _horizontalWheelRemainder = 0;
+        lock (_inputStateLock)
+        {
+            _pressedKeys.Clear();
+            _automationPressedKeys.Clear();
+            _modifiers = 0;
+            _automationModifiers = 0;
+            _mouseButtons = 0;
+            _automationMouseButtons = 0;
+            _verticalWheelRemainder = 0;
+            _horizontalWheelRemainder = 0;
+        }
     }
 
     private void HandleRawMouseInput(NativeMethods.RawMouse input)
     {
+        // 自动化触发监听与 HID 转发是两条独立链路。本机模式虽然不向对端
+        // 累计报告，仍必须把实体鼠标按键送给宏和 Lua 的 OnEvent/IsPressed。
+        ushort flags = input.ButtonFlags;
+        NotifyMouseButtonTransitions(flags);
+
         if (!ForwardingEnabled)
         {
             return;
         }
 
-
-        ushort flags = input.ButtonFlags;
-        byte previousButtons = _mouseButtons;
-        UpdateMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, LeftButton);
-        UpdateMouseButton(flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, RightButton);
-        UpdateMouseButton(flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, MiddleButton);
-        UpdateMouseButton(flags, NativeMethods.RawMouseButton4Down, NativeMethods.RawMouseButton4Up, BackButton);
-        UpdateMouseButton(flags, NativeMethods.RawMouseButton5Down, NativeMethods.RawMouseButton5Up, ForwardButton);
-
+        byte combinedButtons;
+        bool hasButtonChange;
         int wheel = 0;
         int pan = 0;
-        if ((flags & NativeMethods.RawMouseWheel) != 0)
+        lock (_inputStateLock)
         {
-            wheel = ConsumeWheelDelta(input.ButtonData, ref _verticalWheelRemainder);
-        }
-        else if ((flags & NativeMethods.RawMouseHorizontalWheel) != 0)
-        {
-            pan = ConsumeWheelDelta(input.ButtonData, ref _horizontalWheelRemainder);
+            byte previousButtons = unchecked((byte)(_mouseButtons | _automationMouseButtons));
+            UpdateMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, LeftButton);
+            UpdateMouseButton(flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, RightButton);
+            UpdateMouseButton(flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, MiddleButton);
+            UpdateMouseButton(flags, NativeMethods.RawMouseButton4Down, NativeMethods.RawMouseButton4Up, BackButton);
+            UpdateMouseButton(flags, NativeMethods.RawMouseButton5Down, NativeMethods.RawMouseButton5Up, ForwardButton);
+
+            if ((flags & NativeMethods.RawMouseWheel) != 0)
+            {
+                wheel = ConsumeWheelDelta(input.ButtonData, ref _verticalWheelRemainder);
+            }
+            else if ((flags & NativeMethods.RawMouseHorizontalWheel) != 0)
+            {
+                pan = ConsumeWheelDelta(input.ButtonData, ref _horizontalWheelRemainder);
+            }
+            combinedButtons = unchecked((byte)(_mouseButtons | _automationMouseButtons));
+            hasButtonChange = previousButtons != combinedButtons;
         }
 
-        bool hasButtonChange = previousButtons != _mouseButtons;
         if (input.LastX != 0 || input.LastY != 0 || wheel != 0 || pan != 0 || hasButtonChange)
         {
             _mouseReportPump.Accumulate(
-                _mouseButtons,
+                combinedButtons,
                 hasButtonChange,
                 input.LastX,
                 input.LastY,
@@ -344,15 +467,63 @@ internal sealed class InputForwarder : IDisposable
 
     private void SendKeyboardReport()
     {
-        Span<byte> report = stackalloc byte[8];
-        report[0] = _modifiers;
-        int count = Math.Min(6, _pressedKeys.Count);
-        for (int index = 0; index < count; index++)
+        lock (_inputStateLock)
         {
-            report[index + 2] = _pressedKeys[index];
+            SendKeyboardReportLocked();
+        }
+    }
+
+    private void SendKeyboardReportLocked()
+    {
+        Span<byte> report = stackalloc byte[8];
+        report[0] = unchecked((byte)(_modifiers | _automationModifiers));
+        IEnumerable<byte> usages = _pressedKeys.Concat(_automationPressedKeys).Distinct();
+        int index = 0;
+        foreach (byte usage in usages.Take(6))
+        {
+            report[index++ + 2] = usage;
         }
 
         _mouseReportPump.SendKeyboard(report);
+    }
+
+    private void NotifyMouseButtonTransitions(ushort flags)
+    {
+        NotifyMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, 0x01);
+        NotifyMouseButton(flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, 0x02);
+        NotifyMouseButton(flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, 0x04);
+        NotifyMouseButton(flags, NativeMethods.RawMouseButton4Down, NativeMethods.RawMouseButton4Up, 0x05);
+        NotifyMouseButton(flags, NativeMethods.RawMouseButton5Down, NativeMethods.RawMouseButton5Up, 0x06);
+    }
+
+    private void NotifyMouseButton(ushort flags, ushort downFlag, ushort upFlag, uint virtualKey)
+    {
+        if ((flags & downFlag) != 0)
+        {
+            NotifyPhysicalInput(virtualKey, true);
+        }
+        if ((flags & upFlag) != 0)
+        {
+            NotifyPhysicalInput(virtualKey, false);
+        }
+    }
+
+    private void NotifyPhysicalInput(uint virtualKey, bool pressed)
+    {
+        IReadOnlySet<uint> snapshot;
+        lock (_inputStateLock)
+        {
+            if (pressed)
+            {
+                _triggerHeldKeys.Add(virtualKey);
+            }
+            else
+            {
+                _triggerHeldKeys.Remove(virtualKey);
+            }
+            snapshot = new HashSet<uint>(_triggerHeldKeys);
+        }
+        PhysicalInputChanged?.Invoke(new PhysicalInputEvent(snapshot, virtualKey, pressed));
     }
 
     public void Dispose()

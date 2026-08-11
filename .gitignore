@@ -23,3 +23,6 @@ target/HidBridge.TargetAgent/agent.local.json
 Thumbs.db
 /HidBridge.Host.exe
 /bridge.local.json
+/automation.settings.json
+/profiles/
+/artifacts/

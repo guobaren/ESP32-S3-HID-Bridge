@@ -4,13 +4,13 @@
 
 固件支持以下输出后端：
 
-- USB HID：始终启用，连接后可作为 USB 复合键鼠。
+- USB HID：启动后 1.5 秒内检测到 UART 有效协议帧时启用，枚举为键盘与相对触摸板 HID-only。
 - BLE HID：默认编译启用，设备名可配置。
 - Wi-Fi Target Agent：实现代码保留，当前统一运行时开关关闭，不创建网络连接或输出任务。
 
 USB HID 与 BLE HID 同时在线时，先连接并成为活动输出的链路保持锁定，另一链路随后连接不得抢占；USB HID 端点连续 100 ms 不可发送时视为失活并切换到仍在线的 BLE，不依赖可能滞留为真的 TinyUSB `mounted` 状态。切换旧目标和新目标时都会执行 `ReleaseAll`。当前不会向 Wi-Fi Target Agent 镜像报告。
 
-电脑到开发板只能有一个活动输入租约。USB-to-UART 或原生 USB CDC 会话断开、超过租约时间或被另一会话替换时，开发板会向当前 USB/BLE 输出后端发送 `ReleaseAll`。Wi-Fi 输入代码保留但当前不启动。
+电脑到开发板只能有一个活动输入租约。原生 USB CDC 在启动期未检测到 UART 协议时先出现；检测到 UART 时原生 USB 为 HID-only。若有效 UART 协议帧在 1.5 秒窗口后才到达，固件会安全释放并自动重启一次，使持续探测的 UART 在下一启动窗口内触发 HID-only；已经是 HID-only 时不会循环重启。活动会话断开或超过租约时间时，开发板会向当前 USB/BLE 输出后端发送 `ReleaseAll`。Wi-Fi 输入代码保留但当前不启动。
 
 ## 配置开发板
 
@@ -100,6 +100,7 @@ Copy-Item .\host\HidBridge.Host\bridge.json .\host\HidBridge.Host\bridge.local.j
 - 突发输入会在固定 10 槽中按槽合并，内存和计划延迟不会随数据报数量增长。若单槽累计值超过 HID 报告字段范围，500 Hz 报告泵仍会按字段上限分批发送，这是协议数值上限而不是平滑队列延迟。
 - 该功能只处理 UDP 公共输入；未开启“模拟 UDP”的实体鼠标仍直接进入原有 500 Hz 聚合路径。关闭 `HOME`、断线或退出会清空尚未发送的 10 槽状态并执行 `ReleaseAll`。
 - BLE 输出仍受固件 10 ms 发送节拍限制：10 个主机 2 ms 槽通常会被合并为约 2–3 个 BLE 报告（取决于相位和连接调度），USB HID 则可保留主机 2 ms 节拍。关闭主机平滑不会关闭 BLE 自身的 10 ms 合并。
+- BLE 广播名为 `Keyboard with Touchpad`，Appearance 为 Keyboard；Windows 对既有配对可能缓存旧名称，验证新名称时应删除旧配对后重新扫描。
 
 ### UDP 平滑开关
 
@@ -192,6 +193,8 @@ BLE 使用 NimBLE、Just Works 配对和绑定机制，对外提供同一报告�
 
 ## 原生 USB CDC 输入
 
-当前固件把 `ESP32-S3 USB` 枚举为 `CDC + HID` 复合设备。CDC COM 口与板载 CH340 的 USB-to-UART 使用完全相同的二进制协议、`DeviceProbe` / `DeviceHello` 握手和输入租约。主机配置保持 `portName: "auto"` 时会枚举所有 COM 口并选择能够正确响应握手的端口，因此不需要为原生 USB CDC 增加新的 EXE 配置。
+固件启动后先监听 UART 1.5 秒。没有收到有效桥接协议帧时，`ESP32-S3 USB` 以 `VID:PID=303A:4001`、产品名 `HID Bridge CDC` 枚举为 CDC-only。CDC COM 口与板载 CH340 使用相同的二进制协议、`DeviceProbe` / `DeviceHello` 握手和输入租约；`portName: "auto"` 可自动发现。
 
-当原生 USB HID 与 BLE 同时连接时，CDC 只负责输入传输，不决定输出目标；先连接并成为活动输出的 USB 或 BLE 链路保持锁定，后连接的链路不得接管，只有当前活动链路断开时才切换到仍在线的另一链路。使用“原生 USB CDC 输入 + BLE 输出”时，应先让 BLE 成为活动输出并确认蓝灯，再开启主机转发；若 USB 已先成为活动输出并亮绿灯，需断开 USB 后才会切换到仍在线的 BLE。
+收到有效 UART 协议帧时，原生 USB 改为 `VID:PID=303A:4004`、产品名 `USB Keyboard with Touchpad` 的 HID-only 设备，CDC 不会出现。HID Report ID 1 为键盘，Report ID 2 为五键、16 位相对 X/Y、Wheel/Pan 指针；该“触摸板”属于相对指针兼容模式，不是 Precision Touchpad。
+
+选择结果保持到下次复位。仅插入没有协议通信的 UART 线无法被固件识别为连接；切换拓扑后必须复位，并确保控制端在 1.5 秒窗口内发送或不发送 UART 协议。

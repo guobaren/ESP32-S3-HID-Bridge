@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Runtime.InteropServices;
+using HidBridge.Host.Automation;
 using HidBridge.Host.Input;
 
 namespace HidBridge.Host.Ui;
@@ -13,6 +14,7 @@ internal sealed class BridgeMainForm : Form
     private static readonly Color DangerTextOnDeepSurface = Color.FromArgb(255, 154, 154);
 
     private readonly InputForwarder _input;
+    private readonly AutomationController _automation;
     private readonly RuntimeLogSettings _logSettings;
     private readonly MouseCursorLock _cursorLock = new();
     private readonly MouseCaptureSurface _captureSurface;
@@ -24,6 +26,11 @@ internal sealed class BridgeMainForm : Form
     private readonly CheckBox _udpSmoothingCheckBox;
     private readonly System.Windows.Forms.Timer _logFlushTimer;
     private readonly SplitContainer _split;
+    private readonly TabControl _tabs;
+    private readonly MacroPageControl _macroPage;
+    private readonly LuaPageControl _luaPage;
+    private readonly SettingsPageControl _settingsPage;
+    private readonly NotifyIcon _notifyIcon;
     private readonly List<string> _pendingLogs = [];
     private const int EmGetFirstVisibleLine = 0x00CE;
     private const int EmLineScroll = 0x00B6;
@@ -37,18 +44,23 @@ internal sealed class BridgeMainForm : Form
         IntPtr lParam);
 
     private bool _closing;
+    private bool _forceClose;
 
     internal BridgeMainForm(
         InputForwarder input,
+        AutomationController automation,
         string endpointDescription,
         RuntimeLogSettings? logSettings = null)
     {
         _input = input;
+        _automation = automation;
         _logSettings = logSettings ?? new RuntimeLogSettings(RuntimeLogMode.Reduced);
         Text = "ESP32-S3 HID Bridge - 同步已关闭";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(760, 560);
-        ClientSize = new Size(960, 720);
+        ClientSize = new Size(
+            Math.Max(960, automation.Settings.WindowWidth),
+            Math.Max(640, automation.Settings.WindowHeight));
         Font = new Font("Microsoft YaHei UI", 10, FontStyle.Regular);
 
         _captureSurface = new MouseCaptureSurface();
@@ -267,8 +279,39 @@ internal sealed class BridgeMainForm : Form
         };
         _split.Panel1.Controls.Add(capturePanel);
         _split.Panel2.Controls.Add(logPanel);
-        Controls.Add(_split);
+
+        _macroPage = new MacroPageControl(_automation);
+        _luaPage = new LuaPageControl(_automation);
+        _settingsPage = new SettingsPageControl(_automation);
+        _tabs = new TabControl
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Point(16, 6),
+        };
+        TabPage captureTab = new("鼠标捕获");
+        captureTab.Controls.Add(_split);
+        TabPage macroTab = new("宏");
+        macroTab.Controls.Add(_macroPage);
+        TabPage luaTab = new("Lua");
+        luaTab.Controls.Add(_luaPage);
+        TabPage settingsTab = new("设置");
+        settingsTab.Controls.Add(_settingsPage);
+        _tabs.TabPages.AddRange([captureTab, macroTab, luaTab, settingsTab]);
+        Controls.Add(_tabs);
         ApplySplitLayout();
+
+        ContextMenuStrip trayMenu = new();
+        trayMenu.Items.Add("显示主窗口", null, (_, _) => RestoreFromTray());
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add("退出", null, (_, _) => ForceClose());
+        _notifyIcon = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = "ESP32-S3 HID Bridge",
+            ContextMenuStrip = trayMenu,
+            Visible = true,
+        };
+        _notifyIcon.DoubleClick += (_, _) => RestoreFromTray();
 
         _logFlushTimer = new System.Windows.Forms.Timer { Interval = 50 };
         _logFlushTimer.Tick += (_, _) => FlushPendingLogs();
@@ -285,17 +328,12 @@ internal sealed class BridgeMainForm : Form
             {
                 ApplyCursorLock();
             }
+            if (WindowState == FormWindowState.Minimized && _automation.Settings.MinimizeToTray)
+            {
+                Hide();
+            }
         };
-        FormClosing += (_, _) =>
-        {
-            _closing = true;
-            _logFlushTimer.Stop();
-            FlushPendingLogs();
-            _cursorLock.Release();
-            _input.MovementRecordingStarted -= InputOnMovementRecordingStarted;
-            _input.MovementRecordingCompleted -= InputOnMovementRecordingCompleted;
-            _input.Stop();
-        };
+        FormClosing += OnFormClosing;
     }
 
     internal TextBox LogTextBox => _logTextBox;
@@ -305,6 +343,12 @@ internal sealed class BridgeMainForm : Form
     internal CheckBox UdpSmoothingCheckBox => _udpSmoothingCheckBox;
     internal MouseCaptureSurface CaptureSurface => _captureSurface;
     internal SplitContainer MainSplit => _split;
+    internal TabControl MainTabs => _tabs;
+    internal MacroPageControl MacroPage => _macroPage;
+    internal LuaPageControl LuaPage => _luaPage;
+    internal SettingsPageControl SettingsPage => _settingsPage;
+    internal void ProcessMovementRecordingForChecks(MouseMovementRecording recording) =>
+        InputOnMovementRecordingCompleted(recording);
 
     internal void AppendLog(string message)
     {
@@ -509,7 +553,52 @@ internal sealed class BridgeMainForm : Form
             BeginInvoke((Action)(() => InputOnExitRequested(sender, e)));
             return;
         }
+        ForceClose();
+    }
+
+    private void OnFormClosing(object? sender, FormClosingEventArgs eventArgs)
+    {
+        if (!_forceClose && eventArgs.CloseReason == CloseReason.UserClosing && _automation.Settings.CloseToTray)
+        {
+            eventArgs.Cancel = true;
+            Hide();
+            return;
+        }
+
+        _closing = true;
+        _automation.Settings.WindowWidth = Math.Max(MinimumSize.Width, RestoreBounds.Width);
+        _automation.Settings.WindowHeight = Math.Max(MinimumSize.Height, RestoreBounds.Height);
+        _automation.SaveSettings();
+        _notifyIcon.Visible = false;
+        _logFlushTimer.Stop();
+        FlushPendingLogs();
+        _cursorLock.Release();
+        _input.MovementRecordingStarted -= InputOnMovementRecordingStarted;
+        _input.MovementRecordingCompleted -= InputOnMovementRecordingCompleted;
+        _input.Stop();
+    }
+
+    private void RestoreFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+        BringToFront();
+    }
+
+    private void ForceClose()
+    {
+        _forceClose = true;
         Close();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _notifyIcon.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     private int GetSelectedSimulatedUdpFrequency() =>
@@ -544,6 +633,12 @@ internal sealed class BridgeMainForm : Form
         if (InvokeRequired)
         {
             BeginInvoke((Action)(() => InputOnMovementRecordingCompleted(recording)));
+            return;
+        }
+
+        if (!_automation.Settings.GenerateMovementAnalysisImage)
+        {
+            AppendLog($"左右键移动记录完成：样本={recording.SampleCount}；设置已关闭，不生成按键情况分析图片。");
             return;
         }
 

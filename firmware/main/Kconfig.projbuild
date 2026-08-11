@@ -105,7 +105,7 @@ config HID_BRIDGE_BLE_ENABLE
 
 config HID_BRIDGE_BLE_DEVICE_NAME
     string "BLE HID 设备名称"
-    default "HidBridge Keyboard Mouse"
+    default "Keyboard with Touchpad"
     depends on HID_BRIDGE_BLE_ENABLE
 
 endmenu

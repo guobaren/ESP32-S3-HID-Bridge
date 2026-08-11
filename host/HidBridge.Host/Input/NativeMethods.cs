@@ -16,6 +16,7 @@ internal static class NativeMethods
     internal const int WmInput = 0x00FF;
 
     internal const uint LlkhfExtended = 0x01;
+    internal const uint LlkhfInjected = 0x10;
     internal const uint RidInput = 0x10000003;
     internal const uint RidiDeviceName = 0x20000007;
     internal const uint RimTypeMouse = 0;

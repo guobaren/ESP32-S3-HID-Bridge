@@ -22,14 +22,18 @@
 #define REPORT_ID_MOUSE 2
 #define MOUSE_REPORT_LENGTH 7
 #define CONTROL_QUEUE_LENGTH 32
-#define USB_INTERFACE_COUNT 3
+#define USB_HID_INTERFACE_COUNT 1
+#define USB_CDC_INTERFACE_COUNT 2
 #define USB_HID_INTERFACE 0
-#define USB_CDC_INTERFACE 1
+#define USB_CDC_INTERFACE 0
 #define USB_HID_ENDPOINT 0x81
 #define USB_CDC_NOTIFICATION_ENDPOINT 0x82
 #define USB_CDC_DATA_OUT_ENDPOINT 0x03
 #define USB_CDC_DATA_IN_ENDPOINT 0x83
-#define USB_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
+#define USB_HID_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+#define USB_CDC_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN)
+#define USB_PID_CDC_ONLY 0x4001
+#define USB_PID_HID_ONLY 0x4004
 #define MOUSE_SEND_PERIOD_MS 2
 #define USB_UNAVAILABLE_TIMEOUT_MS 100
 #define STATISTICS_PERIOD_MS 1000
@@ -102,10 +106,62 @@ static UBaseType_t s_control_queue_high_water;
 static int64_t s_mouse_submit_time_us;
 static int64_t s_last_motion_completion_time_us;
 static usb_output_liveness_t s_usb_output_liveness;
+static usb_device_profile_t s_usb_profile = USB_DEVICE_PROFILE_CDC;
+
+static const tusb_desc_device_t s_cdc_device_descriptor = {
+    .bLength = sizeof(tusb_desc_device_t),
+    .bDescriptorType = TUSB_DESC_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = TUSB_CLASS_MISC,
+    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol = MISC_PROTOCOL_IAD,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor = TINYUSB_ESPRESSIF_VID,
+    .idProduct = USB_PID_CDC_ONLY,
+    .bcdDevice = 0x0200,
+    .iManufacturer = 1,
+    .iProduct = 2,
+    .iSerialNumber = 3,
+    .bNumConfigurations = 1,
+};
+
+static const tusb_desc_device_t s_hid_device_descriptor = {
+    .bLength = sizeof(tusb_desc_device_t),
+    .bDescriptorType = TUSB_DESC_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = TUSB_CLASS_UNSPECIFIED,
+    .bDeviceSubClass = 0,
+    .bDeviceProtocol = 0,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor = TINYUSB_ESPRESSIF_VID,
+    .idProduct = USB_PID_HID_ONLY,
+    .bcdDevice = 0x0200,
+    .iManufacturer = 1,
+    .iProduct = 2,
+    .iSerialNumber = 3,
+    .bNumConfigurations = 1,
+};
+
+static const char s_usb_language_en_us[] = {0x09, 0x04};
+static const char *s_cdc_string_descriptors[] = {
+    s_usb_language_en_us,
+    "HID Bridge",
+    "HID Bridge CDC",
+    "HIDBRIDGE-CDC",
+    "HID Bridge Serial Interface",
+};
+static const char *s_hid_string_descriptors[] = {
+    s_usb_language_en_us,
+    "HID Bridge",
+    "USB Keyboard with Touchpad",
+    "HIDBRIDGE-HID",
+    "Keyboard and Relative Touchpad",
+};
 
 static const uint8_t s_hid_report_descriptor[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD)),
 
+    /* 常见带触摸板键盘以相对指针集合暴露触摸板；当前协议不承载绝对坐标或触点。 */
     0x05, 0x01,       // Usage Page (Generic Desktop)
     0x09, 0x02,       // Usage (Mouse)
     0xA1, 0x01,       // Collection (Application)
@@ -148,31 +204,48 @@ static const uint8_t s_hid_report_descriptor[] = {
     0xC0,
 };
 
-static const uint8_t s_configuration_descriptor[] = {
+static const uint8_t s_hid_configuration_descriptor[] = {
     TUD_CONFIG_DESCRIPTOR(
         1,
-        USB_INTERFACE_COUNT,
+        USB_HID_INTERFACE_COUNT,
         0,
-        USB_CONFIG_TOTAL_LENGTH,
+        USB_HID_CONFIG_TOTAL_LENGTH,
         TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP,
         100),
     TUD_HID_DESCRIPTOR(
         USB_HID_INTERFACE,
-        0,
+        4,
         HID_ITF_PROTOCOL_NONE,
         sizeof(s_hid_report_descriptor),
         USB_HID_ENDPOINT,
         16,
         1),
+};
+
+static const uint8_t s_cdc_configuration_descriptor[] = {
+    TUD_CONFIG_DESCRIPTOR(
+        1,
+        USB_CDC_INTERFACE_COUNT,
+        0,
+        USB_CDC_CONFIG_TOTAL_LENGTH,
+        TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP,
+        100),
     TUD_CDC_DESCRIPTOR(
         USB_CDC_INTERFACE,
-        0,
+        4,
         USB_CDC_NOTIFICATION_ENDPOINT,
         8,
         USB_CDC_DATA_OUT_ENDPOINT,
         USB_CDC_DATA_IN_ENDPOINT,
         64),
 };
+
+_Static_assert(
+    sizeof(s_hid_configuration_descriptor) == USB_HID_CONFIG_TOTAL_LENGTH,
+    "HID 配置描述符长度必须与 wTotalLength 一致");
+_Static_assert(
+    sizeof(s_cdc_configuration_descriptor) == USB_CDC_CONFIG_TOTAL_LENGTH,
+    "CDC 配置描述符长度必须与 wTotalLength 一致");
 
 static uint64_t absolute_u64(int64_t value)
 {
@@ -270,10 +343,18 @@ static void usb_event_callback(tinyusb_event_t *event, void *argument)
         return;
     }
     if (event->id == TINYUSB_EVENT_ATTACHED) {
-        ESP_LOGI(TAG, "TinyUSB 已挂载，等待 HID 端点可发送后再标记 USB 输出在线");
+        if (s_usb_profile == USB_DEVICE_PROFILE_KEYBOARD_TOUCHPAD) {
+            ESP_LOGI(TAG, "原生 USB 已连接，等待键盘触摸板 HID 端点可发送");
+        } else {
+            ESP_LOGI(TAG, "原生 USB 已连接，CDC 输入等待主机打开串口");
+        }
     } else if (event->id == TINYUSB_EVENT_DETACHED) {
-        usb_cdc_input_on_detached();
-        ESP_LOGI(TAG, "TinyUSB 已卸载，等待发送任务确认 USB 输出失活");
+        if (s_usb_profile == USB_DEVICE_PROFILE_CDC) {
+            usb_cdc_input_on_detached();
+            ESP_LOGI(TAG, "原生 USB CDC 已断开");
+        } else {
+            ESP_LOGI(TAG, "原生 USB HID 已断开，等待发送任务确认输出失活");
+        }
     }
 }
 
@@ -545,7 +626,6 @@ static void hid_sender_task(void *argument)
                 USB_UNAVAILABLE_TIMEOUT_MS,
                 mounted,
                 ready);
-            usb_cdc_input_on_detached();
             output_router_set_connected(OUTPUT_MODE_USB, false);
         }
         portENTER_CRITICAL(&s_mouse_lock);
@@ -602,35 +682,60 @@ static void hid_sender_task(void *argument)
     }
 }
 
-esp_err_t hid_output_init(void)
+esp_err_t hid_output_init(usb_device_profile_t profile)
 {
-    s_control_queue = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(hid_control_event_t));
-    if (s_control_queue == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    s_control_mutex = xSemaphoreCreateMutex();
-    if (s_control_mutex == NULL) {
-        vQueueDelete(s_control_queue);
-        s_control_queue = NULL;
-        return ESP_ERR_NO_MEM;
+    s_usb_profile = profile;
+
+    if (profile == USB_DEVICE_PROFILE_KEYBOARD_TOUCHPAD) {
+        s_control_queue = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(hid_control_event_t));
+        if (s_control_queue == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        s_control_mutex = xSemaphoreCreateMutex();
+        if (s_control_mutex == NULL) {
+            vQueueDelete(s_control_queue);
+            s_control_queue = NULL;
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG(usb_event_callback);
-    usb_config.descriptor.full_speed_config = s_configuration_descriptor;
+    if (profile == USB_DEVICE_PROFILE_KEYBOARD_TOUCHPAD) {
+        usb_config.descriptor.device = &s_hid_device_descriptor;
+        usb_config.descriptor.string = s_hid_string_descriptors;
+        usb_config.descriptor.string_count =
+            sizeof(s_hid_string_descriptors) / sizeof(s_hid_string_descriptors[0]);
+        usb_config.descriptor.full_speed_config = s_hid_configuration_descriptor;
+    } else {
+        usb_config.descriptor.device = &s_cdc_device_descriptor;
+        usb_config.descriptor.string = s_cdc_string_descriptors;
+        usb_config.descriptor.string_count =
+            sizeof(s_cdc_string_descriptors) / sizeof(s_cdc_string_descriptors[0]);
+        usb_config.descriptor.full_speed_config = s_cdc_configuration_descriptor;
+    }
 
     esp_err_t error = tinyusb_driver_install(&usb_config);
     if (error != ESP_OK) {
-        vQueueDelete(s_control_queue);
-        s_control_queue = NULL;
-        vSemaphoreDelete(s_control_mutex);
-        s_control_mutex = NULL;
+        if (s_control_queue != NULL) {
+            vQueueDelete(s_control_queue);
+            s_control_queue = NULL;
+        }
+        if (s_control_mutex != NULL) {
+            vSemaphoreDelete(s_control_mutex);
+            s_control_mutex = NULL;
+        }
         return error;
     }
 
-    error = usb_cdc_input_init();
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "USB CDC 输入初始化失败：%s", esp_err_to_name(error));
-        return error;
+    if (profile == USB_DEVICE_PROFILE_CDC) {
+        error = usb_cdc_input_init();
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "USB CDC 输入初始化失败：%s", esp_err_to_name(error));
+            tinyusb_driver_uninstall();
+            return error;
+        }
+        ESP_LOGI(TAG, "原生 USB 配置：CDC-only，VID:PID=303A:4001");
+        return ESP_OK;
     }
 
     if (xTaskCreate(
@@ -641,15 +746,27 @@ esp_err_t hid_output_init(void)
             8,
             NULL) != pdPASS) {
         ESP_LOGE(TAG, "无法创建 HID 发送任务");
+        tinyusb_driver_uninstall();
+        vQueueDelete(s_control_queue);
+        s_control_queue = NULL;
+        vSemaphoreDelete(s_control_mutex);
+        s_control_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
 
+    ESP_LOGI(TAG, "原生 USB 配置：键盘 + 相对触摸板 HID-only，VID:PID=303A:4004");
     return ESP_OK;
 }
 
 esp_err_t hid_output_submit(const bridge_frame_t *frame)
 {
-    if (frame == NULL || s_control_queue == NULL) {
+    if (frame == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_usb_profile != USB_DEVICE_PROFILE_KEYBOARD_TOUCHPAD) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (s_control_queue == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 

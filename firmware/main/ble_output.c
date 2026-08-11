@@ -344,7 +344,7 @@ esp_err_t ble_output_init(void)
 #else
     ESP_RETURN_ON_ERROR(esp_hid_gap_init(HIDD_BLE_MODE), TAG, "初始化 BLE GAP 失败");
     ESP_RETURN_ON_ERROR(
-        esp_hid_ble_gap_adv_init(ESP_HID_APPEARANCE_GENERIC, s_config.device_name),
+        esp_hid_ble_gap_adv_init(ESP_HID_APPEARANCE_KEYBOARD, s_config.device_name),
         TAG,
         "初始化 BLE 广播失败");
     ESP_RETURN_ON_ERROR(

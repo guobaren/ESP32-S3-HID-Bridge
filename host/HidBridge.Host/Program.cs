@@ -1,3 +1,4 @@
+using HidBridge.Host.Automation;
 using HidBridge.Host.Input;
 using HidBridge.Host.RemoteInput;
 using HidBridge.Host.Transport;
@@ -18,6 +19,7 @@ internal static class Program
 
         IBridgeTransport? transport = null;
         InputForwarder? input = null;
+        AutomationController? automation = null;
         SimulationLogGenerator? simulation = null;
         RemoteInputServer? remoteInput = null;
         try
@@ -35,6 +37,12 @@ internal static class Program
                     ? new NetworkBridge(options)
                     : new SerialBridge(options, logSettings);
             input = new InputForwarder(transport);
+            AutomationProfileStore profileStore = new();
+            if (profileStore.TryImportLegacyMouseHubProfiles(@"F:\Mouse hub\profiles"))
+            {
+                Console.WriteLine("已从 F:\\Mouse hub\\profiles 导入宏、Lua 和配置名称；其他 Mouse hub 设置未启用。");
+            }
+            automation = new AutomationController(profileStore, input);
             if (options.RemoteInputEnabled)
             {
                 remoteInput = new RemoteInputServer(
@@ -56,7 +64,7 @@ internal static class Program
                         ? $"串口自动发现 @ {options.BaudRate}"
                         : $"串口 {options.PortName} @ {options.BaudRate}";
 
-            using BridgeMainForm form = new(input, endpoint, logSettings);
+            using BridgeMainForm form = new(input, automation, endpoint, logSettings);
             logWriter.Attach(form.AppendLog);
             Console.WriteLine($"目标端点：{endpoint}");
             Console.WriteLine($"本地实时日志：{logWriter.FilePath}");
@@ -70,6 +78,7 @@ internal static class Program
             }
 
             input.Start();
+            automation.Start();
             remoteInput?.Start();
             Application.Run(form);
         }
@@ -86,6 +95,7 @@ internal static class Program
         {
             remoteInput?.Dispose();
             simulation?.Dispose();
+            automation?.Dispose();
             input?.Stop();
             input?.Dispose();
             transport?.Dispose();

@@ -36,14 +36,14 @@ static esp_err_t submit_to_mode(output_mode_t mode, const bridge_frame_t *frame)
     return ESP_OK;
 }
 
-esp_err_t output_router_init(void)
+esp_err_t output_router_init(usb_device_profile_t usb_profile)
 {
     s_mode_mutex = xSemaphoreCreateMutex();
     if (s_mode_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
-    esp_err_t usb_result = hid_output_init();
+    esp_err_t usb_result = hid_output_init(usb_profile);
     if (usb_result != ESP_OK) {
         return usb_result;
     }

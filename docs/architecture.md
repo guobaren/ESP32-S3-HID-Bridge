@@ -20,13 +20,13 @@ Windows 主机程序负责：
 固件同时承担输入接收和多后端输出角色：
 
 - UART 接收端：从板载 USB-UART 桥读取主机帧。
-- 原生 USB CDC 接收端：通过 ESP32-S3 内置 USB PHY 接收与 UART 相同的主机帧。
-- USB Device 端：同一原生 USB 设备以 `CDC + HID` 复合设备枚举，HID 负责 USB 输出。
+- 原生 USB CDC 接收端：启动期 1.5 秒未检测到 UART 有效协议帧时启用，原生 USB 以 CDC-only 枚举并接收与 UART 相同的主机帧。
+- USB Device 端：启动期检测到 UART 有效协议帧时启用，原生 USB 以 HID-only 枚举为键盘与相对触摸板。
 - BLE HID 端：通过 NimBLE 对外暴露复合键鼠。
 - Wi-Fi 输入/Target Agent 端：使用项目安全通道传输。
 - USB HID 与 BLE HID 采用先连接锁定策略；先连接并成为活动输出的链路保持锁定，后连接的另一链路不得抢占。USB 侧以 HID 端点可发送性作为实际存活条件，连续 100 ms 不可发送即失活，从而覆盖外部供电时 `tud_mounted()` 未随数据线拔出清除的情况；当前活动链路失活后才切换并双向释放输入状态。
 
-USB 侧使用一个 HID Interface 和两个 Report ID：
+HID-only 模式使用一个 HID Interface 和两个 Report ID：
 
 | Report ID | 类型 | 数据长度 |
 |---:|---|---:|
@@ -80,8 +80,8 @@ USB 侧使用一个 HID Interface 和两个 Report ID：
 
 ### 电脑到开发板
 
-- USB-to-UART 与原生 USB CDC 都是低延迟、无需网络配置的输入通道；主机默认自动发现，固定 COM 口可配置覆盖。
-- 自动发现只接受带正确 CRC、序号、签名和随机数的 `DeviceHello`。CH340 路径仍依赖 USB-UART 驱动；原生 USB CDC 则由复合设备中的 CDC 接口提供 COM 口。
+- USB-to-UART 与原生 USB CDC 都是低延迟、无需网络配置的输入通道；主机默认自动发现，固定 COM 口可配置覆盖。两者不会在同一次启动中同时作为原生 USB 接口出现。
+- 自动发现只接受带正确 CRC、序号、签名和随机数的 `DeviceHello`。启动期任何有效 UART 协议帧都会选择 HID-only；没有 UART 协议帧则选择 CDC-only，模式保持到下次复位。
 - Wi-Fi 输入使用项目原生安全通道，包含预共享密钥双向认证、AES-256-GCM 和重放保护。
 - Wi-Fi 服务拒绝未认证连接，不开放匿名键鼠控制接口。
 - Wi-Fi SSID 和密码由 SoftAP captive portal 写入 NVS；无凭据、连接失败或长按 BOOT 时进入配网模式，连接成功后关闭临时热点。

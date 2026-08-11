@@ -24,6 +24,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "nimble/ble.h"
 #include "host/ble_sm.h"
+#include "host/ble_store.h"
 #else
 #include "esp_bt_device.h"
 #endif
@@ -34,6 +35,10 @@ static const char *TAG = "ESP_HID_GAP";
 static uint16_t s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint32_t s_connection_generation;
 static uint32_t s_connection_update_scheduled_generation;
+static ble_addr_t s_last_bonded_peer_addr;
+static bool s_has_last_bonded_peer;
+static bool s_initial_advertising_started;
+static unsigned int s_directed_reconnect_bursts_remaining;
 
 static void log_connection_parameters(const char *phase, uint16_t conn_handle)
 {
@@ -868,12 +873,62 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
 #endif /* CONFIG_BT_BLE_ENABLED */
 
 #if CONFIG_BT_NIMBLE_ENABLED
+#include "esp_hid_connect_policy.h"
+
+_Static_assert((int)BLE_ERR_CONN_SPVN_TMO == ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT,
+               "HCI connection supervision timeout status changed");
+_Static_assert((int)BLE_ERR_REM_USER_CONN_TERM == ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED,
+               "HCI remote user termination status changed");
+_Static_assert((int)BLE_ERR_UNSUPP_REM_FEATURE == ESP_HID_HCI_STATUS_UNSUPPORTED_REMOTE_FEATURE,
+               "HCI unsupported remote feature status changed");
+
 #define GATT_SVR_SVC_HID_UUID 0x1812
 
 extern void ble_hid_task_start_up(void);
 static struct ble_hs_adv_fields fields;
 static struct ble_hs_adv_fields scan_response_fields;
 static ble_uuid16_t hid_service_uuid = BLE_UUID16_INIT(GATT_SVR_SVC_HID_UUID);
+
+static void nimble_remember_peer(const ble_addr_t *peer_id_addr)
+{
+    if (peer_id_addr == NULL) {
+        return;
+    }
+
+    s_last_bonded_peer_addr = *peer_id_addr;
+    if (s_last_bonded_peer_addr.type == BLE_ADDR_PUBLIC_ID) {
+        s_last_bonded_peer_addr.type = BLE_ADDR_PUBLIC;
+    } else if (s_last_bonded_peer_addr.type == BLE_ADDR_RANDOM_ID) {
+        s_last_bonded_peer_addr.type = BLE_ADDR_RANDOM;
+    }
+    s_has_last_bonded_peer = true;
+}
+
+static bool nimble_load_bonded_peer(void)
+{
+    ble_addr_t peer_addr;
+    int peer_count = 0;
+    int rc = ble_store_util_bonded_peers(&peer_addr, &peer_count, 1);
+    if (rc != 0 || peer_count == 0) {
+        if (rc != 0) {
+            ESP_LOGW(TAG, "read bonded peer for directed reconnect failed; rc=%d", rc);
+        }
+        return false;
+    }
+
+    nimble_remember_peer(&peer_addr);
+    return true;
+}
+
+static void nimble_request_directed_reconnect(void)
+{
+    if (!s_has_last_bonded_peer) {
+        nimble_load_bonded_peer();
+    }
+    if (s_has_last_bonded_peer) {
+        s_directed_reconnect_bursts_remaining = ESP_HID_DIRECTED_RECONNECT_BURSTS;
+    }
+}
 
 esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
 {
@@ -996,22 +1051,49 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
          * mean that the ACL connection was removed, so verify the handle.
          */
         rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-        if (rc != 0) {
+        bool connection_handle_is_active = rc == 0;
+        if (!esp_hid_nimble_connect_event_is_usable(
+                event->connect.status,
+                connection_handle_is_active)) {
             ESP_LOGW(TAG,
-                     "connection failed; status=%d conn_handle=%u is not active; rc=%d",
-                     event->connect.status, event->connect.conn_handle, rc);
+                     "connection rejected; status=%d conn_handle=%u active=%d rc=%d",
+                     event->connect.status,
+                     event->connect.conn_handle,
+                     connection_handle_is_active,
+                     rc);
             ++s_connection_generation;
-            s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
             ble_hid_task_shut_down();
-            nimble_restart_advertising_if_idle("connection attempt failed");
+            if (connection_handle_is_active) {
+                s_active_connection_handle = event->connect.conn_handle;
+                int terminate_rc = ble_gap_terminate(
+                    event->connect.conn_handle,
+                    BLE_ERR_REM_USER_CONN_TERM);
+                if (terminate_rc == 0) {
+                    ESP_LOGI(TAG,
+                             "terminating rejected active connection; conn_handle=%u status=%d",
+                             event->connect.conn_handle,
+                             event->connect.status);
+                } else {
+                    ESP_LOGW(TAG,
+                             "failed to terminate rejected connection; conn_handle=%u rc=%d",
+                             event->connect.conn_handle,
+                             terminate_rc);
+                    s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+                    nimble_restart_advertising_if_idle("rejected connection cleanup failed");
+                }
+            } else {
+                s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+                nimble_restart_advertising_if_idle("connection attempt failed");
+            }
             return 0;
         }
+        s_directed_reconnect_bursts_remaining = 0;
         if (event->connect.status == 0) {
             ESP_LOGI(TAG, "connection established; status=0 conn_handle=%u",
                      event->connect.conn_handle);
         } else {
             ESP_LOGW(TAG,
-                     "connection active despite non-zero status=%d; conn_handle=%u",
+                     "connection compatibility status accepted=%d; conn_handle=%u",
                      event->connect.status, event->connect.conn_handle);
         }
 
@@ -1050,6 +1132,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
         ble_hid_task_shut_down();
+        nimble_request_directed_reconnect();
         nimble_restart_advertising_if_idle("connection disconnected");
         return 0;
     case BLE_GAP_EVENT_CONN_UPDATE:
@@ -1099,6 +1182,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         if (event->enc_change.status == 0) {
             rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
             assert(rc == 0);
+            nimble_remember_peer(&desc.peer_id_addr);
             log_connection_parameters("encryption_current", event->enc_change.conn_handle);
             schedule_narrow_connection_interval(s_connection_generation, "encryption_complete");
             ble_hid_task_start_up();
@@ -1225,14 +1309,40 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
         MODLOG_DFLT(ERROR, "error setting scan response data; rc=%d\n", rc);
         return rc;
     }
-    /* Begin advertising. */
+    if (!s_initial_advertising_started) {
+        s_initial_advertising_started = true;
+        nimble_request_directed_reconnect();
+    }
+
+    /* 已绑定设备先用数个高占空比定向广播；均超时后自动回落普通广播。 */
     memset(&adv_params, 0, sizeof adv_params);
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(30);/* Recommended interval 30ms to 50ms */
-    adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(50);
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
-                           &adv_params, nimble_hid_gap_event, NULL);
+    bool use_directed = esp_hid_nimble_should_use_directed_reconnect(
+        s_has_last_bonded_peer,
+        s_directed_reconnect_bursts_remaining);
+    if (use_directed) {
+        --s_directed_reconnect_bursts_remaining;
+        adv_params.conn_mode = BLE_GAP_CONN_MODE_DIR;
+        adv_params.disc_mode = BLE_GAP_DISC_MODE_NON;
+        adv_params.high_duty_cycle = 1;
+        rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM,
+                               &s_last_bonded_peer_addr,
+                               BLE_HS_FOREVER,
+                               &adv_params,
+                               nimble_hid_gap_event,
+                               NULL);
+        if (rc == 0) {
+            ESP_LOGI(TAG,
+                     "high-duty directed reconnect advertising started; bursts_remaining=%u",
+                     s_directed_reconnect_bursts_remaining);
+        }
+    } else {
+        adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+        adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+        adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(30);/* Recommended interval 30ms to 50ms */
+        adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(50);
+        rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
+                               &adv_params, nimble_hid_gap_event, NULL);
+    }
     if (rc != 0) {
         MODLOG_DFLT(ERROR, "error enabling advertisement; rc=%d\n", rc);
         return rc;

@@ -8,6 +8,7 @@
 #include <stdbool.h>
 
 #include "ble_hidd.h"
+#include "esp_hid_connect_policy.h"
 #include "esp_private/esp_hidd_private.h"
 #include "esp_log.h"
 #include "freertos/semphr.h"
@@ -594,16 +595,19 @@ static int nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
          * feature-exchange status, is the authoritative link-state check.
          */
         rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-        if (rc != 0) {
+        if (!esp_hid_nimble_connect_event_is_usable(event->connect.status, rc == 0)) {
             ESP_LOGW(TAG,
-                     "GAP listener CONNECT ignored: status=%d conn_handle=%u has no active connection; rc=%d",
-                     event->connect.status, event->connect.conn_handle, rc);
+                     "GAP listener CONNECT rejected: status=%d conn_handle=%u active=%d rc=%d",
+                     event->connect.status,
+                     event->connect.conn_handle,
+                     rc == 0,
+                     rc);
             unlock_hidd();
             return 0;
         }
         if (event->connect.status != 0) {
             ESP_LOGW(TAG,
-                     "GAP listener CONNECT compatibility path: non-zero status=%d but conn_handle=%u is active",
+                     "GAP listener CONNECT compatibility path: accepted status=%d with active conn_handle=%u",
                      event->connect.status, event->connect.conn_handle);
         }
 
