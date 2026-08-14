@@ -31,7 +31,11 @@ internal sealed class AutomationController : IDisposable
             ? Settings.ActiveProfile
             : AutomationProfileStore.GlobalProfile;
         _activeProfile = store.LoadProfile(activeProfile);
-        _lua = new LuaScriptRunner(_output, message => Log?.Invoke(message), () => LuaLogCleared?.Invoke());
+        _lua = new LuaScriptRunner(
+            _output,
+            message => Log?.Invoke(message),
+            message => DiagnosticLog?.Invoke(message),
+            () => LuaLogCleared?.Invoke());
     }
 
     internal AutomationSettings Settings { get; }
@@ -39,6 +43,7 @@ internal sealed class AutomationController : IDisposable
     internal bool LuaActive => _lua.Active;
 
     internal event Action<string>? Log;
+    internal event Action<string>? DiagnosticLog;
     internal event Action? LuaLogCleared;
     internal event Action<string>? ActiveProfileChanged;
     internal event Action<bool>? LuaStateChanged;

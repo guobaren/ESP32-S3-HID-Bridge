@@ -14,6 +14,7 @@ internal static class NativeMethods
     internal const int WmSysKeyDown = 0x0104;
     internal const int WmSysKeyUp = 0x0105;
     internal const int WmInput = 0x00FF;
+    internal const int WmQuit = 0x0012;
 
     internal const uint LlkhfExtended = 0x01;
     internal const uint LlkhfInjected = 0x10;
@@ -41,6 +42,17 @@ internal static class NativeMethods
     internal static readonly IntPtr HwndMessage = new(-3);
 
     internal delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll")]
+    internal static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool PostThreadMessage(
+        uint threadId,
+        int message,
+        IntPtr wParam,
+        IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct KeyboardHookData

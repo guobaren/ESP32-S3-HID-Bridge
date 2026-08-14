@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using HidBridge.Host.Automation;
 using HidBridge.Host.Transport;
@@ -8,6 +9,15 @@ namespace HidBridge.Host.Input;
 
 internal sealed class InputForwarder : IDisposable
 {
+    private readonly record struct CapturedInputEvent(
+        bool IsKeyboard,
+        uint VirtualKey,
+        bool Extended,
+        bool IsDown,
+        NativeMethods.RawMouse RawMouse);
+
+    private readonly record struct CapturedKeyboardKey(uint VirtualKey, bool Extended);
+
     private const uint VkEnd = 0x23;
     private const uint VkHome = 0x24;
     private const byte LeftButton = 1 << 0;
@@ -20,13 +30,23 @@ internal sealed class InputForwarder : IDisposable
     private readonly NativeMethods.HookProc _mouseProc;
     private readonly MouseReportPump _mouseReportPump;
     private readonly object _inputStateLock = new();
+    private readonly object _captureLifecycleLock = new();
+    private readonly object _keyboardEdgeLock = new();
     private readonly List<byte> _pressedKeys = [];
     private readonly HashSet<byte> _automationPressedKeys = [];
     private readonly HashSet<uint> _triggerHeldKeys = [];
     private readonly HashSet<uint> _controlHotkeysDown = [];
+    private readonly HashSet<CapturedKeyboardKey> _capturedKeyboardKeysDown = [];
     private IntPtr _keyboardHook;
     private IntPtr _mouseHook;
     private RawMouseInputWindow? _rawMouseInput;
+    private Thread? _captureThread;
+    private Thread? _inputDispatchThread;
+    private BlockingCollection<CapturedInputEvent>? _inputEvents;
+    private ManualResetEventSlim? _captureReady;
+    private Exception? _captureStartupException;
+    private uint _captureThreadId;
+    private bool _captureStopRequested;
     private byte _modifiers;
     private byte _automationModifiers;
     private byte _mouseButtons;
@@ -46,6 +66,7 @@ internal sealed class InputForwarder : IDisposable
     internal bool SimulatedUdpInputEnabled => _mouseReportPump.SimulatedUdpInputEnabled;
     internal int SimulatedUdpInputFrequencyHz => _mouseReportPump.SimulatedUdpInputFrequencyHz;
     internal bool UdpSmoothingEnabled => _mouseReportPump.UdpSmoothingEnabled;
+    internal uint CaptureThreadId => Volatile.Read(ref _captureThreadId);
 
     internal event EventHandler<bool>? ForwardingChanged;
     internal event Action? ForwardingTransitioning;
@@ -84,7 +105,13 @@ internal sealed class InputForwarder : IDisposable
     }
 
     internal void ProcessRawMouseInputForChecks(NativeMethods.RawMouse input) =>
-        HandleRawMouseInput(input);
+        HandleRawMouseInputSafely(input);
+
+    internal bool EnqueueKeyboardInputForChecks(uint virtualKey, bool extended, bool isDown) =>
+        TryEnqueueKeyboardTransition(virtualKey, extended, isDown);
+
+    internal bool EnqueueRawMouseInputForChecks(NativeMethods.RawMouse input) =>
+        TryEnqueueInput(new CapturedInputEvent(false, 0, false, false, input));
 
     internal void SendAutomationMouseMove(int deltaX, int deltaY)
     {
@@ -177,61 +204,243 @@ internal sealed class InputForwarder : IDisposable
 
     internal void Start()
     {
-        if (_started)
+        lock (_captureLifecycleLock)
         {
-            return;
+            if (_started)
+            {
+                return;
+            }
+
+            _captureStartupException = null;
+            _captureStopRequested = false;
+            lock (_keyboardEdgeLock)
+            {
+                _capturedKeyboardKeysDown.Clear();
+            }
+            _inputEvents?.Dispose();
+            _inputEvents = new BlockingCollection<CapturedInputEvent>();
+            _inputDispatchThread = new Thread(InputDispatchLoop)
+            {
+                IsBackground = true,
+                Name = "HidBridge.InputDispatch",
+                Priority = ThreadPriority.AboveNormal,
+            };
+            _inputDispatchThread.Start();
+            _captureReady?.Dispose();
+            _captureReady = new ManualResetEventSlim(false);
+            _captureThread = new Thread(CaptureThreadMain)
+            {
+                IsBackground = true,
+                Name = "HidBridge.InputCapture",
+                Priority = ThreadPriority.AboveNormal,
+            };
+            _captureThread.SetApartmentState(ApartmentState.STA);
+            _captureThread.Start();
         }
 
-        _rawMouseInput = new RawMouseInputWindow((_, input) => HandleRawMouseInput(input));
-
-        IntPtr module = NativeMethods.GetModuleHandle(null);
-        _keyboardHook = NativeMethods.SetWindowsHookEx(
-            NativeMethods.WhKeyboardLl,
-            _keyboardProc,
-            module,
-            0);
-        _mouseHook = NativeMethods.SetWindowsHookEx(
-            NativeMethods.WhMouseLl,
-            _mouseProc,
-            module,
-            0);
-
-        if (_keyboardHook == IntPtr.Zero || _mouseHook == IntPtr.Zero)
+        if (!_captureReady.Wait(TimeSpan.FromSeconds(5)))
         {
             Stop();
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "无法安装全局输入钩子。");
+            throw new TimeoutException("输入捕获线程启动超时。");
         }
 
-        _started = true;
+        if (_captureStartupException is not null)
+        {
+            Exception exception = _captureStartupException;
+            Stop();
+            throw new InvalidOperationException("无法启动独立输入捕获线程。", exception);
+        }
     }
 
     internal void Stop()
     {
-        if (!_started && _keyboardHook == IntPtr.Zero && _mouseHook == IntPtr.Zero && _rawMouseInput is null)
+        Thread? captureThread;
+        uint captureThreadId;
+        lock (_captureLifecycleLock)
+        {
+            captureThread = _captureThread;
+            captureThreadId = _captureThreadId;
+            if (!_started && captureThread is null && _inputDispatchThread is null)
+            {
+                return;
+            }
+        }
+
+        lock (_captureLifecycleLock)
+        {
+            _captureStopRequested = true;
+        }
+        SetForwarding(false, true);
+        if (captureThreadId != 0)
+        {
+            NativeMethods.PostThreadMessage(
+                captureThreadId,
+                NativeMethods.WmQuit,
+                IntPtr.Zero,
+                IntPtr.Zero);
+        }
+        if (captureThread is not null && captureThread != Thread.CurrentThread)
+        {
+            if (!captureThread.Join(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("输入捕获线程未在 5 秒内安全退出。");
+            }
+        }
+        StopInputDispatch();
+        lock (_keyboardEdgeLock)
+        {
+            _capturedKeyboardKeysDown.Clear();
+        }
+    }
+
+    private void CaptureThreadMain()
+    {
+        bool captureStarted = false;
+        lock (_captureLifecycleLock)
+        {
+            _captureThreadId = NativeMethods.GetCurrentThreadId();
+        }
+        try
+        {
+            _rawMouseInput = new RawMouseInputWindow((_, input) => EnqueueRawMouseInput(input));
+            IntPtr module = NativeMethods.GetModuleHandle(null);
+            _keyboardHook = NativeMethods.SetWindowsHookEx(
+                NativeMethods.WhKeyboardLl,
+                _keyboardProc,
+                module,
+                0);
+            _mouseHook = NativeMethods.SetWindowsHookEx(
+                NativeMethods.WhMouseLl,
+                _mouseProc,
+                module,
+                0);
+            if (_keyboardHook == IntPtr.Zero || _mouseHook == IntPtr.Zero)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "无法安装全局输入钩子。");
+            }
+
+            lock (_captureLifecycleLock)
+            {
+                _started = true;
+                captureStarted = true;
+            }
+            _captureReady?.Set();
+            Application.Run();
+        }
+        catch (Exception exception)
+        {
+            if (!captureStarted)
+            {
+                _captureStartupException = exception;
+            }
+            else
+            {
+                Console.Error.WriteLine($"输入捕获线程异常退出：{exception.Message}");
+            }
+            _captureReady?.Set();
+        }
+        finally
+        {
+            bool stopRequested;
+            lock (_captureLifecycleLock)
+            {
+                stopRequested = _captureStopRequested;
+            }
+            if (captureStarted && !stopRequested)
+            {
+                Console.Error.WriteLine("输入捕获线程意外停止，已禁用转发并强制释放全部按键和鼠标按钮。");
+                lock (_captureLifecycleLock)
+                {
+                    _captureStopRequested = true;
+                }
+                FailSafeReleaseAll();
+            }
+            if (_keyboardHook != IntPtr.Zero)
+            {
+                NativeMethods.UnhookWindowsHookEx(_keyboardHook);
+                _keyboardHook = IntPtr.Zero;
+            }
+            if (_mouseHook != IntPtr.Zero)
+            {
+                NativeMethods.UnhookWindowsHookEx(_mouseHook);
+                _mouseHook = IntPtr.Zero;
+            }
+            _rawMouseInput?.Dispose();
+            _rawMouseInput = null;
+            lock (_captureLifecycleLock)
+            {
+                _started = false;
+                _captureThreadId = 0;
+                _captureThread = null;
+            }
+            _inputEvents?.CompleteAdding();
+        }
+    }
+
+    private void InputDispatchLoop()
+    {
+        BlockingCollection<CapturedInputEvent>? events = _inputEvents;
+        if (events is null)
         {
             return;
         }
-
-        SetForwarding(false, true);
-
-        if (_keyboardHook != IntPtr.Zero)
+        try
         {
-            NativeMethods.UnhookWindowsHookEx(_keyboardHook);
-            _keyboardHook = IntPtr.Zero;
+            foreach (CapturedInputEvent input in events.GetConsumingEnumerable())
+            {
+                if (Volatile.Read(ref _captureStopRequested))
+                {
+                    continue;
+                }
+                if (input.IsKeyboard)
+                {
+                    ProcessKeyboardInput(input.VirtualKey, input.Extended, input.IsDown);
+                }
+                else
+                {
+                    HandleRawMouseInputSafely(input.RawMouse);
+                }
+            }
         }
-
-        if (_mouseHook != IntPtr.Zero)
+        catch (Exception exception)
         {
-            NativeMethods.UnhookWindowsHookEx(_mouseHook);
-            _mouseHook = IntPtr.Zero;
+            Console.Error.WriteLine($"输入分发线程异常退出，已强制 ReleaseAll：{exception.Message}");
+            lock (_captureLifecycleLock)
+            {
+                _captureStopRequested = true;
+            }
+            FailSafeReleaseAll();
         }
+    }
 
-        _rawMouseInput?.Dispose();
-        _rawMouseInput = null;
-        _started = false;
+    private void StopInputDispatch()
+    {
+        BlockingCollection<CapturedInputEvent>? events = _inputEvents;
+        Thread? dispatchThread = _inputDispatchThread;
+        events?.CompleteAdding();
+        if (dispatchThread is not null && dispatchThread != Thread.CurrentThread &&
+            !dispatchThread.Join(TimeSpan.FromSeconds(5)))
+        {
+            throw new TimeoutException("输入分发线程未在 5 秒内安全退出。");
+        }
+        _inputDispatchThread = null;
     }
 
     private IntPtr KeyboardCallback(int code, IntPtr wParam, IntPtr lParam)
+    {
+        try
+        {
+            return KeyboardCallbackCore(code, wParam, lParam);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"键盘输入回调异常，已强制 ReleaseAll：{exception.Message}");
+            FailSafeReleaseAll();
+            return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
+        }
+    }
+
+    private IntPtr KeyboardCallbackCore(int code, IntPtr wParam, IntPtr lParam)
     {
         if (code != NativeMethods.HcAction)
         {
@@ -250,19 +459,75 @@ internal sealed class InputForwarder : IDisposable
             Marshal.PtrToStructure<NativeMethods.KeyboardHookData>(lParam);
         uint virtualKey = data.VirtualKey;
 
-        if ((data.Flags & NativeMethods.LlkhfInjected) != 0)
+        if (ShouldIgnoreKeyboardHookEvent(data.Flags, virtualKey))
         {
             return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
         }
 
+        bool isToggleHotkey = isDown && virtualKey == VkHome;
+        bool isExitHotkey = isDown && virtualKey == VkEnd;
+        if (!TryEnqueueKeyboardTransition(
+                virtualKey,
+                (data.Flags & NativeMethods.LlkhfExtended) != 0,
+                isDown))
+        {
+            return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
+        }
+        if (isToggleHotkey || isExitHotkey || ForwardingEnabled)
+        {
+            return (IntPtr)1;
+        }
+
+        return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
+    }
+
+    private bool TryEnqueueKeyboardTransition(uint virtualKey, bool extended, bool isDown)
+    {
+        lock (_keyboardEdgeLock)
+        {
+            CapturedKeyboardKey key = new(virtualKey, extended);
+            bool changed = isDown
+                ? _capturedKeyboardKeysDown.Add(key)
+                : _capturedKeyboardKeysDown.Remove(key);
+            if (!changed)
+            {
+                // 低级键盘 Hook 会收到 Windows/外设驱动的按键自动重复。Lua/宏需要的是
+                // 物理边沿，同一次按住期间只能发布一次 pressed 和一次 released。
+                return false;
+            }
+
+            if (TryEnqueueInput(new CapturedInputEvent(
+                    true,
+                    virtualKey,
+                    extended,
+                    isDown,
+                    default)))
+            {
+                return true;
+            }
+
+            // 入队失败时回滚边沿状态，避免恢复后永久吞掉下一次真实事件。
+            if (isDown)
+            {
+                _capturedKeyboardKeysDown.Remove(key);
+            }
+            else
+            {
+                _capturedKeyboardKeysDown.Add(key);
+            }
+            return false;
+        }
+    }
+
+    private void ProcessKeyboardInput(uint virtualKey, bool extended, bool isDown)
+    {
         lock (_inputStateLock)
         {
-            UpdateKeyboardState(virtualKey, (data.Flags & NativeMethods.LlkhfExtended) != 0, isDown);
+            UpdateKeyboardState(virtualKey, extended, isDown);
         }
 
         bool isToggleHotkey = isDown && virtualKey == VkHome;
         bool isExitHotkey = isDown && virtualKey == VkEnd;
-
         if (isToggleHotkey || isExitHotkey)
         {
             _controlHotkeysDown.Add(virtualKey);
@@ -279,34 +544,43 @@ internal sealed class InputForwarder : IDisposable
                 SetForwarding(false, true);
                 ExitRequested?.Invoke(this, EventArgs.Empty);
             }
-
-            // HOME 会重建自动化运行时；在切换完成后再发布同一次按下事件，
-            // 使 HOME 宏在新的本机/对端路由上执行，而不是刚启动就被取消。
             NotifyPhysicalInput(virtualKey, true);
-
-            return (IntPtr)1;
+            return;
         }
 
-        NotifyPhysicalInput(virtualKey, isDown);
-
-        if (isUp && _controlHotkeysDown.Remove(virtualKey))
+        if (!isDown && _controlHotkeysDown.Remove(virtualKey))
         {
-            return (IntPtr)1;
+            NotifyPhysicalInput(virtualKey, false);
+            return;
         }
-
         if (ForwardingEnabled)
         {
-            // 修饰键在按下事件到达时立即发送，避免 Ctrl/Alt 组合出现首个按键延迟。
+            // 目标端安全状态优先于 Lua/宏回调；released 回调即使阻塞或失败，
+            // 对端也必须先收到不再包含该实体键的键盘报告。
             SendKeyboardReport();
         }
-
-        if (ShouldSuppressKeyboard(ForwardingEnabled, false, false))
-        {
-            return (IntPtr)1;
-        }
-
-        return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
+        NotifyPhysicalInput(virtualKey, isDown);
     }
+
+    private bool TryEnqueueInput(CapturedInputEvent input)
+    {
+        BlockingCollection<CapturedInputEvent>? events = _inputEvents;
+        if (events is null || events.IsAddingCompleted || Volatile.Read(ref _captureStopRequested))
+        {
+            return false;
+        }
+        try
+        {
+            return events.TryAdd(input);
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private void EnqueueRawMouseInput(NativeMethods.RawMouse input) =>
+        EnqueueRawMouseInputForChecks(input);
 
     private IntPtr MouseCallback(int code, IntPtr wParam, IntPtr lParam)
     {
@@ -366,10 +640,57 @@ internal sealed class InputForwarder : IDisposable
             return;
         }
 
-        ForwardingTransitioning?.Invoke();
+        if (enabled)
+        {
+            TryNotifyForwardingTransitioning();
+        }
         ClearInputState();
         _mouseReportPump.ResetAndSendRelease(enabled);
-        ForwardingChanged?.Invoke(this, enabled);
+        if (!enabled)
+        {
+            // 关闭时安全释放必须先于任何外部事件处理器，避免事件阻塞或异常造成卡键。
+            TryNotifyForwardingTransitioning();
+        }
+        TryNotifyForwardingChanged(enabled);
+    }
+
+    private void FailSafeReleaseAll()
+    {
+        try
+        {
+            ClearInputState();
+            _mouseReportPump.ResetAndSendRelease(false);
+            TryNotifyForwardingTransitioning();
+            TryNotifyForwardingChanged(false);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"输入故障保护 ReleaseAll 发送失败：{exception.Message}");
+        }
+    }
+
+    private void TryNotifyForwardingTransitioning()
+    {
+        try
+        {
+            ForwardingTransitioning?.Invoke();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"停止自动化运行时失败，仍将继续执行 ReleaseAll：{exception.Message}");
+        }
+    }
+
+    private void TryNotifyForwardingChanged(bool enabled)
+    {
+        try
+        {
+            ForwardingChanged?.Invoke(this, enabled);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"通知转发状态变化失败：{exception.Message}");
+        }
     }
 
     private void ClearInputState()
@@ -378,6 +699,8 @@ internal sealed class InputForwarder : IDisposable
         {
             _pressedKeys.Clear();
             _automationPressedKeys.Clear();
+            _triggerHeldKeys.Clear();
+            _controlHotkeysDown.Clear();
             _modifiers = 0;
             _automationModifiers = 0;
             _mouseButtons = 0;
@@ -392,10 +715,10 @@ internal sealed class InputForwarder : IDisposable
         // 自动化触发监听与 HID 转发是两条独立链路。本机模式虽然不向对端
         // 累计报告，仍必须把实体鼠标按键送给宏和 Lua 的 OnEvent/IsPressed。
         ushort flags = input.ButtonFlags;
-        NotifyMouseButtonTransitions(flags);
 
         if (!ForwardingEnabled)
         {
+            NotifyMouseButtonTransitions(flags);
             return;
         }
 
@@ -434,6 +757,21 @@ internal sealed class InputForwarder : IDisposable
                 wheel,
                 pan);
         }
+        // 与键盘相同，先把实体按钮的新状态交给 500 Hz 报告泵，再执行 Lua/宏回调。
+        NotifyMouseButtonTransitions(flags);
+    }
+
+    private void HandleRawMouseInputSafely(NativeMethods.RawMouse input)
+    {
+        try
+        {
+            HandleRawMouseInput(input);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"鼠标输入回调异常，已强制 ReleaseAll：{exception.Message}");
+            FailSafeReleaseAll();
+        }
     }
 
     private void UpdateMouseButton(ushort flags, ushort downFlag, ushort upFlag, byte button)
@@ -461,6 +799,10 @@ internal sealed class InputForwarder : IDisposable
         bool handlingControlHotkey,
         bool hotkeyStartedWhileForwarding) =>
         handlingControlHotkey ? hotkeyStartedWhileForwarding : forwardingEnabled;
+
+    internal static bool ShouldIgnoreKeyboardHookEvent(uint flags, uint virtualKey) =>
+        (flags & NativeMethods.LlkhfInjected) != 0 &&
+        virtualKey is not (>= 0x7C and <= 0x87); // 允许驱动模拟的 F13-F24 作为专用宏/Lua 触发键。
 
     internal static bool ShouldSuppressMouse(bool forwardingEnabled) => forwardingEnabled;
 

@@ -1,15 +1,37 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 
 namespace HidBridge.Host.Ui;
 
 internal sealed class UiLogTextWriter : TextWriter
 {
-    private readonly object _sync = new();
+    private const int MaximumQueuedLines = 4_096;
+    private readonly object _lineSync = new();
+    private readonly object _outputSync = new();
     private readonly StringBuilder _line = new();
     private readonly List<string> _pending = [];
+    private readonly BlockingCollection<string> _lines =
+        new(new ConcurrentQueue<string>(), MaximumQueuedLines);
+    private readonly ManualResetEventSlim _idle = new(true);
+    private readonly Thread _writerThread;
     private Action<string>? _sink;
     private StreamWriter? _fileWriter;
     private string? _filePath;
+    private int _queuedLineCount;
+    private long _droppedLineCount;
+    private volatile bool _disposed;
+
+    internal UiLogTextWriter()
+    {
+        _writerThread = new Thread(WriterLoop)
+        {
+            IsBackground = true,
+            Name = "HidBridge.LogWriter",
+            Priority = ThreadPriority.BelowNormal,
+        };
+        _writerThread.Start();
+    }
 
     public override Encoding Encoding => Encoding.UTF8;
 
@@ -17,7 +39,7 @@ internal sealed class UiLogTextWriter : TextWriter
     {
         get
         {
-            lock (_sync)
+            lock (_outputSync)
             {
                 return _filePath;
             }
@@ -44,7 +66,7 @@ internal sealed class UiLogTextWriter : TextWriter
             Directory.CreateDirectory(directory);
         }
 
-        lock (_sync)
+        lock (_outputSync)
         {
             _fileWriter?.Dispose();
             _fileWriter = new StreamWriter(
@@ -60,7 +82,7 @@ internal sealed class UiLogTextWriter : TextWriter
     internal void Attach(Action<string> sink)
     {
         string[] pending;
-        lock (_sync)
+        lock (_outputSync)
         {
             _sink = sink;
             pending = _pending.ToArray();
@@ -75,20 +97,25 @@ internal sealed class UiLogTextWriter : TextWriter
 
     public override void Write(char value)
     {
-        if (value == '\r')
+        string? completed = null;
+        lock (_lineSync)
         {
-            return;
+            if (_disposed || value == '\r')
+            {
+                return;
+            }
+            if (value == '\n')
+            {
+                completed = TakeLineLocked();
+            }
+            else
+            {
+                _line.Append(value);
+            }
         }
-
-        if (value == '\n')
+        if (completed is not null)
         {
-            FlushLine();
-            return;
-        }
-
-        lock (_sync)
-        {
-            _line.Append(value);
+            EnqueueLine(completed);
         }
     }
 
@@ -99,9 +126,32 @@ internal sealed class UiLogTextWriter : TextWriter
             return;
         }
 
-        foreach (char character in value)
+        List<string> completed = [];
+        lock (_lineSync)
         {
-            Write(character);
+            if (_disposed)
+            {
+                return;
+            }
+            foreach (char character in value)
+            {
+                if (character == '\r')
+                {
+                    continue;
+                }
+                if (character == '\n')
+                {
+                    completed.Add(TakeLineLocked());
+                }
+                else
+                {
+                    _line.Append(character);
+                }
+            }
+        }
+        foreach (string line in completed)
+        {
+            EnqueueLine(line);
         }
     }
 
@@ -111,14 +161,109 @@ internal sealed class UiLogTextWriter : TextWriter
         FlushLine();
     }
 
+    public override void Flush()
+    {
+        _idle.Wait(TimeSpan.FromSeconds(5));
+    }
+
     private void FlushLine()
     {
-        string line;
-        Action<string>? sink;
-        lock (_sync)
+        string? completed = null;
+        lock (_lineSync)
         {
-            line = _line.ToString();
-            _line.Clear();
+            if (!_disposed)
+            {
+                completed = TakeLineLocked();
+            }
+        }
+        if (completed is not null)
+        {
+            EnqueueLine(completed);
+        }
+    }
+
+    private string TakeLineLocked()
+    {
+        string line = _line.ToString();
+        _line.Clear();
+        return line;
+    }
+
+    private void EnqueueLine(string line)
+    {
+        if (_disposed || _lines.IsAddingCompleted)
+        {
+            return;
+        }
+
+        _idle.Reset();
+        Interlocked.Increment(ref _queuedLineCount);
+        bool queued;
+        try
+        {
+            queued = _lines.TryAdd(line);
+        }
+        catch (InvalidOperationException)
+        {
+            queued = false;
+        }
+        if (!queued)
+        {
+            Interlocked.Decrement(ref _queuedLineCount);
+            Interlocked.Increment(ref _droppedLineCount);
+            if (Volatile.Read(ref _queuedLineCount) == 0)
+            {
+                _idle.Set();
+            }
+        }
+    }
+
+    private void WriterLoop()
+    {
+        foreach (string line in _lines.GetConsumingEnumerable())
+        {
+            try
+            {
+                long dropped = Interlocked.Exchange(ref _droppedLineCount, 0);
+                if (dropped > 0)
+                {
+                    PersistLine($"日志队列已满，丢弃 {dropped} 行低优先级日志。");
+                }
+                PersistLine(line);
+            }
+            catch (Exception exception)
+            {
+                Debug.WriteLine($"异步日志输出失败：{exception}");
+            }
+            finally
+            {
+                if (Interlocked.Decrement(ref _queuedLineCount) == 0)
+                {
+                    _idle.Set();
+                }
+            }
+        }
+
+        long finalDropped = Interlocked.Exchange(ref _droppedLineCount, 0);
+        if (finalDropped > 0)
+        {
+            try
+            {
+                PersistLine($"日志队列已满，丢弃 {finalDropped} 行低优先级日志。");
+            }
+            catch (Exception exception)
+            {
+                Debug.WriteLine($"异步日志摘要输出失败：{exception}");
+            }
+        }
+        _idle.Set();
+    }
+
+    private void PersistLine(string line)
+    {
+        Action<string>? sink;
+        lock (_outputSync)
+        {
             _fileWriter?.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {line}");
             sink = _sink;
             if (sink is null)
@@ -127,18 +272,24 @@ internal sealed class UiLogTextWriter : TextWriter
                 return;
             }
         }
-
         sink(line);
     }
+
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_disposed)
         {
-            lock (_sync)
+            FlushLine();
+            _disposed = true;
+            _lines.CompleteAdding();
+            _writerThread.Join(TimeSpan.FromSeconds(5));
+            lock (_outputSync)
             {
                 _fileWriter?.Dispose();
                 _fileWriter = null;
             }
+            _lines.Dispose();
+            _idle.Dispose();
         }
         base.Dispose(disposing);
     }

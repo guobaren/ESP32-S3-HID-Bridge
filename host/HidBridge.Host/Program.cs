@@ -16,6 +16,7 @@ internal static class Program
     {
         ApplicationConfiguration.Initialize();
         UiLogTextWriter logWriter = new();
+        UiLogTextWriter automationLogWriter = new();
         Console.SetOut(logWriter);
         Console.SetError(logWriter);
 
@@ -32,6 +33,7 @@ internal static class Program
             RuntimeLogSettings logSettings = new(
                 options.ShowDeviceLogInUi ? RuntimeLogMode.Full : RuntimeLogMode.Reduced);
             logWriter.EnableFile(options.HostLogPath);
+            automationLogWriter.EnableFile(Path.Combine("artifacts", "automation-runtime-{timestamp}.log"));
             SimulationOptions simulationOptions = SimulationOptions.Parse(args);
             SerialBridge? serialBridge = null;
             if (simulationOptions.Enabled)
@@ -56,6 +58,8 @@ internal static class Program
                 Console.WriteLine("已从 F:\\Mouse hub\\profiles 导入宏、Lua 和配置名称；其他 Mouse hub 设置未启用。");
             }
             automation = new AutomationController(profileStore, input);
+            automation.Log += automationLogWriter.WriteLine;
+            automation.DiagnosticLog += automationLogWriter.WriteLine;
             if (serialBridge is not null)
             {
                 firmwareFlash = new FirmwareFlashService(options, serialBridge, input);
@@ -99,6 +103,7 @@ internal static class Program
             logWriter.Attach(form.AppendLog);
             Console.WriteLine($"目标端点：{endpoint}");
             Console.WriteLine($"本地实时日志：{logWriter.FilePath}");
+            Console.WriteLine($"Lua/宏本地诊断日志：{automationLogWriter.FilePath}");
             Console.WriteLine("HOME：开启/关闭同步；END：结束程序。");
             Console.WriteLine("同步开启后，除上述两个快捷键外的其他键鼠输入均只转发到对端。");
             if (simulationOptions.Enabled)
@@ -129,6 +134,7 @@ internal static class Program
             firmwareFlash?.Dispose();
             simulation?.Dispose();
             automation?.Dispose();
+            automationLogWriter.Dispose();
             input?.Stop();
             input?.Dispose();
             transport?.Dispose();

@@ -1,9 +1,14 @@
+using System.Collections.Concurrent;
 using HidBridge.Host.Automation;
 
 namespace HidBridge.Host.Ui;
 
 internal sealed class MacroPageControl : UserControl
 {
+    private const int LogFlushIntervalMilliseconds = 100;
+    private const int MaximumVisibleLogCharacters = 64 * 1024;
+    private const int MaximumPendingLogLines = 2_000;
+    private const int MaximumLogLinesPerFlush = 500;
     private readonly AutomationController _controller;
     private readonly ComboBox _profileComboBox;
     private readonly ListBox _macroListBox;
@@ -13,6 +18,9 @@ internal sealed class MacroPageControl : UserControl
     private readonly TextBox _editor;
     private readonly Label _validationLabel;
     private readonly TextBox _logTextBox;
+    private readonly ConcurrentQueue<string> _pendingLogs = new();
+    private readonly System.Windows.Forms.Timer _logFlushTimer;
+    private int _pendingLogCount;
     private AutomationProfile _profile;
     private bool _loading;
 
@@ -163,6 +171,13 @@ internal sealed class MacroPageControl : UserControl
         saveButton.Click += (_, _) => SaveMacro();
         _controller.ActiveProfileChanged += HandleActiveProfileChanged;
         _controller.Log += AppendLog;
+
+        _logFlushTimer = new System.Windows.Forms.Timer
+        {
+            Interval = LogFlushIntervalMilliseconds,
+        };
+        _logFlushTimer.Tick += (_, _) => FlushPendingLogs();
+        _logFlushTimer.Start();
 
         RefreshProfiles(_profile.Name);
     }
@@ -383,12 +398,56 @@ internal sealed class MacroPageControl : UserControl
         _validationLabel.Text = string.Empty;
     }
 
-    private void AppendLog(string message) => RunOnUiThread(() =>
+    private void AppendLog(string message)
     {
-        _logTextBox.AppendText($"[{DateTime.Now:HH:mm:ss.fff}] {message}{Environment.NewLine}");
+        _pendingLogs.Enqueue($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+        int pendingCount = Interlocked.Increment(ref _pendingLogCount);
+        while (pendingCount > MaximumPendingLogLines && _pendingLogs.TryDequeue(out _))
+        {
+            pendingCount = Interlocked.Decrement(ref _pendingLogCount);
+        }
+    }
+
+    private void FlushPendingLogs()
+    {
+        if (_logTextBox.IsDisposed || _pendingLogs.IsEmpty)
+        {
+            return;
+        }
+
+        List<string> pending = [];
+        while (pending.Count < MaximumLogLinesPerFlush &&
+               _pendingLogs.TryDequeue(out string? line))
+        {
+            Interlocked.Decrement(ref _pendingLogCount);
+            pending.Add(line);
+        }
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        _logTextBox.AppendText(string.Join(Environment.NewLine, pending) + Environment.NewLine);
+        TrimVisibleLogIfNeeded();
         _logTextBox.SelectionStart = _logTextBox.TextLength;
+        _logTextBox.SelectionLength = 0;
         _logTextBox.ScrollToCaret();
-    });
+    }
+
+    private void TrimVisibleLogIfNeeded()
+    {
+        int overflow = _logTextBox.TextLength - MaximumVisibleLogCharacters;
+        if (overflow <= 0)
+        {
+            return;
+        }
+
+        string text = _logTextBox.Text;
+        int firstCompleteLine = text.IndexOf('\n', overflow);
+        _logTextBox.Text = firstCompleteLine >= 0 && firstCompleteLine + 1 < text.Length
+            ? text[(firstCompleteLine + 1)..]
+            : string.Empty;
+    }
 
     private void RunOnUiThread(Action action)
     {
@@ -415,6 +474,8 @@ internal sealed class MacroPageControl : UserControl
     {
         if (disposing)
         {
+            _logFlushTimer.Stop();
+            _logFlushTimer.Dispose();
             _controller.ActiveProfileChanged -= HandleActiveProfileChanged;
             _controller.Log -= AppendLog;
         }

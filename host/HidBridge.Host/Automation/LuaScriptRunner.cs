@@ -10,6 +10,7 @@ internal sealed class LuaScriptRunner : IDisposable
     private readonly object _stateLock = new();
     private readonly IAutomationOutput _output;
     private readonly Action<string> _log;
+    private readonly Action<string> _diagnosticLog;
     private readonly Action _clearLog;
     private readonly HashSet<uint> _heldPhysicalKeys = [];
     private readonly HashSet<int> _pressedButtons = [];
@@ -18,12 +19,18 @@ internal sealed class LuaScriptRunner : IDisposable
     private CancellationTokenSource? _cancellation;
     private Task? _worker;
     private Script? _script;
+    private long _outputSequence;
     private bool _disposed;
 
-    internal LuaScriptRunner(IAutomationOutput output, Action<string> log, Action clearLog)
+    internal LuaScriptRunner(
+        IAutomationOutput output,
+        Action<string> log,
+        Action<string> diagnosticLog,
+        Action clearLog)
     {
         _output = output;
         _log = log;
+        _diagnosticLog = diagnosticLog;
         _clearLog = clearLog;
     }
 
@@ -88,9 +95,11 @@ internal sealed class LuaScriptRunner : IDisposable
         }
         try
         {
+            object argument = AutomationKeyMap.GetLuaEventArgument(input.VirtualKey);
+            _diagnosticLog($"[LuaEvent] 入队 event={(input.Pressed ? "pressed" : "released")} arg={argument} held={input.HeldKeys.Count}");
             events.Add((
                 input.Pressed ? "pressed" : "released",
-                AutomationKeyMap.GetLuaEventArgument(input.VirtualKey)));
+                argument));
         }
         catch (InvalidOperationException)
         {
@@ -141,7 +150,9 @@ internal sealed class LuaScriptRunner : IDisposable
                 DynValue onEvent = script.Globals.Get("OnEvent");
                 if (onEvent.Type is DataType.Function or DataType.ClrFunction)
                 {
+                    _diagnosticLog($"[LuaEvent] 开始 event={eventName} arg={argument}");
                     script.Call(onEvent, eventName, DynValue.FromObject(script, argument));
+                    _diagnosticLog($"[LuaEvent] 结束 event={eventName} arg={argument}");
                 }
             }
         }
@@ -260,7 +271,10 @@ internal sealed class LuaScriptRunner : IDisposable
 
     private void SetMouseButton(int button, bool pressed)
     {
+        long sequence = Interlocked.Increment(ref _outputSequence);
+        _diagnosticLog($"[LuaOutput] #{sequence} 开始 mouse button={button} state={(pressed ? "pressed" : "released")}");
         _output.SetMouseButton(button, pressed);
+        _diagnosticLog($"[LuaOutput] #{sequence} 完成 mouse button={button} state={(pressed ? "pressed" : "released")}");
         lock (_stateLock)
         {
             if (pressed)
@@ -276,6 +290,8 @@ internal sealed class LuaScriptRunner : IDisposable
 
     private void SetKey(byte usage, bool pressed)
     {
+        long sequence = Interlocked.Increment(ref _outputSequence);
+        _diagnosticLog($"[LuaOutput] #{sequence} 开始 key usage={usage} state={(pressed ? "pressed" : "released")}");
         if (pressed)
         {
             _output.KeyDown(usage);
@@ -284,6 +300,7 @@ internal sealed class LuaScriptRunner : IDisposable
         {
             _output.KeyUp(usage);
         }
+        _diagnosticLog($"[LuaOutput] #{sequence} 完成 key usage={usage} state={(pressed ? "pressed" : "released")}");
         lock (_stateLock)
         {
             if (pressed)

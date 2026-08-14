@@ -1,9 +1,14 @@
+using System.Collections.Concurrent;
 using HidBridge.Host.Automation;
 
 namespace HidBridge.Host.Ui;
 
 internal sealed class LuaPageControl : UserControl
 {
+    private const int LuaLogFlushIntervalMilliseconds = 100;
+    private const int MaximumVisibleLuaLogCharacters = 64 * 1024;
+    private const int MaximumPendingLuaLogLines = 2_000;
+    private const int MaximumLuaLogLinesPerFlush = 500;
     private readonly AutomationController _controller;
     private readonly ComboBox _profileComboBox;
     private readonly TextBox _editor;
@@ -13,6 +18,9 @@ internal sealed class LuaPageControl : UserControl
     private readonly Button _stopButton;
     private readonly Button _addProfileButton;
     private readonly Button _deleteProfileButton;
+    private readonly ConcurrentQueue<string> _pendingLogs = new();
+    private readonly System.Windows.Forms.Timer _logFlushTimer;
+    private int _pendingLogCount;
     private AutomationProfile _profile;
     private bool _loading;
 
@@ -49,7 +57,7 @@ internal sealed class LuaPageControl : UserControl
             ForeColor = Color.FromArgb(74, 88, 108),
         });
 
-        _editor = new TextBox
+        _editor = new MultilinePasteTextBox
         {
             Dock = DockStyle.Fill,
             Multiline = true,
@@ -121,11 +129,18 @@ internal sealed class LuaPageControl : UserControl
         saveButton.Click += (_, _) => SaveScript();
         _startButton.Click += (_, _) => StartScript();
         _stopButton.Click += (_, _) => _controller.StopLua();
-        clearButton.Click += (_, _) => _logTextBox.Clear();
+        clearButton.Click += (_, _) => ClearLog();
         _controller.ActiveProfileChanged += HandleActiveProfileChanged;
         _controller.Log += AppendLog;
         _controller.LuaLogCleared += ClearLog;
         _controller.LuaStateChanged += UpdateLuaState;
+
+        _logFlushTimer = new System.Windows.Forms.Timer
+        {
+            Interval = LuaLogFlushIntervalMilliseconds,
+        };
+        _logFlushTimer.Tick += (_, _) => FlushPendingLogs();
+        _logFlushTimer.Start();
 
         RefreshProfiles(_profile.Name);
         UpdateLuaState(_controller.LuaActive);
@@ -249,6 +264,7 @@ internal sealed class LuaPageControl : UserControl
     {
         const string documentation =
             "入口：function OnEvent(event, arg)\r\n\r\n" +
+            "键盘事件 arg 使用小写键名；驱动模拟的 F13-F24 可用 f13..f24 检测。\r\n\r\n" +
             "move(dx, dy) / moveto(x, y)\r\n" +
             "mouse(button, state) / wheel(delta)\r\n" +
             "keydown(key) / keyup(key) / keypress(key[, ms])\r\n" +
@@ -276,14 +292,65 @@ internal sealed class LuaPageControl : UserControl
         }
     });
 
-    private void AppendLog(string message) => RunOnUiThread(() =>
+    private void AppendLog(string message)
     {
-        _logTextBox.AppendText($"[{DateTime.Now:HH:mm:ss.fff}] {message}{Environment.NewLine}");
-        _logTextBox.SelectionStart = _logTextBox.TextLength;
-        _logTextBox.ScrollToCaret();
-    });
+        _pendingLogs.Enqueue($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+        int pendingCount = Interlocked.Increment(ref _pendingLogCount);
+        while (pendingCount > MaximumPendingLuaLogLines && _pendingLogs.TryDequeue(out _))
+        {
+            pendingCount = Interlocked.Decrement(ref _pendingLogCount);
+        }
+    }
 
-    private void ClearLog() => RunOnUiThread(_logTextBox.Clear);
+    private void FlushPendingLogs()
+    {
+        if (_logTextBox.IsDisposed || _pendingLogs.IsEmpty)
+        {
+            return;
+        }
+
+        List<string> pending = [];
+        while (pending.Count < MaximumLuaLogLinesPerFlush &&
+               _pendingLogs.TryDequeue(out string? line))
+        {
+            Interlocked.Decrement(ref _pendingLogCount);
+            pending.Add(line);
+        }
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        _logTextBox.AppendText(string.Join(Environment.NewLine, pending) + Environment.NewLine);
+        TrimVisibleLogIfNeeded();
+        _logTextBox.SelectionStart = _logTextBox.TextLength;
+        _logTextBox.SelectionLength = 0;
+        _logTextBox.ScrollToCaret();
+    }
+
+    private void TrimVisibleLogIfNeeded()
+    {
+        int overflow = _logTextBox.TextLength - MaximumVisibleLuaLogCharacters;
+        if (overflow <= 0)
+        {
+            return;
+        }
+
+        string text = _logTextBox.Text;
+        int firstCompleteLine = text.IndexOf('\n', overflow);
+        _logTextBox.Text = firstCompleteLine >= 0 && firstCompleteLine + 1 < text.Length
+            ? text[(firstCompleteLine + 1)..]
+            : string.Empty;
+    }
+
+    private void ClearLog() => RunOnUiThread(() =>
+    {
+        while (_pendingLogs.TryDequeue(out _))
+        {
+            Interlocked.Decrement(ref _pendingLogCount);
+        }
+        _logTextBox.Clear();
+    });
 
     private void RunOnUiThread(Action action)
     {
@@ -301,7 +368,7 @@ internal sealed class LuaPageControl : UserControl
         }
     }
 
-    private static string NormalizeEditorNewlines(string text) =>
+    internal static string NormalizeEditorNewlines(string text) =>
         text.Replace("\r\n", "\n", StringComparison.Ordinal)
             .Replace('\r', '\n')
             .Replace("\n", Environment.NewLine, StringComparison.Ordinal);
@@ -310,11 +377,28 @@ internal sealed class LuaPageControl : UserControl
     {
         if (disposing)
         {
+            _logFlushTimer.Stop();
+            _logFlushTimer.Dispose();
             _controller.ActiveProfileChanged -= HandleActiveProfileChanged;
             _controller.Log -= AppendLog;
             _controller.LuaLogCleared -= ClearLog;
             _controller.LuaStateChanged -= UpdateLuaState;
         }
         base.Dispose(disposing);
+    }
+
+    private sealed class MultilinePasteTextBox : TextBox
+    {
+        private const int WmPaste = 0x0302;
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == WmPaste && Clipboard.ContainsText())
+            {
+                SelectedText = NormalizeEditorNewlines(Clipboard.GetText());
+                return;
+            }
+            base.WndProc(ref message);
+        }
     }
 }

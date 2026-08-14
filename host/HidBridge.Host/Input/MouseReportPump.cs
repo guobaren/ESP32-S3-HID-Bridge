@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using HidBridge.Host.Transport;
@@ -14,7 +15,7 @@ internal sealed class MouseReportPump : IDisposable
     private const uint TimerAllAccess = 0x001F0003;
     private const uint WaitObject0 = 0;
     private const uint Infinite = 0xFFFFFFFF;
-    private static readonly TimeSpan StatisticsInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DefaultStatisticsInterval = TimeSpan.FromSeconds(5);
 
     private readonly IBridgeTransport _transport;
     private readonly object _stateLock = new();
@@ -23,6 +24,11 @@ internal sealed class MouseReportPump : IDisposable
     private readonly UdpMouseSmoother _udpMouseSmoother = new();
     private readonly SimulatedUdpMouseInput _simulatedUdpInput = new();
     private readonly Queue<byte> _buttonStates = [];
+    private readonly TimeSpan _statisticsInterval;
+    private readonly Action<string> _statisticsSink;
+    private readonly BlockingCollection<MouseStatisticsSnapshot> _statisticsQueue =
+        new(new ConcurrentQueue<MouseStatisticsSnapshot>());
+    private readonly Thread _statisticsThread;
     private readonly Thread _senderThread;
     private readonly IntPtr _waitableTimer;
     private long _pendingX;
@@ -52,10 +58,18 @@ internal sealed class MouseReportPump : IDisposable
 
     internal MouseReportPump(
         IBridgeTransport transport,
-        MouseMovementRecorder? movementRecorder = null)
+        MouseMovementRecorder? movementRecorder = null,
+        TimeSpan? statisticsInterval = null,
+        Action<string>? statisticsSink = null)
     {
         _transport = transport;
         _movementRecorder = movementRecorder ?? new MouseMovementRecorder();
+        _statisticsInterval = statisticsInterval ?? DefaultStatisticsInterval;
+        if (_statisticsInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(statisticsInterval));
+        }
+        _statisticsSink = statisticsSink ?? Console.WriteLine;
         _waitableTimer = CreateWaitableTimerEx(
             IntPtr.Zero,
             null,
@@ -83,6 +97,14 @@ internal sealed class MouseReportPump : IDisposable
             CloseHandle(_waitableTimer);
             throw new Win32Exception(error, "无法启动鼠标高精度定时器。");
         }
+
+        _statisticsThread = new Thread(StatisticsLoop)
+        {
+            IsBackground = true,
+            Name = "HidBridge.MouseStatistics",
+            Priority = ThreadPriority.BelowNormal,
+        };
+        _statisticsThread.Start();
 
         _senderThread = new Thread(SenderLoop)
         {
@@ -175,6 +197,7 @@ internal sealed class MouseReportPump : IDisposable
 
             _transport.Send(MessageType.ReleaseAll, ReadOnlySpan<byte>.Empty);
             _movementRecorder.ObserveReleaseAll(DateTime.UtcNow);
+            Console.WriteLine($"已发送 ReleaseAll；释放后转发={(enabledAfterRelease ? "开启" : "关闭")}。");
 
             lock (_stateLock)
             {
@@ -311,7 +334,7 @@ internal sealed class MouseReportPump : IDisposable
 
     private void SendPendingReport()
     {
-        string? statistics = null;
+        MouseStatisticsSnapshot? statistics = null;
         bool recordingStarted = false;
         lock (_sendLock)
         {
@@ -362,10 +385,11 @@ internal sealed class MouseReportPump : IDisposable
                         RecordSubmittedIntervalLocked(Stopwatch.GetTimestamp());
                     }
 
-                    if (DateTime.UtcNow - _lastStatisticsUtc >= StatisticsInterval)
+                    DateTime nowUtc = DateTime.UtcNow;
+                    if (nowUtc - _lastStatisticsUtc >= _statisticsInterval)
                     {
-                        statistics = BuildStatisticsLocked();
-                        _lastStatisticsUtc = DateTime.UtcNow;
+                        statistics = CaptureStatisticsLocked();
+                        _lastStatisticsUtc = nowUtc;
                     }
                 }
             }
@@ -389,7 +413,22 @@ internal sealed class MouseReportPump : IDisposable
 
         if (statistics is not null)
         {
-            Console.WriteLine(statistics);
+            _statisticsQueue.TryAdd(statistics.Value);
+        }
+    }
+
+    private void StatisticsLoop()
+    {
+        foreach (MouseStatisticsSnapshot statistics in _statisticsQueue.GetConsumingEnumerable())
+        {
+            try
+            {
+                _statisticsSink(FormatStatistics(statistics));
+            }
+            catch (Exception exception)
+            {
+                Debug.WriteLine($"鼠标统计日志输出失败：{exception}");
+            }
         }
     }
 
@@ -435,23 +474,43 @@ internal sealed class MouseReportPump : IDisposable
         _lastSubmittedTimestamp = now;
     }
 
-    private string BuildStatisticsLocked()
+    private MouseStatisticsSnapshot CaptureStatisticsLocked()
     {
         UdpMouseSmootherStatistics udp = _udpMouseSmoother.GetStatistics();
         SimulatedUdpInputStatistics simulated = _simulatedUdpInput.GetStatistics();
-        return $"鼠标统计（500 Hz）：原始事件={_rawEventCount}，采集位移=({_capturedX},{_capturedY})，" +
-        $"已提交报告={_submittedReportCount}，已提交位移=({_submittedX},{_submittedY})，" +
-        $"待发送=({_pendingX},{_pendingY})，按钮转换={_buttonTransitionCount}，" +
-        $"按钮待发送={_buttonStates.Count}，最大积压=({_maxPendingX},{_maxPendingY})，" +
-        $"提交间隔us=({_minSubmittedIntervalUs}..{_maxSubmittedIntervalUs})，" +
-        $"UDP平滑={(_udpSmoothingEnabled ? "开启" : "关闭")}，" +
-        $"UDP平滑窗={udp.SmoothingSlots}槽/{UdpMouseSmoother.MaximumScheduledDelayMilliseconds}ms，" +
-        $"平滑待发送槽={udp.PendingSlots}，接收命令={udp.EnqueuedCommands}，" +
-        $"重叠分摊={udp.OverlappingCommands}，" +
-        $"模拟UDP={(simulated.Enabled ? FormatSimulatedUdpFrequency(simulated.FrequencyHz) : "关闭")}，" +
-        $"模拟待整合=({simulated.PendingX},{simulated.PendingY},{simulated.PendingWheel},{simulated.PendingPan})，" +
-        $"模拟输出桶={simulated.EmittedBuckets}";
+        return new MouseStatisticsSnapshot(
+            _rawEventCount,
+            _capturedX,
+            _capturedY,
+            _submittedReportCount,
+            _submittedX,
+            _submittedY,
+            _pendingX,
+            _pendingY,
+            _buttonTransitionCount,
+            _buttonStates.Count,
+            _maxPendingX,
+            _maxPendingY,
+            _minSubmittedIntervalUs,
+            _maxSubmittedIntervalUs,
+            _udpSmoothingEnabled,
+            udp,
+            simulated);
     }
+
+    private static string FormatStatistics(MouseStatisticsSnapshot statistics) =>
+        $"鼠标统计（500 Hz）：原始事件={statistics.RawEventCount}，采集位移=({statistics.CapturedX},{statistics.CapturedY})，" +
+        $"已提交报告={statistics.SubmittedReportCount}，已提交位移=({statistics.SubmittedX},{statistics.SubmittedY})，" +
+        $"待发送=({statistics.PendingX},{statistics.PendingY})，按钮转换={statistics.ButtonTransitionCount}，" +
+        $"按钮待发送={statistics.PendingButtonTransitions}，最大积压=({statistics.MaxPendingX},{statistics.MaxPendingY})，" +
+        $"提交间隔us=({statistics.MinSubmittedIntervalUs}..{statistics.MaxSubmittedIntervalUs})，" +
+        $"UDP平滑={(statistics.UdpSmoothingEnabled ? "开启" : "关闭")}，" +
+        $"UDP平滑窗={statistics.Udp.SmoothingSlots}槽/{UdpMouseSmoother.MaximumScheduledDelayMilliseconds}ms，" +
+        $"平滑待发送槽={statistics.Udp.PendingSlots}，接收命令={statistics.Udp.EnqueuedCommands}，" +
+        $"重叠分摊={statistics.Udp.OverlappingCommands}，" +
+        $"模拟UDP={(statistics.Simulated.Enabled ? FormatSimulatedUdpFrequency(statistics.Simulated.FrequencyHz) : "关闭")}，" +
+        $"模拟待整合=({statistics.Simulated.PendingX},{statistics.Simulated.PendingY},{statistics.Simulated.PendingWheel},{statistics.Simulated.PendingPan})，" +
+        $"模拟输出桶={statistics.Simulated.EmittedBuckets}";
 
     private void RouteUdpDeltaLocked(MouseDelta delta)
     {
@@ -534,7 +593,29 @@ internal sealed class MouseReportPump : IDisposable
         _senderThread.Join();
         CancelWaitableTimer(_waitableTimer);
         CloseHandle(_waitableTimer);
+        _statisticsQueue.CompleteAdding();
+        _statisticsThread.Join();
+        _statisticsQueue.Dispose();
     }
+
+    private readonly record struct MouseStatisticsSnapshot(
+        long RawEventCount,
+        long CapturedX,
+        long CapturedY,
+        long SubmittedReportCount,
+        long SubmittedX,
+        long SubmittedY,
+        long PendingX,
+        long PendingY,
+        long ButtonTransitionCount,
+        int PendingButtonTransitions,
+        long MaxPendingX,
+        long MaxPendingY,
+        long MinSubmittedIntervalUs,
+        long MaxSubmittedIntervalUs,
+        bool UdpSmoothingEnabled,
+        UdpMouseSmootherStatistics Udp,
+        SimulatedUdpInputStatistics Simulated);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateWaitableTimerEx(

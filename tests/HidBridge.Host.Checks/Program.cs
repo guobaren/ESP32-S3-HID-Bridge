@@ -18,11 +18,18 @@ CheckMouseAggregation();
 CheckSimulatedUdpInputAggregation();
 CheckUdpSmoothingSwitch();
 CheckUdpMouseSmoothing();
+CheckMouseStatisticsLoggingDoesNotBlockPump();
 CheckMouseMovementRecordingAndChart();
 CheckSerialDiscoveryProtocol();
 CheckWiFiBoardTransportDisabled();
 CheckDeviceLogPolicy();
 CheckInputSuppressionPolicy();
+CheckKeyboardAutoRepeatEdgeFiltering();
+CheckInputCaptureThreadIsolation();
+CheckUnexpectedInputCaptureExitReleasesAll();
+CheckForwardingNotificationFailureStillReleasesAll();
+CheckInputCallbackFailureStillReleasesAll();
+CheckLuaReleaseCannotBlockInputCapture();
 CheckCursorLockGeometry();
 CheckUiLogWriter();
 CheckRemoteInputUdpPath();
@@ -560,6 +567,63 @@ static void CheckUdpMouseSmoothing()
         $"实际尾部完成={completionMilliseconds:F1} ms，最大报告间隔={maximumReportGapMilliseconds:F1} ms。");
 }
 
+static void CheckMouseStatisticsLoggingDoesNotBlockPump()
+{
+    RecordingTransport transport = new();
+    using ManualResetEventSlim statisticsEntered = new(false);
+    using ManualResetEventSlim releaseStatistics = new(false);
+    using MouseReportPump pump = new(
+        transport,
+        statisticsInterval: TimeSpan.FromMilliseconds(20),
+        statisticsSink: _ =>
+        {
+            statisticsEntered.Set();
+            releaseStatistics.Wait(TimeSpan.FromSeconds(2));
+        });
+
+    try
+    {
+        pump.ResetAndSendRelease(true);
+        Require(
+            statisticsEntered.Wait(TimeSpan.FromSeconds(1)),
+            "鼠标统计专用日志线程未收到统计快照");
+
+        int reportsBefore = transport.MouseReports().Length;
+        long injectedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        pump.AccumulateRemote(100, -50, 0, 0);
+        DateTime deadline = DateTime.UtcNow.AddSeconds(1);
+        while (DateTime.UtcNow < deadline && transport.MouseReports().Length - reportsBefore < 10)
+        {
+            Thread.Sleep(2);
+        }
+
+        MouseReport[] actual = transport.MouseReports().Skip(reportsBefore).Take(10).ToArray();
+        Require(actual.Length == 10, $"统计日志阻塞期间报告数不正确：{actual.Length}");
+        Require(actual.Sum(report => (long)report.X) == 100, "统计日志阻塞期间 X 位移不守恒");
+        Require(actual.Sum(report => (long)report.Y) == -50, "统计日志阻塞期间 Y 位移不守恒");
+        long[] timestamps = transport.MouseTimestamps().Skip(reportsBefore).Take(10).ToArray();
+        double completionMilliseconds =
+            (timestamps[^1] - injectedTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        double maximumGapMilliseconds = timestamps
+            .Zip(timestamps.Skip(1), (previous, current) =>
+                (current - previous) * 1000.0 / System.Diagnostics.Stopwatch.Frequency)
+            .Max();
+        Require(
+            completionMilliseconds < 100,
+            $"统计日志阻塞拖慢 500 Hz 输出尾部：{completionMilliseconds:F1} ms");
+        Require(
+            maximumGapMilliseconds < 50,
+            $"统计日志阻塞造成报告间隔过大：{maximumGapMilliseconds:F1} ms");
+        Console.WriteLine(
+            $"鼠标统计异步检查：日志线程阻塞时 10 份报告仍完成，尾部={completionMilliseconds:F1} ms，" +
+            $"最大间隔={maximumGapMilliseconds:F1} ms。 ");
+    }
+    finally
+    {
+        releaseStatistics.Set();
+    }
+}
+
 static void CheckSerialDiscoveryProtocol()
 {
     byte[] nonce = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87];
@@ -647,6 +711,73 @@ static void CheckInputSuppressionPolicy()
     Require(InputForwarder.ShouldSuppressKeyboard(false, true, true), "从开启状态关闭同步时，控制快捷键释放必须继续拦截");
     Require(!InputForwarder.ShouldSuppressMouse(false), "同步关闭时鼠标不得拦截");
     Require(InputForwarder.ShouldSuppressMouse(true), "同步开启时鼠标必须拦截");
+    Require(
+        InputForwarder.ShouldIgnoreKeyboardHookEvent(NativeMethods.LlkhfInjected, 0x41),
+        "普通注入键必须继续忽略，避免自动化输入回环");
+    Require(
+        InputForwarder.ShouldIgnoreKeyboardHookEvent(NativeMethods.LlkhfInjected, 0x7B),
+        "注入的 F12 必须继续按普通注入键忽略");
+    for (uint virtualKey = 0x7C; virtualKey <= 0x87; virtualKey++)
+    {
+        int functionNumber = unchecked((int)(virtualKey - 0x70 + 1));
+        Require(
+            !InputForwarder.ShouldIgnoreKeyboardHookEvent(NativeMethods.LlkhfInjected, virtualKey),
+            $"注入的 F{functionNumber} 不应在进入 Lua 前被过滤");
+        Require(
+            AutomationKeyMap.GetLuaEventArgument(virtualKey) as string == $"f{functionNumber}",
+            $"F{functionNumber} 的 Lua 事件参数必须使用小写友好键名");
+    }
+}
+
+static void CheckKeyboardAutoRepeatEdgeFiltering()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    ConcurrentQueue<PhysicalInputEvent> f13Events = new();
+    input.PhysicalInputChanged += physicalInput =>
+    {
+        if (physicalInput.VirtualKey == 0x7C)
+        {
+            f13Events.Enqueue(physicalInput);
+        }
+    };
+
+    input.Start();
+    try
+    {
+        Require(input.EnqueueKeyboardInputForChecks(0x7C, false, true), "F13 首次 KeyDown 应成功入队");
+        for (int index = 0; index < 2_048; index++)
+        {
+            Require(
+                !input.EnqueueKeyboardInputForChecks(0x7C, false, true),
+                "同一次 F13 按住期间的重复 KeyDown 必须被过滤");
+        }
+        Require(input.EnqueueKeyboardInputForChecks(0x7C, false, false), "F13 首次 KeyUp 应成功入队");
+        Require(
+            !input.EnqueueKeyboardInputForChecks(0x7C, false, false),
+            "没有对应按下的重复 F13 KeyUp 必须被过滤");
+
+        Require(
+            SpinWait.SpinUntil(() => f13Events.Count == 2, 1000),
+            $"F13 边沿事件未按时完成，实际数量={f13Events.Count}");
+        PhysicalInputEvent[] actual = f13Events.ToArray();
+        Require(actual.Length == 2, $"一次 F13 按住周期只能产生两个事件，实际={actual.Length}");
+        Require(actual[0].Pressed && !actual[1].Pressed, "F13 事件必须严格为一次 pressed、一次 released");
+
+        Require(input.EnqueueKeyboardInputForChecks(0x24, false, true), "HOME 首次 KeyDown 应成功入队");
+        Require(
+            !input.EnqueueKeyboardInputForChecks(0x24, false, true),
+            "HOME 自动重复不得再次切换同步状态");
+        Require(SpinWait.SpinUntil(() => input.ForwardingEnabled, 1000), "HOME 首次按下未开启同步");
+        Thread.Sleep(20);
+        Require(input.ForwardingEnabled, "HOME 自动重复导致同步状态被二次切换");
+        Require(input.EnqueueKeyboardInputForChecks(0x24, false, false), "HOME KeyUp 应成功入队");
+    }
+    finally
+    {
+        input.Stop();
+    }
+    Console.WriteLine("键盘边沿检查：2,048 次 F13 重复 KeyDown 仅产生一次 pressed/一次 released，HOME 自动重复仅切换一次。");
 }
 
 static void CheckCursorLockGeometry()
@@ -654,6 +785,149 @@ static void CheckCursorLockGeometry()
     NativeMethods.ClipRect rect = MouseCursorLock.CalculateClipRect(new System.Drawing.Point(321, 654));
     Require(rect.Left == 321 && rect.Top == 654, "鼠标锁定矩形左上角不正确");
     Require(rect.Right == 322 && rect.Bottom == 655, "鼠标锁定矩形必须限制为一个像素");
+}
+
+static void CheckInputCaptureThreadIsolation()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    uint callerThreadId = NativeMethods.GetCurrentThreadId();
+    input.Start();
+    try
+    {
+        Require(input.CaptureThreadId != 0, "独立输入捕获线程未发布 Windows 线程 ID");
+        Require(
+            input.CaptureThreadId != callerThreadId,
+            "键盘 Hook 和 Raw Input 不得继续依赖调用方/UI 消息线程");
+    }
+    finally
+    {
+        input.Stop();
+    }
+    Require(input.CaptureThreadId == 0, "输入捕获线程停止后未完成 Hook/Raw Input 清理");
+    Console.WriteLine("输入线程隔离检查：键盘 Hook 与 Raw Input 使用独立消息线程，停止后已完成清理。");
+}
+
+static void CheckUnexpectedInputCaptureExitReleasesAll()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    input.Start();
+    input.SetForwardingEnabled(true);
+    int releaseCountBeforeExit = transport.FrameCount(MessageType.ReleaseAll);
+    uint captureThreadId = input.CaptureThreadId;
+    Require(captureThreadId != 0, "故障保护检查未取得输入捕获线程 ID");
+    Require(
+        NativeMethods.PostThreadMessage(captureThreadId, NativeMethods.WmQuit, IntPtr.Zero, IntPtr.Zero),
+        "无法模拟输入捕获消息循环意外退出");
+
+    DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+    while (input.CaptureThreadId != 0 && DateTime.UtcNow < deadline)
+    {
+        Thread.Sleep(10);
+    }
+
+    Require(input.CaptureThreadId == 0, "模拟故障后输入捕获线程未退出");
+    Require(!input.ForwardingEnabled, "输入捕获线程意外退出后仍保持转发状态");
+    Require(
+        transport.FrameCount(MessageType.ReleaseAll) > releaseCountBeforeExit,
+        "输入捕获线程意外退出时未强制发送 ReleaseAll");
+    Console.WriteLine("输入失控保护检查：捕获线程意外退出后已禁用转发并发送 ReleaseAll。");
+}
+
+static void CheckForwardingNotificationFailureStillReleasesAll()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    input.SetForwardingEnabled(true);
+    input.ForwardingTransitioning += () => throw new InvalidOperationException("故意模拟自动化停止失败");
+    int releaseCountBeforeStop = transport.FrameCount(MessageType.ReleaseAll);
+
+    input.DisableForwarding();
+
+    Require(!input.ForwardingEnabled, "转发状态通知异常后仍保持转发状态");
+    Require(
+        transport.FrameCount(MessageType.ReleaseAll) > releaseCountBeforeStop,
+        "转发状态通知异常阻止了 ReleaseAll");
+    Console.WriteLine("ReleaseAll 顺序检查：外部状态事件异常不能阻止安全释放。");
+}
+
+static void CheckInputCallbackFailureStillReleasesAll()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    input.SetForwardingEnabled(true);
+    input.PhysicalInputChanged += _ => throw new InvalidOperationException("故意模拟 Lua/宏输入回调失败");
+    int releaseCountBeforeInput = transport.FrameCount(MessageType.ReleaseAll);
+
+    input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+    {
+        Buttons = NativeMethods.RawMouseLeftButtonDown,
+    });
+
+    Require(!input.ForwardingEnabled, "Lua/宏输入回调异常后仍保持转发状态");
+    Require(
+        transport.FrameCount(MessageType.ReleaseAll) > releaseCountBeforeInput,
+        "Lua/宏输入回调异常后未强制发送 ReleaseAll");
+    Console.WriteLine("输入回调故障检查：Lua/宏回调异常后已禁用转发并发送 ReleaseAll。");
+}
+
+static void CheckLuaReleaseCannotBlockInputCapture()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    using ManualResetEventSlim releaseHandlerEntered = new(false);
+    using ManualResetEventSlim allowReleaseHandler = new(false);
+    input.PhysicalInputChanged += physicalInput =>
+    {
+        if (!physicalInput.Pressed && physicalInput.VirtualKey == 0x01)
+        {
+            releaseHandlerEntered.Set();
+            allowReleaseHandler.Wait(TimeSpan.FromSeconds(2));
+        }
+    };
+    input.Start();
+    try
+    {
+        input.SetForwardingEnabled(true);
+        Require(
+            input.EnqueueRawMouseInputForChecks(new NativeMethods.RawMouse
+            {
+                Buttons = NativeMethods.RawMouseLeftButtonDown,
+            }),
+            "无法排入实体左键按下事件");
+        Require(
+            input.EnqueueRawMouseInputForChecks(new NativeMethods.RawMouse
+            {
+                Buttons = NativeMethods.RawMouseLeftButtonUp,
+            }),
+            "无法排入实体左键松开事件");
+        Require(releaseHandlerEntered.Wait(TimeSpan.FromSeconds(1)), "左键松开事件未进入 Lua/宏分发");
+        Require(
+            SpinWait.SpinUntil(() => transport.MouseReports().Length >= 2, 1000),
+            "Lua released 回调阻塞期间未送出实体左键按下/松开报告");
+        MouseReport[] reportsBeforeUnblock = transport.MouseReports();
+        Require(
+            reportsBeforeUnblock.Any(report => (report.Buttons & 0x01) != 0),
+            "实体左键按下报告未在 Lua 回调前送出");
+        Require(
+            reportsBeforeUnblock[^1].Buttons == 0,
+            "Lua released 回调阻塞时，实体左键松开报告尚未优先送出");
+
+        System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        bool accepted = input.EnqueueKeyboardInputForChecks(0x41, false, true);
+        stopwatch.Stop();
+        Require(accepted, "Lua 松开回调阻塞时输入捕获队列拒绝新事件");
+        Require(
+            stopwatch.ElapsedMilliseconds < 50,
+            $"Lua 松开回调反向阻塞输入捕获：{stopwatch.ElapsedMilliseconds} ms");
+    }
+    finally
+    {
+        allowReleaseHandler.Set();
+        input.Stop();
+    }
+    Console.WriteLine("Lua 松开连点隔离检查：阻塞 released 回调时实体左键松开已优先送出，且不会阻塞输入捕获入队。");
 }
 
 static void CheckUiLogWriter()
@@ -664,11 +938,13 @@ static void CheckUiLogWriter()
     {
         using UiLogTextWriter writer = new();
         writer.EnableFile(pathTemplate);
-        List<string> actual = [];
+        ConcurrentQueue<string> actual = new();
         writer.WriteLine("启动前日志");
-        writer.Attach(actual.Add);
+        writer.Flush();
+        writer.Attach(actual.Enqueue);
         writer.Write("运行中");
         writer.WriteLine("日志");
+        writer.Flush();
         Require(actual.SequenceEqual(["启动前日志", "运行中日志"]), "UI 日志缓存或按行输出不符合预期");
         Require(writer.FilePath is not null && File.Exists(writer.FilePath), "实时日志文件未创建");
         string persisted;
@@ -679,6 +955,21 @@ static void CheckUiLogWriter()
         }
         Require(persisted.Contains("启动前日志", StringComparison.Ordinal), "启动前日志未实时写入本地文件");
         Require(persisted.Contains("运行中日志", StringComparison.Ordinal), "运行中日志未实时写入本地文件");
+
+        using ManualResetEventSlim sinkEntered = new(false);
+        using ManualResetEventSlim releaseSink = new(false);
+        writer.Attach(_ =>
+        {
+            sinkEntered.Set();
+            releaseSink.Wait(TimeSpan.FromSeconds(2));
+        });
+        System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        writer.WriteLine("阻塞接收器隔离检查");
+        stopwatch.Stop();
+        Require(sinkEntered.Wait(TimeSpan.FromSeconds(1)), "异步日志线程未进入阻塞接收器");
+        Require(stopwatch.ElapsedMilliseconds < 50, $"日志调用方被 UI/文件输出阻塞：{stopwatch.ElapsedMilliseconds} ms");
+        releaseSink.Set();
+        writer.Flush();
     }
     finally
     {
@@ -890,7 +1181,7 @@ static void CheckAutomationProfilesAndRuntime()
 
         RecordingAutomationOutput luaOutput = new();
         List<string> luaLogs = [];
-        using LuaScriptRunner lua = new(luaOutput, luaLogs.Add, () => luaLogs.Clear());
+        using LuaScriptRunner lua = new(luaOutput, luaLogs.Add, _ => { }, () => luaLogs.Clear());
         string luaText = """
             function OnEvent(event, arg)
                 if event == "pressed" and arg == 4 and IsPressed(4) then
@@ -962,7 +1253,9 @@ static void CheckLocalMouseTriggersReachLua()
         using InputForwarder input = new(transport);
         using AutomationController automation = new(store, input);
         ConcurrentQueue<string> logs = new();
+        ConcurrentQueue<string> diagnosticLogs = new();
         automation.Log += logs.Enqueue;
+        automation.DiagnosticLog += diagnosticLogs.Enqueue;
         automation.Start();
 
         Require(!input.ForwardingEnabled, "本机 Lua 触发检查必须在捕获关闭状态运行");
@@ -979,6 +1272,13 @@ static void CheckLocalMouseTriggersReachLua()
             () => logs.Any(line => line.Contains("event=pressed arg=4", StringComparison.Ordinal)) &&
                   logs.Any(line => line.Contains("event=released arg=4", StringComparison.Ordinal)),
             1000), "捕获关闭时实体鼠标按键未送达 Lua OnEvent/DebugLog");
+        Require(
+            diagnosticLogs.Any(line => line.StartsWith("[LuaEvent]", StringComparison.Ordinal)),
+            "Lua 事件详细诊断未进入独立日志通道");
+        Require(
+            !logs.Any(line => line.StartsWith("[LuaEvent]", StringComparison.Ordinal) ||
+                              line.StartsWith("[LuaOutput]", StringComparison.Ordinal)),
+            "Lua UI 简略日志通道不得包含详细事件或输出诊断");
         Require(transport.MouseReports().Length == 0, "本机 Lua 触发不得向对端发送实体鼠标报告");
         Console.WriteLine(
             "本机 Lua 触发检查：捕获关闭；实际日志包含 event=pressed arg=4 和 event=released arg=4；对端鼠标报告=0。");
@@ -1068,6 +1368,15 @@ static void CheckWindowLayout()
             Require(form.MacroPage.ProfileComboBox.Items.Count >= 1, "宏页未加载手动配置列表");
             Require(form.LuaPage.ProfileComboBox.Items.Count >= 1, "Lua 页未加载手动配置列表");
             Require(form.LuaPage.AddProfileButton.Text == "新增配置" && form.LuaPage.DeleteProfileButton.Text == "删除配置", "Lua 页缺少新增/删除配置按钮");
+            Require(
+                form.LuaPage.Editor.Multiline &&
+                form.LuaPage.Editor.ScrollBars == ScrollBars.Both &&
+                !form.LuaPage.Editor.WordWrap,
+                "Lua 编辑器必须保留多行文本和横向滚动能力");
+            Require(
+                LuaPageControl.NormalizeEditorNewlines("第一行\n第二行\r第三行\r\n第四行") ==
+                $"第一行{Environment.NewLine}第二行{Environment.NewLine}第三行{Environment.NewLine}第四行",
+                "Lua 编辑器粘贴前必须把不同换行格式统一为 Windows 多行文本");
             string[] macroPageOptions = EnumerateControls(form.MacroPage).Select(control => control.Text).ToArray();
             Require(!macroPageOptions.Contains("开机启动") && !macroPageOptions.Contains("最小化到托盘") && !macroPageOptions.Contains("关闭到托盘"), "程序行为设置不得继续显示在宏页");
             Require(form.SettingsPage.StartOnBootCheckBox.Text.StartsWith("开机启动", StringComparison.Ordinal), "设置页缺少开机启动选项");
@@ -1345,6 +1654,8 @@ internal sealed class RecordingTransport : IBridgeTransport
         .Where(frame => frame.Type == MessageType.KeyboardReport)
         .Select(frame => frame.Payload)
         .ToArray();
+
+    internal int FrameCount(MessageType type) => _frames.Count(frame => frame.Type == type);
 
     public void Dispose()
     {
