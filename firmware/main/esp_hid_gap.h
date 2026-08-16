@@ -7,6 +7,8 @@
 #ifndef _ESP_HID_GAP_H_
 #define _ESP_HID_GAP_H_
 
+#include <stdbool.h>
+
 #define HIDD_IDLE_MODE 0x00
 #define HIDD_BLE_MODE 0x01
 #define HIDD_BT_MODE 0x02
@@ -78,6 +80,8 @@ esp_err_t esp_hid_gap_deinit(void);
 
 esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name);
 esp_err_t esp_hid_ble_gap_adv_start(void);
+esp_err_t esp_hid_ble_gap_adv_stop(void);
+void esp_hid_ble_gap_set_advertising_allowed(bool allowed);
 
 #ifdef __cplusplus
 }

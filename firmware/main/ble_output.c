@@ -26,6 +26,9 @@ static const char *TAG = "ble_output";
 
 static esp_hidd_dev_t *s_device;
 static volatile bool s_connected;
+static volatile bool s_transport_allowed;
+static bool s_hid_started;
+static bool s_gap_initialized;
 static uint64_t s_mouse_sent_reports;
 static int64_t s_mouse_sent_x;
 static int64_t s_mouse_sent_y;
@@ -103,6 +106,26 @@ static esp_hid_device_config_t s_config = {
     .report_maps = s_report_maps,
     .report_maps_len = 1,
 };
+
+void ble_output_set_transport_allowed(bool allowed)
+{
+    s_transport_allowed = allowed;
+    if (s_gap_initialized) {
+        esp_hid_ble_gap_set_advertising_allowed(allowed);
+    }
+}
+
+void ble_output_start_advertising_if_allowed(void)
+{
+    if (!s_transport_allowed || !s_hid_started || s_connected) {
+        return;
+    }
+
+    esp_err_t result = esp_hid_ble_gap_adv_start();
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "BLE 广播启动失败：%s", esp_err_to_name(result));
+    }
+}
 
 static void ble_output_set_connected(bool connected, const char *reason)
 {
@@ -322,8 +345,13 @@ static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32
     esp_hidd_event_data_t *event = (esp_hidd_event_data_t *)data;
     switch ((esp_hidd_event_t)id) {
     case ESP_HIDD_START_EVENT:
-        ESP_LOGI(TAG, "BLE HID 已启动并开始广播");
-        esp_hid_ble_gap_adv_start();
+        s_hid_started = true;
+        if (s_transport_allowed) {
+            ESP_LOGI(TAG, "BLE HID 已启动，允许后端在线，开始广播");
+            ble_output_start_advertising_if_allowed();
+        } else {
+            ESP_LOGI(TAG, "USB HID 尚未确认离线，BLE HID 已启动但跳过广播");
+        }
         break;
     case ESP_HIDD_CONNECT_EVENT:
         if (event->connect.status == ESP_OK) {
@@ -359,6 +387,8 @@ esp_err_t ble_output_init(void)
         esp_hid_ble_gap_adv_init(ESP_HID_APPEARANCE_KEYBOARD, s_config.device_name),
         TAG,
         "初始化 BLE 广播失败");
+    s_gap_initialized = true;
+    esp_hid_ble_gap_set_advertising_allowed(s_transport_allowed);
     ESP_RETURN_ON_ERROR(
         esp_hidd_dev_init(&s_config, ESP_HID_TRANSPORT_BLE, hidd_event_callback, &s_device),
         TAG,

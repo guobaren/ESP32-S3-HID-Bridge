@@ -620,12 +620,21 @@ static void hid_sender_task(void *argument)
             ESP_LOGI(TAG, "USB HID 端点可发送，标记 USB 输出在线");
             output_router_set_connected(OUTPUT_MODE_USB, true);
         } else if (liveness_event == USB_OUTPUT_LIVENESS_BECAME_UNAVAILABLE) {
-            ESP_LOGW(
-                TAG,
-                "USB HID 连续 %d ms 不可发送（mounted=%d ready=%d），标记 USB 输出离线",
-                USB_UNAVAILABLE_TIMEOUT_MS,
-                mounted,
-                ready);
+            if (s_usb_output_liveness.has_been_ready) {
+                ESP_LOGW(
+                    TAG,
+                    "USB HID 连续 %d ms 不可发送（mounted=%d ready=%d），标记 USB 输出离线",
+                    USB_UNAVAILABLE_TIMEOUT_MS,
+                    mounted,
+                    ready);
+            } else {
+                ESP_LOGW(
+                    TAG,
+                    "USB HID 启动枚举等待 %u ms 后仍不可发送（mounted=%d ready=%d），允许 BLE 后备",
+                    USB_OUTPUT_STARTUP_ENUMERATION_GRACE_MS,
+                    mounted,
+                    ready);
+            }
             output_router_set_connected(OUTPUT_MODE_USB, false);
         }
         portENTER_CRITICAL(&s_mouse_lock);

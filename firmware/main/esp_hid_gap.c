@@ -25,16 +25,19 @@
 #include "nimble/ble.h"
 #include "host/ble_sm.h"
 #include "host/ble_store.h"
+#include "esp_hid_connect_policy.h"
 #else
 #include "esp_bt_device.h"
 #endif
 
 static const char *TAG = "ESP_HID_GAP";
+static bool s_ble_advertising_allowed;
+static bool s_ble_gap_initialized;
 
 #if CONFIG_BT_NIMBLE_ENABLED
 static uint16_t s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint32_t s_connection_generation;
-static uint32_t s_connection_update_scheduled_generation;
+static uint32_t s_connection_update_requested_generation;
 static ble_addr_t s_last_bonded_peer_addr;
 static bool s_has_last_bonded_peer;
 static bool s_initial_advertising_started;
@@ -71,12 +74,11 @@ static void log_connection_parameters(const char *phase, uint16_t conn_handle)
 
 static void verify_low_latency_connection_parameters(const struct ble_gap_conn_desc *desc)
 {
-    const uint16_t target_min = BLE_GAP_CONN_ITVL_MS(7.5);
-    const uint16_t target_max = BLE_GAP_CONN_ITVL_MS(10);
     uint32_t interval_us = (uint32_t)desc->conn_itvl * 1250U;
 
-    if (desc->conn_itvl >= target_min && desc->conn_itvl <= target_max &&
-        desc->conn_latency == 0) {
+    if (esp_hid_nimble_connection_parameters_match_target(
+            desc->conn_itvl,
+            desc->conn_latency)) {
         ESP_LOGI(TAG,
                  "low-latency connection parameters confirmed: interval=%" PRIu32
                  " us latency=0",
@@ -90,8 +92,42 @@ static void verify_low_latency_connection_parameters(const struct ble_gap_conn_d
              interval_us, desc->conn_latency);
 }
 
-static void request_narrow_connection_interval(void *argument)
+static void request_narrow_connection_interval_if_needed(
+    uint32_t generation,
+    uint16_t conn_handle)
 {
+    if (!s_ble_advertising_allowed) {
+        ESP_LOGI(TAG, "skip connection parameter update: USB HID is available");
+        return;
+    }
+    if (s_connection_update_requested_generation == generation) {
+        ESP_LOGI(TAG,
+                 "skip duplicate low-latency connection update; generation=%" PRIu32,
+                 generation);
+        return;
+    }
+
+    struct ble_gap_conn_desc desc;
+    int rc = ble_gap_conn_find(conn_handle, &desc);
+    if (rc != 0) {
+        ESP_LOGW(TAG,
+                 "read connection parameters before update failed; conn_handle=%u rc=%d",
+                 conn_handle,
+                 rc);
+        return;
+    }
+
+    if (!esp_hid_nimble_should_request_connection_update(
+            desc.conn_itvl,
+            desc.conn_latency,
+            false)) {
+        ESP_LOGI(TAG,
+                 "skip connection parameter update: interval=%u units latency=%u already within target",
+                 desc.conn_itvl,
+                 desc.conn_latency);
+        return;
+    }
+
     const struct ble_gap_upd_params params = {
         .itvl_min = BLE_GAP_CONN_ITVL_MS(7.5),
         .itvl_max = BLE_GAP_CONN_ITVL_MS(10),
@@ -100,60 +136,21 @@ static void request_narrow_connection_interval(void *argument)
         .min_ce_len = 0,
         .max_ce_len = 0,
     };
-    uint32_t generation = (uint32_t)(uintptr_t)argument;
-
-    vTaskDelay(pdMS_TO_TICKS(500));
-    for (int attempt = 1; attempt <= 30; attempt++) {
-        if (generation != s_connection_generation ||
-            s_active_connection_handle == BLE_HS_CONN_HANDLE_NONE) {
-            break;
-        }
-        int rc = ble_gap_update_params(s_active_connection_handle, &params);
-        if (rc == 0) {
-            ESP_LOGI(TAG,
-                     "submitted delayed connection interval 7.5-10 ms, latency=0; "
-                     "attempt=%d generation=%" PRIu32,
-                     attempt, generation);
-            break;
-        }
-        if (rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG,
-                     "delayed narrow connection update failed; rc=%d attempt=%d "
-                     "generation=%" PRIu32,
-                     rc, attempt, generation);
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    vTaskDelete(NULL);
-}
-
-static void schedule_narrow_connection_interval(uint32_t generation, const char *source)
-{
-    if (s_connection_update_scheduled_generation == generation) {
-        ESP_LOGI(TAG,
-                 "skip duplicate low-latency connection update; source=%s "
-                 "generation=%" PRIu32,
-                 source, generation);
-        return;
-    }
-
-    s_connection_update_scheduled_generation = generation;
-    if (xTaskCreate(request_narrow_connection_interval,
-                    "ble_conn_narrow", 3072,
-                    (void *)(uintptr_t)generation, 5, NULL) != pdPASS) {
-        s_connection_update_scheduled_generation = 0;
+    s_connection_update_requested_generation = generation;
+    rc = ble_gap_update_params(conn_handle, &params);
+    if (rc != 0) {
         ESP_LOGW(TAG,
-                 "create delayed narrow connection task failed; source=%s "
-                 "generation=%" PRIu32,
-                 source, generation);
-        return;
+                 "post-encryption connection parameter update failed; rc=%d generation=%" PRIu32,
+                 rc,
+                 generation);
+    } else {
+        ESP_LOGI(TAG,
+                 "submitted one post-encryption connection interval update; "
+                 "target=7.5-10 ms latency=0 generation=%" PRIu32,
+                 generation);
     }
-    ESP_LOGI(TAG,
-             "scheduled low-latency connection update; source=%s "
-             "target=7.5-10 ms latency=0 generation=%" PRIu32,
-             source, generation);
 }
+
 #endif
 
 // uncomment to print all devices that were seen during a scan
@@ -861,6 +858,10 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
 #endif
 esp_err_t esp_hid_ble_gap_adv_start(void)
 {
+    if (!s_ble_advertising_allowed) {
+        ESP_LOGI(TAG, "USB HID 在线，跳过 BLE 广播启动");
+        return ESP_ERR_INVALID_STATE;
+    }
     static esp_ble_adv_params_t hidd_adv_params = {
         .adv_int_min        = 0x20,
         .adv_int_max        = 0x30,
@@ -874,8 +875,6 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
 #endif /* CONFIG_BT_BLE_ENABLED */
 
 #if CONFIG_BT_NIMBLE_ENABLED
-#include "esp_hid_connect_policy.h"
-
 _Static_assert((int)BLE_ERR_CONN_SPVN_TMO == ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT,
                "HCI connection supervision timeout status changed");
 _Static_assert((int)BLE_ERR_REM_USER_CONN_TERM == ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED,
@@ -923,6 +922,10 @@ static bool nimble_load_bonded_peer(void)
 
 static void nimble_request_directed_reconnect(void)
 {
+    if (!s_ble_advertising_allowed) {
+        s_directed_reconnect_bursts_remaining = 0;
+        return;
+    }
     if (!s_has_last_bonded_peer) {
         nimble_load_bonded_peer();
     }
@@ -1002,6 +1005,11 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
 static int nimble_restart_advertising_if_idle(const char *reason)
 {
     struct ble_gap_conn_desc desc;
+    if (!s_ble_advertising_allowed) {
+        (void)esp_hid_ble_gap_adv_stop();
+        ESP_LOGI(TAG, "skip advertising restart (%s): USB HID is available", reason);
+        return 0;
+    }
     if (s_active_connection_handle != BLE_HS_CONN_HANDLE_NONE) {
         int find_rc = ble_gap_conn_find(s_active_connection_handle, &desc);
         if (find_rc == 0) {
@@ -1034,14 +1042,6 @@ static int
 nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
 {
     struct ble_gap_conn_desc desc;
-    const struct ble_gap_upd_params low_latency_params = {
-        .itvl_min = BLE_GAP_CONN_ITVL_MS(7.5),
-        .itvl_max = BLE_GAP_CONN_ITVL_MS(10),
-        .latency = 0,
-        .supervision_timeout = BLE_GAP_SUPERVISION_TIMEOUT_MS(5000),
-        .min_ce_len = 0,
-        .max_ce_len = 0,
-    };
     int rc;
 
     switch (event->type) {
@@ -1053,6 +1053,29 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
          */
         rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
         bool connection_handle_is_active = rc == 0;
+        if (!s_ble_advertising_allowed) {
+            ESP_LOGI(TAG,
+                     "USB HID 在线，拒绝 BLE 连接尝试：conn_handle=%u active=%d",
+                     event->connect.conn_handle,
+                     connection_handle_is_active);
+            ++s_connection_generation;
+            s_directed_reconnect_bursts_remaining = 0;
+            s_skip_next_directed_reconnect_request = false;
+            ble_hid_task_shut_down();
+            if (connection_handle_is_active) {
+                s_active_connection_handle = event->connect.conn_handle;
+                int terminate_rc = ble_gap_terminate(
+                    event->connect.conn_handle,
+                    BLE_ERR_REM_USER_CONN_TERM);
+                ESP_LOGI(TAG,
+                         "已终止 USB HID 在线期间的 BLE 连接尝试：conn_handle=%u rc=%d",
+                         event->connect.conn_handle,
+                         terminate_rc);
+            } else {
+                s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+            }
+            return 0;
+        }
         if (!esp_hid_nimble_connect_event_is_usable(
                 event->connect.status,
                 connection_handle_is_active)) {
@@ -1109,41 +1132,25 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         }
 
         s_active_connection_handle = event->connect.conn_handle;
-        uint32_t generation = ++s_connection_generation;
+        ++s_connection_generation;
         log_connection_parameters("connect_event_initial", event->connect.conn_handle);
 
         /*
-         * status=26/19 can accompany a still-present ACL on this NimBLE
-         * peripheral path.  Do not immediately send a connection-parameter
-         * update in that ambiguous state: Windows may terminate the link
-         * while service discovery/encryption is still completing.  The HID
-         * path only needs the existing negotiated parameters to reconnect;
-         * prioritize completing encryption and subscriptions first.
+         * CONNECT 事件只确认 ACL/远端特性交换状态，不在此处更新参数。
+         * 即使初始 interval 已满足目标，也不能再次调用 ble_gap_update_params；
+         * 只有加密并进入 HID 就绪路径后，才允许按当前参数判断是否最多请求一次。
          */
-        if (event->connect.status != 0) {
-            ESP_LOGI(TAG,
-                     "skip low-latency connection update until encryption; "
-                     "connect_status=%d",
-                     event->connect.status);
-            return 0;
-        }
-
-        rc = ble_gap_update_params(event->connect.conn_handle,
-                                   &low_latency_params);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "low-latency connection update failed; rc=%d", rc);
-        } else {
-            ESP_LOGI(TAG,
-                     "submitted connection interval 7.5-10 ms, latency=0; source=connect_event");
-        }
-        schedule_narrow_connection_interval(generation, "connect_event");
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
         ++s_connection_generation;
         s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
         ble_hid_task_shut_down();
-        if (s_skip_next_directed_reconnect_request) {
+        if (!s_ble_advertising_allowed) {
+            s_skip_next_directed_reconnect_request = false;
+            s_directed_reconnect_bursts_remaining = 0;
+            ESP_LOGI(TAG, "USB HID 在线，跳过 BLE 断线后的广播和重连");
+        } else if (s_skip_next_directed_reconnect_request) {
             s_skip_next_directed_reconnect_request = false;
             s_directed_reconnect_bursts_remaining = 0;
             ESP_LOGI(TAG,
@@ -1203,8 +1210,20 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
             assert(rc == 0);
             nimble_remember_peer(&desc.peer_id_addr);
             log_connection_parameters("encryption_current", event->enc_change.conn_handle);
-            schedule_narrow_connection_interval(s_connection_generation, "encryption_complete");
+            if (!s_ble_advertising_allowed) {
+                ESP_LOGI(TAG, "USB HID 在线，拒绝完成 HID 就绪的 BLE 连接");
+                ble_hid_task_shut_down();
+                if (s_active_connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+                    (void)ble_gap_terminate(
+                        s_active_connection_handle,
+                        BLE_ERR_REM_USER_CONN_TERM);
+                }
+                return 0;
+            }
             ble_hid_task_start_up();
+            request_narrow_connection_interval_if_needed(
+                s_connection_generation,
+                event->enc_change.conn_handle);
         } else {
             ble_hid_task_shut_down();
             /*
@@ -1298,6 +1317,10 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
     int rc;
     uint8_t random_address[BLE_DEV_ADDR_LEN];
     struct ble_gap_adv_params adv_params;
+    if (!s_ble_advertising_allowed) {
+        ESP_LOGI(TAG, "USB HID 在线，跳过 BLE 广播启动");
+        return 0;
+    }
     if (!random_address_set) {
         rc = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, random_address, NULL);
         if (rc != 0) {
@@ -1372,6 +1395,53 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
     return rc;
 }
 #endif
+
+esp_err_t esp_hid_ble_gap_adv_stop(void)
+{
+#if CONFIG_BT_NIMBLE_ENABLED
+    if (!s_ble_gap_initialized || !ble_gap_adv_active()) {
+        return ESP_OK;
+    }
+    return ble_gap_adv_stop();
+#elif CONFIG_BT_BLE_ENABLED
+    if (!s_ble_gap_initialized) {
+        return ESP_OK;
+    }
+    return esp_ble_gap_stop_advertising();
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+void esp_hid_ble_gap_set_advertising_allowed(bool allowed)
+{
+    s_ble_advertising_allowed = allowed;
+    if (allowed || !s_ble_gap_initialized) {
+        return;
+    }
+
+    esp_err_t stop_result = esp_hid_ble_gap_adv_stop();
+    if (stop_result != ESP_OK && stop_result != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "USB HID 在线，停止 BLE 广播失败：%s", esp_err_to_name(stop_result));
+    }
+#if CONFIG_BT_NIMBLE_ENABLED
+    if (s_active_connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+        struct ble_gap_conn_desc desc;
+        int find_rc = ble_gap_conn_find(s_active_connection_handle, &desc);
+        if (find_rc == 0) {
+            int terminate_rc = ble_gap_terminate(
+                s_active_connection_handle,
+                BLE_ERR_REM_USER_CONN_TERM);
+            ESP_LOGI(TAG,
+                     "USB HID 在线，终止尚未完成 HID 就绪的 BLE 连接：conn_handle=%u rc=%d",
+                     s_active_connection_handle,
+                     terminate_rc);
+        } else {
+            s_active_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+        }
+    }
+#endif
+}
 
 
 /*
@@ -1546,6 +1616,8 @@ esp_err_t esp_hid_gap_deinit(void)
 {
     esp_err_t ret;
 
+    s_ble_gap_initialized = false;
+
     ret = deinit_low_level();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "deinit_low_level failed: %d", ret);
@@ -1599,6 +1671,8 @@ esp_err_t esp_hid_gap_init(uint8_t mode)
         ble_hidh_cb_semaphore = NULL;
         return ret;
     }
+
+    s_ble_gap_initialized = true;
 
     return ESP_OK;
 }

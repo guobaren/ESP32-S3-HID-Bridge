@@ -21,8 +21,14 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
     private const uint MouseXUp = 0x0100;
     private const uint XButton1 = 0x0001;
     private const uint XButton2 = 0x0002;
+    private readonly object _stateLock = new();
+    private readonly HashSet<int> _pressedButtons = [];
+    private readonly HashSet<byte> _pressedKeys = [];
+    private long _releaseAllCount;
 
     public bool IsRemote => false;
+
+    internal long ReleaseAllCount => Interlocked.Read(ref _releaseAllCount);
 
     public Point GetCursorPosition()
     {
@@ -55,22 +61,87 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
             5 => (pressed ? MouseXDown : MouseXUp, XButton2),
             _ => throw new ArgumentOutOfRangeException(nameof(button), "鼠标按钮必须为 1-5。"),
         };
-        SendMouse(flags, 0, 0, data);
+        lock (_stateLock)
+        {
+            bool wasPressed = _pressedButtons.Contains(button);
+            if (pressed)
+            {
+                _pressedButtons.Add(button);
+            }
+            else
+            {
+                _pressedButtons.Remove(button);
+            }
+            try
+            {
+                SendMouse(flags, 0, 0, data);
+            }
+            catch
+            {
+                RestoreState(_pressedButtons, button, wasPressed);
+                throw;
+            }
+        }
     }
 
     public void Wheel(int delta) => SendMouse(MouseWheel, 0, 0, unchecked((uint)delta));
 
-    public void KeyDown(byte hidUsage) => SendKey(hidUsage, false);
+    public void KeyDown(byte hidUsage) => SetKey(hidUsage, true);
 
-    public void KeyUp(byte hidUsage) => SendKey(hidUsage, true);
+    public void KeyUp(byte hidUsage) => SetKey(hidUsage, false);
 
-    private static void SendKey(byte hidUsage, bool keyUp)
+    internal void ReleaseAll()
+    {
+        lock (_stateLock)
+        {
+            List<NativeInput> inputs =
+            [
+                CreateMouseInput(MouseLeftUp, 0, 0, 0),
+                CreateMouseInput(MouseMiddleUp, 0, 0, 0),
+                CreateMouseInput(MouseRightUp, 0, 0, 0),
+                CreateMouseInput(MouseXUp, 0, 0, XButton1),
+                CreateMouseInput(MouseXUp, 0, 0, XButton2),
+            ];
+            inputs.AddRange(_pressedKeys.Select(hidUsage => CreateKeyInput(hidUsage, true)));
+            Send(inputs.ToArray());
+            _pressedButtons.Clear();
+            _pressedKeys.Clear();
+            Interlocked.Increment(ref _releaseAllCount);
+        }
+    }
+
+    private void SetKey(byte hidUsage, bool pressed)
+    {
+        lock (_stateLock)
+        {
+            bool wasPressed = _pressedKeys.Contains(hidUsage);
+            if (pressed)
+            {
+                _pressedKeys.Add(hidUsage);
+            }
+            else
+            {
+                _pressedKeys.Remove(hidUsage);
+            }
+            try
+            {
+                Send([CreateKeyInput(hidUsage, !pressed)]);
+            }
+            catch
+            {
+                RestoreState(_pressedKeys, hidUsage, wasPressed);
+                throw;
+            }
+        }
+    }
+
+    private static NativeInput CreateKeyInput(byte hidUsage, bool keyUp)
     {
         if (!AutomationKeyMap.TryGetVirtualKeyForHid(hidUsage, out ushort virtualKey))
         {
             throw new InvalidOperationException($"HID Usage {hidUsage} 没有可用的 Win32 VK 映射。");
         }
-        NativeInput input = new()
+        return new NativeInput
         {
             Type = InputKeyboard,
             Union = new InputUnion
@@ -83,15 +154,17 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
                 },
             },
         };
-        Send([input]);
     }
 
     private static bool IsExtendedHidUsage(byte usage) =>
         usage is 70 or >= 73 and <= 82 or 84 or 88 or 227 or 228 or 230 or 231;
 
     private static void SendMouse(uint flags, int x, int y, uint data)
+        => Send([CreateMouseInput(flags, x, y, data)]);
+
+    private static NativeInput CreateMouseInput(uint flags, int x, int y, uint data)
     {
-        NativeInput input = new()
+        return new NativeInput
         {
             Type = InputMouse,
             Union = new InputUnion
@@ -105,7 +178,18 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
                 },
             },
         };
-        Send([input]);
+    }
+
+    private static void RestoreState<T>(HashSet<T> state, T value, bool contained)
+    {
+        if (contained)
+        {
+            state.Add(value);
+        }
+        else
+        {
+            state.Remove(value);
+        }
     }
 
     private static void Send(NativeInput[] inputs)

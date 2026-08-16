@@ -41,6 +41,7 @@ internal sealed class AutomationController : IDisposable
     internal AutomationSettings Settings { get; }
     internal AutomationProfile ActiveProfile => _activeProfile;
     internal bool LuaActive => _lua.Active;
+    internal long LocalReleaseAllCount => _output.LocalReleaseAllCount;
 
     internal event Action<string>? Log;
     internal event Action<string>? DiagnosticLog;
@@ -201,7 +202,14 @@ internal sealed class AutomationController : IDisposable
 
     private void HandleForwardingTransitioning()
     {
-        StopRuntime();
+        try
+        {
+            StopRuntime();
+        }
+        finally
+        {
+            TryReleaseLocalInputs();
+        }
     }
 
     private void HandleForwardingChanged(object? sender, bool enabled)
@@ -226,6 +234,19 @@ internal sealed class AutomationController : IDisposable
         LuaStateChanged?.Invoke(false);
     }
 
+    private void TryReleaseLocalInputs()
+    {
+        try
+        {
+            _output.ReleaseLocalInputs();
+            DiagnosticLog?.Invoke("[LocalOutput] 已发送本机 Win32 ReleaseAll");
+        }
+        catch (Exception exception)
+        {
+            Log?.Invoke($"本机 Win32 ReleaseAll 失败：{exception.Message}");
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -240,6 +261,7 @@ internal sealed class AutomationController : IDisposable
             _input.ForwardingChanged -= HandleForwardingChanged;
         }
         StopRuntime();
+        TryReleaseLocalInputs();
         _lua.Dispose();
     }
 }

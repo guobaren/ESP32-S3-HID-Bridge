@@ -43,6 +43,13 @@ esp_err_t output_router_init(usb_device_profile_t usb_profile)
         return ESP_ERR_NO_MEM;
     }
 
+    s_selector = (output_mode_selector_t){0};
+    output_mode_selector_set_usb_monitoring(
+        &s_selector,
+        usb_profile == USB_DEVICE_PROFILE_KEYBOARD_TOUCHPAD);
+    ble_output_set_transport_allowed(
+        output_mode_selector_should_allow_ble(&s_selector));
+
     esp_err_t usb_result = hid_output_init(usb_profile);
     if (usb_result != ESP_OK) {
         return usb_result;
@@ -140,9 +147,14 @@ void output_router_set_connected(output_mode_t mode, bool connected)
         }
         s_release_pending = active_mode != OUTPUT_MODE_NONE;
     }
+    bool ble_allowed = output_mode_selector_should_allow_ble(&s_selector);
     xSemaphoreGive(s_mode_mutex);
 
     status_led_set_active_mode(active_mode);
+    ble_output_set_transport_allowed(ble_allowed);
+    if (mode == OUTPUT_MODE_USB && !connected && ble_allowed) {
+        ble_output_start_advertising_if_allowed();
+    }
 
     if (active_mode != previous_mode) {
         ESP_LOGI(

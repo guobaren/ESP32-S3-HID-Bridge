@@ -10,9 +10,7 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "input_session.h"
 #include "nvs_flash.h"
@@ -26,22 +24,7 @@
 #define BRIDGE_UART_BAUD_RATE 921600
 #define UART_RX_BUFFER_SIZE 4096
 #define UART_READ_CHUNK_SIZE 256
-#define UART_PROFILE_DETECTION_MS 1500
-#define UART_PROTOCOL_DETECTED_BIT (1U << 0)
-#define OUTPUT_ROUTER_READY_BIT (1U << 1)
-#define USB_PROFILE_RESTART_PENDING_BIT (1U << 2)
 static const char *TAG = "hid_bridge";
-static EventGroupHandle_t s_startup_events;
-static usb_device_profile_t s_usb_profile = USB_DEVICE_PROFILE_CDC;
-
-static void restart_for_uart_profile_task(void *argument)
-{
-    (void)argument;
-    input_session_release_all();
-    uart_wait_tx_done(BRIDGE_UART, pdMS_TO_TICKS(100));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    esp_restart();
-}
 
 static void send_device_hello(const bridge_frame_t *probe)
 {
@@ -70,45 +53,8 @@ static void send_device_hello(const bridge_frame_t *probe)
 static void on_bridge_frame(const bridge_frame_t *frame, void *context)
 {
     (void)context;
-    EventBits_t startup_bits = 0;
-    if (s_startup_events != NULL) {
-        xEventGroupSetBits(s_startup_events, UART_PROTOCOL_DETECTED_BIT);
-        startup_bits = xEventGroupGetBits(s_startup_events);
-    }
-
-    bool output_router_ready = (startup_bits & OUTPUT_ROUTER_READY_BIT) != 0;
-    bool restart_pending = (startup_bits & USB_PROFILE_RESTART_PENDING_BIT) != 0;
-    bool schedule_restart = false;
-    if (output_router_ready && !restart_pending &&
-        usb_device_profile_requires_restart(s_usb_profile, true)) {
-        ESP_LOGW(TAG, "启动窗口后检测到 UART 协议，准备重启并切换原生 USB 为 HID");
-        xEventGroupSetBits(s_startup_events, USB_PROFILE_RESTART_PENDING_BIT);
-        restart_pending = true;
-        schedule_restart = true;
-    }
-
     if (frame->type == BRIDGE_MESSAGE_DEVICE_PROBE) {
         send_device_hello(frame);
-    }
-
-    if (restart_pending) {
-        if (schedule_restart) {
-            BaseType_t created = xTaskCreate(
-                restart_for_uart_profile_task,
-                "uart_profile_restart",
-                3072,
-                NULL,
-                10,
-                NULL);
-            if (created != pdPASS) {
-                ESP_LOGE(TAG, "无法创建 USB profile 重启任务，立即重启");
-                esp_restart();
-            }
-        }
-        return;
-    }
-
-    if (frame->type == BRIDGE_MESSAGE_DEVICE_PROBE || !output_router_ready) {
         return;
     }
     input_session_handle(BRIDGE_INPUT_UART, frame);
@@ -241,8 +187,12 @@ void app_main(void)
     ESP_ERROR_CHECK(input_session_init());
     ESP_ERROR_CHECK(configure_uart());
 
-    s_startup_events = xEventGroupCreate();
-    ESP_ERROR_CHECK(s_startup_events != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    const usb_device_profile_t usb_profile = usb_device_profile_select();
+    ESP_LOGI(
+        TAG,
+        "原生 USB 固定枚举为%s，不依赖控制端 EXE 或 UART 握手",
+        usb_device_profile_name(usb_profile));
+    ESP_ERROR_CHECK(output_router_init(usb_profile));
 
     BaseType_t created = xTaskCreate(
         uart_receiver_task,
@@ -252,22 +202,6 @@ void app_main(void)
         9,
         NULL);
     ESP_ERROR_CHECK(created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-
-    EventBits_t startup_bits = xEventGroupWaitBits(
-        s_startup_events,
-        UART_PROTOCOL_DETECTED_BIT,
-        pdFALSE,
-        pdTRUE,
-        pdMS_TO_TICKS(UART_PROFILE_DETECTION_MS));
-    bool uart_protocol_detected = (startup_bits & UART_PROTOCOL_DETECTED_BIT) != 0;
-    s_usb_profile = usb_device_profile_select(uart_protocol_detected);
-    ESP_LOGI(
-        TAG,
-        "启动期 UART 协议检测=%s，原生 USB 将枚举为%s",
-        uart_protocol_detected ? "已连接" : "未连接",
-        usb_device_profile_name(s_usb_profile));
-    ESP_ERROR_CHECK(output_router_init(s_usb_profile));
-    xEventGroupSetBits(s_startup_events, OUTPUT_ROUTER_READY_BIT);
 
 #if HID_BRIDGE_WIFI_RUNTIME_ENABLED
     wifi_result = wifi_input_start();
@@ -291,6 +225,6 @@ void app_main(void)
 
     ESP_LOGI(
         TAG,
-        "运行模式：UART 握手决定原生 USB 为 CDC 或键盘触摸板 HID；BLE HID 保持可用；Wi-Fi 输入/输出代码已保留但暂不启用");
+        "运行模式：原生 USB 固定为键盘触摸板 HID；UART 仅负责控制输入，不改变 USB profile 或触发重启；BLE 仅在 USB 不可用时作为后备");
     ESP_LOGI(TAG, "ESP32-S3 HID Bridge 已启动");
 }

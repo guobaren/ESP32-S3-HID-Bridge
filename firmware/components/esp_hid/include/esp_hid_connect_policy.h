@@ -14,9 +14,30 @@ enum {
     ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT = 8,
     ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED = 19,
     ESP_HID_HCI_STATUS_UNSUPPORTED_REMOTE_FEATURE = 26,
+    /* BLE connection interval units are 1.25 ms: 7.5 ms=6, 10 ms=8. */
+    ESP_HID_CONNECTION_INTERVAL_MIN_UNITS = 6,
+    ESP_HID_CONNECTION_INTERVAL_MAX_UNITS = 8,
     /* Legacy 高占空比定向广播每轮最多约 1.28 秒；24 轮覆盖约 30 秒。 */
     ESP_HID_DIRECTED_RECONNECT_BURSTS = 24,
 };
+
+static inline bool esp_hid_nimble_connection_parameters_match_target(
+    unsigned int interval_units,
+    unsigned int latency)
+{
+    return interval_units >= ESP_HID_CONNECTION_INTERVAL_MIN_UNITS &&
+           interval_units <= ESP_HID_CONNECTION_INTERVAL_MAX_UNITS &&
+           latency == 0;
+}
+
+static inline bool esp_hid_nimble_should_request_connection_update(
+    unsigned int interval_units,
+    unsigned int latency,
+    bool update_already_requested)
+{
+    return !update_already_requested &&
+           !esp_hid_nimble_connection_parameters_match_target(interval_units, latency);
+}
 
 static inline bool esp_hid_nimble_connect_event_is_usable(
     int status,

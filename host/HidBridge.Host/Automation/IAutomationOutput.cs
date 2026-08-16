@@ -26,6 +26,10 @@ internal sealed class RoutedAutomationOutput : IAutomationOutput
 
     public bool IsRemote => _input.ForwardingEnabled;
 
+    internal long LocalReleaseAllCount => _local.ReleaseAllCount;
+
+    internal void ReleaseLocalInputs() => _local.ReleaseAll();
+
     public Point GetCursorPosition() => _local.GetCursorPosition();
 
     public void MoveRelative(int deltaX, int deltaY)

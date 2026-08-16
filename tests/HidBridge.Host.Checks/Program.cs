@@ -1311,9 +1311,13 @@ static void CheckTriggerForwardingIntegration()
 
         RecordingTransport transport = new();
         using InputForwarder input = new(transport);
-        input.SetForwardingEnabled(true);
         using AutomationController automation = new(store, input);
         automation.Start();
+        long localReleaseCountBeforeTransitions = automation.LocalReleaseAllCount;
+        input.SetForwardingEnabled(true);
+        Require(
+            automation.LocalReleaseAllCount == localReleaseCountBeforeTransitions + 1,
+            "进入捕获模式时必须向主控端发送一次 Win32 ReleaseAll");
         input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
         {
             Buttons = NativeMethods.RawMouseButton4Down,
@@ -1336,6 +1340,10 @@ static void CheckTriggerForwardingIntegration()
         Require(reports.Any(report => (report.Buttons & 0x08) != 0), "宏触发侧键本身未透传到对端");
         Require(reports.Last().Buttons == 0, "宏触发侧键松开未透传到对端");
         Require(reports.Sum(report => report.X) == 23 && reports.Sum(report => report.Y) == -11, "侧键触发宏的对端位移不正确");
+        input.SetForwardingEnabled(false);
+        Require(
+            automation.LocalReleaseAllCount == localReleaseCountBeforeTransitions + 2,
+            "退出捕获模式时必须再次向主控端发送一次 Win32 ReleaseAll");
     }
     finally
     {

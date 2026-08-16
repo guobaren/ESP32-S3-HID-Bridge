@@ -50,6 +50,46 @@ static void test_recovery_is_immediate(void)
                USB_OUTPUT_LIVENESS_NO_CHANGE);
 }
 
+static void test_startup_grace_boundary(void)
+{
+    usb_output_liveness_t state = {0};
+    const uint32_t timeout_ms = 100U;
+
+    test_event(usb_output_liveness_update(
+                   &state,
+                   false,
+                   USB_OUTPUT_STARTUP_ENUMERATION_GRACE_MS - 1U,
+                   timeout_ms),
+               USB_OUTPUT_LIVENESS_NO_CHANGE);
+    test_event(usb_output_liveness_update(&state, false, 1U, timeout_ms),
+               USB_OUTPUT_LIVENESS_BECAME_UNAVAILABLE);
+    test_event(usb_output_liveness_update(
+                   &state,
+                   false,
+                   USB_OUTPUT_STARTUP_ENUMERATION_GRACE_MS,
+                   timeout_ms),
+               USB_OUTPUT_LIVENESS_NO_CHANGE);
+}
+
+static void test_ready_during_startup_grace_uses_runtime_timeout_afterward(void)
+{
+    usb_output_liveness_t state = {0};
+    const uint32_t timeout_ms = 100U;
+
+    test_event(usb_output_liveness_update(
+                   &state,
+                   false,
+                   USB_OUTPUT_STARTUP_ENUMERATION_GRACE_MS - 1U,
+                   timeout_ms),
+               USB_OUTPUT_LIVENESS_NO_CHANGE);
+    test_event(usb_output_liveness_update(&state, true, 0U, timeout_ms),
+               USB_OUTPUT_LIVENESS_BECAME_AVAILABLE);
+    test_event(usb_output_liveness_update(&state, false, 99U, timeout_ms),
+               USB_OUTPUT_LIVENESS_NO_CHANGE);
+    test_event(usb_output_liveness_update(&state, false, 1U, timeout_ms),
+               USB_OUTPUT_LIVENESS_BECAME_UNAVAILABLE);
+}
+
 static void test_unavailable_elapsed_time_saturates(void)
 {
     usb_output_liveness_t state = {0};
@@ -93,8 +133,10 @@ int main(void)
 {
     test_ready_and_unavailable_boundaries();
     test_recovery_is_immediate();
+    test_startup_grace_boundary();
+    test_ready_during_startup_grace_uses_runtime_timeout_afterward();
     test_unavailable_elapsed_time_saturates();
     test_unavailable_usb_switches_to_connected_ble();
-    puts("USB 输出存活测试通过：覆盖 99/100 ms 边界、恢复、累计时间饱和及断线后切换 BLE。");
+    puts("USB 输出存活测试通过：覆盖 3000 ms 冷启动枚举宽限期、曾 ready 后 99/100 ms 掉线、恢复及 BLE 切换。");
     return 0;
 }
