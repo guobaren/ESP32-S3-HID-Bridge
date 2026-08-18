@@ -114,7 +114,12 @@ idf.py -p <实际串口> flash
 
 当前 BLE、USB CDC、日志及保留的 Wi-Fi 实现说明见 [docs/configuration.md](docs/configuration.md)。当前构建不会启动 Wi-Fi、临时 SoftAP 或 Target Agent 输出；相关配置只作为未来恢复参考。Wi-Fi 输入与 Target Agent 的预共享密钥仍只能写入被 Git 忽略的 `firmware/sdkconfig`、`bridge.local.json` 和 `agent.local.json`，不要写入仓库文件。
 
-控制软件也可以在不退出进程的情况下释放串口并刷写当前 build。该接口在设置页默认关闭，固定监听 `127.0.0.1`；调用方式见 [docs/firmware-update-api.md](docs/firmware-update-api.md)。
+控制软件也可以在不退出进程的情况下释放串口并刷写固件，共有两个入口，最终都调用**内置的独立版 esptool.exe**（构建时嵌入，目标机无需安装 Python / ESP-IDF 环境）：
+
+- **远端接口**：设置页勾选“启用本机固件刷写接口”（默认关闭），固定监听 127.0.0.1；调用方式见 [docs/firmware-update-api.md](docs/firmware-update-api.md)。固件来源为本地 firmware/build，找不到时回退到构建时嵌入的默认固件。
+- **设置页本地刷写**：设置页底部“本地固件刷写”区，选择固件文件（flasher_args.json 三段刷写，或单个 .bin 按 0x10000 应用分区刷写），点“确定”后弹窗二次确认，并打开带实时日志的小窗口显示刷写进度。
+
+内置 esptool 由 [scripts/build-embedded-esptool.ps1](scripts/build-embedded-esptool.ps1) 生成并放入 host/HidBridge.Host/EmbeddedAssets/（不提交 git），构建时作为嵌入资源打进 exe；首次刷写时解压到 %LOCALAPPDATA%/HidBridge/embedded 缓存。
 
 烧录后可任选输入连接方式：
 

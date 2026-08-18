@@ -99,7 +99,7 @@ internal static class Program
                         ? $"串口自动发现 @ {options.BaudRate}"
                         : $"串口 {options.PortName} @ {options.BaudRate}";
 
-            using BridgeMainForm form = new(input, automation, endpoint, logSettings, firmwareUpdateApi);
+            using BridgeMainForm form = new(input, automation, endpoint, logSettings, firmwareUpdateApi, firmwareFlash);
             logWriter.Attach(form.AppendLog);
             Console.WriteLine($"目标端点：{endpoint}");
             Console.WriteLine($"本地实时日志：{logWriter.FilePath}");

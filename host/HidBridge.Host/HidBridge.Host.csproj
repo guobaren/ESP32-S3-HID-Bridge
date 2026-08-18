@@ -16,7 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\shared\HidBridge.Protocol\HidBridge.Protocol.csproj" />
+    <ProjectReference Include="../../shared/HidBridge.Protocol/HidBridge.Protocol.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -29,9 +29,30 @@
     </None>
   </ItemGroup>
 
+  <!-- 内置刷写资源：独立版 esptool.exe（由 scripts/build-embedded-esptool.ps1 生成）与
+       当前 firmware/build 固件镜像。存在才嵌入；运行期由 EmbeddedFlashAssets 解压到
+       %LOCALAPPDATA%/HidBridge/embedded 缓存。两个刷写入口均优先使用内置 esptool。 -->
+  <ItemGroup>
+    <EmbeddedResource Include="EmbeddedAssets/esptool.exe"
+                      Condition="Exists('EmbeddedAssets/esptool.exe')"
+                      LogicalName="HidBridge.Host.assets.esptool.exe" />
+    <EmbeddedResource Include="../../firmware/build/flasher_args.json"
+                      Condition="Exists('../../firmware/build/flasher_args.json')"
+                      LogicalName="HidBridge.Host.assets.firmware.build.flasher_args.json" />
+    <EmbeddedResource Include="../../firmware/build/bootloader/bootloader.bin"
+                      Condition="Exists('../../firmware/build/bootloader/bootloader.bin')"
+                      LogicalName="HidBridge.Host.assets.firmware.build.bootloader.bootloader.bin" />
+    <EmbeddedResource Include="../../firmware/build/partition_table/partition-table.bin"
+                      Condition="Exists('../../firmware/build/partition_table/partition-table.bin')"
+                      LogicalName="HidBridge.Host.assets.firmware.build.partition_table.partition-table.bin" />
+    <EmbeddedResource Include="../../firmware/build/esp32_s3_hid_bridge.bin"
+                      Condition="Exists('../../firmware/build/esp32_s3_hid_bridge.bin')"
+                      LogicalName="HidBridge.Host.assets.firmware.build.esp32_s3_hid_bridge.bin" />
+  </ItemGroup>
+
   <PropertyGroup>
-    <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..\'))</RepositoryRoot>
-    <RootExecutablePublishDir>$(BaseIntermediateOutputPath)root-executable\$(Configuration)\</RootExecutablePublishDir>
+    <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../'))</RepositoryRoot>
+    <RootExecutablePublishDir>$(BaseIntermediateOutputPath)root-executable/$(Configuration)/</RootExecutablePublishDir>
   </PropertyGroup>
 
   <Target Name="PublishRootExecutable"

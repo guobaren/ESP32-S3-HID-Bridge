@@ -12,6 +12,8 @@ internal sealed record FirmwareFlashImage(
 internal sealed class FirmwareFlashPlan
 {
     private static readonly long[] RequiredOffsets = [0x0000, 0x8000, 0x10000];
+    private static readonly string[] DefaultWriteFlashArguments =
+        ["--flash-mode", "dio", "--flash-size", "2MB", "--flash-freq", "80m"];
 
     private FirmwareFlashPlan(
         string projectRoot,
@@ -42,10 +44,60 @@ internal sealed class FirmwareFlashPlan
     internal IReadOnlyList<string> WriteFlashArguments { get; }
     internal IReadOnlyList<FirmwareFlashImage> Images { get; }
 
+    /// <summary>使用本地项目固件（firmware/build），找不到时回退到程序内置的默认固件。</summary>
     internal static FirmwareFlashPlan Load(BridgeOptions options)
     {
         string projectRoot = ResolveProjectRoot(options.FirmwareProjectRoot);
         string buildDirectory = Path.Combine(projectRoot, "firmware", "build");
+        return CreateFromManifest(projectRoot, buildDirectory);
+    }
+
+    /// <summary>使用用户选择的 flasher_args.json 清单（三段固件）。</summary>
+    internal static FirmwareFlashPlan LoadFromManifest(string manifestPath)
+    {
+        string fullPath = Path.GetFullPath(manifestPath);
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException("刷写清单不存在。", fullPath);
+        }
+        string buildDirectory = Path.GetDirectoryName(fullPath)
+            ?? throw new InvalidDataException("刷写清单路径无效。");
+        return CreateFromManifest(buildDirectory, buildDirectory);
+    }
+
+    /// <summary>使用用户选择的单个固件镜像，按 0x10000（应用分区）刷写。</summary>
+    internal static FirmwareFlashPlan LoadFromSingleImage(string imagePath)
+    {
+        string fullPath = Path.GetFullPath(imagePath);
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException("固件镜像不存在。", fullPath);
+        }
+        string buildDirectory = Path.GetDirectoryName(fullPath)
+            ?? throw new InvalidDataException("固件镜像路径无效。");
+        List<FirmwareFlashImage> images =
+        [
+            new FirmwareFlashImage(
+                0x10000,
+                "0x10000",
+                fullPath,
+                Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(fullPath)))),
+        ];
+        return new FirmwareFlashPlan(
+            buildDirectory,
+            buildDirectory,
+            ResolveEsptoolPath(buildDirectory),
+            "esp32s3",
+            "default-reset",
+            "hard-reset",
+            DefaultWriteFlashArguments,
+            images);
+    }
+
+    private static FirmwareFlashPlan CreateFromManifest(
+        string projectRoot,
+        string buildDirectory)
+    {
         string manifestPath = Path.Combine(buildDirectory, "flasher_args.json");
         if (!File.Exists(manifestPath))
         {
@@ -69,7 +121,17 @@ internal sealed class FirmwareFlashPlan
         {
             long offset = ParseOffset(property.Name);
             string relativePath = property.Value.GetString() ?? string.Empty;
-            string imagePath = Path.GetFullPath(Path.Combine(buildDirectory, relativePath));
+            string candidate = Path.Combine(buildDirectory, relativePath);
+            if (!File.Exists(candidate))
+            {
+                // 兼容平铺布局：bootloader/bootloader.bin 不存在时，尝试同目录下的 bootloader.bin。
+                string flatCandidate = Path.Combine(buildDirectory, Path.GetFileName(relativePath));
+                if (File.Exists(flatCandidate))
+                {
+                    candidate = flatCandidate;
+                }
+            }
+            string imagePath = Path.GetFullPath(candidate);
             if (!imagePath.StartsWith(buildRoot, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidDataException($"刷写清单包含 build 目录外的文件：{relativePath}");
@@ -125,28 +187,48 @@ internal sealed class FirmwareFlashPlan
                 current = current.Parent;
             }
         }
-        throw new DirectoryNotFoundException("无法从程序目录或当前目录定位 firmware/build/flasher_args.json。");
+
+        string? embeddedRoot = EmbeddedFlashAssets.ExtractFirmwareProjectRoot();
+        if (embeddedRoot is not null)
+        {
+            return embeddedRoot;
+        }
+        throw new DirectoryNotFoundException(
+            "无法从程序目录或当前目录定位 firmware/build/flasher_args.json，且程序未内置默认固件。" +
+            "请先执行 idf.py build，或在设置页选择本地固件文件刷写。");
     }
 
     private static string ResolveEsptoolPath(string projectRoot)
     {
+        // 两个刷写入口（远端 API 与设置页本地刷写）统一优先使用内置的独立版 esptool；
+        // 仅当程序未内置时，才回退到项目 ESP-IDF Python 环境中的 esptool。
+        string? embeddedEsptool = EmbeddedFlashAssets.ExtractEsptool();
+        if (embeddedEsptool is not null)
+        {
+            return embeddedEsptool;
+        }
+
         string pythonEnvironmentRoot = Path.Combine(
             projectRoot,
             ".esp-idf",
             "environment",
             "idf-tools",
             "python_env");
-        if (!Directory.Exists(pythonEnvironmentRoot))
+        if (Directory.Exists(pythonEnvironmentRoot))
         {
-            throw new DirectoryNotFoundException($"找不到项目 ESP-IDF Python 环境：{pythonEnvironmentRoot}");
+            string? path = Directory.EnumerateFiles(
+                    pythonEnvironmentRoot,
+                    "esptool.exe",
+                    SearchOption.AllDirectories)
+                .OrderBy(candidate => candidate, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
+            if (path is not null)
+            {
+                return path;
+            }
         }
-        string? path = Directory.EnumerateFiles(
-                pythonEnvironmentRoot,
-                "esptool.exe",
-                SearchOption.AllDirectories)
-            .OrderBy(candidate => candidate, StringComparer.OrdinalIgnoreCase)
-            .FirstOrDefault();
-        return path ?? throw new FileNotFoundException("项目 ESP-IDF 环境中找不到 esptool.exe。");
+        throw new FileNotFoundException(
+            "找不到 esptool：程序未内置独立版 esptool，且项目 ESP-IDF Python 环境无 esptool.exe。");
     }
 
     private static string GetRequiredString(JsonElement element, string propertyName) =>

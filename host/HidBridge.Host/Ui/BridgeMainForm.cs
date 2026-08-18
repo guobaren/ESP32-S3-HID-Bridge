@@ -18,6 +18,7 @@ internal sealed class BridgeMainForm : Form
     private readonly AutomationController _automation;
     private readonly RuntimeLogSettings _logSettings;
     private readonly FirmwareUpdateApiServer? _firmwareUpdateApi;
+    private readonly FirmwareFlashService? _firmwareFlash;
     private readonly MouseCursorLock _cursorLock = new();
     private readonly MouseCaptureSurface _captureSurface;
     private readonly Label _statusLabel;
@@ -53,12 +54,14 @@ internal sealed class BridgeMainForm : Form
         AutomationController automation,
         string endpointDescription,
         RuntimeLogSettings? logSettings = null,
-        FirmwareUpdateApiServer? firmwareUpdateApi = null)
+        FirmwareUpdateApiServer? firmwareUpdateApi = null,
+        FirmwareFlashService? firmwareFlash = null)
     {
         _input = input;
         _automation = automation;
         _logSettings = logSettings ?? new RuntimeLogSettings(RuntimeLogMode.Reduced);
         _firmwareUpdateApi = firmwareUpdateApi;
+        _firmwareFlash = firmwareFlash;
         Text = "ESP32-S3 HID Bridge - 同步已关闭";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(760, 560);
@@ -286,7 +289,7 @@ internal sealed class BridgeMainForm : Form
 
         _macroPage = new MacroPageControl(_automation);
         _luaPage = new LuaPageControl(_automation);
-        _settingsPage = new SettingsPageControl(_automation, firmwareUpdateApi);
+        _settingsPage = new SettingsPageControl(_automation, firmwareUpdateApi, firmwareFlash);
         _tabs = new TabControl
         {
             Dock = DockStyle.Fill,

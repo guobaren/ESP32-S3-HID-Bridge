@@ -7,22 +7,29 @@ internal sealed class SettingsPageControl : UserControl
 {
     private readonly AutomationController _controller;
     private readonly FirmwareUpdateApiServer? _firmwareUpdateApi;
+    private readonly FirmwareFlashService? _firmwareFlash;
     private readonly CheckBox _startOnBootCheckBox;
     private readonly CheckBox _minimizeToTrayCheckBox;
     private readonly CheckBox _closeToTrayCheckBox;
     private readonly CheckBox _generateMovementAnalysisImageCheckBox;
     private readonly CheckBox _firmwareUpdateApiCheckBox;
+    private TextBox _firmwareFileTextBox;
+    private Button _browseFirmwareButton;
+    private Button _confirmFlashButton;
     private readonly Label _statusLabel;
     private bool _loading;
 
     internal SettingsPageControl(
         AutomationController controller,
-        FirmwareUpdateApiServer? firmwareUpdateApi = null)
+        FirmwareUpdateApiServer? firmwareUpdateApi = null,
+        FirmwareFlashService? firmwareFlash = null)
     {
         _controller = controller;
         _firmwareUpdateApi = firmwareUpdateApi;
+        _firmwareFlash = firmwareFlash;
         Dock = DockStyle.Fill;
         Padding = new Padding(24);
+        AutoScroll = true;
 
         Label title = new()
         {
@@ -66,6 +73,8 @@ internal sealed class SettingsPageControl : UserControl
             WrapOption(_firmwareUpdateApiCheckBox),
         ]);
 
+        Panel flashPanel = BuildFlashPanel();
+
         _statusLabel = new Label
         {
             Dock = DockStyle.Top,
@@ -75,6 +84,7 @@ internal sealed class SettingsPageControl : UserControl
         };
 
         Controls.Add(_statusLabel);
+        Controls.Add(flashPanel);
         Controls.Add(options);
         Controls.Add(description);
         Controls.Add(title);
@@ -93,9 +103,155 @@ internal sealed class SettingsPageControl : UserControl
     internal CheckBox GenerateMovementAnalysisImageCheckBox => _generateMovementAnalysisImageCheckBox;
     internal CheckBox FirmwareUpdateApiCheckBox => _firmwareUpdateApiCheckBox;
 
+    private Panel BuildFlashPanel()
+    {
+        Panel panel = new()
+        {
+            Dock = DockStyle.Top,
+            Height = 168,
+            Padding = new Padding(4, 10, 0, 0),
+        };
+
+        Label sectionTitle = new()
+        {
+            Text = "本地固件刷写",
+            Dock = DockStyle.Top,
+            Height = 30,
+            Font = new Font(Font.FontFamily, 12, FontStyle.Bold),
+        };
+        Label sectionDescription = new()
+        {
+            Text = "选择固件文件（flasher_args.json 三段刷写，或单个 .bin 应用分区刷写），点“确定”后弹窗确认并打开进度日志窗口。远端接口与本入口最终都调用内置的 esptool.exe，无需 Python 环境。",
+            Dock = DockStyle.Top,
+            Height = 44,
+            ForeColor = Color.FromArgb(74, 88, 108),
+        };
+        _firmwareFileTextBox = new TextBox
+        {
+            Dock = DockStyle.Top,
+            Height = 30,
+            ReadOnly = true,
+            PlaceholderText = "尚未选择固件文件",
+            Text = string.Empty,
+        };
+        _browseFirmwareButton = new Button
+        {
+            Text = "选择固件文件",
+            AutoSize = true,
+            Enabled = _firmwareFlash is not null,
+        };
+        _browseFirmwareButton.Click += (_, _) => BrowseFirmwareFile();
+        _confirmFlashButton = new Button
+        {
+            Text = "确定",
+            AutoSize = true,
+            Enabled = false,
+        };
+        _confirmFlashButton.Click += (_, _) => ConfirmAndStartFlash();
+
+        FlowLayoutPanel buttonRow = new()
+        {
+            Dock = DockStyle.Top,
+            Height = 40,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(0, 6, 0, 0),
+        };
+        buttonRow.Controls.Add(_browseFirmwareButton);
+        buttonRow.Controls.Add(_confirmFlashButton);
+
+        if (_firmwareFlash is null)
+        {
+            Label unavailable = new()
+            {
+                Text = "当前不是串口模式，本地固件刷写不可用。",
+                Dock = DockStyle.Top,
+                Height = 24,
+                ForeColor = Color.FromArgb(170, 42, 42),
+            };
+            panel.Controls.Add(unavailable);
+        }
+
+        panel.Controls.Add(buttonRow);
+        panel.Controls.Add(_firmwareFileTextBox);
+        panel.Controls.Add(sectionDescription);
+        panel.Controls.Add(sectionTitle);
+        return panel;
+    }
+
+    private void BrowseFirmwareFile()
+    {
+        using OpenFileDialog dialog = new()
+        {
+            Title = "选择固件文件",
+            Filter = "固件文件|flasher_args.json;*.bin|刷写清单 (flasher_args.json)|flasher_args.json|固件镜像 (*.bin)|*.bin",
+            CheckFileExists = true,
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+        _firmwareFileTextBox.Text = dialog.FileName;
+        _confirmFlashButton.Enabled = true;
+    }
+
+    private void ConfirmAndStartFlash()
+    {
+        if (_firmwareFlash is null)
+        {
+            return;
+        }
+        string file = _firmwareFileTextBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(file) || !File.Exists(file))
+        {
+            MessageBox.Show(this, "请先选择有效的固件文件。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (_firmwareFlash.GetSnapshot().State == "running")
+        {
+            MessageBox.Show(this, "已有刷写任务正在进行，请等待其结束后再试。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        FirmwareFlashPlan plan;
+        try
+        {
+            plan = Path.GetFileName(file).Equals("flasher_args.json", StringComparison.OrdinalIgnoreCase)
+                ? FirmwareFlashPlan.LoadFromManifest(file)
+                : FirmwareFlashPlan.LoadFromSingleImage(file);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"无法准备刷写计划：{exception.Message}", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        string message = "即将刷写固件到开发板：" + Environment.NewLine
+            + file + Environment.NewLine + Environment.NewLine
+            + "请确认开发板已连接；刷写期间将暂停键鼠同步转发。" + Environment.NewLine
+            + "确定开始刷写吗？";
+        DialogResult confirm = MessageBox.Show(
+            this,
+            message,
+            "确认刷写固件",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+        if (confirm != DialogResult.Yes)
+        {
+            return;
+        }
+
+        if (!_firmwareFlash.TryStart(plan, out _))
+        {
+            MessageBox.Show(this, "已有刷写任务正在进行，请等待其结束后再试。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        new FirmwareFlashDialog(_firmwareFlash).Show(this);
+    }
+
     private static CheckBox CreateOption(string title, string description) => new()
     {
-        Text = $"{title}\r\n{description}",
+        Text = $"{title}{Environment.NewLine}{description}",
         AutoSize = false,
         Width = 720,
         Height = 58,

@@ -33,6 +33,9 @@ internal sealed class FirmwareFlashService : IDisposable
         _input = input;
     }
 
+    /// <summary>刷写进度日志（后台线程触发，UI 需自行封送到界面线程）。</summary>
+    internal event Action<string>? Log;
+
     internal FirmwareFlashSnapshot GetSnapshot()
     {
         lock (_sync)
@@ -41,7 +44,11 @@ internal sealed class FirmwareFlashService : IDisposable
         }
     }
 
-    internal bool TryStart(out FirmwareFlashSnapshot snapshot)
+    /// <summary>使用默认固件来源（本地 build 或内置固件）启动刷写，供远端 API 调用。</summary>
+    internal bool TryStart(out FirmwareFlashSnapshot snapshot) => TryStart(null, out snapshot);
+
+    /// <summary>使用指定刷写计划启动刷写，供设置页本地文件刷写调用。</summary>
+    internal bool TryStart(FirmwareFlashPlan? plan, out FirmwareFlashSnapshot snapshot)
     {
         lock (_sync)
         {
@@ -61,13 +68,13 @@ internal sealed class FirmwareFlashService : IDisposable
                 null,
                 null,
                 null);
-            _activeTask = Task.Run(() => RunAsync(jobId));
+            _activeTask = Task.Run(() => RunAsync(jobId, plan));
             snapshot = _snapshot;
             return true;
         }
     }
 
-    private async Task RunAsync(string jobId)
+    private async Task RunAsync(string jobId, FirmwareFlashPlan? plan)
     {
         bool restoreForwarding = _input.ForwardingEnabled;
         SerialBridge.FirmwareUpdatePortLease? lease = null;
@@ -77,15 +84,15 @@ internal sealed class FirmwareFlashService : IDisposable
         {
             _input.DisableForwarding();
             await Task.Delay(100).ConfigureAwait(false);
-            FirmwareFlashPlan plan = FirmwareFlashPlan.Load(_options);
+            plan ??= FirmwareFlashPlan.Load(_options);
             lease = _serialBridge.AcquireFirmwareUpdatePort();
             portName = lease.PortName;
-            SetRunning(jobId, $"正在通过 {portName} 刷写三段固件。", portName);
-            Console.WriteLine(
+            SetRunning(jobId, $"正在通过 {portName} 刷写固件。", portName);
+            WriteLog(
                 $"固件刷写任务 {jobId}：端口={portName}，esptool={plan.EsptoolPath}，build={plan.BuildDirectory}。");
             foreach (FirmwareFlashImage image in plan.Images)
             {
-                Console.WriteLine(
+                WriteLog(
                     $"固件镜像：offset={image.OffsetArgument}，bytes={new FileInfo(image.Path).Length}，SHA-256={image.Sha256}。");
             }
 
@@ -108,7 +115,7 @@ internal sealed class FirmwareFlashService : IDisposable
             {
                 throw new InvalidOperationException("刷写输出缺少 RTS 硬复位完成标记。");
             }
-            Console.WriteLine(FormatVerificationSummary(plan.Images, verifiedImages, hardReset));
+            WriteLog(FormatVerificationSummary(plan.Images, verifiedImages, hardReset));
 
             lease.Dispose();
             lease = null;
@@ -124,7 +131,7 @@ internal sealed class FirmwareFlashService : IDisposable
         }
         catch (Exception exception)
         {
-            Console.Error.WriteLine($"固件刷写任务 {jobId} 失败：{exception.Message}");
+            WriteLog($"固件刷写任务 {jobId} 失败：{exception.Message}");
             Complete(jobId, "failed", exception.Message, exitCode, portName);
         }
         finally
@@ -204,7 +211,7 @@ internal sealed class FirmwareFlashService : IDisposable
         return (process.ExitCode, output.ToString());
     }
 
-    private static async Task CaptureOutputAsync(
+    private async Task CaptureOutputAsync(
         StreamReader reader,
         StringBuilder output,
         object outputLock)
@@ -215,7 +222,7 @@ internal sealed class FirmwareFlashService : IDisposable
             {
                 output.AppendLine(line);
             }
-            Console.WriteLine($"[刷写] {line}");
+            WriteLog($"[刷写] {line}");
         }
     }
 
@@ -229,6 +236,12 @@ internal sealed class FirmwareFlashService : IDisposable
             images.Select(image => $"{image.OffsetArgument}={image.Sha256}"));
         return $"固件刷写最终摘要：{hashes}；设备校验={verifiedImages}/{images.Count}；" +
                $"RTS复位={(hardReset ? "完成" : "未确认")}";
+    }
+
+    private void WriteLog(string message)
+    {
+        Console.WriteLine(message);
+        Log?.Invoke(message);
     }
 
     private void SetRunning(string jobId, string message, string portName)
@@ -258,6 +271,7 @@ internal sealed class FirmwareFlashService : IDisposable
                 };
             }
         }
+        WriteLog($"刷写任务 {jobId} 结束：{state} - {message}");
     }
 
     public void Dispose()

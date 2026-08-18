@@ -15,6 +15,13 @@ firmware/sdkconfig.old
 host/HidBridge.Host/bridge.local.json
 target/HidBridge.TargetAgent/agent.local.json
 
+# 内置刷写资源构建产物
+.build-tools/
+host/HidBridge.Host/EmbeddedAssets/esptool.exe
+
+# 根目录 EXE 备份
+/HidBridge.Host.exe.backup-*
+
 # 编辑器与系统文件
 .idea/
 .vs/

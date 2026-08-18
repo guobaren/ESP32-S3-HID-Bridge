@@ -1,6 +1,6 @@
 # 本机固件刷写接口
 
-控制软件可以在不退出进程的情况下释放串口、刷写当前项目已构建的固件，并自动恢复连接。
+控制软件可以在不退出进程的情况下释放串口、刷写固件，并自动恢复连接。刷写工具使用**内置的独立版 esptool.exe**（构建时嵌入 exe，无需安装 Python / ESP-IDF 环境），固件来源优先本地 firmware/build，找不到时回退到构建时嵌入的默认固件。
 
 ## 启用
 
@@ -25,6 +25,9 @@ Invoke-RestMethod `
 ```powershell
 Invoke-RestMethod -Uri 'http://127.0.0.1:24815/api/v1/firmware/status'
 ```
+
+注意：当前没有单独的“只释放 COM、不刷写”HTTP 路由。COM 释放是
+`POST /api/v1/firmware/flash` 的刷写前置步骤；如果不执行刷写，应使用控制软件自身的正常退出流程。
 
 状态 `state` 可能为：
 
