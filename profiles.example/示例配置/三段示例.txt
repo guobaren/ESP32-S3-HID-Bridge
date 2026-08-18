@@ -1,0 +1,10 @@
+# 示例宏：触发键 ctrl+f14，模式 staged，按按下/按住/松开三段执行
+[on_press]
+keydown(insert)
+
+[while_hold]
+move(0, 3)
+randsleep(40, 90)
+
+[on_release]
+keyup(insert)

@@ -1,0 +1,5 @@
+# 示例宏：触发键 mouse_side1，模式 hold_loop，按住期间循环执行
+mouse(1, 1)
+randsleep(30, 70)
+mouse(1, 0)
+randsleep(30, 70)
