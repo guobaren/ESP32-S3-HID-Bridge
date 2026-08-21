@@ -85,15 +85,13 @@ Copy-Item bridge.json bridge.local.json
 
 控制软件可以在不退出进程的情况下释放串口刷写固件，刷写完成后自动恢复连接。两个入口**最终都调用内置的独立版 esptool.exe**（构建时嵌入 exe，目标机无需安装 Python / ESP-IDF 环境；首次刷写时解压到 %LOCALAPPDATA%/HidBridge/embedded 缓存）。
 
-固件来源优先级：本地 firmware/build（最新构建）> 构建时嵌入 exe 的默认固件 > 用户在设置页手动选择的文件。
+EXE 不内嵌固件。设置页和远程 API 各自指定运行控制软件电脑上的 JSON 清单；两者只共用清单校验、esptool 调用和串口恢复逻辑。
 
 ### 方式一：设置页本地刷写（手动，推荐）
 
 1. 运行 HidBridge.Host.exe，确认日志显示已自动发现并连接串口。
-2. 打开「设置」页，底部「本地固件刷写」区，点「选择固件文件」。
-3. 固件文件两种选择：
-   - `flasher_args.json`：三段完整刷写（bootloader 0x0、partition table 0x8000、应用 0x10000）。清单里的镜像可按标准子目录（bootloader/、partition_table/）或与清单同目录平铺放置。
-   - 单个 `.bin`：仅按 0x10000 刷写应用分区。
+2. 打开「设置」页，底部「本地固件刷写」区，点「选择 JSON」。
+3. 选择三段完整刷写清单；清单里的相对镜像路径按 JSON 所在目录解析，可按标准子目录（bootloader/、partition_table/）或与清单同目录平铺放置。
 4. 点「确定」→ 弹窗二次确认 → 打开小日志窗口实时显示 esptool 进度（百分比、哈希校验、RTS 复位），完成后显示「刷写完成」。
 
 ### 方式二：远端刷写接口（远程调用）
@@ -106,7 +104,8 @@ Copy-Item bridge.json bridge.local.json
 
 ```powershell
 $headers = @{ 'X-HidBridge-Action' = 'flash-firmware' }
-Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:24815/api/v1/firmware/flash' -Headers $headers
+$body = @{ manifestPath = 'D:\ESP32-S3-HID-Bridge\firmware\build\flasher_args.json' } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:24815/api/v1/firmware/flash' -Headers $headers -ContentType 'application/json' -Body $body
 ```
 
 **查询状态**：
@@ -117,7 +116,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:24815/api/v1/firmware/status'
 
 状态 state 取值：`idle`（未执行）/ `running`（释放串口、刷写或恢复中）/ `succeeded`（三段哈希校验 + RTS 复位 + 串口恢复通过）/ `failed`（原因见 message，退出码见 exitCode）。重复提交时不会并发执行，返回 HTTP 409 和当前任务状态。
 
-**安全边界**：只绑定 127.0.0.1；POST 必须携带确认头且不接受请求体；不接受远程上传、镜像路径、串口名或命令行参数；清单必须且只能包含 0x0、0x8000、0x10000 三段且文件位于 build 目录内；刷写期间独占串口并暂停同步，程序退出时等待 esptool 安全结束。成功后日志输出「固件刷写最终摘要」（三段 SHA-256、设备校验计数、RTS 复位结果）。
+**安全边界**：只绑定 127.0.0.1；POST 必须携带确认头，并在 JSON 正文中指定本机 `manifestPath`；不接受固件上传、串口名或命令行参数；清单必须且只能包含 0x0、0x8000、0x10000 三段且镜像位于 JSON 所在目录内；刷写期间独占串口并暂停同步，程序退出时等待 esptool 安全结束。成功后日志输出「固件刷写最终摘要」（三段 SHA-256、设备校验计数、RTS 复位结果）。
 
 ### 内置 esptool 的重新构建
 
@@ -128,7 +127,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-embedded-esptool.ps1
 dotnet build host/HidBridge.Host/HidBridge.Host.csproj -c Release
 ```
 
-注意：替换内置默认固件需要重新构建 exe（构建时自动嵌入当前 firmware/build）。
+固件更新只需替换本地 JSON 及其引用镜像，不需要重新构建 EXE。
 
 ## 宏
 
@@ -253,7 +252,6 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
   "deviceLogPath": "artifacts/host-serial-{timestamp}.log",
   "showDeviceLogInUi": false,
   "firmwareUpdateApiPort": 24815,
-  "firmwareProjectRoot": "",
   "firmwareFlashBaudRate": 460800,
   "firmwareFlashTimeoutSeconds": 180
 }
@@ -263,12 +261,12 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
 - portName 为 auto 时自动扫描 COM 并完成随机数握手；固定串口模式不自动扫描。
 - hostLogPath / deviceLogPath 支持 {timestamp} 占位符；deviceLogPath 置空可关闭设备日志。
 - showDeviceLogInUi 为启动默认值：false 精简模式 / true 完整日志模式；窗口内可随时切换。
-- firmwareProjectRoot 留空时从 exe 目录和当前目录向上查找 firmware/build。
+- EXE 只内嵌刷写工具，不内嵌固件；设置页选择本机 JSON 清单，远程 API 在请求正文中单独指定本机 JSON 路径。
 
 ## 常见问题
 
 - **COM 被占用**：主机程序与 idf.py monitor、串口工具不能同时打开同一 COM 口；关闭占用程序后主机会自动重连。
-- **手动刷写提示「刷写镜像不存在」**：flasher_args.json 引用的 bin 需与清单同级（支持 bootloader/、partition_table/ 子目录或平铺），或直接选单个应用 .bin。
+- **手动刷写提示「刷写镜像不存在」**：JSON 引用的 bin 必须位于清单所在目录内（支持 bootloader/、partition_table/ 子目录或平铺）。
 - **BLE 配对后反复「已配对/已连接」**：旧固件无绑定持久化，升级后需在目标设备删除/忽略旧配对，重新配对一次。
 - **防火墙弹窗**：UDP 24814 与刷写接口 24815 首次监听可能触发 Windows 防火墙提示。
 - **exe 无法启动**：需要 .NET 8 Desktop Runtime（x64）。
@@ -277,7 +275,7 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
 ## 安全边界
 
 - UDP 模拟鼠标入口默认开启且无身份认证，默认监听 0.0.0.0:24814，仅限受信任网络。
-- 固件刷写接口默认关闭、只绑定 127.0.0.1，不接受上传、文件路径或命令参数。
+- 固件刷写接口默认关闭、只绑定 127.0.0.1；不接受固件上传、串口名或命令参数，只接受本机 JSON 清单路径。
 - 主机退出、串口断开或切换转发状态时发送 ReleaseAll，防止目标设备卡键。
 - 预共享密钥类配置只写入被 Git 忽略的本地文件（bridge.local.json、firmware/sdkconfig 等），不要写入仓库文件。
 

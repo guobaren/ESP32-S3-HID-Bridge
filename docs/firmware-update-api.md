@@ -1,6 +1,6 @@
 # 本机固件刷写接口
 
-控制软件可以在不退出进程的情况下释放串口、刷写固件，并自动恢复连接。刷写工具使用**内置的独立版 esptool.exe**（构建时嵌入 exe，无需安装 Python / ESP-IDF 环境），固件来源优先本地 firmware/build，找不到时回退到构建时嵌入的默认固件。
+控制软件可以在不退出进程的情况下释放串口、刷写固件，并自动恢复连接。刷写工具使用**内置的独立版 esptool.exe**（无需安装 Python / ESP-IDF 环境），但 EXE 不内嵌任何固件镜像。设置页和远程 API 分别指定本机 JSON 清单，并共用同一套计划校验与刷写执行工具。
 
 ## 启用
 
@@ -14,10 +14,13 @@
 
 ```powershell
 $headers = @{ 'X-HidBridge-Action' = 'flash-firmware' }
+$body = @{ manifestPath = 'D:\ESP32-S3-HID-Bridge\firmware\build\flasher_args.json' } | ConvertTo-Json
 Invoke-RestMethod `
     -Method Post `
     -Uri 'http://127.0.0.1:24815/api/v1/firmware/flash' `
-    -Headers $headers
+    -Headers $headers `
+    -ContentType 'application/json' `
+    -Body $body
 ```
 
 查询状态：
@@ -41,10 +44,10 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:24815/api/v1/firmware/status'
 ## 固定安全边界
 
 - 只绑定 IPv4 Loopback `127.0.0.1`。
-- POST 必须携带 `X-HidBridge-Action: flash-firmware`，且不接受请求体。
-- 不接受远程上传、镜像路径、串口名或命令行参数。
-- 固件固定来自项目的 `firmware/build/flasher_args.json`。
-- 清单必须且只能包含 `0x0`、`0x8000`、`0x10000` 三段，并且所有文件必须位于 build 目录内。
+- POST 必须携带 `X-HidBridge-Action: flash-firmware`，正文必须是 `{"manifestPath":"本机 JSON 绝对路径"}`。
+- 不接受远程上传固件、串口名或命令行参数；`manifestPath` 指向运行控制软件电脑上的本地文件。
+- 清单中的相对镜像路径按 JSON 所在目录解析。
+- 清单必须且只能包含 `0x0`、`0x8000`、`0x10000` 三段，并且所有镜像必须位于 JSON 所在目录内。
 - 控制软件刷写前关闭同步并发送 `ReleaseAll`，刷写期间独占串口，结束后恢复串口和原同步状态。
 - 程序退出时若仍在刷写，会等待 esptool 结束，避免主动中断写入。
 - 成功后日志会额外输出一条 `固件刷写最终摘要`，在同一行列出 `0x0`、`0x8000`、`0x10000` 三段 SHA-256、设备校验计数和 RTS 复位结果。
@@ -56,10 +59,9 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:24815/api/v1/firmware/status'
 ```json
 {
   "firmwareUpdateApiPort": 24815,
-  "firmwareProjectRoot": "D:\\ESP32-S3-HID-Bridge",
   "firmwareFlashBaudRate": 460800,
   "firmwareFlashTimeoutSeconds": 180
 }
 ```
 
-`firmwareProjectRoot` 留空时，程序会从 EXE 目录和当前目录向上查找 `firmware/build/flasher_args.json`。项目内必须存在 `.esp-idf/environment/.../esptool.exe`。
+本地设置页选择的 JSON 路径保存在自动化设置中；远程 API 每次请求单独提供 `manifestPath`，不会复用设置页选择值。

@@ -24,7 +24,6 @@ internal sealed class BridgeOptions
     public string RemoteInputBindAddress { get; init; } = "0.0.0.0";
     public int RemoteInputPort { get; init; } = 24814;
     public int FirmwareUpdateApiPort { get; init; } = 24815;
-    public string FirmwareProjectRoot { get; init; } = string.Empty;
     public int FirmwareFlashBaudRate { get; init; } = 460800;
     public int FirmwareFlashTimeoutSeconds { get; init; } = 180;
 

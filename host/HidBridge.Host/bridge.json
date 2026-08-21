@@ -14,7 +14,6 @@
   "remoteInputBindAddress": "0.0.0.0",
   "remoteInputPort": 24814,
   "firmwareUpdateApiPort": 24815,
-  "firmwareProjectRoot": "",
   "firmwareFlashBaudRate": 460800,
   "firmwareFlashTimeoutSeconds": 180
 }

@@ -13,9 +13,9 @@ internal sealed class SettingsPageControl : UserControl
     private readonly CheckBox _closeToTrayCheckBox;
     private readonly CheckBox _generateMovementAnalysisImageCheckBox;
     private readonly CheckBox _firmwareUpdateApiCheckBox;
-    private TextBox _firmwareFileTextBox;
-    private Button _browseFirmwareButton;
-    private Button _confirmFlashButton;
+    private TextBox _firmwareFileTextBox = null!;
+    private Button _browseFirmwareButton = null!;
+    private Button _confirmFlashButton = null!;
     private readonly Label _statusLabel;
     private bool _loading;
 
@@ -121,7 +121,7 @@ internal sealed class SettingsPageControl : UserControl
         };
         Label sectionDescription = new()
         {
-            Text = "选择固件文件（flasher_args.json 三段刷写，或单个 .bin 应用分区刷写），点“确定”后弹窗确认并打开进度日志窗口。远端接口与本入口最终都调用内置的 esptool.exe，无需 Python 环境。",
+            Text = "选择本机 JSON 刷写清单；清单中的相对镜像路径按 JSON 所在目录解析。点“确定”后弹窗确认并打开进度日志窗口。远程 API 使用请求中单独指定的 JSON。",
             Dock = DockStyle.Top,
             Height = 44,
             ForeColor = Color.FromArgb(74, 88, 108),
@@ -131,12 +131,12 @@ internal sealed class SettingsPageControl : UserControl
             Dock = DockStyle.Top,
             Height = 30,
             ReadOnly = true,
-            PlaceholderText = "尚未选择固件文件",
+            PlaceholderText = "尚未选择 JSON 刷写清单",
             Text = string.Empty,
         };
         _browseFirmwareButton = new Button
         {
-            Text = "选择固件文件",
+            Text = "选择 JSON",
             AutoSize = true,
             Enabled = _firmwareFlash is not null,
         };
@@ -183,16 +183,28 @@ internal sealed class SettingsPageControl : UserControl
     {
         using OpenFileDialog dialog = new()
         {
-            Title = "选择固件文件",
-            Filter = "固件文件|flasher_args.json;*.bin|刷写清单 (flasher_args.json)|flasher_args.json|固件镜像 (*.bin)|*.bin",
+            Title = "选择 JSON 刷写清单",
+            Filter = "JSON 刷写清单 (*.json)|*.json",
             CheckFileExists = true,
         };
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
             return;
         }
-        _firmwareFileTextBox.Text = dialog.FileName;
-        _confirmFlashButton.Enabled = true;
+        try
+        {
+            _ = FirmwareFlashPlan.LoadFromManifest(dialog.FileName);
+            _controller.Settings.FirmwareManifestPath = Path.GetFullPath(dialog.FileName);
+            _controller.SaveSettings();
+            _firmwareFileTextBox.Text = _controller.Settings.FirmwareManifestPath;
+            _confirmFlashButton.Enabled = true;
+            _statusLabel.ForeColor = Color.FromArgb(34, 125, 70);
+            _statusLabel.Text = "已保存固件 JSON 清单";
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"JSON 刷写清单无效：{exception.Message}", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void ConfirmAndStartFlash()
@@ -204,25 +216,12 @@ internal sealed class SettingsPageControl : UserControl
         string file = _firmwareFileTextBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(file) || !File.Exists(file))
         {
-            MessageBox.Show(this, "请先选择有效的固件文件。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "请先选择有效的 JSON 刷写清单。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         if (_firmwareFlash.GetSnapshot().State == "running")
         {
             MessageBox.Show(this, "已有刷写任务正在进行，请等待其结束后再试。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-
-        FirmwareFlashPlan plan;
-        try
-        {
-            plan = Path.GetFileName(file).Equals("flasher_args.json", StringComparison.OrdinalIgnoreCase)
-                ? FirmwareFlashPlan.LoadFromManifest(file)
-                : FirmwareFlashPlan.LoadFromSingleImage(file);
-        }
-        catch (Exception exception)
-        {
-            MessageBox.Show(this, $"无法准备刷写计划：{exception.Message}", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
 
@@ -241,9 +240,9 @@ internal sealed class SettingsPageControl : UserControl
             return;
         }
 
-        if (!_firmwareFlash.TryStart(plan, out _))
+        if (!_firmwareFlash.TryStartFromManifest(file, out FirmwareFlashSnapshot snapshot))
         {
-            MessageBox.Show(this, "已有刷写任务正在进行，请等待其结束后再试。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, snapshot.Message, "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         new FirmwareFlashDialog(_firmwareFlash).Show(this);
@@ -276,6 +275,9 @@ internal sealed class SettingsPageControl : UserControl
         _generateMovementAnalysisImageCheckBox.Checked = _controller.Settings.GenerateMovementAnalysisImage;
         _firmwareUpdateApiCheckBox.Checked =
             _firmwareUpdateApi is not null && _controller.Settings.FirmwareUpdateApiEnabled;
+        _firmwareFileTextBox.Text = _controller.Settings.FirmwareManifestPath;
+        _confirmFlashButton.Enabled = _firmwareFlash is not null &&
+            File.Exists(_controller.Settings.FirmwareManifestPath);
         _loading = false;
     }
 

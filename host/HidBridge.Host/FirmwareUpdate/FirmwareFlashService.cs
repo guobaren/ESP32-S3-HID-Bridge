@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using HidBridge.Host.Input;
 using HidBridge.Host.Transport;
@@ -44,11 +45,40 @@ internal sealed class FirmwareFlashService : IDisposable
         }
     }
 
-    /// <summary>使用默认固件来源（本地 build 或内置固件）启动刷写，供远端 API 调用。</summary>
-    internal bool TryStart(out FirmwareFlashSnapshot snapshot) => TryStart(null, out snapshot);
+    /// <summary>从调用方指定的本地 JSON 清单创建计划并启动刷写。</summary>
+    internal bool TryStartFromManifest(string manifestPath, out FirmwareFlashSnapshot snapshot)
+    {
+        FirmwareFlashPlan plan;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(manifestPath) || !Path.IsPathFullyQualified(manifestPath))
+            {
+                throw new ArgumentException("JSON 刷写清单必须使用本机绝对路径。", nameof(manifestPath));
+            }
+            plan = FirmwareFlashPlan.LoadFromManifest(manifestPath);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException or JsonException)
+        {
+            lock (_sync)
+            {
+                _snapshot = new(
+                    "",
+                    "failed",
+                    $"无法准备刷写计划：{exception.Message}",
+                    null,
+                    DateTimeOffset.Now,
+                    null,
+                    null);
+                snapshot = _snapshot;
+            }
+            return false;
+        }
+        return TryStart(plan, out snapshot);
+    }
 
-    /// <summary>使用指定刷写计划启动刷写，供设置页本地文件刷写调用。</summary>
-    internal bool TryStart(FirmwareFlashPlan? plan, out FirmwareFlashSnapshot snapshot)
+    /// <summary>使用已校验的刷写计划启动底层任务。</summary>
+    internal bool TryStart(FirmwareFlashPlan plan, out FirmwareFlashSnapshot snapshot)
     {
         lock (_sync)
         {
@@ -74,7 +104,7 @@ internal sealed class FirmwareFlashService : IDisposable
         }
     }
 
-    private async Task RunAsync(string jobId, FirmwareFlashPlan? plan)
+    private async Task RunAsync(string jobId, FirmwareFlashPlan plan)
     {
         bool restoreForwarding = _input.ForwardingEnabled;
         SerialBridge.FirmwareUpdatePortLease? lease = null;
@@ -84,7 +114,6 @@ internal sealed class FirmwareFlashService : IDisposable
         {
             _input.DisableForwarding();
             await Task.Delay(100).ConfigureAwait(false);
-            plan ??= FirmwareFlashPlan.Load(_options);
             lease = _serialBridge.AcquireFirmwareUpdatePort();
             portName = lease.PortName;
             SetRunning(jobId, $"正在通过 {portName} 刷写固件。", portName);

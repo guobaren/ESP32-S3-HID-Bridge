@@ -102,7 +102,13 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
                 CreateMouseInput(MouseXUp, 0, 0, XButton1),
                 CreateMouseInput(MouseXUp, 0, 0, XButton2),
             ];
-            inputs.AddRange(_pressedKeys.Select(hidUsage => CreateKeyInput(hidUsage, true)));
+            // 全局键盘 Hook 在捕获期间可能已经拦截过实体修饰键的 KeyUp；这些键不在
+            // 自动化状态表中。每次进入/退出捕获都主动发送八个修饰键的 KeyUp，才能
+            // 修复控制端 Windows 已经形成的 Shift/Ctrl/Alt/Win 卡键状态。
+            IEnumerable<byte> keysToRelease = _pressedKeys
+                .Concat(Enumerable.Range(224, 8).Select(value => unchecked((byte)value)))
+                .Distinct();
+            inputs.AddRange(keysToRelease.Select(hidUsage => CreateKeyInput(hidUsage, true)));
             Send(inputs.ToArray());
             _pressedButtons.Clear();
             _pressedKeys.Clear();

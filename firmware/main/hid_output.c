@@ -34,7 +34,7 @@
 #define USB_CDC_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN)
 #define USB_PID_CDC_ONLY 0x4001
 #define USB_PID_HID_ONLY 0x4004
-#define MOUSE_SEND_PERIOD_MS 2
+#define MOUSE_SEND_PERIOD_MS 1
 #define USB_UNAVAILABLE_TIMEOUT_MS 100
 #define STATISTICS_PERIOD_MS 1000
 #define COMPLETION_LATENCY_BUCKET_COUNT 7
@@ -43,6 +43,7 @@ static const char *TAG = "hid_output";
 static QueueHandle_t s_control_queue;
 static SemaphoreHandle_t s_control_mutex;
 static TaskHandle_t s_hid_sender_task;
+static TaskHandle_t s_statistics_task;
 static portMUX_TYPE s_mouse_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef enum {
@@ -290,6 +291,14 @@ static bool report_has_motion(int16_t x, int16_t y, int8_t wheel, int8_t pan)
     return x != 0 || y != 0 || wheel != 0 || pan != 0;
 }
 
+static uint64_t elapsed_us_without_underflow(int64_t now_us, int64_t start_us)
+{
+    if (start_us <= 0 || now_us < start_us) {
+        return 0;
+    }
+    return (uint64_t)(now_us - start_us);
+}
+
 static size_t completion_latency_bucket(uint64_t latency_us)
 {
     static const uint64_t upper_bounds_us[] = {1000, 2000, 4000, 8000, 16000, 32000};
@@ -374,7 +383,9 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_
         if (report_has_motion(x, y, wheel, pan)) {
             s_diagnostics.motion_completed++;
             if (s_last_motion_completion_time_us != 0) {
-                uint64_t gap_us = (uint64_t)(completion_time_us - s_last_motion_completion_time_us);
+                uint64_t gap_us = elapsed_us_without_underflow(
+                    completion_time_us,
+                    s_last_motion_completion_time_us);
                 if (gap_us > s_diagnostics.completion_gap_max_us) {
                     s_diagnostics.completion_gap_max_us = gap_us;
                 }
@@ -382,13 +393,17 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_
             s_last_motion_completion_time_us = completion_time_us;
         }
         if (s_mouse_submit_time_us != 0) {
-            uint64_t latency_us = (uint64_t)(completion_time_us - s_mouse_submit_time_us);
-            s_diagnostics.completion_latency_samples++;
-            s_diagnostics.completion_latency_total_us += latency_us;
-            if (latency_us > s_diagnostics.completion_latency_max_us) {
-                s_diagnostics.completion_latency_max_us = latency_us;
+            if (completion_time_us >= s_mouse_submit_time_us) {
+                uint64_t latency_us = elapsed_us_without_underflow(
+                    completion_time_us,
+                    s_mouse_submit_time_us);
+                s_diagnostics.completion_latency_samples++;
+                s_diagnostics.completion_latency_total_us += latency_us;
+                if (latency_us > s_diagnostics.completion_latency_max_us) {
+                    s_diagnostics.completion_latency_max_us = latency_us;
+                }
+                s_diagnostics.completion_latency_buckets[completion_latency_bucket(latency_us)]++;
             }
-            s_diagnostics.completion_latency_buckets[completion_latency_bucket(latency_us)]++;
             s_mouse_submit_time_us = 0;
         }
     }
@@ -478,7 +493,6 @@ static bool submit_mouse_report(uint8_t buttons, bool force)
         portEXIT_CRITICAL(&s_mouse_lock);
         return false;
     }
-
     portENTER_CRITICAL(&s_mouse_lock);
     s_mouse.pending_x -= x;
     s_mouse.pending_y -= y;
@@ -549,7 +563,7 @@ static void log_statistics(void)
         : diagnostics.completion_latency_total_us / diagnostics.completion_latency_samples;
     ESP_LOGI(
         TAG,
-        "鼠标统计（500 Hz）：接收=%" PRIu64 " 位移=(%" PRId64 ",%" PRId64 ")，"
+        "鼠标统计（1000 Hz）：接收=%" PRIu64 " 位移=(%" PRId64 ",%" PRId64 ")，"
         "提交=%" PRIu64 " 位移=(%" PRId64 ",%" PRId64 ")，"
         "完成=%" PRIu64 " 位移=(%" PRId64 ",%" PRId64 ")，"
         "待发送=(%" PRId64 ",%" PRId64 ")，会话丢弃=(%" PRId64 ",%" PRId64 ")，"
@@ -598,6 +612,16 @@ static void log_statistics(void)
         diagnostics.completion_latency_buckets[4],
         diagnostics.completion_latency_buckets[5],
         diagnostics.completion_latency_buckets[6]);
+}
+
+static void statistics_task(void *argument)
+{
+    (void)argument;
+    while (true) {
+        // HID 实时任务只发通知；快照、格式化与 UART 输出全部留在低优先级任务。
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        log_statistics();
+    }
 }
 
 static void hid_sender_task(void *argument)
@@ -651,7 +675,9 @@ static void hid_sender_task(void *argument)
         }
         portEXIT_CRITICAL(&s_mouse_lock);
         if (xTaskGetTickCount() - last_statistics >= pdMS_TO_TICKS(STATISTICS_PERIOD_MS)) {
-            log_statistics();
+            if (s_statistics_task != NULL) {
+                xTaskNotifyGive(s_statistics_task);
+            }
             last_statistics = xTaskGetTickCount();
         }
         if (!ready) {
@@ -748,6 +774,22 @@ esp_err_t hid_output_init(usb_device_profile_t profile)
     }
 
     if (xTaskCreate(
+            statistics_task,
+            "hid_stats",
+            4096,
+            NULL,
+            2,
+            &s_statistics_task) != pdPASS) {
+        ESP_LOGE(TAG, "无法创建 HID 统计任务");
+        tinyusb_driver_uninstall();
+        vQueueDelete(s_control_queue);
+        s_control_queue = NULL;
+        vSemaphoreDelete(s_control_mutex);
+        s_control_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskCreate(
             hid_sender_task,
             "hid_sender",
             4096,
@@ -755,6 +797,8 @@ esp_err_t hid_output_init(usb_device_profile_t profile)
             8,
             NULL) != pdPASS) {
         ESP_LOGE(TAG, "无法创建 HID 发送任务");
+        vTaskDelete(s_statistics_task);
+        s_statistics_task = NULL;
         tinyusb_driver_uninstall();
         vQueueDelete(s_control_queue);
         s_control_queue = NULL;
@@ -853,6 +897,7 @@ esp_err_t hid_output_submit(const bridge_frame_t *frame)
         s_mouse.pending_y = 0;
         s_mouse.pending_wheel = 0;
         s_mouse.pending_pan = 0;
+        s_mouse.pending_motion_reports = 0;
         s_mouse.received_buttons = 0;
         s_mouse.release_pending = true;
         s_last_motion_completion_time_us = 0;

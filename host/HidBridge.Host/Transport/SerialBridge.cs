@@ -170,23 +170,37 @@ internal sealed class SerialBridge : IBridgeTransport
                 Directory.CreateDirectory(directory);
             }
 
-            _traceWriter = new StreamWriter(path, append: false, new UTF8Encoding(false))
-            {
-                AutoFlush = false,
-            };
+            _traceWriter = CreateTraceWriter(path, _logSettings.FullLoggingEnabled);
             _nextTraceFlushTimestamp = Stopwatch.GetTimestamp() +
                                        Stopwatch.Frequency * TraceFlushIntervalMilliseconds / 1000;
             _traceCancellation = new CancellationTokenSource();
             CancellationToken cancellation = _traceCancellation.Token;
             _traceTask = Task.Run(() => TraceDeviceOutput(port, portName, cancellation), cancellation);
             Console.WriteLine(
-                $"设备日志已启用（缓冲写入，模式={(_logSettings.FullLoggingEnabled ? "完整诊断" : "精简高性能")}）：{path}");
+                $"设备日志已启用（异步实时落盘，模式={(_logSettings.FullLoggingEnabled ? "完整诊断" : "精简高性能")}）：{path}");
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
             Console.Error.WriteLine($"设备日志创建失败：{exception.Message}");
             _traceWriter = null;
         }
+    }
+
+    internal static StreamWriter CreateTraceWriter(string path, bool fullLogging)
+    {
+        FileStream stream = new(
+            path,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.ReadWrite,
+            bufferSize: 64 * 1024,
+            FileOptions.SequentialScan);
+        return new StreamWriter(stream, new UTF8Encoding(false))
+        {
+            // 精简模式每秒只有少量关键行，立即刷新便于运行中排障；
+            // 完整模式由专用串口日志线程周期刷新，避免每行强制刷新造成高频磁盘 I/O。
+            AutoFlush = !fullLogging,
+        };
     }
 
     private void TraceDeviceOutput(SerialPort port, string portName, CancellationToken cancellation)

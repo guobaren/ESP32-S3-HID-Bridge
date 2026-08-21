@@ -5,13 +5,16 @@ using System.Text.Json;
 
 namespace HidBridge.Host.FirmwareUpdate;
 
-internal delegate bool FirmwareFlashStarter(out FirmwareFlashSnapshot snapshot);
+internal delegate bool FirmwareFlashStarter(string manifestPath, out FirmwareFlashSnapshot snapshot);
+
+internal sealed record FirmwareFlashRequest(string ManifestPath);
 
 internal sealed class FirmwareUpdateApiServer : IDisposable
 {
     internal const string ConfirmationHeaderName = "X-HidBridge-Action";
     internal const string ConfirmationHeaderValue = "flash-firmware";
     private const int MaximumHeaderBytes = 8192;
+    private const int MaximumBodyBytes = 4096;
     private readonly int _port;
     private readonly Func<FirmwareFlashSnapshot> _getSnapshot;
     private readonly FirmwareFlashStarter _tryStart;
@@ -22,7 +25,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
     private bool _disposed;
 
     internal FirmwareUpdateApiServer(int port, FirmwareFlashService service)
-        : this(port, service.GetSnapshot, service.TryStart)
+        : this(port, service.GetSnapshot, service.TryStartFromManifest)
     {
     }
 
@@ -165,16 +168,24 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                         .ConfigureAwait(false);
                     return;
                 }
+                int contentLength = 0;
                 if (headers.TryGetValue("content-length", out string? contentLengthText) &&
-                    (!int.TryParse(contentLengthText, out int contentLength) || contentLength != 0))
+                    (!int.TryParse(contentLengthText, out contentLength) ||
+                     contentLength < 0 || contentLength > MaximumBodyBytes))
                 {
-                    await WriteJsonAsync(stream, 400, new { error = "request_body_not_allowed" }, requestTimeout.Token)
+                    await WriteJsonAsync(stream, 400, new { error = "invalid_content_length" }, requestTimeout.Token)
                         .ConfigureAwait(false);
                     return;
                 }
 
                 if (method == "GET" && path == "/api/v1/firmware/status")
                 {
+                    if (contentLength != 0)
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "request_body_not_allowed" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
                     await WriteJsonAsync(stream, 200, _getSnapshot(), requestTimeout.Token)
                         .ConfigureAwait(false);
                     return;
@@ -188,8 +199,40 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                             .ConfigureAwait(false);
                         return;
                     }
-                    bool started = _tryStart(out FirmwareFlashSnapshot snapshot);
-                    await WriteJsonAsync(stream, started ? 202 : 409, snapshot, requestTimeout.Token)
+                    if (contentLength == 0)
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "manifest_path_required" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    string body = await ReadBodyAsync(stream, contentLength, requestTimeout.Token)
+                        .ConfigureAwait(false);
+                    FirmwareFlashRequest? request;
+                    try
+                    {
+                        request = JsonSerializer.Deserialize<FirmwareFlashRequest>(
+                            body,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    }
+                    catch (JsonException)
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "invalid_json" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (string.IsNullOrWhiteSpace(request?.ManifestPath))
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "manifest_path_required" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    bool started = _tryStart(request.ManifestPath, out FirmwareFlashSnapshot snapshot);
+                    int responseCode = started
+                        ? 202
+                        : snapshot.State == "failed" && string.IsNullOrEmpty(snapshot.JobId)
+                            ? 400
+                            : 409;
+                    await WriteJsonAsync(stream, responseCode, snapshot, requestTimeout.Token)
                         .ConfigureAwait(false);
                     return;
                 }
@@ -210,7 +253,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
 
     private static async Task<string> ReadHeadersAsync(NetworkStream stream, CancellationToken cancellationToken)
     {
-        byte[] buffer = new byte[1024];
+        byte[] buffer = new byte[1];
         using MemoryStream collected = new();
         while (collected.Length < MaximumHeaderBytes)
         {
@@ -220,14 +263,37 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                 break;
             }
             collected.Write(buffer, 0, read);
-            string text = Encoding.ASCII.GetString(collected.GetBuffer(), 0, checked((int)collected.Length));
-            int end = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-            if (end >= 0)
+            if (collected.Length >= 4)
             {
-                return text[..(end + 4)];
+                byte[] bytes = collected.GetBuffer();
+                int length = checked((int)collected.Length);
+                if (bytes[length - 4] == '\r' && bytes[length - 3] == '\n' &&
+                    bytes[length - 2] == '\r' && bytes[length - 1] == '\n')
+                {
+                    return Encoding.ASCII.GetString(bytes, 0, length);
+                }
             }
         }
         throw new InvalidDataException("HTTP 请求头不完整或超过 8192 字节。");
+    }
+
+    private static async Task<string> ReadBodyAsync(
+        NetworkStream stream,
+        int contentLength,
+        CancellationToken cancellationToken)
+    {
+        byte[] body = new byte[contentLength];
+        int offset = 0;
+        while (offset < body.Length)
+        {
+            int read = await stream.ReadAsync(body.AsMemory(offset), cancellationToken).ConfigureAwait(false);
+            if (read <= 0)
+            {
+                throw new InvalidDataException("HTTP 请求正文不完整。");
+            }
+            offset += read;
+        }
+        return Encoding.UTF8.GetString(body);
     }
 
     internal static bool TryParseRequest(

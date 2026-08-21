@@ -13,8 +13,8 @@ internal readonly record struct UdpMouseSmootherStatistics(
 
 internal sealed class UdpMouseSmoother
 {
-    internal const int OutputIntervalMilliseconds = 2;
-    internal const int SmoothingSlots = 10;
+    internal const int OutputIntervalMilliseconds = 1;
+    internal const int SmoothingSlots = 20;
     internal const int MaximumScheduledDelayMilliseconds =
         OutputIntervalMilliseconds * SmoothingSlots;
 

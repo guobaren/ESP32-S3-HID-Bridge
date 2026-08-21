@@ -54,6 +54,7 @@ internal sealed class AutomationSettings
     public bool CloseToTray { get; set; } = true;
     public bool GenerateMovementAnalysisImage { get; set; } = true;
     public bool FirmwareUpdateApiEnabled { get; set; }
+    public string FirmwareManifestPath { get; set; } = string.Empty;
     public int WindowWidth { get; set; } = 1080;
     public int WindowHeight { get; set; } = 760;
 }

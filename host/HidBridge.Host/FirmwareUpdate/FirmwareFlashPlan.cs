@@ -12,9 +12,6 @@ internal sealed record FirmwareFlashImage(
 internal sealed class FirmwareFlashPlan
 {
     private static readonly long[] RequiredOffsets = [0x0000, 0x8000, 0x10000];
-    private static readonly string[] DefaultWriteFlashArguments =
-        ["--flash-mode", "dio", "--flash-size", "2MB", "--flash-freq", "80m"];
-
     private FirmwareFlashPlan(
         string projectRoot,
         string buildDirectory,
@@ -44,15 +41,7 @@ internal sealed class FirmwareFlashPlan
     internal IReadOnlyList<string> WriteFlashArguments { get; }
     internal IReadOnlyList<FirmwareFlashImage> Images { get; }
 
-    /// <summary>使用本地项目固件（firmware/build），找不到时回退到程序内置的默认固件。</summary>
-    internal static FirmwareFlashPlan Load(BridgeOptions options)
-    {
-        string projectRoot = ResolveProjectRoot(options.FirmwareProjectRoot);
-        string buildDirectory = Path.Combine(projectRoot, "firmware", "build");
-        return CreateFromManifest(projectRoot, buildDirectory);
-    }
-
-    /// <summary>使用用户选择的 flasher_args.json 清单（三段固件）。</summary>
+    /// <summary>使用调用方指定的 JSON 清单（三段本地固件）。</summary>
     internal static FirmwareFlashPlan LoadFromManifest(string manifestPath)
     {
         string fullPath = Path.GetFullPath(manifestPath);
@@ -62,48 +51,14 @@ internal sealed class FirmwareFlashPlan
         }
         string buildDirectory = Path.GetDirectoryName(fullPath)
             ?? throw new InvalidDataException("刷写清单路径无效。");
-        return CreateFromManifest(buildDirectory, buildDirectory);
-    }
-
-    /// <summary>使用用户选择的单个固件镜像，按 0x10000（应用分区）刷写。</summary>
-    internal static FirmwareFlashPlan LoadFromSingleImage(string imagePath)
-    {
-        string fullPath = Path.GetFullPath(imagePath);
-        if (!File.Exists(fullPath))
-        {
-            throw new FileNotFoundException("固件镜像不存在。", fullPath);
-        }
-        string buildDirectory = Path.GetDirectoryName(fullPath)
-            ?? throw new InvalidDataException("固件镜像路径无效。");
-        List<FirmwareFlashImage> images =
-        [
-            new FirmwareFlashImage(
-                0x10000,
-                "0x10000",
-                fullPath,
-                Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(fullPath)))),
-        ];
-        return new FirmwareFlashPlan(
-            buildDirectory,
-            buildDirectory,
-            ResolveEsptoolPath(buildDirectory),
-            "esp32s3",
-            "default-reset",
-            "hard-reset",
-            DefaultWriteFlashArguments,
-            images);
+        return CreateFromManifest(buildDirectory, buildDirectory, fullPath);
     }
 
     private static FirmwareFlashPlan CreateFromManifest(
         string projectRoot,
-        string buildDirectory)
+        string buildDirectory,
+        string manifestPath)
     {
-        string manifestPath = Path.Combine(buildDirectory, "flasher_args.json");
-        if (!File.Exists(manifestPath))
-        {
-            throw new FileNotFoundException("找不到固件刷写清单，请先执行 idf.py build。", manifestPath);
-        }
-
         using JsonDocument document = JsonDocument.Parse(File.ReadAllText(manifestPath));
         JsonElement root = document.RootElement;
         JsonElement extra = root.GetProperty("extra_esptool_args");
@@ -161,41 +116,6 @@ internal sealed class FirmwareFlashPlan
             after,
             writeFlashArguments,
             images);
-    }
-
-    private static string ResolveProjectRoot(string configuredRoot)
-    {
-        if (!string.IsNullOrWhiteSpace(configuredRoot))
-        {
-            string candidate = Path.GetFullPath(configuredRoot, AppContext.BaseDirectory);
-            if (!File.Exists(Path.Combine(candidate, "firmware", "build", "flasher_args.json")))
-            {
-                throw new DirectoryNotFoundException($"firmwareProjectRoot 无有效固件 build：{candidate}");
-            }
-            return candidate;
-        }
-
-        foreach (string start in new[] { AppContext.BaseDirectory, Environment.CurrentDirectory }.Distinct())
-        {
-            DirectoryInfo? current = new(Path.GetFullPath(start));
-            while (current is not null)
-            {
-                if (File.Exists(Path.Combine(current.FullName, "firmware", "build", "flasher_args.json")))
-                {
-                    return current.FullName;
-                }
-                current = current.Parent;
-            }
-        }
-
-        string? embeddedRoot = EmbeddedFlashAssets.ExtractFirmwareProjectRoot();
-        if (embeddedRoot is not null)
-        {
-            return embeddedRoot;
-        }
-        throw new DirectoryNotFoundException(
-            "无法从程序目录或当前目录定位 firmware/build/flasher_args.json，且程序未内置默认固件。" +
-            "请先执行 idf.py build，或在设置页选择本地固件文件刷写。");
     }
 
     private static string ResolveEsptoolPath(string projectRoot)

@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using HidBridge.Host.Automation;
 using HidBridge.Host.Transport;
@@ -11,6 +12,7 @@ internal sealed class InputForwarder : IDisposable
 {
     private readonly record struct CapturedInputEvent(
         bool IsKeyboard,
+        bool IsCoalescedMouseMovement,
         uint VirtualKey,
         bool Extended,
         bool IsDown,
@@ -32,6 +34,7 @@ internal sealed class InputForwarder : IDisposable
     private readonly object _inputStateLock = new();
     private readonly object _captureLifecycleLock = new();
     private readonly object _keyboardEdgeLock = new();
+    private readonly object _rawMouseMovementLock = new();
     private readonly List<byte> _pressedKeys = [];
     private readonly HashSet<byte> _automationPressedKeys = [];
     private readonly HashSet<uint> _triggerHeldKeys = [];
@@ -47,6 +50,9 @@ internal sealed class InputForwarder : IDisposable
     private Exception? _captureStartupException;
     private uint _captureThreadId;
     private bool _captureStopRequested;
+    private long _pendingRawMouseX;
+    private long _pendingRawMouseY;
+    private bool _rawMouseMovementQueued;
     private byte _modifiers;
     private byte _automationModifiers;
     private byte _mouseButtons;
@@ -67,6 +73,7 @@ internal sealed class InputForwarder : IDisposable
     internal int SimulatedUdpInputFrequencyHz => _mouseReportPump.SimulatedUdpInputFrequencyHz;
     internal bool UdpSmoothingEnabled => _mouseReportPump.UdpSmoothingEnabled;
     internal uint CaptureThreadId => Volatile.Read(ref _captureThreadId);
+    internal int PendingInputEventCountForChecks => _inputEvents?.Count ?? 0;
 
     internal event EventHandler<bool>? ForwardingChanged;
     internal event Action? ForwardingTransitioning;
@@ -111,7 +118,7 @@ internal sealed class InputForwarder : IDisposable
         TryEnqueueKeyboardTransition(virtualKey, extended, isDown);
 
     internal bool EnqueueRawMouseInputForChecks(NativeMethods.RawMouse input) =>
-        TryEnqueueInput(new CapturedInputEvent(false, 0, false, false, input));
+        EnqueueRawMouseInputCore(input);
 
     internal void SendAutomationMouseMove(int deltaX, int deltaY)
     {
@@ -217,6 +224,7 @@ internal sealed class InputForwarder : IDisposable
             {
                 _capturedKeyboardKeysDown.Clear();
             }
+            ResetCoalescedRawMouseMovement();
             _inputEvents?.Dispose();
             _inputEvents = new BlockingCollection<CapturedInputEvent>();
             _inputDispatchThread = new Thread(InputDispatchLoop)
@@ -396,6 +404,10 @@ internal sealed class InputForwarder : IDisposable
                 {
                     ProcessKeyboardInput(input.VirtualKey, input.Extended, input.IsDown);
                 }
+                else if (input.IsCoalescedMouseMovement)
+                {
+                    DrainCoalescedRawMouseMovement();
+                }
                 else
                 {
                     HandleRawMouseInputSafely(input.RawMouse);
@@ -464,16 +476,12 @@ internal sealed class InputForwarder : IDisposable
             return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
         }
 
-        bool isToggleHotkey = isDown && virtualKey == VkHome;
-        bool isExitHotkey = isDown && virtualKey == VkEnd;
-        if (!TryEnqueueKeyboardTransition(
-                virtualKey,
-                (data.Flags & NativeMethods.LlkhfExtended) != 0,
-                isDown))
-        {
-            return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
-        }
-        if (isToggleHotkey || isExitHotkey || ForwardingEnabled)
+        bool isControlHotkey = virtualKey is VkHome or VkEnd;
+        TryEnqueueKeyboardTransition(
+            virtualKey,
+            (data.Flags & NativeMethods.LlkhfExtended) != 0,
+            isDown);
+        if (ShouldSuppressKeyboard(ForwardingEnabled, isControlHotkey, isUp))
         {
             return (IntPtr)1;
         }
@@ -481,7 +489,10 @@ internal sealed class InputForwarder : IDisposable
         return NativeMethods.CallNextHookEx(_keyboardHook, code, wParam, lParam);
     }
 
-    private bool TryEnqueueKeyboardTransition(uint virtualKey, bool extended, bool isDown)
+    private bool TryEnqueueKeyboardTransition(
+        uint virtualKey,
+        bool extended,
+        bool isDown)
     {
         lock (_keyboardEdgeLock)
         {
@@ -498,6 +509,7 @@ internal sealed class InputForwarder : IDisposable
 
             if (TryEnqueueInput(new CapturedInputEvent(
                     true,
+                    false,
                     virtualKey,
                     extended,
                     isDown,
@@ -579,8 +591,95 @@ internal sealed class InputForwarder : IDisposable
         }
     }
 
+    private bool TryEnqueueCoalescedRawMouseMovement(
+        int deltaX,
+        int deltaY)
+    {
+        lock (_rawMouseMovementLock)
+        {
+            _pendingRawMouseX += deltaX;
+            _pendingRawMouseY += deltaY;
+            if (_rawMouseMovementQueued)
+            {
+                return true;
+            }
+
+            _rawMouseMovementQueued = true;
+            if (TryEnqueueInput(new CapturedInputEvent(
+                    false,
+                    true,
+                    0,
+                    false,
+                    false,
+                    default)))
+            {
+                return true;
+            }
+
+            _pendingRawMouseX -= deltaX;
+            _pendingRawMouseY -= deltaY;
+            _rawMouseMovementQueued = false;
+            return false;
+        }
+    }
+
+    private void DrainCoalescedRawMouseMovement()
+    {
+        long deltaX;
+        long deltaY;
+        lock (_rawMouseMovementLock)
+        {
+            deltaX = _pendingRawMouseX;
+            deltaY = _pendingRawMouseY;
+            _pendingRawMouseX = 0;
+            _pendingRawMouseY = 0;
+            _rawMouseMovementQueued = false;
+        }
+
+        while (deltaX != 0 || deltaY != 0)
+        {
+            int chunkX = unchecked((int)Math.Clamp(deltaX, int.MinValue, int.MaxValue));
+            int chunkY = unchecked((int)Math.Clamp(deltaY, int.MinValue, int.MaxValue));
+            HandleRawMouseInputSafely(new NativeMethods.RawMouse { LastX = chunkX, LastY = chunkY });
+            deltaX -= chunkX;
+            deltaY -= chunkY;
+        }
+    }
+
+    private void ResetCoalescedRawMouseMovement()
+    {
+        lock (_rawMouseMovementLock)
+        {
+            _pendingRawMouseX = 0;
+            _pendingRawMouseY = 0;
+            _rawMouseMovementQueued = false;
+        }
+    }
+
+    private static bool IsCoalescibleRawMouseMovement(NativeMethods.RawMouse input) =>
+        input.Buttons == 0 &&
+        input.RawButtons == 0 &&
+        (input.Flags & NativeMethods.MouseMoveAbsolute) == 0 &&
+        (input.LastX != 0 || input.LastY != 0);
+
     private void EnqueueRawMouseInput(NativeMethods.RawMouse input) =>
         EnqueueRawMouseInputForChecks(input);
+
+    private bool EnqueueRawMouseInputCore(NativeMethods.RawMouse input)
+    {
+        if (IsCoalescibleRawMouseMovement(input))
+        {
+            return TryEnqueueCoalescedRawMouseMovement(input.LastX, input.LastY);
+        }
+
+        return TryEnqueueInput(new CapturedInputEvent(
+                false,
+                false,
+                0,
+                false,
+                false,
+                input));
+    }
 
     private IntPtr MouseCallback(int code, IntPtr wParam, IntPtr lParam)
     {
@@ -757,7 +856,7 @@ internal sealed class InputForwarder : IDisposable
                 wheel,
                 pan);
         }
-        // 与键盘相同，先把实体按钮的新状态交给 500 Hz 报告泵，再执行 Lua/宏回调。
+        // 与键盘相同，先把实体按钮的新状态交给 1000 Hz 报告泵，再执行 Lua/宏回调。
         NotifyMouseButtonTransitions(flags);
     }
 
@@ -797,8 +896,8 @@ internal sealed class InputForwarder : IDisposable
     internal static bool ShouldSuppressKeyboard(
         bool forwardingEnabled,
         bool handlingControlHotkey,
-        bool hotkeyStartedWhileForwarding) =>
-        handlingControlHotkey ? hotkeyStartedWhileForwarding : forwardingEnabled;
+        bool isKeyUp) =>
+        !isKeyUp && (handlingControlHotkey || forwardingEnabled);
 
     internal static bool ShouldIgnoreKeyboardHookEvent(uint flags, uint virtualKey) =>
         (flags & NativeMethods.LlkhfInjected) != 0 &&

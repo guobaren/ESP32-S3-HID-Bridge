@@ -9,7 +9,7 @@ namespace HidBridge.Host.Input;
 
 internal sealed class MouseReportPump : IDisposable
 {
-    private const int OutputFrequencyHz = 500;
+    private const int OutputFrequencyHz = 1000;
     private const int OutputIntervalMilliseconds = 1000 / OutputFrequencyHz;
     private const uint CreateWaitableTimerHighResolution = 0x00000002;
     private const uint TimerAllAccess = 0x001F0003;
@@ -109,7 +109,7 @@ internal sealed class MouseReportPump : IDisposable
         _senderThread = new Thread(SenderLoop)
         {
             IsBackground = true,
-            Name = "HidBridge.Mouse500Hz",
+            Name = "HidBridge.Mouse1000Hz",
             Priority = ThreadPriority.AboveNormal,
         };
         _senderThread.Start();
@@ -478,6 +478,10 @@ internal sealed class MouseReportPump : IDisposable
     {
         UdpMouseSmootherStatistics udp = _udpMouseSmoother.GetStatistics();
         SimulatedUdpInputStatistics simulated = _simulatedUdpInput.GetStatistics();
+        long minSubmittedIntervalUs = _minSubmittedIntervalUs;
+        long maxSubmittedIntervalUs = _maxSubmittedIntervalUs;
+        _minSubmittedIntervalUs = 0;
+        _maxSubmittedIntervalUs = 0;
         return new MouseStatisticsSnapshot(
             _rawEventCount,
             _capturedX,
@@ -491,15 +495,15 @@ internal sealed class MouseReportPump : IDisposable
             _buttonStates.Count,
             _maxPendingX,
             _maxPendingY,
-            _minSubmittedIntervalUs,
-            _maxSubmittedIntervalUs,
+            minSubmittedIntervalUs,
+            maxSubmittedIntervalUs,
             _udpSmoothingEnabled,
             udp,
             simulated);
     }
 
     private static string FormatStatistics(MouseStatisticsSnapshot statistics) =>
-        $"鼠标统计（500 Hz）：原始事件={statistics.RawEventCount}，采集位移=({statistics.CapturedX},{statistics.CapturedY})，" +
+        $"鼠标统计（1000 Hz）：原始事件={statistics.RawEventCount}，采集位移=({statistics.CapturedX},{statistics.CapturedY})，" +
         $"已提交报告={statistics.SubmittedReportCount}，已提交位移=({statistics.SubmittedX},{statistics.SubmittedY})，" +
         $"待发送=({statistics.PendingX},{statistics.PendingY})，按钮转换={statistics.ButtonTransitionCount}，" +
         $"按钮待发送={statistics.PendingButtonTransitions}，最大积压=({statistics.MaxPendingX},{statistics.MaxPendingY})，" +
