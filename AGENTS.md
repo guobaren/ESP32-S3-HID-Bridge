@@ -150,3 +150,40 @@
 - 未执行、无法执行或未取得真实结果的验证，必须明确标记为"未验证"，不得推断为通过。
 
 - 子代理提供的测试结果必须经过主代理审核后，才能写入审计文档并作为最终结论。
+
+## 项目特有规则
+
+以下规则适用于 ESP32-S3 HID Bridge，是本项目对全局协作规则的补充。
+
+### 通用要求
+
+- 面向人的文档、注释和提交说明优先使用中文；协议字段、API 名称和技术标识符保持原样。
+- 不在日志、配置或示例中加入真实设备序列号等不必要的本机标识。
+
+### 修改主机端（C#）后
+
+至少运行：
+
+```powershell
+dotnet build .\host\HidBridge.Host\HidBridge.Host.csproj -c Release
+dotnet format .\host\HidBridge.Host\HidBridge.Host.csproj --verify-no-changes --no-restore
+```
+
+### 修改固件（ESP32-S3）后
+
+在已进入 ESP-IDF 环境的终端运行：
+
+```powershell
+Set-Location .\firmware
+. ..\scripts\Enter-EspIdf.ps1
+idf.py set-target esp32s3
+idf.py build
+```
+
+### 串口协议变更
+
+串口协议发生变化时，同步更新 `docs/protocol.md`、C# 编码器和 C 解析器。
+
+### 输入安全
+
+任何停止转发、断线或退出路径都必须释放键盘按键和鼠标按钮，避免目标设备卡键。

@@ -1,12 +1,12 @@
 # ESP32-S3 HID Bridge
 
-把 Windows 电脑的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的键盘与相对触摸板 HID，输出到手机、平板、嵌入式设备或其他项目。原生 USB 在启动时根据 UART 协议握手二选一枚举为 CDC-only 或 HID-only；BLE HID 保持可用。Wi-Fi 输入、配网和 Target Agent 输出代码暂时保留但不启用。
+把 Windows 电脑的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的键盘与相对触摸板 HID，输出到手机、平板、嵌入式设备或其他项目。当前原生 USB 固定枚举为键盘 + 相对触摸板 HID，不依赖 EXE 是否运行或 UART 握手；BLE HID 保持可用。Wi-Fi 输入、配网和 Target Agent 输出代码暂时保留但不启用。
 
 ## 功能特性
 
-- Windows 全局键盘/鼠标捕获：低级钩子 + Raw Input，500 Hz 鼠标报告聚合
+- Windows 全局键盘/鼠标捕获：低级钩子 + Raw Input，1000 Hz / 1 ms 鼠标报告聚合上限
 - 串口自动发现（COM 改变后自动重连）与随机数设备握手
-- 原生 USB：启动期 UART 握手选择 CDC-only 或「键盘 + 相对触摸板」HID-only（不同 PID）
+- 原生 USB：固定枚举「键盘 + 相对触摸板」HID-only，不依赖启动期 UART 帧
 - BLE HID 键盘/鼠标输出，NimBLE Just Works 配对 + 绑定密钥持久化
 - USB/BLE 双输出活动链路锁定与 100 ms 失活切换，切换前后自动 ReleaseAll
 - 局域网 UDP 模拟鼠标输入（默认 0.0.0.0:24814，20 ms 平滑分摊）
@@ -22,19 +22,48 @@ Windows 键盘/鼠标
         │ 键鼠低级钩子 + 鼠标 Raw Input
         ▼
 HidBridge.Host
-        │ USB-to-UART 或原生 USB CDC，自动发现与二进制帧握手
+        │ USB-to-UART/CH340 控制输入，自动发现与二进制帧握手
         ▼
 ESP32-S3-DevKitC-1
-        ├─ 原生 USB OTG，启动时选择 CDC-only 或键盘触摸板 HID-only
+        ├─ 原生 USB OTG，固定键盘 + 相对触摸板 HID
         ├─ BLE HID ────────────────> 手机/电脑
 ```
 
 开发板支持两种有线主机输入方式：
 
 - **USB-to-UART**：CH340 COM 口接收主机端生成的 HID 报告。
-- **ESP32-S3 USB**：固件启动后 1.5 秒内收到 UART 有效协议帧 → 枚举为 `USB Keyboard with Touchpad`（HID-only）；未收到 → 枚举为 `HID Bridge CDC`（CDC-only，可作输入并经 BLE 输出）。
+- **ESP32-S3 USB**：当前始终枚举为 `USB Keyboard with Touchpad`（HID-only）。UART/CH340 是正式的主机控制输入；固件中保留的 CDC 输入代码不再参与当前 USB profile 选择，也不会因晚到 UART 帧重启切换。
 
-USB HID 与 BLE HID 同时可用时，先连接并成为活动输出的链路保持锁定，另一链路不得抢占；活动链路连续 100 ms 不可发送时切换到仍在线的另一链路，切换前后都执行 ReleaseAll。官方 DevKitC-1 支持两个 USB 端口同时供电；第三方兼容板需先核对原理图，确认两端口间没有 VBUS 回灌路径。
+USB HID 与 BLE HID 同时可用时，先连接并成为活动输出的链路保持锁定，另一链路不得抢占；活动链路连续 100 ms 不可发送时切换到仍在线的另一链路，切换前后都执行 ReleaseAll。BLE 已活动时 USB 恢复不会抢占，BLE 断开后才按可用性回退到 USB。官方 DevKitC-1 支持两个 USB 端口同时供电；第三方兼容板需先核对原理图，确认两端口间没有 VBUS 回灌路径。
+
+## 架构与生命周期
+
+### 主机端职责
+
+- `HidBridge.Host` 使用 `WH_KEYBOARD_LL`、`WH_MOUSE_LL` 和鼠标 Raw Input 捕获实体输入；捕获线程只做快速入队，独立分发线程负责状态更新、Lua/宏事件和报告发送。
+- `MouseReportPump` 以 1000 Hz / 1 ms 为发送上限，连续相对移动在队列中合并，按钮、滚轮和键盘边沿保持顺序；Windows 调度不保证每份报告严格间隔 1 ms。
+- `SerialBridge` 通过 `DeviceProbe`/`DeviceHello` 自动发现串口并建立二进制会话；主机负责发送 `ReleaseAll`、维护输入租约和记录诊断日志。
+- 固件刷写设置页与 Loopback API 共用校验和刷写服务，但各自提供本机 JSON 清单路径；EXE 不内嵌固件镜像。
+- 普通键鼠捕获转发路径不创建虚拟 HID 设备；UDP、Lua/宏等自动化路径属于主动输出路径，不能据此推断为“完全没有本机输入注入”。
+
+### 固件端职责
+
+- UART 接收主机报告和控制帧；原生 USB 固定提供 HID 输出；BLE 提供备用 HID 输出。
+- 输出选择器采用单一活动租约：USB 在线时禁止 BLE 抢占，活动链路断开或连续不可用约 100 ms 后才允许切换；切换、断线、复位和退出路径都释放键盘与鼠标状态。
+- Wi-Fi/SoftAP/Target Agent 代码保留但由 Kconfig 与 `HID_BRIDGE_WIFI_RUNTIME_ENABLED=0` 双重闸门禁用；当前正式链路不是未经认证的 Wi-Fi 输入。
+
+### HID 报告
+
+| Report ID | 当前用途 | 长度/内容 |
+|---|---|---|
+| `1` | Boot Keyboard | 8 字节键盘报告，含修饰键、保留字节和最多 6 个按键 |
+| `2` | 相对触摸板鼠标 | 7 字节报告，使用有符号 16 位相对 X/Y，另含按钮、滚轮和横滚轮 |
+
+报告路径中的累计位移使用更宽的内部整数，最终按 HID 字段范围分块；USB/BLE 端点完成只证明固件完成发送，不证明目标系统或目标应用已经消费报告。
+
+### 验证边界
+
+构建、策略测试和主机自检分别记录；它们不能替代真实 USB 枚举、BLE 配对/重连、插拔顺序、Raw Input 和被控端光标行为验收。真实链路测试必须保留设备日志、目标端结果和对应版本/镜像 SHA-256。
 
 ## 快速开始
 
@@ -218,7 +247,7 @@ function OnEvent(event, arg)
 end
 ```
 
-Lua 诊断日志写入 artifacts/automation-runtime-<时间戳>.log，主界面 Lua 页可实时查看。
+Lua 详细诊断日志写入 `artifacts/automation-runtime-<时间戳>.log`；Lua/宏 UI 只显示初版的普通简略日志，文件中另外保留 `LuaEvent`、`LuaOutput` 及开始/完成序号，便于分析长按、松开和连点问题。
 
 ## UDP 模拟鼠标接口
 
@@ -236,7 +265,7 @@ Lua 诊断日志写入 artifacts/automation-runtime-<时间戳>.log，主界面 
 
 ## 鼠标移动记录与分析图
 
-HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键松开 3 秒后自动停止并弹出分析图（X 有符号值时间序列 + Y 有符号值时间序列），同时保存到 artifacts/mouse-movement-<时间戳>.png。记录点位于 500 Hz 报告实际提交边界，不做平滑或降采样。
+HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键松开 3 秒后自动停止并弹出分析图（X 有符号值时间序列 + Y 有符号值时间序列），同时保存到 artifacts/mouse-movement-<时间戳>.png。记录点位于 1000 Hz 报告实际提交边界，不做平滑或降采样。
 
 ## 主机配置参考（bridge.local.json）
 
@@ -262,6 +291,35 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
 - hostLogPath / deviceLogPath 支持 {timestamp} 占位符；deviceLogPath 置空可关闭设备日志。
 - showDeviceLogInUi 为启动默认值：false 精简模式 / true 完整日志模式；窗口内可随时切换。
 - EXE 只内嵌刷写工具，不内嵌固件；设置页选择本机 JSON 清单，远程 API 在请求正文中单独指定本机 JSON 路径。
+
+### 串口、日志与输入租约
+
+- `portName: "auto"` 会扫描串口并发送 `DeviceProbe`/`DeviceHello`；固定 COM 只适用于明确知道设备端口的环境。默认波特率为 `921600`。
+- 同一个 COM 口不能同时由 Host、`idf.py monitor` 或其他串口工具打开；刷写前必须释放串口，刷写结束后再恢复会话。
+- `host-runtime-{timestamp}.log` 保存主机运行日志，`host-serial-{timestamp}.log` 保存设备日志，`automation-runtime-{timestamp}.log` 保存 Lua/宏详细事件和输出时间线。
+- `showDeviceLogInUi` 默认关闭。完整设备日志只用于短时排障；文件写入、UI 投递和实时输入线程相互隔离，UI 采用批量刷新和有界文本。
+- 输入租约默认约 `1500 ms`；停止转发、COM 断开、USB/BLE 切换、HOME/END 和进程退出都必须执行 `ReleaseAll`。
+
+### ESP-IDF 与 Wi-Fi/SoftAP
+
+- 固件构建前进入项目提供的 ESP-IDF 终端，执行 `idf.py set-target esp32s3` 和 `idf.py build`；默认 USB/BLE 拓扑不需要启用 Wi-Fi。
+- 设备配置使用仓库中的 `sdkconfig`/`sdkconfig.defaults`；BLE 绑定持久化依赖 `CONFIG_BT_NIMBLE_NVS_PERSIST`，板载 RGB 使用 GPIO48，当前约定为 USB 绿、BLE 蓝、无活动红灯闪烁。
+- Wi-Fi 输入、SoftAP 配网和 Target Agent 后端目前只保留代码，不作为可用功能发布。运行时还必须保持 `HID_BRIDGE_WIFI_RUNTIME_ENABLED=0`，不能仅凭编译产物存在就认为 Wi-Fi 已启用。
+- 未来恢复 SoftAP 前，需要重新设计认证、PSK/AES-256-GCM、计数器/时间窗防重放、心跳超时、重连和 `ReleaseAll`；不能直接开放当前无认证的 UDP 规则到 Wi-Fi。
+- 规划中的配网入口可使用临时 `HID-Bridge-Setup-XXXX` 热点和 `192.168.4.1`，但当前不应把该流程当作已实现或已验收功能。
+
+### UDP 平滑与安全边界
+
+- 默认监听 `0.0.0.0:24814`，JSON 字段为 `dx`、`dy`、`wheel`、`pan`；范围分别为 `-32768..32767`、`-128..127`，四项全零的数据报拒绝并应由发送端在复用 socket 的前提下跳过。
+- 平滑器使用固定 20 个 1 ms 槽覆盖最多 20 ms 尾部，整数位移在槽间守恒且不无界积压；关闭“UDP 平滑”只用于 A/B 对比。
+- “模拟 UDP”可按 30/60/100/140/200/500 Hz 或无上限生成测试源；模拟结果不能替代真实 USB/BLE 和目标端 Raw Input 验收。
+- 当前 UDP 入口没有身份认证、计数器或时间窗防重放，只适用于受信任局域网；本机测试应将 `remoteInputBindAddress` 改为 `127.0.0.1`。
+
+### BLE 维护
+
+- BLE 使用 NimBLE HID、Just Works 配对和绑定密钥持久化；升级固件或更换设备后若反复显示“已配对/已连接”，应在目标系统删除旧配对后重新配对。
+- BLE 鼠标路径按约 10 ms 节拍发送合并状态；API 调用率、空口报告率和目标端 Raw Input 频率是三个不同指标，必须分别测量。
+- 当前 USB/BLE 活动锁保证后连接链路不抢占；真实冷启动、插回 USB、BLE 断开回退和目标端输入仍需按版本单独验收。
 
 ## 常见问题
 
@@ -290,7 +348,7 @@ tests/                    主机/硬件自检程序与固件测试
 scripts/                  构建与工具脚本（含内置 esptool 构建）
 profiles/                 宏/Lua 配置（运行目录，不提交默认内容）
 profiles.example/         示例配置（宏 + Lua，可复制到 profiles/）
-docs/                     设计文档（协议、配置、架构、交接与审计记录）
+docs/                     项目文档（协议、刷写 API、交接与审计记录）
 artifacts/                运行日志与产物（不提交）
 tools/                    辅助工具（如 UDP 发送示例）
 ```
@@ -301,4 +359,4 @@ tools/                    辅助工具（如 UDP 发送示例）
 dotnet run --project tests/HidBridge.Host.Checks -c Release
 ```
 
-协议细节（帧格式、消息类型、握手与 UDP 接口）见 [docs/protocol.md](docs/protocol.md)，连接与配置细节见 [docs/configuration.md](docs/configuration.md)。
+协议细节（帧格式、消息类型、握手与 UDP 接口）见 [docs/protocol.md](docs/protocol.md)，固件刷写接口见 [docs/firmware-update-api.md](docs/firmware-update-api.md)；连接、配置和架构说明已整合在本 README。
