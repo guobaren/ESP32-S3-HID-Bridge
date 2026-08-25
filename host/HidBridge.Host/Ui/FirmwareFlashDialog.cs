@@ -5,6 +5,7 @@ namespace HidBridge.Host.Ui;
 /// <summary>固件刷写进度窗口：小日志显示窗，实时展示刷写过程。</summary>
 internal sealed class FirmwareFlashDialog : Form
 {
+    private const int MaxVisibleLogCharacters = 500_000;
     private readonly FirmwareFlashService _service;
     private readonly TextBox _logTextBox;
     private readonly Label _statusLabel;
@@ -86,9 +87,7 @@ internal sealed class FirmwareFlashDialog : Form
 
     private void AppendLog(string line)
     {
-        _logTextBox.AppendText(line + Environment.NewLine);
-        _logTextBox.SelectionStart = _logTextBox.TextLength;
-        _logTextBox.ScrollToCaret();
+        LogTextBoxAppender.Append(_logTextBox, [line], MaxVisibleLogCharacters);
     }
 
     private void RefreshStatus()

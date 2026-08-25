@@ -9,6 +9,8 @@ internal static class AutomationKeyMap
     private static readonly Dictionary<string, byte> HidUsages = BuildHidUsages();
     private static readonly Dictionary<byte, ushort> HidToVirtualKey = BuildHidToVirtualKey();
 
+    internal static IReadOnlyList<string> TriggerKeyNames { get; } = BuildTriggerKeyNames();
+
     internal static bool TryGetVirtualKey(string name, out uint virtualKey) =>
         VirtualKeys.TryGetValue(name.Trim(), out virtualKey);
 
@@ -87,6 +89,37 @@ internal static class AutomationKeyMap
         HidToVirtualKey.TryGetValue(usage, out virtualKey);
 
     internal static IReadOnlyDictionary<string, uint> LuaVirtualKeys => VirtualKeys;
+
+    private static IReadOnlyList<string> BuildTriggerKeyNames()
+    {
+        string[] mouseButtons = ["mouse_left", "mouse_middle", "mouse_right", "mouse_side1", "mouse_side2"];
+        string[] modifiers = [
+            "ctrl", "lctrl", "rctrl", "shift", "lshift", "rshift", "alt", "lalt", "ralt", "lwin", "rwin",
+        ];
+        string[] control = [
+            "pause", "scrolllock", "numlock", "capslock", "esc", "tab", "space", "enter", "backspace",
+            "insert", "delete", "home", "end", "pageup", "pagedown", "left", "up", "right", "down",
+            "printscreen", "apps",
+        ];
+        string[] functionKeys = Enumerable.Range(1, 24).Select(index => $"f{index}").ToArray();
+        string[] numpad = [
+            ..Enumerable.Range(0, 10).Select(index => $"num{index}"),
+            "nummultiply", "numadd", "numsubtract", "numdecimal", "numdivide",
+        ];
+        string[] letters = Enumerable.Range('a', 26).Select(value => ((char)value).ToString()).ToArray();
+        string[] digits = Enumerable.Range(0, 10).Select(value => value.ToString()).ToArray();
+
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+        List<string> ordered = [];
+        foreach (string name in mouseButtons.Concat(modifiers).Concat(control).Concat(functionKeys).Concat(numpad).Concat(letters).Concat(digits).Concat(VirtualKeys.Keys))
+        {
+            if (VirtualKeys.ContainsKey(name) && seen.Add(name))
+            {
+                ordered.Add(name);
+            }
+        }
+        return ordered;
+    }
 
     private static Dictionary<string, uint> BuildVirtualKeys()
     {

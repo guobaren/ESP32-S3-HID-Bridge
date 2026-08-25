@@ -46,7 +46,9 @@ internal sealed class UiLogTextWriter : TextWriter
         }
     }
 
-    internal void EnableFile(string pathTemplate)
+    internal void EnableFile(
+        string pathTemplate,
+        int maxFileCount = LogFileRetention.DefaultMaxFileCount)
     {
         if (string.IsNullOrWhiteSpace(pathTemplate))
         {
@@ -65,6 +67,7 @@ internal sealed class UiLogTextWriter : TextWriter
         {
             Directory.CreateDirectory(directory);
         }
+        LogFileRetention.Enforce(pathTemplate, path, maxFileCount);
 
         lock (_outputSync)
         {

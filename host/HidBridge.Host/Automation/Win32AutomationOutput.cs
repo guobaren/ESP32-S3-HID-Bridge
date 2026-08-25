@@ -3,6 +3,8 @@ using System.Runtime.InteropServices;
 
 namespace HidBridge.Host.Automation;
 
+internal readonly record struct MouseReleasePlanEntry(int Button, uint Flags, uint Data);
+
 internal sealed class Win32AutomationOutput : IAutomationOutput
 {
     private const uint InputMouse = 0;
@@ -24,11 +26,8 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
     private readonly object _stateLock = new();
     private readonly HashSet<int> _pressedButtons = [];
     private readonly HashSet<byte> _pressedKeys = [];
-    private long _releaseAllCount;
 
     public bool IsRemote => false;
-
-    internal long ReleaseAllCount => Interlocked.Read(ref _releaseAllCount);
 
     public Point GetCursorPosition()
     {
@@ -90,18 +89,13 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
 
     public void KeyUp(byte hidUsage) => SetKey(hidUsage, false);
 
-    internal void ReleaseAll()
+    public void ReleaseAll()
     {
         lock (_stateLock)
         {
-            List<NativeInput> inputs =
-            [
-                CreateMouseInput(MouseLeftUp, 0, 0, 0),
-                CreateMouseInput(MouseMiddleUp, 0, 0, 0),
-                CreateMouseInput(MouseRightUp, 0, 0, 0),
-                CreateMouseInput(MouseXUp, 0, 0, XButton1),
-                CreateMouseInput(MouseXUp, 0, 0, XButton2),
-            ];
+            List<NativeInput> inputs = BuildMouseReleasePlan(_pressedButtons)
+                .Select(entry => CreateMouseInput(entry.Flags, 0, 0, entry.Data))
+                .ToList();
             // 全局键盘 Hook 在捕获期间可能已经拦截过实体修饰键的 KeyUp；这些键不在
             // 自动化状态表中。每次进入/退出捕获都主动发送八个修饰键的 KeyUp，才能
             // 修复控制端 Windows 已经形成的 Shift/Ctrl/Alt/Win 卡键状态。
@@ -112,8 +106,32 @@ internal sealed class Win32AutomationOutput : IAutomationOutput
             Send(inputs.ToArray());
             _pressedButtons.Clear();
             _pressedKeys.Clear();
-            Interlocked.Increment(ref _releaseAllCount);
         }
+    }
+
+    internal static IReadOnlyList<MouseReleasePlanEntry> BuildMouseReleasePlan(
+        IEnumerable<int> pressedButtons)
+    {
+        ArgumentNullException.ThrowIfNull(pressedButtons);
+
+        List<MouseReleasePlanEntry> releases = [];
+        foreach (int button in pressedButtons.Distinct().OrderBy(button => button))
+        {
+            releases.Add(button switch
+            {
+                1 => new MouseReleasePlanEntry(button, MouseLeftUp, 0),
+                2 => new MouseReleasePlanEntry(button, MouseMiddleUp, 0),
+                3 => new MouseReleasePlanEntry(button, MouseRightUp, 0),
+                4 => new MouseReleasePlanEntry(button, MouseXUp, XButton1),
+                5 => new MouseReleasePlanEntry(button, MouseXUp, XButton2),
+                _ => throw new ArgumentOutOfRangeException(
+                    nameof(pressedButtons),
+                    button,
+                    "鼠标按钮必须为 1-5。"),
+            });
+        }
+
+        return releases;
     }
 
     private void SetKey(byte hidUsage, bool pressed)

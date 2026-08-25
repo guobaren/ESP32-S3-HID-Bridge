@@ -17,8 +17,17 @@ enum {
     /* BLE connection interval units are 1.25 ms: 7.5 ms=6, 10 ms=8. */
     ESP_HID_CONNECTION_INTERVAL_MIN_UNITS = 6,
     ESP_HID_CONNECTION_INTERVAL_MAX_UNITS = 8,
-    /* Legacy 高占空比定向广播每轮最多约 1.28 秒；24 轮覆盖约 30 秒。 */
-    ESP_HID_DIRECTED_RECONNECT_BURSTS = 24,
+    /* Legacy 高占空比定向广播每轮最多约 1.28 秒；4 轮覆盖约 5 秒。 */
+    ESP_HID_DIRECTED_RECONNECT_BURSTS = 4,
+    /*
+     * BLE_GAP_EVENT_DISCONNECT.reason 使用 BLE_HS_HCI_ERR(status) 包装，
+     * 其 HCI 错误基值为 0x200；CONNECT.status 则仍是原始 HCI status。
+     */
+    ESP_HID_NIMBLE_HCI_ERROR_BASE = 0x200,
+    ESP_HID_NIMBLE_DISCONNECT_REASON_CONNECTION_SUPERVISION_TIMEOUT =
+        ESP_HID_NIMBLE_HCI_ERROR_BASE + ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT,
+    ESP_HID_NIMBLE_DISCONNECT_REASON_REMOTE_USER_TERMINATED =
+        ESP_HID_NIMBLE_HCI_ERROR_BASE + ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED,
 };
 
 static inline bool esp_hid_nimble_connection_parameters_match_target(
@@ -68,4 +77,16 @@ static inline bool esp_hid_nimble_rejected_connect_should_fall_back_to_undirecte
 {
     return status == ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT ||
            status == ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED;
+}
+
+/*
+ * 与上面的 CONNECT helper 分开：DISCONNECT 事件传入的是 NimBLE Host
+ * 包装后的 reason（例如 BLE_HS_HCI_ERR(0x13) == 531），不能直接比较
+ * 原始 HCI status 19。
+ */
+static inline bool esp_hid_nimble_disconnect_should_fall_back_to_undirected(
+    int reason)
+{
+    return reason == ESP_HID_NIMBLE_DISCONNECT_REASON_CONNECTION_SUPERVISION_TIMEOUT ||
+           reason == ESP_HID_NIMBLE_DISCONNECT_REASON_REMOTE_USER_TERMINATED;
 }

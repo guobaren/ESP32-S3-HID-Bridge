@@ -107,13 +107,7 @@ internal sealed class SerialBridge : IBridgeTransport
             : [_options.PortName];
         if (candidates.Length == 0)
         {
-            Console.Error.WriteLine("暂未发现可用串口，等待设备连接。");
             return false;
-        }
-
-        if (automatic)
-        {
-            Console.WriteLine($"正在探测串口：{string.Join("、", candidates)}");
         }
 
         foreach (string portName in candidates)
@@ -132,9 +126,7 @@ internal sealed class SerialBridge : IBridgeTransport
 
                 _port = candidate;
                 StartDeviceTrace(candidate, portName);
-                Console.WriteLine(automatic
-                    ? $"已自动发现并连接 {portName}。"
-                    : $"已连接 {portName}。");
+                Console.WriteLine($"已连接 {portName}。");
                 return true;
             }
             catch (Exception exception) when (
@@ -163,12 +155,13 @@ internal sealed class SerialBridge : IBridgeTransport
                 StringComparison.OrdinalIgnoreCase);
             string path = Path.IsPathRooted(relativePath)
                 ? relativePath
-                : Path.Combine(Environment.CurrentDirectory, relativePath);
+                : Path.Combine(AppContext.BaseDirectory, relativePath);
             string? directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(directory))
             {
                 Directory.CreateDirectory(directory);
             }
+            LogFileRetention.Enforce(template, path, _options.DeviceLogRetentionCount);
 
             _traceWriter = CreateTraceWriter(path, _logSettings.FullLoggingEnabled);
             _nextTraceFlushTimestamp = Stopwatch.GetTimestamp() +

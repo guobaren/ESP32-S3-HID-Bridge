@@ -12,23 +12,32 @@ internal interface IAutomationOutput
     void Wheel(int delta);
     void KeyDown(byte hidUsage);
     void KeyUp(byte hidUsage);
+    void ReleaseAll();
 }
 
 internal sealed class RoutedAutomationOutput : IAutomationOutput
 {
     private readonly InputForwarder _input;
-    private readonly Win32AutomationOutput _local = new();
+    private readonly IAutomationOutput _local;
+    private long _localReleaseAllCount;
 
-    internal RoutedAutomationOutput(InputForwarder input)
+    internal RoutedAutomationOutput(InputForwarder input, IAutomationOutput? localOutput = null)
     {
         _input = input;
+        _local = localOutput ?? new Win32AutomationOutput();
     }
 
     public bool IsRemote => _input.ForwardingEnabled;
 
-    internal long LocalReleaseAllCount => _local.ReleaseAllCount;
+    internal long LocalReleaseAllCount => Interlocked.Read(ref _localReleaseAllCount);
 
-    internal void ReleaseLocalInputs() => _local.ReleaseAll();
+    internal void ReleaseLocalInputs()
+    {
+        _local.ReleaseAll();
+        Interlocked.Increment(ref _localReleaseAllCount);
+    }
+
+    public void ReleaseAll() => ReleaseLocalInputs();
 
     public Point GetCursorPosition() => _local.GetCursorPosition();
 

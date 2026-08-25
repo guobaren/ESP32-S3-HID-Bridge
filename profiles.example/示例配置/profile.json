@@ -1,9 +1,24 @@
 {
   "apps": [],
-  "lua_script_text": "function OnEvent(event, arg) if event == 'pressed' and arg == 'f24' then DebugLog('F24 pressed') end end",
+  "lua_script_file": "lua/main.txt",
   "macros": {
-    "连点": { "trigger": "f13", "mode": "once", "enabled": true },
-    "按住连射": { "trigger": "mouse_side1", "mode": "hold_loop", "enabled": true },
-    "三段示例": { "trigger": "ctrl+f14", "mode": "staged", "enabled": true }
+    "连点": {
+      "trigger": "f13",
+      "mode": "once",
+      "enabled": true,
+      "file": "macros/连点.txt"
+    },
+    "按住连射": {
+      "trigger": "mouse_side1",
+      "mode": "hold_loop",
+      "enabled": true,
+      "file": "macros/按住连射.txt"
+    },
+    "三段示例": {
+      "trigger": "ctrl+f14",
+      "mode": "staged",
+      "enabled": true,
+      "file": "macros/三段示例.txt"
+    }
   }
 }

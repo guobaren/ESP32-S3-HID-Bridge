@@ -33,3 +33,6 @@ Thumbs.db
 /automation.settings.json
 /profiles/
 /artifacts/
+/log/
+/release/
+/dist/

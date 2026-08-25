@@ -5,6 +5,9 @@ namespace HidBridge.Host.Automation;
 internal sealed class AutomationProfileStore
 {
     internal const string GlobalProfile = "Global";
+    internal const string MacroDirectoryName = "macros";
+    internal const string LuaDirectoryName = "lua";
+    internal const string DefaultLuaScriptFile = "lua/main.txt";
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -69,6 +72,7 @@ internal sealed class AutomationProfileStore
         EnsureProfile(normalized);
         AutomationProfile profile = new() { Name = normalized };
         string metadataPath = GetMetadataPath(normalized);
+        bool needsMigration = !MetadataUsesCurrentLayout(metadataPath);
         try
         {
             if (File.Exists(metadataPath))
@@ -88,30 +92,74 @@ internal sealed class AutomationProfileStore
         profile.Macros = new Dictionary<string, MacroDefinition>(
             profile.Macros ?? new Dictionary<string, MacroDefinition>(),
             StringComparer.OrdinalIgnoreCase);
-        foreach (string macroPath in Directory.EnumerateFiles(GetProfileDirectory(normalized), "*.txt"))
+
+        profile.LuaScriptFile = NormalizeAssociatedFile(
+            profile.LuaScriptFile,
+            DefaultLuaScriptFile,
+            LuaDirectoryName);
+        string luaPath = ResolveAssociatedFilePath(normalized, profile.LuaScriptFile, DefaultLuaScriptFile);
+        if (File.Exists(luaPath))
         {
-            string macroName = Path.GetFileNameWithoutExtension(macroPath);
-            if (!profile.Macros.TryGetValue(macroName, out MacroDefinition? macro))
-            {
-                macro = new MacroDefinition();
-                profile.Macros[macroName] = macro;
-            }
+            profile.LuaScriptText = File.ReadAllText(luaPath);
+        }
+        else if (profile.LegacyLuaScriptText is not null)
+        {
+            profile.LuaScriptText = profile.LegacyLuaScriptText;
+            needsMigration = true;
+        }
+        profile.LegacyLuaScriptText = null;
+
+        foreach ((string macroName, MacroDefinition macro) in profile.Macros)
+        {
             macro.Name = macroName;
-            macro.Text = File.ReadAllText(macroPath);
+            string defaultRelativePath = GetDefaultMacroRelativePath(macroName);
+            string associatedRelativePath = NormalizeAssociatedFile(
+                macro.ScriptFile,
+                defaultRelativePath,
+                MacroDirectoryName);
+            if (!string.Equals(macro.ScriptFile, associatedRelativePath, StringComparison.Ordinal))
+            {
+                needsMigration = true;
+            }
+            macro.ScriptFile = associatedRelativePath;
+            string macroPath = ResolveAssociatedFilePath(normalized, associatedRelativePath, defaultRelativePath);
+            string legacyMacroPath = GetLegacyMacroPath(normalized, macroName);
+            if (File.Exists(macroPath))
+            {
+                macro.Text = File.ReadAllText(macroPath);
+            }
+            else if (File.Exists(legacyMacroPath))
+            {
+                macro.Text = File.ReadAllText(legacyMacroPath);
+                needsMigration = true;
+            }
             if (!MacroRunModes.All.Contains(macro.Mode, StringComparer.Ordinal))
             {
                 macro.Mode = MacroRunModes.Once;
             }
         }
 
-        foreach ((string macroName, MacroDefinition macro) in profile.Macros)
+        // 旧版宏正文位于配置根目录的 *.txt；读取后加入元数据并在本次打开时迁移。
+        foreach (string legacyMacroPath in Directory.EnumerateFiles(GetProfileDirectory(normalized), "*.txt"))
         {
-            macro.Name = macroName;
-            string macroPath = GetMacroPath(normalized, macroName);
-            if (File.Exists(macroPath) && string.IsNullOrEmpty(macro.Text))
+            string macroName = Path.GetFileNameWithoutExtension(legacyMacroPath);
+            if (profile.Macros.ContainsKey(macroName))
             {
-                macro.Text = File.ReadAllText(macroPath);
+                continue;
             }
+            MacroDefinition macro = new()
+            {
+                Name = macroName,
+                ScriptFile = GetDefaultMacroRelativePath(macroName),
+                Text = File.ReadAllText(legacyMacroPath),
+            };
+            profile.Macros[macroName] = macro;
+            needsMigration = true;
+        }
+
+        if (needsMigration)
+        {
+            SaveProfile(profile);
         }
         return profile;
     }
@@ -121,11 +169,26 @@ internal sealed class AutomationProfileStore
         string name = NormalizeProfileName(profile.Name);
         profile.Name = name;
         EnsureProfile(name);
+
+        profile.LuaScriptFile = NormalizeAssociatedFile(
+            profile.LuaScriptFile,
+            DefaultLuaScriptFile,
+            LuaDirectoryName);
+        string luaPath = ResolveAssociatedFilePath(name, profile.LuaScriptFile, DefaultLuaScriptFile);
+        AtomicWrite(luaPath, profile.LuaScriptText ?? string.Empty);
+
         foreach ((string macroName, MacroDefinition macro) in profile.Macros)
         {
             macro.Name = macroName;
-            AtomicWrite(GetMacroPath(name, macroName), macro.Text ?? string.Empty);
+            macro.ScriptFile = NormalizeAssociatedFile(
+                macro.ScriptFile,
+                GetDefaultMacroRelativePath(macroName),
+                MacroDirectoryName);
+            string macroPath = ResolveAssociatedFilePath(name, macro.ScriptFile, GetDefaultMacroRelativePath(macroName));
+            AtomicWrite(macroPath, macro.Text ?? string.Empty);
         }
+
+        profile.LegacyLuaScriptText = null;
         AtomicWrite(GetMetadataPath(name), JsonSerializer.Serialize(profile, JsonOptions));
     }
 
@@ -151,12 +214,23 @@ internal sealed class AutomationProfileStore
         Directory.Delete(GetProfileDirectory(normalized), true);
     }
 
-    internal void DeleteMacro(string profileName, string macroName)
+    internal void DeleteMacro(string profileName, string macroName, string? associatedFile = null)
     {
-        string path = GetMacroPath(profileName, macroName);
+        string defaultRelativePath = GetDefaultMacroRelativePath(macroName);
+        string path = ResolveAssociatedFilePath(profileName, associatedFile, defaultRelativePath);
         if (File.Exists(path))
         {
             File.Delete(path);
+        }
+        string defaultPath = ResolveAssociatedFilePath(profileName, defaultRelativePath, defaultRelativePath);
+        if (!path.Equals(defaultPath, StringComparison.OrdinalIgnoreCase) && File.Exists(defaultPath))
+        {
+            File.Delete(defaultPath);
+        }
+        string legacyPath = GetLegacyMacroPath(profileName, macroName);
+        if (File.Exists(legacyPath))
+        {
+            File.Delete(legacyPath);
         }
     }
 
@@ -171,49 +245,54 @@ internal sealed class AutomationProfileStore
         foreach (string sourceDirectory in Directory.EnumerateDirectories(legacyProfilesDirectory))
         {
             string name = Path.GetFileName(sourceDirectory);
-            string destinationDirectory = GetProfileDirectory(name);
-            Directory.CreateDirectory(destinationDirectory);
             string sourceMetadata = Path.Combine(sourceDirectory, "profile.json");
-            string destinationMetadata = Path.Combine(destinationDirectory, "profile.json");
+            AutomationProfile destinationProfile = LoadProfile(name);
+            bool profileChanged = false;
             if (File.Exists(sourceMetadata))
             {
                 AutomationProfile sourceProfile = DeserializeFilteredLegacyProfile(name, sourceMetadata);
-                AutomationProfile destinationProfile = File.Exists(destinationMetadata)
-                    ? DeserializeFilteredLegacyProfile(name, destinationMetadata)
-                    : new AutomationProfile { Name = name };
-                bool metadataChanged = false;
                 if (string.IsNullOrWhiteSpace(destinationProfile.LuaScriptText) &&
                     !string.IsNullOrWhiteSpace(sourceProfile.LuaScriptText))
                 {
                     destinationProfile.LuaScriptText = sourceProfile.LuaScriptText;
-                    metadataChanged = true;
+                    profileChanged = true;
                 }
                 if (destinationProfile.Apps.Count == 0 && sourceProfile.Apps.Count > 0)
                 {
                     destinationProfile.Apps = sourceProfile.Apps;
-                    metadataChanged = true;
+                    profileChanged = true;
                 }
                 foreach ((string macroName, MacroDefinition macro) in sourceProfile.Macros)
                 {
                     if (destinationProfile.Macros.TryAdd(macroName, macro))
                     {
-                        metadataChanged = true;
+                        profileChanged = true;
                     }
-                }
-                if (metadataChanged)
-                {
-                    AtomicWrite(destinationMetadata, JsonSerializer.Serialize(destinationProfile, JsonOptions));
-                    imported = true;
                 }
             }
             foreach (string sourceMacro in Directory.EnumerateFiles(sourceDirectory, "*.txt"))
             {
-                string destinationMacro = Path.Combine(destinationDirectory, Path.GetFileName(sourceMacro));
-                if (!File.Exists(destinationMacro))
+                string macroName = Path.GetFileNameWithoutExtension(sourceMacro);
+                if (!destinationProfile.Macros.TryGetValue(macroName, out MacroDefinition? macro))
                 {
-                    File.Copy(sourceMacro, destinationMacro);
-                    imported = true;
+                    macro = new MacroDefinition
+                    {
+                        Name = macroName,
+                        ScriptFile = GetDefaultMacroRelativePath(macroName),
+                    };
+                    destinationProfile.Macros[macroName] = macro;
+                    profileChanged = true;
                 }
+                if (string.IsNullOrEmpty(macro.Text))
+                {
+                    macro.Text = File.ReadAllText(sourceMacro);
+                    profileChanged = true;
+                }
+            }
+            if (profileChanged)
+            {
+                SaveProfile(destinationProfile);
+                imported = true;
             }
         }
         File.WriteAllText(_legacyImportMarker, DateTimeOffset.Now.ToString("O"));
@@ -222,9 +301,22 @@ internal sealed class AutomationProfileStore
 
     private static AutomationProfile DeserializeFilteredLegacyProfile(string name, string path)
     {
-        AutomationProfile profile = JsonSerializer.Deserialize<AutomationProfile>(
-                                        File.ReadAllText(path),
-                                        JsonOptions) ?? new AutomationProfile();
+        string json = File.ReadAllText(path);
+        AutomationProfile profile = JsonSerializer.Deserialize<AutomationProfile>(json, JsonOptions)
+            ?? new AutomationProfile();
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(json);
+            if (document.RootElement.TryGetProperty("lua_script_text", out JsonElement luaText) &&
+                luaText.ValueKind == JsonValueKind.String)
+            {
+                profile.LuaScriptText = luaText.GetString() ?? string.Empty;
+            }
+        }
+        catch (JsonException)
+        {
+            // 保持原有反序列化错误处理边界，由调用方继续使用可读取的元数据。
+        }
         profile.Name = name;
         profile.Apps ??= [];
         profile.Macros ??= new Dictionary<string, MacroDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -235,6 +327,8 @@ internal sealed class AutomationProfileStore
     {
         string directory = GetProfileDirectory(name);
         Directory.CreateDirectory(directory);
+        Directory.CreateDirectory(Path.Combine(directory, MacroDirectoryName));
+        Directory.CreateDirectory(Path.Combine(directory, LuaDirectoryName));
         string metadata = GetMetadataPath(name);
         if (!File.Exists(metadata))
         {
@@ -250,8 +344,88 @@ internal sealed class AutomationProfileStore
 
     private string GetMacroPath(string profileName, string macroName)
     {
+        return ResolveAssociatedFilePath(
+            profileName,
+            GetDefaultMacroRelativePath(macroName),
+            GetDefaultMacroRelativePath(macroName));
+    }
+
+    private string GetLegacyMacroPath(string profileName, string macroName)
+    {
         string normalizedMacro = NormalizeFileName(macroName, "宏名称");
         return Path.Combine(GetProfileDirectory(profileName), normalizedMacro + ".txt");
+    }
+
+    private static string GetDefaultMacroRelativePath(string macroName)
+    {
+        string normalizedMacro = NormalizeFileName(macroName, "宏名称");
+        return $"{MacroDirectoryName}/{normalizedMacro}.txt";
+    }
+
+    private string ResolveAssociatedFilePath(
+        string profileName,
+        string? associatedFile,
+        string fallbackRelativePath)
+    {
+        string requiredDirectory = fallbackRelativePath.Split('/')[0];
+        string relativePath = NormalizeAssociatedFile(associatedFile, fallbackRelativePath, requiredDirectory);
+        return Path.Combine(
+            GetProfileDirectory(profileName),
+            relativePath.Replace('/', Path.DirectorySeparatorChar));
+    }
+
+    private static string NormalizeAssociatedFile(
+        string? associatedFile,
+        string fallbackRelativePath,
+        string requiredDirectory)
+    {
+        string normalized = (associatedFile ?? string.Empty).Trim().Replace('\\', '/');
+        string prefix = requiredDirectory.Trim().Trim('/') + "/";
+        bool valid = !string.IsNullOrWhiteSpace(normalized) &&
+            !Path.IsPathRooted(normalized) &&
+            normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+            normalized.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) &&
+            normalized.Split('/').All(part => part.Length > 0 && part is not "." and not "..") &&
+            normalized.IndexOfAny(Path.GetInvalidPathChars()) < 0;
+        return valid ? normalized : fallbackRelativePath;
+    }
+
+    private static bool MetadataUsesCurrentLayout(string metadataPath)
+    {
+        if (!File.Exists(metadataPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(metadataPath));
+            JsonElement root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("lua_script_file", out _) ||
+                root.TryGetProperty("lua_script_text", out _))
+            {
+                return false;
+            }
+            if (!root.TryGetProperty("macros", out JsonElement macros) ||
+                macros.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+            foreach (JsonProperty macro in macros.EnumerateObject())
+            {
+                if (macro.Value.ValueKind != JsonValueKind.Object ||
+                    !macro.Value.TryGetProperty("file", out _))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static string NormalizeProfileName(string name) => NormalizeFileName(name, "配置名称");

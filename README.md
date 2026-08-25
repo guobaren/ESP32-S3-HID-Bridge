@@ -36,6 +36,45 @@ ESP32-S3-DevKitC-1
 
 USB HID 与 BLE HID 同时可用时，先连接并成为活动输出的链路保持锁定，另一链路不得抢占；活动链路连续 100 ms 不可发送时切换到仍在线的另一链路，切换前后都执行 ReleaseAll。BLE 已活动时 USB 恢复不会抢占，BLE 断开后才按可用性回退到 USB。官方 DevKitC-1 支持两个 USB 端口同时供电；第三方兼容板需先核对原理图，确认两端口间没有 VBUS 回灌路径。
 
+## Windows CH340/CH341 驱动
+
+当前硬件枚举为 `USB\VID_1A86&PID_7523`。历史诊断中该设备曾为
+`CM_PROB_FAILED_INSTALL`、Problem Code `28`，表示 Windows 缺少可用的匹配驱动；
+本机历史上曾完成安装并枚举为 `USB-SERIAL CH340 (COM6)`、Status `OK`；当前驱动包已入库，
+但没有 CH340/CH341 设备节点或 COM 口。这不是 Code 43，也不是 ESP32-S3 原生 USB HID
+能够替代的串口链路。驱动离线包已保存于
+[`drivers/wch-ch341ser/CH341SER_v4.0_2026-06-26.zip`](drivers/wch-ch341ser/CH341SER_v4.0_2026-06-26.zip)，
+详细校验记录见 [`drivers/wch-ch341ser/README.md`](drivers/wch-ch341ser/README.md)。
+
+来源是 [WCH 官方页面](https://www.wch-ic.com/downloads/CH341SER_ZIP.html) 和
+[官方直链](https://www.wch-ic.com/download/file?id=5)，页面元数据为 v4.0、
+2026-06-26、696KB。离线安装步骤：
+
+1. 解压上述 ZIP；以管理员身份运行 `CH341SER\SETUP.EXE`，或在设备管理器中对
+   `USB\VID_1A86&PID_7523` 选择“更新驱动程序”，浏览到解压后的 `CH341SER` 目录/`CH341SER.INF`。
+2. 安装完成后在“端口 (COM 和 LPT)”确认出现 `USB-SERIAL CH340 (COMx)` 或同类 COM 设备。
+3. 用下面的 PowerShell 命令核对设备和 COM 名称，再让 Host 自动发现：
+
+   ```powershell
+   Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\VID_1A86&PID_7523*'
+   [System.IO.Ports.SerialPort]::GetPortNames()
+   ```
+
+发布件中的 Host 会在启动时检查该设备：检测到 Problem Code `28` 且找到随包 INF 时显示确认窗口；
+只有用户确认并通过 UAC 后才执行安装，完成后会重新检查 PnP 状态和 COM。其他 Problem Code
+只提示手动处理，不会自动覆盖现有驱动。
+
+仅在 `serial` 模式启动时执行这项检查。若设备节点暂时不可见，Host 还会只读执行
+`pnputil /enum-drivers`：Driver Store 缺少 `CH341SER.INF` 且随包 INF 存在时，即使卸载驱动后设备节点暂时消失，也会显示安装确认；
+Driver Store 已有驱动、设备已正常工作或 Driver Store 探测失败时不弹安装窗口。未插入设备但 Driver Store 确实缺少驱动时仍会提示，以便预先安装随包驱动。
+用户确认后仍必须通过 UAC。当前 Host 使用随包、签名有效的 WCH 官方 `SETUP.EXE /S` 安装，
+与手动点击官方安装器的 INSTALL 走同一安装器路径；后续可运行同一 `SETUP.EXE` 点击 UNINSTALL，
+或使用其内置参数 `/U` 卸载、`/D` 卸载并删除驱动。安装器成功仍不代表设备已经枚举或 COM 口可用；
+如果安装后的瞬时复检仍没有 CH340/CH341 设备或 COM 口，Host 不显示可能过时的阻塞弹窗，
+而是继续启动并由串口握手自动发现；只有握手成功才记录“已连接 COMx”。这既不会把“驱动包入库”误报成“串口可用”，
+也不会在 Windows 稍后完成 COM 初始化时错误要求重插 USB。WCH 自带卸载器在没有已绑定设备时可能提示“无驱动可卸载”，
+是否已入库应以 `pnputil /enum-drivers` 中的 `CH341SER.INF` 为准。
+
 ## 架构与生命周期
 
 ### 主机端职责
@@ -103,7 +142,64 @@ dotnet run -c Release
 Copy-Item bridge.json bridge.local.json
 ```
 
-### 3. 快捷键
+### 3. 生成可直接交付的发布件
+
+发布脚本会先构建最新 Host，并把根目录最新 `HidBridge.Host.exe`、默认 `profiles/`、CH340/CH341
+驱动和三段可刷写固件复制到 `release/`；根目录仍保留同一份最新 EXE。固件默认使用最近一次
+ESP-IDF 构建结果，要求重新构建固件时加上 `-BuildFirmware`：
+
+```powershell
+.\scripts\Prepare-Release.ps1
+# 重新构建 ESP32-S3 后再生成发布件
+.\scripts\Prepare-Release.ps1 -BuildFirmware
+```
+
+发布目录结构：
+
+```text
+release/
+├─ HidBridge.Host.exe
+├─ bridge.json
+├─ profiles/                       默认 Global 与示例配置
+├─ drivers/wch-ch341ser/           WCH 官方驱动与 INF
+├─ firmware/                       flasher_args.json + 三段镜像
+├─ SHA256SUMS.txt
+└─ README.md
+```
+
+### 4. 创建 GitHub Release
+
+`Publish-GitHubRelease.ps1` 会先调用 `Prepare-Release.ps1` 重建 `release/`，校验根目录与
+`release/HidBridge.Host.exe` 大小和 SHA-256 一致，再把 `release/` 内容直接打入 ZIP 根目录，
+输出 `dist/ESP32-S3-HID-Bridge-<Tag>.zip` 及外部 `.zip.sha256`。打包后会用 .NET ZipArchive
+核对 ZIP 条目、`release/SHA256SUMS.txt` 和强制驱动 INF；默认发布命令最后才调用
+`gh release create <Tag> --target <SHA>` 上传，不会覆盖已有 tag/Release。
+
+正常发布前置条件：当前目录必须是 Git 仓库；tracked 工作树必须干净（确认风险后才使用
+`-AllowDirty`）；已安装并登录 GitHub CLI `gh`；当前本地/远端 tag 和 GitHub Release 不得存在；
+`Target` 默认为当前 HEAD SHA，也可显式传入分支或提交。默认会重建 Host，固件需要重建时加
+`-BuildFirmware`；只有明确确认已有根目录 EXE 时才使用 `-SkipHostBuild`。
+
+只打包、不联网、不登录 gh、也不要求工作树干净：
+
+```powershell
+.\scripts\Publish-GitHubRelease.ps1 -Tag v0.0.0-localtest -PackageOnly
+```
+
+创建新 Release（示例不会在本轮执行）：
+
+```powershell
+.\scripts\Publish-GitHubRelease.ps1 -Tag v1.2.3 -Title 'ESP32-S3 HID Bridge v1.2.3'
+.\scripts\Publish-GitHubRelease.ps1 -Tag v1.2.3 -Repo owner/repo -Target <commit-or-branch> `
+    -NotesFile .\docs\release-notes-v1.2.3.md -Prerelease
+```
+
+可用参数：`Tag`（必填，`vX.Y.Z`/预发布后缀）、`Title`、`NotesFile`（缺省使用
+`--generate-notes`）、`Repo`、`Target`、`Draft`、`Prerelease`、`BuildFirmware`、
+`SkipHostBuild`、`AllowDirty` 和 `PackageOnly`。脚本只会删除 `dist/` 下当前 Tag 对应的
+ZIP/哈希文件；不会递归清理其他发布产物，也不会自动创建或覆盖已有 GitHub Release。
+
+### 5. 快捷键
 
 - `HOME`：启用 / 停止向目标设备转发。
 - `END`：安全释放所有按键并退出。
@@ -118,7 +214,7 @@ EXE 不内嵌固件。设置页和远程 API 各自指定运行控制软件电�
 
 ### 方式一：设置页本地刷写（手动，推荐）
 
-1. 运行 HidBridge.Host.exe，确认日志显示已自动发现并连接串口。
+1. 运行 HidBridge.Host.exe，确认日志显示已连接串口。
 2. 打开「设置」页，底部「本地固件刷写」区，点「选择 JSON」。
 3. 选择三段完整刷写清单；清单里的相对镜像路径按 JSON 所在目录解析，可按标准子目录（bootloader/、partition_table/）或与清单同目录平铺放置。
 4. 点「确定」→ 弹窗二次确认 → 打开小日志窗口实时显示 esptool 进度（百分比、哈希校验、RTS 复位），完成后显示「刷写完成」。
@@ -160,7 +256,7 @@ dotnet build host/HidBridge.Host/HidBridge.Host.csproj -c Release
 
 ## 宏
 
-宏是主机端按键脚本，保存在 profiles/<配置名>/ 下（宏文件为 .txt，profile.json 记录触发键与模式），在设置页选择激活的配置（automation.settings.json 的 ActiveProfile）。触发键示例：`f13`、`ctrl+f1`、`mouse_side1`。仓库提供完整示例配置（含宏与 Lua），见 [profiles.example/](profiles.example/)，复制到 profiles/ 即可使用。
+宏是主机端按键脚本，保存在 profiles/<配置名>/macros/ 下，每个宏一个 .txt；配置目录中的 profile.json 只记录触发键、模式、启用状态和文件关联。在设置页选择激活的配置（automation.settings.json 的 ActiveProfile）。触发键示例：`f13`、`ctrl+f1`、`mouse_side1`。仓库提供完整示例配置（含宏与 Lua），见 [profiles.example/](profiles.example/)，复制到 profiles/ 即可使用。
 
 ### 语法
 
@@ -175,7 +271,7 @@ dotnet build host/HidBridge.Host/HidBridge.Host.csproj -c Release
 | `keyup` | key | 松开按键 |
 | `keypress` | key [, hold_ms] | 点按按键，可带按住时长 |
 | `wheel` | amount | 垂直滚轮增量 |
-| `delay` / `sleep` | ms | 延时 |
+| `delay` / `sleep` | ms | 可取消延时，底层共用同一实现 |
 | `randsleep` / `randdelay` | min, max | 随机延时（毫秒） |
 
 示例：
@@ -215,18 +311,24 @@ mouse(1, 0)
 
 ## Lua 脚本
 
-每个配置可携带一段 Lua 脚本（profile.json 的 lua_script_text），激活配置时自动运行。采用鼠标宏常见的 OnEvent 事件模型：按键/鼠标事件到达时调用 `OnEvent(event, arg)`，event 为 `pressed` / `released`，arg 为按键名（字符串，如 "a"、"f13"、"num0"）或鼠标键数字（1 左 / 2 右 / 3 中）。
+每个配置可携带一段 Lua 脚本，正文保存在 profiles/<配置名>/lua/ 下的 txt，profile.json 的 lua_script_file 记录关联文件，激活配置时自动运行。采用鼠标宏常见的 OnEvent 事件模型：按键/鼠标事件到达时调用 `OnEvent(event, arg)`，event 为 `pressed` / `released`，arg 为按键名（字符串，如 "a"、"f13"、"num0"）或鼠标键数字（1 左 / 2 右 / 3 中）。
+
+Lua 页的“检查”会先校验脚本，再自动调整已有行的 4 空格缩进，并规范运算符、逗号等行内空格；不会插入或重排换行，也不会修改字符串和注释。旧版本把 Lua 正文写在 profile.json 的 lua_script_text 时，打开配置会先读取旧字段并自动转换为 lua/、macros/ 目录下的 txt，再保存新版 JSON。
+
+Lua 语法检查、启动失败和运行时失败都会在状态或日志中显示脚本错误行号。
+
+Lua 输入栏左侧显示随滚动同步的行号。Host 不再为每次按键额外生成 `press arg=...` / `release arg=...` 日志；脚本主动调用 `DebugLog(...)` 的内容仍会照常显示。
 
 ### 可用 API
 
 | API | 说明 |
 |---|---|
-| `move(x, y)` | 相对移动鼠标 |
+| `move(x, y)` | 相对移动鼠标，支持小数并按累计结果输出整数 HID 位移 |
 | `moveto(x, y)` | 绝对坐标移动 |
 | `mouse(button, state)` | 鼠标键按下/松开（1 左 / 2 右 / 3 中） |
 | `wheel(amount)` | 垂直滚轮 |
 | `keydown(key)` / `keyup(key)` / `keypress(key, hold_ms)` | 按键控制 |
-| `sleep(ms)` / `Sleep(ms)` | 延时 |
+| `delay(ms)` / `sleep(ms)` / `Sleep(ms)` | 可取消延时，底层共用同一实现，单位为毫秒 |
 | `randdelay(min, max)` / `randsleep(min, max)` | 随机延时 |
 | `IsPressed(key)` | 查询按键当前是否按住（可轮询） |
 | `DebugLog(...)` | 输出到 Lua 诊断日志 |
@@ -247,11 +349,11 @@ function OnEvent(event, arg)
 end
 ```
 
-Lua 详细诊断日志写入 `artifacts/automation-runtime-<时间戳>.log`；Lua/宏 UI 只显示初版的普通简略日志，文件中另外保留 `LuaEvent`、`LuaOutput` 及开始/完成序号，便于分析长按、松开和连点问题。
+Lua 详细诊断日志写入 EXE 同目录的 `log/automation/automation-runtime-<时间戳>.log`；文件中保留 `LuaEvent`、`LuaOutput` 及开始/完成序号，便于分析长按、松开和连点问题。宏/Lua 页面只显示实际发布的状态日志和脚本 `DebugLog`，不会重复显示 Host 自动生成的按键摘要。
 
 ## UDP 模拟鼠标接口
 
-主机 EXE 默认监听 UDP 0.0.0.0:24814，接收 UTF-8 JSON 相对移动命令（仅 HOME 开启同步后转发，不直接移动本机光标）：
+主机 EXE 默认监听 UDP 0.0.0.0:24814，接收 UTF-8 JSON 相对移动命令（默认开启“始终开启 UDP 输出”时，即使 HOME 关闭也会发送到 ESP32；不直接移动本机光标）：
 
 ```json
 {"dx":12,"dy":-4,"wheel":0,"pan":0}
@@ -261,11 +363,18 @@ Lua 详细诊断日志写入 `artifacts/automation-runtime-<时间戳>.log`；Lu
 - 命令分摊到固定 10 个 2 ms 槽（20 ms 低延迟平滑），连续输入在槽内合并。
 - 无身份认证：仅应在受信任网络使用；只做本机测试可把 remoteInputBindAddress 改为 127.0.0.1。
 - 可选发送示例：tools/send-remote-mouse.ps1 -HostAddress 192.168.1.20 -Port 24814 -Dx 25 -Dy -10。
-- 主界面「UDP 平滑」开关可临时关闭分摊做 A/B；「模拟 UDP」开关可把实体鼠标按 30/60/100/140/200/500 Hz/无上限 分桶成模拟 UDP 源。
+- 主界面「UDP 平滑」开关可临时关闭分摊做 A/B；「始终开启 UDP 输出」默认开启，关闭 HOME 时仍允许网络 UDP 输入输出到 ESP32，关闭后网络 UDP 仅在 HOME 同步开启时输出。
+- 设置页的「模拟 UDP 输入（测试）」默认关闭；启用后可把实体鼠标按 30/60/100/140/200/500 Hz/无上限分桶成模拟 UDP 源，仅用于测试输入聚合、平滑和输出链路，不代表真实网络性能。
+
+## 统一输出灵敏度
+
+鼠标捕获页底部的「输出灵敏度」是发送到固件前的最后一道 X/Y 相对移动处理。左侧滑块可在 `0.3` 到 `3.0` 之间拖动，右侧输入框也可直接输入数值；`1` 表示保持原始移动量，小于 `1` 会降低输出，大于 `1` 会放大输出。输入超出范围时会自动限制到边界，输入无效时恢复上一次有效值。
+
+该比例在主机统一的 1000 Hz 鼠标报告泵中生效：实体鼠标、UDP 输入、Lua `move()` 和宏 `move()` 都会经过同一处理，再编码为发送给 ESP32 固件的报告。因此无论输入来源如何，最终 X/Y 输出都使用同一个灵敏度；小数比例会保留未满一个整数报告的余量，连续移动不会因为逐条取整而丢失。滚轮、水平滚动和鼠标按键不受该设置影响；未开启 HOME 同步时走本机 Win32 输出的 Lua/宏动作也不会被该固件输出比例改写。
 
 ## 鼠标移动记录与分析图
 
-HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键松开 3 秒后自动停止并弹出分析图（X 有符号值时间序列 + Y 有符号值时间序列），同时保存到 artifacts/mouse-movement-<时间戳>.png。记录点位于 1000 Hz 报告实际提交边界，不做平滑或降采样。
+该功能默认关闭，可在设置页开启。HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键松开 3 秒后自动停止并弹出分析图（X 有符号值时间序列 + Y 有符号值时间序列），同时保存到 EXE 同目录的 `log/mouse-movement-<时间戳>.png`。记录点位于 1000 Hz 报告实际提交边界，不做平滑或降采样；分析图仅用于观察实际输出，不改变输入转发逻辑。
 
 ## 主机配置参考（bridge.local.json）
 
@@ -277,8 +386,12 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
   "remoteInputEnabled": true,
   "remoteInputBindAddress": "0.0.0.0",
   "remoteInputPort": 24814,
-  "hostLogPath": "artifacts/host-runtime-{timestamp}.log",
-  "deviceLogPath": "artifacts/host-serial-{timestamp}.log",
+  "hostLogPath": "log/host/host-runtime-{timestamp}.log",
+  "hostLogRetentionCount": 10,
+  "deviceLogPath": "log/device/host-serial-{timestamp}.log",
+  "deviceLogRetentionCount": 10,
+  "automationLogPath": "log/automation/automation-runtime-{timestamp}.log",
+  "automationLogRetentionCount": 10,
   "showDeviceLogInUi": false,
   "firmwareUpdateApiPort": 24815,
   "firmwareFlashBaudRate": 460800,
@@ -288,7 +401,8 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
 
 - transport 只能是 serial（wifi 实现保留但当前被功能闸门拒绝）。
 - portName 为 auto 时自动扫描 COM 并完成随机数握手；固定串口模式不自动扫描。
-- hostLogPath / deviceLogPath 支持 {timestamp} 占位符；deviceLogPath 置空可关闭设备日志。
+- hostLogPath / deviceLogPath / automationLogPath 支持 `{timestamp}` 占位符；路径为相对路径时相对于 EXE 所在目录；deviceLogPath 置空可关闭设备日志。
+- hostLogRetentionCount / deviceLogRetentionCount / automationLogRetentionCount 分别限制三类日志目录中的文件数量，默认每类保留 10 个，范围为 1..1000；创建新日志时优先删除最旧文件。
 - showDeviceLogInUi 为启动默认值：false 精简模式 / true 完整日志模式；窗口内可随时切换。
 - EXE 只内嵌刷写工具，不内嵌固件；设置页选择本机 JSON 清单，远程 API 在请求正文中单独指定本机 JSON 路径。
 
@@ -296,7 +410,7 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
 
 - `portName: "auto"` 会扫描串口并发送 `DeviceProbe`/`DeviceHello`；固定 COM 只适用于明确知道设备端口的环境。默认波特率为 `921600`。
 - 同一个 COM 口不能同时由 Host、`idf.py monitor` 或其他串口工具打开；刷写前必须释放串口，刷写结束后再恢复会话。
-- `host-runtime-{timestamp}.log` 保存主机运行日志，`host-serial-{timestamp}.log` 保存设备日志，`automation-runtime-{timestamp}.log` 保存 Lua/宏详细事件和输出时间线。
+- EXE 同目录的 `log/host` 保存主机运行日志，`log/device` 保存设备串口日志，`log/automation` 保存 Lua/宏详细事件和输出时间线；三类目录分别执行文件数量限制。
 - `showDeviceLogInUi` 默认关闭。完整设备日志只用于短时排障；文件写入、UI 投递和实时输入线程相互隔离，UI 采用批量刷新和有界文本。
 - 输入租约默认约 `1500 ms`；停止转发、COM 断开、USB/BLE 切换、HOME/END 和进程退出都必须执行 `ReleaseAll`。
 
@@ -312,7 +426,7 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
 
 - 默认监听 `0.0.0.0:24814`，JSON 字段为 `dx`、`dy`、`wheel`、`pan`；范围分别为 `-32768..32767`、`-128..127`，四项全零的数据报拒绝并应由发送端在复用 socket 的前提下跳过。
 - 平滑器使用固定 20 个 1 ms 槽覆盖最多 20 ms 尾部，整数位移在槽间守恒且不无界积压；关闭“UDP 平滑”只用于 A/B 对比。
-- “模拟 UDP”可按 30/60/100/140/200/500 Hz 或无上限生成测试源；模拟结果不能替代真实 USB/BLE 和目标端 Raw Input 验收。
+- “模拟 UDP 输入（测试）”位于设置页且默认关闭，可按 30/60/100/140/200/500 Hz 或无上限生成测试源；模拟结果不能替代真实 USB/BLE 和目标端 Raw Input 验收。
 - 当前 UDP 入口没有身份认证、计数器或时间窗防重放，只适用于受信任局域网；本机测试应将 `remoteInputBindAddress` 改为 `127.0.0.1`。
 
 ### BLE 维护
@@ -324,6 +438,8 @@ HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键�
 ## 常见问题
 
 - **COM 被占用**：主机程序与 idf.py monitor、串口工具不能同时打开同一 COM 口；关闭占用程序后主机会自动重连。
+- **检测到 CH340/CH341 Code 28**：发布件中的 Host 会显示驱动路径和管理员权限提示；只有确认“安装驱动”并通过 UAC 后才执行随包 WCH 驱动，其他 Problem Code 请在设备管理器中处理。
+- **生成发布件**：在项目根目录执行 `scripts/Prepare-Release.ps1`；如果要把最新 ESP-IDF 构建也纳入发布件，使用 `-BuildFirmware`。
 - **手动刷写提示「刷写镜像不存在」**：JSON 引用的 bin 必须位于清单所在目录内（支持 bootloader/、partition_table/ 子目录或平铺）。
 - **BLE 配对后反复「已配对/已连接」**：旧固件无绑定持久化，升级后需在目标设备删除/忽略旧配对，重新配对一次。
 - **防火墙弹窗**：UDP 24814 与刷写接口 24815 首次监听可能触发 Windows 防火墙提示。
@@ -346,10 +462,13 @@ shared/HidBridge.Protocol 主机与固件共享协议
 target/                   保留的 Target Agent 输出后端
 tests/                    主机/硬件自检程序与固件测试
 scripts/                  构建与工具脚本（含内置 esptool 构建）
-profiles/                 宏/Lua 配置（运行目录，不提交默认内容）
+drivers/wch-ch341ser/    WCH CH340/CH341 官方驱动归档与可安装 INF
+release/                  可直接交付的 Host、默认 profiles、驱动和三段固件发布件
+profiles/                 宏/Lua 配置（每个配置含 profile.json、macros/*.txt、lua/*.txt）
 profiles.example/         示例配置（宏 + Lua，可复制到 profiles/）
 docs/                     项目文档（协议、刷写 API、交接与审计记录）
-artifacts/                运行日志与产物（不提交）
+log/                      EXE 运行日志、自动化日志、设备日志和可选分析图
+artifacts/                检查/调试临时产物（不提交）
 tools/                    辅助工具（如 UDP 发送示例）
 ```
 

@@ -23,7 +23,7 @@ internal sealed class MouseMovementAnalysisForm : Form
         {
             savedImagePath = MouseMovementAnalysisRenderer.SavePng(
                 recording,
-                Path.Combine(AppContext.BaseDirectory, "artifacts"));
+                Path.Combine(AppContext.BaseDirectory, "log"));
         }
         catch (Exception exception)
         {

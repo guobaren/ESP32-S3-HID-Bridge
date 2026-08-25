@@ -1,0 +1,47 @@
+can_aim = 1
+count = 0
+runtime = 0
+sleep_time = 10
+x = 0
+y = 1
+
+function OnEvent(event, arg)
+    if (event == "pressed" and (arg == 1 or arg == 2)) then
+        -- ClearLog()
+    end
+
+    if (event == "pressed") then
+        DebugLog("pressed arg=%d\n", arg)
+    end
+
+    if (event == "released") then
+        DebugLog("released arg=%d\n", arg)
+    end
+
+    if (event == "pressed" and arg == "a") then
+        if can_aim == 1 then
+            can_aim = 2
+        else
+            can_aim = 1
+        end
+        DebugLog("can_aim=%d\n", can_aim)
+    end
+
+    if (event == "pressed" and arg == 1) then
+        count = 0
+        runtime = 0
+        while IsPressed(1) and IsPressed(3) do
+            sleep_time = 10
+            if IsPressed(3) then
+                -- move(x, y)
+            end
+            sleep(sleep_time)
+            count = count + 1
+            runtime = runtime + sleep_time
+            DebugLog("sleep_time=%d count=%d runtime=%d\n", sleep_time, count, runtime)
+        end
+
+        count = 0
+        runtime = 0
+    end
+end

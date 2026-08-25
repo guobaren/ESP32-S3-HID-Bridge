@@ -27,25 +27,26 @@ internal sealed class MacroJob : IDisposable
         _log = log;
     }
 
-    internal void OnPressed()
+    internal bool OnPressed()
     {
         if (_disposed)
         {
-            return;
+            return false;
         }
         switch (_mode)
         {
             case MacroRunModes.Toggle:
                 lock (_stateLock)
                 {
-                    _toggleActive = !_toggleActive;
-                    if (!_toggleActive)
+                    if (_toggleActive)
                     {
+                        _toggleActive = false;
                         CancelLocked();
-                        return;
+                        return false;
                     }
+                    _toggleActive = true;
+                    StartLocked(token => RunLoopAsync(_macro.Body, token));
                 }
-                Start(token => RunLoopAsync(_macro.Body, token));
                 break;
             case MacroRunModes.HoldLoop:
                 Start(token => RunLoopAsync(_macro.Body, token));
@@ -57,18 +58,22 @@ internal sealed class MacroJob : IDisposable
                 Start(token => RunBodyAsync(_macro.Body, token));
                 break;
         }
+        return true;
     }
 
-    internal void OnReleased()
+    internal bool OnReleased()
     {
         if (_mode == MacroRunModes.HoldLoop)
         {
             Stop();
+            return true;
         }
-        else if (_mode == MacroRunModes.Staged)
+        if (_mode == MacroRunModes.Staged)
         {
             Stop(runReleaseSection: true);
+            return true;
         }
+        return false;
     }
 
     internal void Stop(bool runReleaseSection = false)
@@ -106,32 +111,37 @@ internal sealed class MacroJob : IDisposable
     {
         lock (_stateLock)
         {
-            if (_task is { IsCompleted: false })
-            {
-                return;
-            }
-            _cancellation?.Dispose();
-            _cancellation = new CancellationTokenSource();
-            CancellationToken token = _cancellation.Token;
-            _task = Task.Run(async () =>
-            {
-                try
-                {
-                    await action(token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (token.IsCancellationRequested)
-                {
-                }
-                catch (Exception exception)
-                {
-                    _log($"宏 {_name} 执行失败：{exception.Message}");
-                }
-                finally
-                {
-                    ReleaseTrackedInputs();
-                }
-            }, token);
+            StartLocked(action);
         }
+    }
+
+    private void StartLocked(Func<CancellationToken, Task> action)
+    {
+        if (_task is { IsCompleted: false })
+        {
+            return;
+        }
+        _cancellation?.Dispose();
+        _cancellation = new CancellationTokenSource();
+        CancellationToken token = _cancellation.Token;
+        _task = Task.Run(async () =>
+        {
+            try
+            {
+                await action(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+            }
+            catch (Exception exception)
+            {
+                _log($"宏 {_name} 执行失败：{exception.Message}");
+            }
+            finally
+            {
+                ReleaseTrackedInputs();
+            }
+        }, token);
     }
 
     private async Task RunLoopAsync(IReadOnlyList<MacroCommand> commands, CancellationToken token)

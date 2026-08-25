@@ -33,6 +33,8 @@ internal sealed class MouseReportPump : IDisposable
     private readonly IntPtr _waitableTimer;
     private long _pendingX;
     private long _pendingY;
+    private double _scaledPendingX;
+    private double _scaledPendingY;
     private long _pendingWheel;
     private long _pendingPan;
     private long _capturedX;
@@ -48,8 +50,10 @@ internal sealed class MouseReportPump : IDisposable
     private long _minSubmittedIntervalUs;
     private long _maxSubmittedIntervalUs;
     private byte _lastSubmittedButtons;
-    private DateTime _lastStatisticsUtc = DateTime.UtcNow;
+    private readonly StatisticsActivityGate _statisticsActivityGate = new(DateTime.UtcNow);
     private bool _udpSmoothingEnabled = true;
+    private double _outputSensitivity = MouseOutputSensitivity.Default;
+    private bool _alwaysOutputUdp = true;
     private bool _enabled;
     private bool _disposed;
 
@@ -126,6 +130,70 @@ internal sealed class MouseReportPump : IDisposable
         }
     }
 
+    internal double OutputSensitivity
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _outputSensitivity;
+            }
+        }
+    }
+
+    internal bool AlwaysOutputUdpEnabled
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _alwaysOutputUdp;
+            }
+        }
+    }
+
+    internal void ConfigureAlwaysOutputUdp(bool enabled)
+    {
+        lock (_sendLock)
+        {
+            lock (_stateLock)
+            {
+                if (_disposed || _alwaysOutputUdp == enabled)
+                {
+                    return;
+                }
+
+                // 捕获关闭时，切换为关闭状态应丢弃尚未发出的 UDP 尾部，
+                // 避免下次重新开启时把旧输入误认为新输入。
+                if (!enabled && !_enabled)
+                {
+                    _pendingX = 0;
+                    _pendingY = 0;
+                    _scaledPendingX = 0;
+                    _scaledPendingY = 0;
+                    _pendingWheel = 0;
+                    _pendingPan = 0;
+                    _udpMouseSmoother.Reset();
+                }
+
+                _alwaysOutputUdp = enabled;
+            }
+        }
+    }
+
+    internal void ConfigureOutputSensitivity(double sensitivity)
+    {
+        lock (_stateLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _outputSensitivity = MouseOutputSensitivity.Clamp(sensitivity);
+        }
+    }
+
     internal void Accumulate(
         byte buttons,
         bool buttonsChanged,
@@ -144,6 +212,7 @@ internal sealed class MouseReportPump : IDisposable
             _rawEventCount++;
             _capturedX += deltaX;
             _capturedY += deltaY;
+            _statisticsActivityGate.RecordMovement(deltaX, deltaY);
             if (_simulatedUdpInput.Enabled)
             {
                 if (_simulatedUdpInput.Accumulate(
@@ -202,7 +271,7 @@ internal sealed class MouseReportPump : IDisposable
             lock (_stateLock)
             {
                 _enabled = enabledAfterRelease && !_disposed;
-                _lastStatisticsUtc = DateTime.UtcNow;
+                _statisticsActivityGate.Reset(DateTime.UtcNow);
             }
         }
     }
@@ -320,7 +389,7 @@ internal sealed class MouseReportPump : IDisposable
     {
         lock (_stateLock)
         {
-            if (!_enabled || _disposed)
+            if ((!_enabled && !_alwaysOutputUdp) || _disposed)
             {
                 return;
             }
@@ -328,6 +397,7 @@ internal sealed class MouseReportPump : IDisposable
             _rawEventCount++;
             _capturedX += deltaX;
             _capturedY += deltaY;
+            _statisticsActivityGate.RecordMovement(deltaX, deltaY);
             RouteUdpDeltaLocked(new MouseDelta(deltaX, deltaY, wheel, pan));
         }
     }
@@ -342,7 +412,7 @@ internal sealed class MouseReportPump : IDisposable
             MouseReport submittedReport = default;
             lock (_stateLock)
             {
-                if (_enabled && !_disposed)
+                if ((_enabled || _alwaysOutputUdp) && !_disposed)
                 {
                     long nowTimestamp = Stopwatch.GetTimestamp();
                     if (_simulatedUdpInput.TryFlush(nowTimestamp, out MouseDelta simulatedDelta))
@@ -361,19 +431,19 @@ internal sealed class MouseReportPump : IDisposable
                         _maxPendingY = Math.Max(_maxPendingY, Math.Abs(_pendingY));
                     }
 
+                    ApplyOutputSensitivityLocked();
+
                     bool hasButtonTransition = _buttonStates.Count > 0;
                     byte buttons = hasButtonTransition
                         ? _buttonStates.Dequeue()
                         : _lastSubmittedButtons;
-                    short x = (short)Math.Clamp(_pendingX, short.MinValue, short.MaxValue);
-                    short y = (short)Math.Clamp(_pendingY, short.MinValue, short.MaxValue);
+                    short x = TakeScaledMovementLocked(ref _scaledPendingX);
+                    short y = TakeScaledMovementLocked(ref _scaledPendingY);
                     sbyte wheel = (sbyte)Math.Clamp(_pendingWheel, sbyte.MinValue, sbyte.MaxValue);
                     sbyte pan = (sbyte)Math.Clamp(_pendingPan, sbyte.MinValue, sbyte.MaxValue);
 
                     if (hasButtonTransition || x != 0 || y != 0 || wheel != 0 || pan != 0)
                     {
-                        _pendingX -= x;
-                        _pendingY -= y;
                         _pendingWheel -= wheel;
                         _pendingPan -= pan;
                         _lastSubmittedButtons = buttons;
@@ -386,10 +456,9 @@ internal sealed class MouseReportPump : IDisposable
                     }
 
                     DateTime nowUtc = DateTime.UtcNow;
-                    if (nowUtc - _lastStatisticsUtc >= _statisticsInterval)
+                    if (_statisticsActivityGate.TryConsume(nowUtc, _statisticsInterval))
                     {
                         statistics = CaptureStatisticsLocked();
-                        _lastStatisticsUtc = nowUtc;
                     }
                 }
             }
@@ -480,6 +549,7 @@ internal sealed class MouseReportPump : IDisposable
         SimulatedUdpInputStatistics simulated = _simulatedUdpInput.GetStatistics();
         long minSubmittedIntervalUs = _minSubmittedIntervalUs;
         long maxSubmittedIntervalUs = _maxSubmittedIntervalUs;
+        (long pendingX, long pendingY) = GetPendingOutputForStatisticsLocked();
         _minSubmittedIntervalUs = 0;
         _maxSubmittedIntervalUs = 0;
         return new MouseStatisticsSnapshot(
@@ -489,8 +559,8 @@ internal sealed class MouseReportPump : IDisposable
             _submittedReportCount,
             _submittedX,
             _submittedY,
-            _pendingX,
-            _pendingY,
+            pendingX,
+            pendingY,
             _buttonTransitionCount,
             _buttonStates.Count,
             _maxPendingX,
@@ -542,16 +612,66 @@ internal sealed class MouseReportPump : IDisposable
             ? "无上限"
             : $"{frequencyHz}Hz";
 
+    private void ApplyOutputSensitivityLocked()
+    {
+        if (_pendingX != 0)
+        {
+            _scaledPendingX += _pendingX * _outputSensitivity;
+            _pendingX = 0;
+        }
+        if (_pendingY != 0)
+        {
+            _scaledPendingY += _pendingY * _outputSensitivity;
+            _pendingY = 0;
+        }
+        _maxPendingX = Math.Max(_maxPendingX, SaturatingAbsToLong(_scaledPendingX));
+        _maxPendingY = Math.Max(_maxPendingY, SaturatingAbsToLong(_scaledPendingY));
+    }
+
+    private static short TakeScaledMovementLocked(ref double pending)
+    {
+        double integral = pending >= 0
+            ? Math.Floor(pending + 1e-9)
+            : Math.Ceiling(pending - 1e-9);
+        double clamped = Math.Clamp(integral, short.MinValue, short.MaxValue);
+        short output = (short)clamped;
+        pending -= output;
+        return output;
+    }
+
+    private (long X, long Y) GetPendingOutputForStatisticsLocked()
+    {
+        double pendingX = _scaledPendingX + _pendingX * _outputSensitivity;
+        double pendingY = _scaledPendingY + _pendingY * _outputSensitivity;
+        return (SaturatingToLong(pendingX), SaturatingToLong(pendingY));
+    }
+
+    private static long SaturatingAbsToLong(double value)
+    {
+        double absolute = Math.Abs(value);
+        return absolute >= long.MaxValue ? long.MaxValue : (long)absolute;
+    }
+
+    private static long SaturatingToLong(double value) =>
+        value >= long.MaxValue
+            ? long.MaxValue
+            : value <= long.MinValue
+                ? long.MinValue
+                : (long)Math.Truncate(value);
+
     private void LogDiscardedPendingLocked()
     {
         SimulatedUdpInputStatistics simulated = _simulatedUdpInput.GetStatistics();
-        if (_pendingX != 0 || _pendingY != 0 || _pendingWheel != 0 ||
+        if (_pendingX != 0 || _pendingY != 0 ||
+            Math.Abs(_scaledPendingX) > 1e-9 || Math.Abs(_scaledPendingY) > 1e-9 ||
+            _pendingWheel != 0 ||
             _pendingPan != 0 || _buttonStates.Count != 0 ||
             simulated.PendingX != 0 || simulated.PendingY != 0 ||
             simulated.PendingWheel != 0 || simulated.PendingPan != 0)
         {
             Console.WriteLine(
-                $"鼠标会话结束，丢弃未发送状态：位移=({_pendingX},{_pendingY})，" +
+                $"鼠标会话结束，丢弃未发送状态：原始位移=({_pendingX},{_pendingY})，" +
+                $"缩放后积压=({_scaledPendingX:0.###},{_scaledPendingY:0.###})，" +
                 $"滚轮=({_pendingWheel},{_pendingPan})，" +
                 $"模拟UDP待整合=({simulated.PendingX},{simulated.PendingY},{simulated.PendingWheel},{simulated.PendingPan})，" +
                 $"按钮转换={_buttonStates.Count}");
@@ -562,6 +682,8 @@ internal sealed class MouseReportPump : IDisposable
     {
         _pendingX = 0;
         _pendingY = 0;
+        _scaledPendingX = 0;
+        _scaledPendingY = 0;
         _pendingWheel = 0;
         _pendingPan = 0;
         _capturedX = 0;

@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using HidBridge.Host;
 using HidBridge.Host.Automation;
+using HidBridge.Host.Drivers;
 using HidBridge.Host.FirmwareUpdate;
 using HidBridge.Host.Input;
 using HidBridge.Host.RemoteInput;
@@ -14,12 +15,59 @@ using HidBridge.Host.Transport;
 using HidBridge.Host.Ui;
 using HidBridge.Protocol;
 
+if (args.Any(argument => argument.Equals("--layout-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckHotkeyChooserControl();
+    CheckWindowLayout();
+    return;
+}
+
+if (args.Any(argument => argument.Equals("--mouse-release-plan-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckWin32MouseReleasePlan();
+    return;
+}
+
+if (args.Any(argument => argument.Equals("--statistics-gate-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckStatisticsActivityGate();
+    return;
+}
+
+if (args.Any(argument => argument.Equals("--driver-support-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckCh341DriverSupport();
+    return;
+}
+
+if (args.Any(argument => argument.Equals("--driver-store-probe-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckCh341DriverStoreProbeReadOnly();
+    return;
+}
+
+if (args.Any(argument => argument.Equals("--lua-format-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckLuaSpacingFormatting();
+    return;
+}
+
+if (args.Any(argument => argument.Equals("--lua-runtime-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckLuaRuntimeFeatures();
+    return;
+}
+
 CheckMouseReportCodec();
+CheckCh341DriverSupport();
 CheckMouseAggregation();
+CheckOutputSensitivity();
 CheckSimulatedUdpInputAggregation();
 CheckUdpSmoothingSwitch();
+CheckAlwaysOutputUdp();
 CheckUdpMouseSmoothing();
 CheckMouseStatisticsLoggingDoesNotBlockPump();
+CheckStatisticsActivityGate();
 CheckMouseMovementRecordingAndChart();
 CheckSerialDiscoveryProtocol();
 CheckWiFiBoardTransportDisabled();
@@ -32,17 +80,23 @@ CheckUnexpectedInputCaptureExitReleasesAll();
 CheckForwardingNotificationFailureStillReleasesAll();
 CheckInputCallbackFailureStillReleasesAll();
 CheckLuaReleaseCannotBlockInputCapture();
+CheckWin32MouseReleasePlan();
 CheckCursorLockGeometry();
 CheckUiLogWriter();
+CheckLogFileRetention();
 CheckRemoteInputUdpPath();
 CheckFirmwareUpdateApiPolicy();
 CheckFirmwareUpdateApiLoopback();
 CheckAutomationProfilesAndRuntime();
+CheckLuaRuntimeFeatures();
+CheckExternalProfileStorageAndLuaIndentation();
 CheckAutomationRemoteOutput();
 CheckLocalMouseTriggersReachLua();
 CheckTriggerForwardingIntegration();
+CheckToggleMacroStopsOnSecondPress();
+CheckHotkeyChooserControl();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、1000 Hz 聚合、可选频率模拟 UDP、UDP 平滑开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、本机固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议、1000 Hz 聚合、可选频率模拟 UDP、UDP 平滑和始终输出开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、本机固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
 
 static void CheckMouseReportCodec()
 {
@@ -266,6 +320,48 @@ static void CheckSimulatedUdpInputAggregation()
         "模拟 UDP 输入检查：频率=[30,60,100,140,200,500] Hz 和无上限；" +
         "100 Hz=10 ms、500 Hz=2 ms；无上限逐原始事件生成命令；" +
         "频率只影响模拟源，按钮即时发送，真实 UDP 共用后续链路，停止后无残留移动。");
+}
+
+static void CheckAlwaysOutputUdp()
+{
+    RecordingTransport transport = new();
+    using MouseReportPump pump = new(transport);
+    Require(pump.AlwaysOutputUdpEnabled, "始终 UDP 输出默认必须开启");
+
+    pump.AccumulateRemote(17, -9, 1, -1);
+    DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           transport.MouseReports().Sum(report => (long)report.X) != 17)
+    {
+        Thread.Sleep(2);
+    }
+    MouseReport[] reports = transport.MouseReports();
+    Require(reports.Length > 0, "捕获关闭时始终 UDP 输出未发送远端 UDP 移动");
+    Require(reports.Sum(report => (long)report.X) == 17, "捕获关闭时 UDP X 位移未完整发送");
+    Require(reports.Sum(report => (long)report.Y) == -9, "捕获关闭时 UDP Y 位移未完整发送");
+
+    pump.ConfigureAlwaysOutputUdp(false);
+    int beforeDisabled = transport.MouseReports().Length;
+    pump.AccumulateRemote(30, 30, 0, 0);
+    Thread.Sleep(40);
+    Require(
+        transport.MouseReports().Length == beforeDisabled,
+        "关闭始终 UDP 输出后，HOME 关闭状态仍不应发送远端 UDP 移动");
+
+    pump.ConfigureAlwaysOutputUdp(true);
+    pump.AccumulateRemote(-4, 6, 0, 0);
+    long baseX = reports.Sum(report => (long)report.X);
+    long baseY = reports.Sum(report => (long)report.Y);
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           transport.MouseReports().Sum(report => (long)report.X) != baseX - 4)
+    {
+        Thread.Sleep(2);
+    }
+    reports = transport.MouseReports();
+    Require(reports.Sum(report => (long)report.X) == baseX - 4, "重新开启始终 UDP 输出后 X 位移未恢复");
+    Require(reports.Sum(report => (long)report.Y) == baseY + 6, "重新开启始终 UDP 输出后 Y 位移未恢复");
+    Console.WriteLine("始终 UDP 输出检查：HOME 关闭时默认发送，关闭开关后阻断，重新开启后恢复。");
 }
 
 static void CheckUdpSmoothingSwitch()
@@ -568,6 +664,24 @@ static void CheckUdpMouseSmoothing()
         $"实际尾部完成={completionMilliseconds:F1} ms，最大报告间隔={maximumReportGapMilliseconds:F1} ms。");
 }
 
+static void CheckStatisticsActivityGate()
+{
+    DateTime initial = new(2026, 8, 25, 0, 0, 0, DateTimeKind.Utc);
+    TimeSpan interval = TimeSpan.FromSeconds(1);
+    StatisticsActivityGate gate = new(initial);
+    gate.RecordMovement(0, 0);
+    Require(!gate.TryConsume(initial.AddSeconds(10), interval), "统计门控在纯空闲周期不得输出");
+
+    gate.RecordMovement(4, 0);
+    Require(!gate.TryConsume(initial.AddMilliseconds(999), interval), "统计门控不得在周期到达前输出");
+    Require(gate.TryConsume(initial.AddSeconds(1), interval), "一次实际位移后应允许输出一条统计");
+    Require(!gate.TryConsume(initial.AddSeconds(2), interval), "一次统计后空闲不得重复输出");
+
+    gate.RecordMovement(0, -3);
+    Require(gate.TryConsume(initial.AddSeconds(3), interval), "新实际位移后应再次允许输出统计");
+    Console.WriteLine("鼠标统计活动门控检查：空闲不输出；一次位移输出一次；再次空闲不重复；新位移后再次输出。");
+}
+
 static void CheckMouseStatisticsLoggingDoesNotBlockPump()
 {
     RecordingTransport transport = new();
@@ -587,6 +701,7 @@ static void CheckMouseStatisticsLoggingDoesNotBlockPump()
     try
     {
         pump.ResetAndSendRelease(true);
+        pump.AccumulateRemote(1, 1, 0, 0);
         Require(
             statisticsEntered.Wait(TimeSpan.FromSeconds(1)),
             "鼠标统计专用日志线程未收到统计快照");
@@ -988,6 +1103,333 @@ static void CheckLuaReleaseCannotBlockInputCapture()
     Console.WriteLine("Lua 松开连点隔离检查：实体左键松开优先送出；5000 个纯移动仅保留一份队列标记且累计位移守恒。");
 }
 
+static void CheckOutputSensitivity()
+{
+    RecordingTransport transport = new();
+    using MouseReportPump pump = new(transport);
+    pump.ConfigureUdpSmoothing(false);
+    pump.ConfigureOutputSensitivity(0.3);
+    Require(Math.Abs(pump.OutputSensitivity - 0.3) < 0.0001, "输出灵敏度未接受 0.3 下限值");
+    Require(Math.Abs(MouseOutputSensitivity.Clamp(1.234) - 1.23) < 0.0001, "输出灵敏度输入精度未与滑块步进同步");
+    pump.ResetAndSendRelease(true);
+
+    for (int index = 0; index < 10; index++)
+    {
+        pump.Accumulate(0, false, 1, -1, index == 0 ? 2 : 0, 0);
+    }
+
+    DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           transport.MouseReports().Sum(report => (long)report.X) < 3)
+    {
+        Thread.Sleep(2);
+    }
+    MouseReport[] lowSensitivityReports = transport.MouseReports();
+    Require(lowSensitivityReports.Sum(report => (long)report.X) == 3, "0.3 灵敏度未保留小数余量并输出完整 X");
+    Require(lowSensitivityReports.Sum(report => (long)report.Y) == -3, "0.3 灵敏度未保留小数余量并输出完整 Y");
+    Require(lowSensitivityReports.Sum(report => (long)report.Wheel) == 2, "输出灵敏度不得改变滚轮值");
+
+    pump.ResetAndSendRelease(false);
+    pump.ConfigureOutputSensitivity(2.0);
+    Require(Math.Abs(pump.OutputSensitivity - 2.0) < 0.0001, "输出灵敏度未接受 2.0 倍放大");
+    pump.ResetAndSendRelease(true);
+    int highSensitivityStart = transport.MouseReports().Length;
+    pump.AccumulateRemote(3, -2, 1, 0);
+
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           transport.MouseReports().Skip(highSensitivityStart).Sum(report => (long)report.X) < 6)
+    {
+        Thread.Sleep(2);
+    }
+    MouseReport[] highSensitivityReports = transport.MouseReports().Skip(highSensitivityStart).ToArray();
+    Require(highSensitivityReports.Sum(report => (long)report.X) == 6, "2.0 灵敏度未覆盖 UDP 公共发送链路");
+    Require(highSensitivityReports.Sum(report => (long)report.Y) == -4, "2.0 灵敏度 Y 输出不正确");
+    Require(highSensitivityReports.Sum(report => (long)report.Wheel) == 1, "2.0 灵敏度不得改变 UDP 滚轮值");
+    Console.WriteLine("统一输出灵敏度检查：0.3 倍小数余量守恒、2.0 倍 UDP 输入放大，滚轮保持原值。");
+}
+
+static void CheckCh341DriverSupport()
+{
+    Require(
+        WindowsCh341DeviceProbe.ClassifyProblemCode(0) == Ch341DeviceState.Working,
+        "PnP Problem Code 0 应判定为 Working");
+    Require(
+        WindowsCh341DeviceProbe.ClassifyProblemCode(28) == Ch341DeviceState.MissingDriver,
+        "PnP Problem Code 28 应判定为 MissingDriver");
+    Require(
+        WindowsCh341DeviceProbe.ClassifyProblemCode(10) == Ch341DeviceState.OtherProblem,
+        "非 0/28 的 PnP Problem Code 不得触发自动安装");
+
+    Ch341DriverStoreProbeResult englishDriverStore = Ch341DriverStoreParser.Parse(
+        "Published Name : oem42.inf\n" +
+        "Original Name : CH341SER.INF\n" +
+        "Provider Name : wch.cn\n" +
+        "Class Name : Ports\n");
+    Require(
+        englishDriverStore.State == Ch341DriverStoreState.Installed,
+        "英文 pnputil Driver Store 输出应识别 CH341SER.INF 与 wch.cn");
+    Ch341DriverStoreProbeResult localizedDriverStore = Ch341DriverStoreParser.Parse(
+        "发布项：oem43.inf\n" +
+        "原始文件：CH341SER.INF\n" +
+        "供应商：Nanjing Qinheng Microelectronics Co., Ltd.\n" +
+        "类别：端口\n");
+    Require(
+        localizedDriverStore.State == Ch341DriverStoreState.Installed,
+        "中文标签 pnputil Driver Store 输出应只按稳定值识别驱动");
+    Require(
+        Ch341DriverStoreParser.Parse("Published Name : oem44.inf\nOriginal Name : CH340SER.INF\nProvider Name : wch.cn\n").State ==
+        Ch341DriverStoreState.Missing,
+        "Driver Store 中没有 CH341SER.INF 时应判定为 Missing");
+    Ch341DriverStoreProbeResult driverStoreProbeFailed = Ch341DriverStoreProbeResult.ProbeFailed("test");
+    Require(
+        driverStoreProbeFailed.State == Ch341DriverStoreState.ProbeFailed,
+        "Driver Store 探测错误必须保留为 ProbeFailed，不得当作缺失驱动");
+
+    string root = Path.Combine(Path.GetTempPath(), $"hidbridge-driver-check-{Guid.NewGuid():N}");
+    try
+    {
+        string preferredDirectory = Path.Combine(root, "drivers", "wch-ch341ser", "CH341SER");
+        Directory.CreateDirectory(preferredDirectory);
+        string preferredInf = Path.Combine(preferredDirectory, "CH341SER.INF");
+        string preferredSetup = Path.Combine(preferredDirectory, "SETUP.EXE");
+        File.WriteAllText(preferredInf, "; test INF");
+        File.WriteAllText(preferredSetup, "test setup");
+        Ch341DriverPackage preferred = Ch341DriverPackageLocator.Locate(root)
+            ?? throw new InvalidOperationException("未找到整理后的 CH341SER 驱动目录");
+        Require(
+            preferred.InfPath.Equals(Path.GetFullPath(preferredInf), StringComparison.OrdinalIgnoreCase),
+            "驱动包定位必须优先使用 drivers/wch-ch341ser/CH341SER/CH341SER.INF");
+        Require(
+            preferred.SetupPath.Equals(Path.GetFullPath(preferredSetup), StringComparison.OrdinalIgnoreCase),
+            "驱动包必须同时定位同目录的 WCH 官方 SETUP.EXE");
+
+        File.Delete(preferredInf);
+        File.Delete(preferredSetup);
+        string legacyDirectory = Path.Combine(
+            root,
+            "drivers",
+            "wch-ch341ser",
+            "CH341SER_v4.0_2026-06-26",
+            "CH341SER");
+        Directory.CreateDirectory(legacyDirectory);
+        string legacyInf = Path.Combine(legacyDirectory, "CH341SER.INF");
+        string legacySetup = Path.Combine(legacyDirectory, "SETUP.EXE");
+        File.WriteAllText(legacyInf, "; legacy test INF");
+        File.WriteAllText(legacySetup, "legacy test setup");
+        Ch341DriverPackage legacy = Ch341DriverPackageLocator.Locate(root)
+            ?? throw new InvalidOperationException("未找到旧版嵌套 CH341SER 驱动目录");
+        Require(
+            legacy.InfPath.Equals(Path.GetFullPath(legacyInf), StringComparison.OrdinalIgnoreCase),
+            "驱动包定位必须兼容旧版带版本目录的嵌套路径");
+        Require(
+            legacy.SetupPath.Equals(Path.GetFullPath(legacySetup), StringComparison.OrdinalIgnoreCase) &&
+            Ch341DriverInstallerPolicy.VendorInstallArguments == "/S",
+            "自动安装必须调用同目录 WCH SETUP.EXE /S，以便后续由官方安装器卸载");
+        Require(
+            Ch341DriverInstallerPolicy.ClassifyExitCode(0) == Ch341DriverInstallState.PackageCommandSucceeded &&
+            Ch341DriverInstallerPolicy.ClassifyExitCode(3010) == Ch341DriverInstallState.PackageCommandSucceeded &&
+            Ch341DriverInstallerPolicy.ClassifyExitCode(1) == Ch341DriverInstallState.Failed,
+            "WCH SETUP.EXE 退出码只能分类为安装器命令成功，不能直接分类为设备可用");
+
+        Ch341ProbeResult missing = new(
+            Ch341DeviceState.MissingDriver,
+            new Ch341DeviceInfo(
+                "USB\\VID_1A86&PID_7523\\TEST",
+                "USB-SERIAL CH340",
+                Ch341DeviceState.MissingDriver,
+                28,
+                0,
+                null),
+            null);
+        Ch341ProbeResult other = missing with
+        {
+            State = Ch341DeviceState.OtherProblem,
+            Device = missing.Device! with
+            {
+                State = Ch341DeviceState.OtherProblem,
+                ProblemCode = 10,
+            },
+        };
+        Require(
+            Ch341StartupPolicy.Decide(missing, packageAvailable: true) == Ch341StartupAction.OfferInstall,
+            "Code 28 且驱动包存在时必须提示安装");
+        Require(
+            Ch341StartupPolicy.Decide(missing, packageAvailable: false) == Ch341StartupAction.None,
+            "Code 28 但驱动包缺失时不得调用安装");
+        Require(
+            Ch341StartupPolicy.Decide(other, packageAvailable: true) == Ch341StartupAction.ManualRecovery,
+            "其他 Problem Code 只能提示手动处理");
+        Require(
+            Ch341StartupPolicy.Decide(Ch341ProbeResult.NoDevice(), packageAvailable: true) == Ch341StartupAction.None,
+            "未发现 CH340 设备时不得提示驱动安装");
+        Require(
+            Ch341StartupPolicy.Decide(
+                Ch341ProbeResult.NoDevice(),
+                packageAvailable: true,
+                englishDriverStore with { State = Ch341DriverStoreState.Missing }) == Ch341StartupAction.OfferInstall,
+            "未发现设备但 Driver Store 缺少 CH341SER.INF 且包存在时必须提示安装");
+        Require(
+            Ch341StartupPolicy.Decide(
+                Ch341ProbeResult.NoDevice(),
+                packageAvailable: true,
+                englishDriverStore) == Ch341StartupAction.None,
+            "未发现设备但 Driver Store 已安装驱动时不得提示安装");
+        Require(
+            Ch341StartupPolicy.Decide(
+                Ch341ProbeResult.NoDevice(),
+                packageAvailable: true,
+                driverStoreProbeFailed) == Ch341StartupAction.None,
+            "Driver Store 探测失败时不得冒险提示安装");
+        Require(
+            Ch341StartupPolicy.Decide(
+                missing,
+                packageAvailable: true,
+                driverStoreProbeFailed) == Ch341StartupAction.None,
+            "Driver Store 探测失败时即使设备为 Code 28 也不得冒险提示安装");
+        Require(
+            Ch341StartupPolicy.GetPromptReason(
+                Ch341ProbeResult.NoDevice(),
+                englishDriverStore with { State = Ch341DriverStoreState.Missing }) ==
+            Ch341DriverPromptReason.DriverStoreMissing,
+            "无设备且 Driver Store 缺失时提示原因必须明确为 Driver Store 缺失");
+        Require(
+            Ch341StartupPolicy.GetPromptReason(missing, driverStoreProbeFailed) ==
+            null,
+            "Driver Store 探测失败时不得生成安装提示原因");
+        Require(
+            Ch341StartupPolicy.GetPromptReason(missing, englishDriverStore) ==
+            Ch341DriverPromptReason.DeviceProblemCode28,
+            "设备 Code 28 且 Driver Store 探测成功时提示原因必须明确为设备 Problem Code 28");
+        Require(
+            DriverInstallPrompt.BuildMessage(
+                    new Ch341DriverPackage("C:\\drivers\\CH341SER.INF"),
+                    Ch341DriverPromptReason.DriverStoreMissing)
+                .Contains("Driver Store", StringComparison.Ordinal),
+            "Driver Store 缺失提示不得复用设备 Code 28 文案");
+        string vendorPrompt = DriverInstallPrompt.BuildMessage(
+            new Ch341DriverPackage("C:\\drivers\\CH341SER.INF"),
+            Ch341DriverPromptReason.DriverStoreMissing);
+        Require(
+            vendorPrompt.Contains("SETUP.EXE /S", StringComparison.Ordinal) &&
+            vendorPrompt.Contains("/U", StringComparison.Ordinal),
+            "自动安装提示必须说明使用 WCH 官方安装器并可由同一安装器卸载");
+
+        Ch341ProbeResult working = missing with
+        {
+            State = Ch341DeviceState.Working,
+            Device = missing.Device! with
+            {
+                State = Ch341DeviceState.Working,
+                ProblemCode = 0,
+            },
+        };
+        Require(
+            Ch341StartupPolicy.Decide(working, packageAvailable: true, englishDriverStore) == Ch341StartupAction.None,
+            "Working 设备即使重新探测 Driver Store 也不得弹安装提示");
+        Require(
+            Ch341StartupPolicy.DecidePostInstall(
+                Ch341ProbeResult.NoDevice(),
+                null,
+                englishDriverStore) == Ch341PostInstallAction.DriverPackageStagedNoDevice,
+            "安装后无设备但 Driver Store 已有包时应报告仅完成驱动包入库而不虚报 COM");
+        Require(
+            Ch341StartupPolicy.DecidePostInstall(
+                Ch341ProbeResult.NoDevice(),
+                null,
+                driverStoreProbeFailed) == Ch341PostInstallAction.VerificationFailed,
+            "安装后无设备且 Driver Store 探测失败时不得宣称安装完成");
+        Require(
+            Ch341StartupPolicy.DecidePostInstall(working, "COM6", englishDriverStore) ==
+            Ch341PostInstallAction.WorkingCom,
+            "安装后 Working 且匹配 COM 时应报告完整复检通过");
+
+        string? port = Ch341StartupPolicy.TryGetComPort(
+            new Ch341DeviceInfo(
+                "USB\\VID_1A86&PID_7523\\TEST",
+                "USB-SERIAL CH340 (COM6)",
+                Ch341DeviceState.Working,
+                0,
+                0,
+                null),
+            () => ["COM6", "COM7"]);
+        Require(port == "COM6", "Working CH340 的 friendly name 与 SerialPort 列表应能匹配 COM6");
+        Require(
+            Ch341StartupPolicy.TryGetComPort(
+                new Ch341DeviceInfo(
+                    "USB\\VID_1A86&PID_7523\\TEST",
+                    "USB-SERIAL CH340 (COM6)",
+                    Ch341DeviceState.Working,
+                    0,
+                    0,
+                    null),
+                () => ["COM7"]) is null,
+            "SerialPort 列表没有 friendly name 中的 COM 时不得宣称已确认");
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    Console.WriteLine(
+        "CH340/CH341 驱动支持检查：Problem Code 0/28/其他码分类、" +
+        "Driver Store 中英文样本解析、新旧驱动包路径、WCH SETUP /S 安装与 /U 卸载语义、" +
+        "无设备/Code 28/Working 安装提示策略、驱动包入库语义和安装后继续自动发现策略均通过；未执行真实 PnP、UAC 或驱动安装。");
+}
+
+static void CheckCh341DriverStoreProbeReadOnly()
+{
+    Ch341DriverStoreProbeResult result = new WindowsCh341DriverStoreProbe().Probe();
+    Console.WriteLine(
+        $"只读 Driver Store 探测：State={result.State}；" +
+        $"MatchedOriginalName={result.MatchedOriginalName ?? "<none>"}；" +
+        $"Error={result.Error ?? "<none>"}；未执行安装、UAC 或设备修改。");
+    Require(
+        result.State is Ch341DriverStoreState.Installed or Ch341DriverStoreState.Missing,
+        $"只读 Driver Store 探测失败：{result.Error ?? "未知错误"}");
+}
+
+static void CheckWin32MouseReleasePlan()
+{
+    MouseReleasePlanEntry[] empty =
+        Win32AutomationOutput.BuildMouseReleasePlan(Array.Empty<int>()).ToArray();
+    Require(empty.Length == 0, "没有按下鼠标键时释放计划不得生成任何鼠标 Up");
+
+    MouseReleasePlanEntry[] right =
+        Win32AutomationOutput.BuildMouseReleasePlan([3]).ToArray();
+    Require(
+        right.SequenceEqual([new MouseReleasePlanEntry(3, 0x0010, 0)]),
+        "仅右键按下时释放计划必须只生成右键 Up");
+
+    MouseReleasePlanEntry[] side1 =
+        Win32AutomationOutput.BuildMouseReleasePlan([4]).ToArray();
+    Require(
+        side1.SequenceEqual([new MouseReleasePlanEntry(4, 0x0100, 0x0001)]),
+        "仅 XButton1 按下时释放计划必须只生成对应侧键 Up");
+
+    MouseReleasePlanEntry[] side2 =
+        Win32AutomationOutput.BuildMouseReleasePlan([5]).ToArray();
+    Require(
+        side2.SequenceEqual([new MouseReleasePlanEntry(5, 0x0100, 0x0002)]),
+        "仅 XButton2 按下时释放计划必须只生成对应侧键 Up");
+
+    MouseReleasePlanEntry[] multiple =
+        Win32AutomationOutput.BuildMouseReleasePlan([5, 1, 4, 3, 4]).ToArray();
+    Require(
+        multiple.SequenceEqual([
+            new MouseReleasePlanEntry(1, 0x0004, 0),
+            new MouseReleasePlanEntry(3, 0x0010, 0),
+            new MouseReleasePlanEntry(4, 0x0100, 0x0001),
+            new MouseReleasePlanEntry(5, 0x0100, 0x0002),
+        ]),
+        "多个已按按钮的释放计划必须准确生成、去重且不得多发");
+
+    Console.WriteLine("Win32 鼠标释放计划检查：空集合、右键、XButton1、XButton2及多按钮均只生成已跟踪的对应 Up。");
+}
+
 static void CheckUiLogWriter()
 {
     string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-log-{Guid.NewGuid():N}");
@@ -1028,6 +1470,52 @@ static void CheckUiLogWriter()
         Require(stopwatch.ElapsedMilliseconds < 50, $"日志调用方被 UI/文件输出阻塞：{stopwatch.ElapsedMilliseconds} ms");
         releaseSink.Set();
         writer.Flush();
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+}
+
+static void CheckLogFileRetention()
+{
+    BridgeOptions defaults = new();
+    Require(defaults.HostLogPath.StartsWith("log/host/", StringComparison.Ordinal), "主机日志默认目录必须位于 EXE 同目录 log/host");
+    Require(defaults.DeviceLogPath.StartsWith("log/device/", StringComparison.Ordinal), "设备日志默认目录必须位于 EXE 同目录 log/device");
+    Require(defaults.AutomationLogPath.StartsWith("log/automation/", StringComparison.Ordinal), "自动化日志默认目录必须位于 EXE 同目录 log/automation");
+    Require(
+        defaults.HostLogRetentionCount == LogFileRetention.DefaultMaxFileCount &&
+        defaults.DeviceLogRetentionCount == LogFileRetention.DefaultMaxFileCount &&
+        defaults.AutomationLogRetentionCount == LogFileRetention.DefaultMaxFileCount,
+        "三类日志默认保留数量必须一致且启用限制");
+
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-log-retention-{Guid.NewGuid():N}");
+    string template = Path.Combine(directory, "runtime-{timestamp}.log");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        string[] oldFiles =
+        [
+            Path.Combine(directory, "runtime-20200101-000001.log"),
+            Path.Combine(directory, "runtime-20200101-000002.log"),
+            Path.Combine(directory, "runtime-20200101-000003.log"),
+        ];
+        for (int index = 0; index < oldFiles.Length; index++)
+        {
+            File.WriteAllText(oldFiles[index], $"old-{index}");
+            File.SetLastWriteTimeUtc(oldFiles[index], DateTime.UtcNow.AddMinutes(-3 + index));
+        }
+
+        string current = Path.Combine(directory, "runtime-20200101-000004.log");
+        LogFileRetention.Enforce(template, current, maxFileCount: 3);
+        File.WriteAllText(current, "current");
+        string[] retained = Directory.GetFiles(directory, "runtime-*.log");
+        Require(retained.Length == 3, $"日志数量限制未生效：实际保留 {retained.Length} 个文件");
+        Require(!File.Exists(oldFiles[0]), "日志数量限制应优先删除最旧文件");
+        Console.WriteLine("日志目录与数量限制检查：三类默认目录、默认保留数量和最旧文件清理均符合预期。");
     }
     finally
     {
@@ -1086,11 +1574,28 @@ static void CheckRemoteInputUdpPath()
     Require(transport.MouseReports().Length == reportCount, "超范围的 UDP 模拟输入不得进入鼠标报告链路");
 
     input.SetForwardingEnabled(false);
-    byte[] disabled = Encoding.UTF8.GetBytes(
+    byte[] alwaysOutput = Encoding.UTF8.GetBytes(
         "{\"dx\":5,\"dy\":5}");
+    client.Send(alwaysOutput, alwaysOutput.Length, "127.0.0.1", server.Port);
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           transport.MouseReports().Sum(report => (long)report.X) < 42)
+    {
+        Thread.Sleep(5);
+    }
+    Require(
+        transport.MouseReports().Sum(report => (long)report.X) == 42,
+        "默认始终 UDP 输出开启时，同步关闭后仍应发送 UDP 模拟输入");
+
+    input.ConfigureAlwaysOutputUdp(false);
+    int disabledReportCount = transport.MouseReports().Length;
+    byte[] disabled = Encoding.UTF8.GetBytes(
+        "{\"dx\":6,\"dy\":6}");
     client.Send(disabled, disabled.Length, "127.0.0.1", server.Port);
     Thread.Sleep(50);
-    Require(transport.MouseReports().Length == reportCount, "同步关闭后 UDP 模拟输入不得继续发送鼠标报告");
+    Require(
+        transport.MouseReports().Length == disabledReportCount,
+        "关闭始终 UDP 输出后，同步关闭时不得继续发送 UDP 模拟输入");
 }
 
 static void CheckFirmwareUpdateApiPolicy()
@@ -1257,6 +1762,27 @@ static void CheckAutomationProfilesAndRuntime()
         Require(profile.LuaScriptText.Contains("OnEvent", StringComparison.Ordinal), "旧配置 Lua 文本未导入");
         Require(profile.Macros.TryGetValue("侧键测试", out MacroDefinition? importedMacro), "旧配置宏元数据未导入");
         Require(importedMacro!.Trigger == "mouse_side1" && importedMacro.Text.Contains("move(10,-4)", StringComparison.Ordinal), "旧宏触发键或正文未完整导入");
+        string migratedProfileDirectory = Path.Combine(current, "profiles", "Global");
+        Require(
+            File.Exists(Path.Combine(migratedProfileDirectory, "lua", "main.txt")) &&
+            File.ReadAllText(Path.Combine(migratedProfileDirectory, "lua", "main.txt")).Contains("OnEvent", StringComparison.Ordinal),
+            "旧版 Lua 打开后必须迁移到 lua/main.txt");
+        Require(
+            File.Exists(Path.Combine(migratedProfileDirectory, "macros", "侧键测试.txt")) &&
+            File.ReadAllText(Path.Combine(migratedProfileDirectory, "macros", "侧键测试.txt")).Contains("move(10,-4)", StringComparison.Ordinal),
+            "旧版宏打开后必须迁移到 macros/ 下的 txt");
+        string migratedMetadata = File.ReadAllText(Path.Combine(migratedProfileDirectory, "profile.json"));
+        Require(migratedMetadata.Contains("\"lua_script_file\"", StringComparison.Ordinal), "新版 JSON 必须保存 Lua 文件关联");
+        Require(!migratedMetadata.Contains("\"lua_script_text\"", StringComparison.Ordinal), "新版 JSON 不得继续保存 Lua 正文");
+        using (JsonDocument migratedDocument = JsonDocument.Parse(migratedMetadata))
+        {
+            Require(
+                migratedDocument.RootElement.GetProperty("macros")
+                    .GetProperty("侧键测试")
+                    .GetProperty("file")
+                    .GetString() == "macros/侧键测试.txt",
+                "新版 JSON 必须保存宏文件关联");
+        }
         AutomationSettings behaviorSettings = store.LoadSettings();
         behaviorSettings.MinimizeToTray = false;
         behaviorSettings.CloseToTray = false;
@@ -1318,6 +1844,191 @@ static void CheckAutomationProfilesAndRuntime()
     }
 }
 
+static void CheckLuaRuntimeFeatures()
+{
+    RecordingAutomationOutput output = new();
+    List<string> logs = [];
+    using LuaScriptRunner lua = new(output, logs.Add, _ => { }, () => logs.Clear());
+    string decimalScript = """
+        function OnEvent(event, arg)
+            if event == "pressed" then
+                move(0.25, -0.25)
+                move(0.25, -0.25)
+                move(0.25, -0.25)
+                move(0.25, -0.25)
+                delay(0)
+                sleep(0)
+            end
+        end
+        """;
+    (bool valid, string validationMessage) = lua.Check(decimalScript);
+    Require(valid, $"Lua 小数 move/delay/sleep 脚本检查失败：{validationMessage}");
+    lua.Start(decimalScript);
+    lua.HandlePhysicalInput(new PhysicalInputEvent(new HashSet<uint> { 0x05 }, 0x05, true));
+    Require(SpinWait.SpinUntil(() => output.Actions.Length >= 4, 1000), "Lua 小数 move 未在超时前执行完动作");
+    lua.Stop();
+    Require(
+        output.Actions.Count(action => action == "move:0,0") == 2 &&
+        output.Actions.Count(action => action == "move:1,-1") == 2,
+        $"Lua move 小数累计结果不正确：{string.Join(", ", output.Actions)}");
+
+    (bool syntaxValid, string syntaxMessage) = lua.Check(
+        "function OnEvent(event, arg)\n" +
+        "    if then\n" +
+        "    end\n" +
+        "end");
+    Require(
+        !syntaxValid && syntaxMessage.Contains("第 ", StringComparison.Ordinal) && syntaxMessage.Contains(" 行", StringComparison.Ordinal),
+        $"Lua 语法错误应显示错误行号：{syntaxMessage}");
+    try
+    {
+        lua.Start("function OnEvent(event, arg)\n    if then\n    end\nend");
+        throw new InvalidOperationException("Lua 非法脚本启动时未抛出语法错误");
+    }
+    catch (InvalidOperationException exception) when (exception.Message.Contains("第 ", StringComparison.Ordinal))
+    {
+        // 启动按钮使用同一格式化错误消息，语法错误不会丢失行号。
+    }
+
+    string runtimeScript = """
+        function OnEvent(event, arg)
+            if event == "pressed" then
+                missing_function()
+            end
+        end
+        """;
+    lua.Start(runtimeScript);
+    lua.HandlePhysicalInput(new PhysicalInputEvent(new HashSet<uint> { 0x05 }, 0x05, true));
+    Require(
+        SpinWait.SpinUntil(
+            () => logs.Any(line => line.Contains("Lua 执行错误", StringComparison.Ordinal) &&
+                                  line.Contains("第 3 行", StringComparison.Ordinal)),
+            1000),
+        $"Lua 运行时错误应显示错误行号：{string.Join(" | ", logs)}");
+    lua.Stop();
+    Console.WriteLine("Lua 运行特性检查：delay/sleep 可执行；move 小数累计输出正确；语法和运行时错误均显示行号。");
+}
+
+static void CheckExternalProfileStorageAndLuaIndentation()
+{
+    string root = Path.Combine(Path.GetTempPath(), $"hidbridge-profile-layout-{Guid.NewGuid():N}");
+    try
+    {
+        AutomationProfileStore store = new(root);
+        AutomationProfile profile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+        profile.LuaScriptText = "function OnEvent(event, arg)\nif event == 'pressed' then -- end in comment\nDebugLog('end in string')\nend\nend";
+        profile.Macros["布局宏"] = new MacroDefinition
+        {
+            Name = "布局宏",
+            Trigger = "f1",
+            Mode = MacroRunModes.Once,
+            Enabled = true,
+            Text = "move(1, 2)\n",
+        };
+        store.SaveProfile(profile);
+
+        string profileDirectory = Path.Combine(root, "profiles", AutomationProfileStore.GlobalProfile);
+        string metadataPath = Path.Combine(profileDirectory, "profile.json");
+        string metadata = File.ReadAllText(metadataPath);
+        Require(File.Exists(Path.Combine(profileDirectory, "lua", "main.txt")), "Lua 正文必须位于 lua/ 下的 txt");
+        Require(File.Exists(Path.Combine(profileDirectory, "macros", "布局宏.txt")), "宏正文必须位于 macros/ 下的 txt");
+        Require(metadata.Contains("\"lua_script_file\"", StringComparison.Ordinal), "配置 JSON 缺少 Lua 文件关联");
+        Require(!metadata.Contains("\"lua_script_text\"", StringComparison.Ordinal), "新配置 JSON 不得嵌入 Lua 正文");
+        using (JsonDocument metadataDocument = JsonDocument.Parse(metadata))
+        {
+            Require(
+                metadataDocument.RootElement.GetProperty("macros")
+                    .GetProperty("布局宏")
+                    .GetProperty("file")
+                    .GetString() == "macros/布局宏.txt",
+                "配置 JSON 缺少宏文件关联");
+        }
+
+        AutomationProfile reloaded = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+        Require(reloaded.LuaScriptText.Contains("end in string", StringComparison.Ordinal), "外置 Lua 重新加载失败");
+        Require(reloaded.Macros["布局宏"].Text.Contains("move(1, 2)", StringComparison.Ordinal), "外置宏重新加载失败");
+
+        string source =
+            "function OnEvent(event, arg)\n" +
+            "if event == 'pressed' then -- end must remain comment\n" +
+            "DebugLog('end must remain string')\n" +
+            "end\n" +
+            "end";
+        string aligned = LuaScriptIndentation.Align(source);
+        Require(aligned.Split(Environment.NewLine).Length == source.Split('\n').Length, "Lua 对齐不得改变换行数量");
+        Require(
+            aligned ==
+            string.Join(Environment.NewLine,
+            [
+                "function OnEvent(event, arg)",
+                "    if event == 'pressed' then -- end must remain comment",
+                "        DebugLog('end must remain string')",
+                "    end",
+                "end",
+            ]),
+            "Lua 对齐缩进结果不符合预期");
+        Require(LuaScriptIndentation.Align(aligned) == aligned, "Lua 对齐必须幂等");
+        Require(aligned.Contains("end must remain comment", StringComparison.Ordinal) &&
+                aligned.Contains("'end must remain string'", StringComparison.Ordinal),
+            "Lua 对齐不得修改注释或字符串内容");
+        CheckLuaSpacingFormatting();
+        Console.WriteLine("外置配置与 Lua 对齐检查：宏/Lua 独立 txt、JSON 关联、重新加载、缩进和行内空格格式化均通过，且不改换行。");
+    }
+    finally
+    {
+        if (Directory.Exists(root))
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+}
+
+static void CheckLuaSpacingFormatting()
+{
+    string spacingSource =
+        "local a=1+2\n" +
+        "local b=a..-3\n" +
+        "local c=-1\n" +
+        "local d=a- -b\n" +
+        "local e=1e-3\n" +
+        "local s='a=b .. -c'\n" +
+        "local long=[=[a=b .. -c]=] -- a=b .. -c\n" +
+        "local vararg=...\n" +
+        "local compare=a~=b and c<=d and e>=f\n" +
+        "local floor=7//2\n" +
+        "local table={a=1,b=2}\n" +
+        "foo(a,b)\n" +
+        "if(x==1)then";
+    string spaced = LuaScriptIndentation.Align(spacingSource);
+    string expectedSpacing = string.Join(
+        Environment.NewLine,
+        [
+            "local a = 1 + 2",
+            "local b = a .. -3",
+            "local c = -1",
+            "local d = a - -b",
+            "local e = 1e-3",
+            "local s = 'a=b .. -c'",
+            "local long = [=[a=b .. -c]=] -- a=b .. -c",
+            "local vararg = ...",
+            "local compare = a ~= b and c <= d and e >= f",
+            "local floor = 7 // 2",
+            "local table = {a = 1, b = 2}",
+            "foo(a, b)",
+            "if (x == 1) then",
+        ]);
+    Require(spaced == expectedSpacing, "Lua 行内空格格式化结果不符合预期");
+    Require(
+        spaced.Split(Environment.NewLine).Length == spacingSource.Split('\n').Length,
+        "Lua 空格格式化不得改变换行数量");
+    Require(LuaScriptIndentation.Align(spaced) == spaced, "Lua 空格格式化必须幂等");
+    Require(
+        spaced.Contains("'a=b .. -c'", StringComparison.Ordinal) &&
+        spaced.Contains("[=[a=b .. -c]=] -- a=b .. -c", StringComparison.Ordinal),
+        "Lua 空格格式化不得修改字符串或注释内容");
+    Console.WriteLine("Lua 空格格式化专项检查通过：运算符、连接符、逗号、括号、一元负号、数字和注释/字符串保护均符合预期。");
+}
+
 static void CheckAutomationRemoteOutput()
 {
     RecordingTransport transport = new();
@@ -1351,12 +2062,15 @@ static void CheckLocalMouseTriggersReachLua()
         AutomationProfileStore store = new(directory);
         AutomationProfile profile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
         profile.LuaScriptText =
-            "function OnEvent(event, arg) DebugLog(\"event=%s arg=%s\", event, tostring(arg)) end";
+            "function OnEvent(event, arg) " +
+            "DebugLog(\"event=%s arg=%s\", event, tostring(arg)); " +
+            "if event == \"pressed\" then DebugLog(\"press arg=%s\", tostring(arg)) " +
+            "else DebugLog(\"release arg=%s\", tostring(arg)) end end";
         store.SaveProfile(profile);
 
         RecordingTransport transport = new();
         using InputForwarder input = new(transport);
-        using AutomationController automation = new(store, input);
+        using AutomationController automation = new(store, input, new RecordingAutomationOutput());
         ConcurrentQueue<string> logs = new();
         ConcurrentQueue<string> diagnosticLogs = new();
         automation.Log += logs.Enqueue;
@@ -1381,12 +2095,20 @@ static void CheckLocalMouseTriggersReachLua()
             diagnosticLogs.Any(line => line.StartsWith("[LuaEvent]", StringComparison.Ordinal)),
             "Lua 事件详细诊断未进入独立日志通道");
         Require(
+            logs.Count(line => line == "press arg=4") == 1 &&
+            logs.Count(line => line == "release arg=4") == 1,
+            "脚本主动 DebugLog 的 press/release arg=4 必须保留且不能被 Host 重复生成");
+        Require(
+            diagnosticLogs.Any(line => line.Contains("event=pressed arg=4", StringComparison.Ordinal)) &&
+            diagnosticLogs.Any(line => line.Contains("event=released arg=4", StringComparison.Ordinal)),
+            "Lua 事件详细诊断必须保留原始参数");
+        Require(
             !logs.Any(line => line.StartsWith("[LuaEvent]", StringComparison.Ordinal) ||
                               line.StartsWith("[LuaOutput]", StringComparison.Ordinal)),
             "Lua UI 简略日志通道不得包含详细事件或输出诊断");
         Require(transport.MouseReports().Length == 0, "本机 Lua 触发不得向对端发送实体鼠标报告");
         Console.WriteLine(
-            "本机 Lua 触发检查：捕获关闭；实际日志包含 event=pressed arg=4 和 event=released arg=4；对端鼠标报告=0。");
+            "本机 Lua 触发检查：脚本 DebugLog 保留；Host 不额外生成 press/release arg 日志；对端鼠标报告=0。");
     }
     finally
     {
@@ -1416,7 +2138,7 @@ static void CheckTriggerForwardingIntegration()
 
         RecordingTransport transport = new();
         using InputForwarder input = new(transport);
-        using AutomationController automation = new(store, input);
+        using AutomationController automation = new(store, input, new RecordingAutomationOutput());
         ConcurrentQueue<string> transitionLogs = new();
         automation.Log += transitionLogs.Enqueue;
         automation.Start();
@@ -1461,6 +2183,98 @@ static void CheckTriggerForwardingIntegration()
     }
 }
 
+static void CheckToggleMacroStopsOnSecondPress()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-toggle-{Guid.NewGuid():N}");
+    try
+    {
+        AutomationProfileStore store = new(directory);
+        AutomationProfile profile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+        profile.Macros["切换宏"] = new MacroDefinition
+        {
+            Name = "切换宏",
+            Trigger = "mouse_side1",
+            Mode = MacroRunModes.Toggle,
+            Enabled = true,
+            Text = "move(1,0)\ndelay(10)",
+        };
+        store.SaveProfile(profile);
+
+        RecordingTransport transport = new();
+        RecordingAutomationOutput output = new();
+        ConcurrentQueue<string> logs = new();
+        using InputForwarder input = new(transport);
+        using AutomationController automation = new(store, input, output);
+        automation.Log += logs.Enqueue;
+        automation.Start();
+
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Down,
+        });
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Up,
+        });
+        Require(
+            SpinWait.SpinUntil(() => output.Actions.Count(action => action == "move:1,0") >= 3, 1000),
+            "切换重复宏第一次按下未启动循环");
+        Require(logs.Any(line => line.StartsWith("触发宏：mouse_side1", StringComparison.Ordinal)), "切换重复宏第一次按下未记录触发宏");
+
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Down,
+        });
+        input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseButton4Up,
+        });
+        Thread.Sleep(100);
+        int moveCountAfterStop = output.Actions.Count(action => action == "move:1,0");
+        Thread.Sleep(100);
+        Require(
+            output.Actions.Count(action => action == "move:1,0") == moveCountAfterStop,
+            "切换重复宏第二次按下后仍在循环执行");
+        Require(logs.Any(line => line.StartsWith("停止宏：mouse_side1", StringComparison.Ordinal)), "切换重复宏第二次按下未记录停止宏");
+        Console.WriteLine($"切换重复宏检查：第一次按下启动，第二次按下停止，停止时累计 move={moveCountAfterStop}，日志已区分触发/停止。");
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+}
+
+static void CheckHotkeyChooserControl()
+{
+    using HotkeyChooserControl chooser = new();
+    TableLayoutPanel layout = chooser.Controls.OfType<TableLayoutPanel>().Single();
+    ComboBox keyComboBox = layout.Controls.OfType<ComboBox>().Single();
+    Button addButton = layout.Controls.OfType<Button>().Single(button => button.Text == "添加按键");
+    Button clearButton = layout.Controls.OfType<Button>().Single(button => button.Text == "清空");
+
+    Require(
+        AutomationKeyMap.TriggerKeyNames.Contains("mouse_side1", StringComparer.OrdinalIgnoreCase) &&
+        AutomationKeyMap.TriggerKeyNames.Contains("ctrl", StringComparer.OrdinalIgnoreCase) &&
+        AutomationKeyMap.TriggerKeyNames.Contains("f24", StringComparer.OrdinalIgnoreCase),
+        "触发键下拉列表未包含鼠标侧键、修饰键和 F24");
+
+    keyComboBox.SelectedItem = "ctrl";
+    addButton.PerformClick();
+    keyComboBox.SelectedItem = "f1";
+    addButton.PerformClick();
+    addButton.PerformClick();
+    Require(chooser.Value == "ctrl+f1", $"触发键添加/去重结果不正确：{chooser.Value}");
+
+    chooser.SetHotkey("mouse_side1+ctrl+f1");
+    Require(chooser.Value == "mouse_side1+ctrl+f1", $"已有组合键载入结果不正确：{chooser.Value}");
+    clearButton.PerformClick();
+    Require(string.IsNullOrEmpty(chooser.Value), "清空触发键后仍保留组合键");
+    Console.WriteLine("宏触发键选择器检查：下拉键表、组合添加、重复去重、已有组合载入和清空均通过。");
+}
+
 static void CheckWindowLayout()
 {
     Exception? failure = null;
@@ -1472,14 +2286,32 @@ static void CheckWindowLayout()
             RecordingTransport transport = new();
             using InputForwarder input = new(transport);
             AutomationProfileStore store = new(automationDirectory);
-            using AutomationController automation = new(store, input);
-            using BridgeMainForm form = new(input, automation, "测试端点");
+            AutomationProfile uiProfile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+            uiProfile.LuaScriptText = "function OnEvent(event, arg)\nif event == \"pressed\" then\nDebugLog(\"aligned\")\nend\nend";
+            uiProfile.Macros["立即保存宏"] = new MacroDefinition
+            {
+                Name = "立即保存宏",
+                Trigger = "f1",
+                Mode = MacroRunModes.Once,
+                Enabled = true,
+                Text = "move(1,1)",
+            };
+            store.SaveProfile(uiProfile);
+            using AutomationController automation = new(store, input, new RecordingAutomationOutput());
+            // 该布局检查只验证离屏控件和 RecordingAutomationOutput；禁止把测试光标移到真实桌面。
+            using BridgeMainForm form = new(input, automation, "测试端点", enableCursorLock: false);
             _ = form.Handle;
             form.PerformLayout();
             double upperRatio = form.MainSplit.SplitterDistance / (double)form.MainSplit.ClientSize.Height;
             Require(upperRatio is >= 0.45 and <= 0.55, "窗口上半区必须约占客户区一半");
             Require(form.MainTabs.TabPages.Count == 4, "主窗口必须包含鼠标捕获、宏、Lua、设置四个功能页");
             Require(form.MainTabs.TabPages.Cast<TabPage>().Select(page => page.Text).SequenceEqual(["鼠标捕获", "宏", "Lua", "设置"]), "四个功能页顺序或名称不正确");
+            form.MainTabs.SelectedTab = form.MainTabs.TabPages[1];
+            form.MainTabs.PerformLayout();
+            form.MainTabs.SelectedTab.PerformLayout();
+            form.MacroPage.PerformLayout();
+            Application.DoEvents();
+            form.PerformLayout();
             Require(form.MacroPage.ProfileComboBox.Items.Count >= 1, "宏页未加载手动配置列表");
             Require(form.LuaPage.ProfileComboBox.Items.Count >= 1, "Lua 页未加载手动配置列表");
             Require(form.LuaPage.AddProfileButton.Text == "新增配置" && form.LuaPage.DeleteProfileButton.Text == "删除配置", "Lua 页缺少新增/删除配置按钮");
@@ -1492,14 +2324,193 @@ static void CheckWindowLayout()
                 LuaPageControl.NormalizeEditorNewlines("第一行\n第二行\r第三行\r\n第四行") ==
                 $"第一行{Environment.NewLine}第二行{Environment.NewLine}第三行{Environment.NewLine}第四行",
                 "Lua 编辑器粘贴前必须把不同换行格式统一为 Windows 多行文本");
+            form.MainTabs.SelectedTab = form.MainTabs.TabPages[2];
+            form.LuaPage.Editor.Text = "function OnEvent(event,arg)\nif event==\"pressed\" then\nDebugLog(\"aligned\")\nend\nend";
+            int luaLineCountBeforeCheck = form.LuaPage.Editor.Text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n').Length;
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-32000, -32000);
+            form.Show();
+            Application.DoEvents();
+            Require(!automation.LuaActive, "Lua 布局检查初始状态必须为已停止");
+            Require(form.LuaPage.StartButton.Enabled && !form.LuaPage.StopButton.Enabled, "Lua 初始按钮状态必须为启动可用、停止禁用");
+            CheckCopyableInterfaceDialog(form.LuaPage.ApiButton, "Lua 接口说明", "move(dx, dy)");
+            form.LuaPage.StartButton.PerformClick();
+            Application.DoEvents();
+            Require(automation.LuaActive, "点击 Lua 启动后控制器必须进入运行状态");
+            Require(!form.LuaPage.StartButton.Enabled && form.LuaPage.StopButton.Enabled, "Lua 运行时必须禁用启动、启用停止");
+            form.LuaPage.StopButton.PerformClick();
+            Application.DoEvents();
+            Require(!automation.LuaActive, "点击 Lua 停止后控制器必须回到停止状态");
+            Require(form.LuaPage.StartButton.Enabled && !form.LuaPage.StopButton.Enabled, "Lua 停止后必须恢复启动可用、停止禁用");
+            form.LuaPage.Editor.Text = "function OnEvent(event, arg)\nthis is not valid Lua\nend";
+            form.LuaPage.StartButton.PerformClick();
+            Application.DoEvents();
+            Require(!automation.LuaActive, "Lua 启动失败后控制器不得报告运行中");
+            Require(form.LuaPage.StartButton.Enabled && !form.LuaPage.StopButton.Enabled, "Lua 启动失败后按钮状态必须仍为启动可用、停止禁用");
+            Console.WriteLine("Lua 按钮状态检查：初始、启动、停止和启动失败均按控制器真实状态互斥。");
+            form.LuaPage.Editor.Text = "function OnEvent(event,arg)\nif event==\"pressed\" then\nDebugLog(\"aligned\")\nend\nend";
+            Require(
+                form.LuaPage.LineNumberGutter.Visible && form.LuaPage.LineNumberGutter.Width >= 30,
+                "Lua 输入栏左侧必须显示可见的行号栏");
+            form.LuaPage.CheckButton.PerformClick();
+            Require(
+                form.LuaPage.Editor.Text.StartsWith($"function OnEvent(event, arg){Environment.NewLine}    if event == \"pressed\" then", StringComparison.Ordinal) &&
+                form.LuaPage.Editor.Text.Contains($"{Environment.NewLine}        DebugLog", StringComparison.Ordinal) &&
+                form.LuaPage.Editor.Text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n').Length == luaLineCountBeforeCheck &&
+                form.LuaPage.StatusLabel.Text.Contains("自动对齐缩进和空格", StringComparison.Ordinal),
+                "Lua 检查必须自动对齐已有行、规范行内空格且不得改变换行数量");
+            form.MainTabs.SelectedTab = form.MainTabs.TabPages[1];
+            form.MacroPage.PerformLayout();
+            Application.DoEvents();
+            CheckCopyableInterfaceDialog(form.MacroPage.InterfaceButton, "宏接口说明", "randsleep(base, variance)");
+            SplitContainer macroEditorSplit = EnumerateControls(form.MacroPage)
+                .OfType<SplitContainer>()
+                .Single(split => split.Orientation == Orientation.Vertical);
+            Require(macroEditorSplit.SplitterDistance >= 330, $"宏列表区域应加宽：当前分隔位置={macroEditorSplit.SplitterDistance}，客户区={macroEditorSplit.ClientSize.Width}x{macroEditorSplit.ClientSize.Height}");
+            TableLayoutPanel macroButtons = EnumerateControls(form.MacroPage)
+                .OfType<TableLayoutPanel>()
+                .Single(layout => layout.Controls.OfType<Button>().Any(button => button.Text == "新增宏"));
+            Require(
+                macroButtons.RowCount == 2 &&
+                macroButtons.Controls.OfType<Button>().Select(button => button.Text).ToHashSet().SetEquals(["新增宏", "删除宏", "重命名"]) &&
+                macroButtons.GetControlFromPosition(0, 1)?.Text == "重命名" &&
+                macroButtons.GetColumnSpan(macroButtons.GetControlFromPosition(0, 1)!) == 1 &&
+                macroButtons.GetControlFromPosition(1, 1) is null,
+                "宏列表下方按钮必须分成两行并完整显示新增、删除、重命名");
+            TableLayoutPanel editorButtons = EnumerateControls(form.MacroPage)
+                .OfType<TableLayoutPanel>()
+                .Single(layout => layout.Controls.OfType<Button>().Any(button => button.Text == "检查语法"));
+            Require(
+                editorButtons.GetControlFromPosition(0, 0)?.Text == "接口说明" &&
+                editorButtons.GetControlFromPosition(1, 0)?.Text == "检查语法" &&
+                editorButtons.GetControlFromPosition(2, 0)?.Text == "保存宏",
+                "宏编辑器按钮顺序必须为接口说明、检查语法、保存宏");
+            foreach (TextBox logTextBox in new[]
+            {
+                EnumerateControls(form.MacroPage).OfType<TextBox>().Single(textBox => textBox.ReadOnly && textBox.Multiline),
+                EnumerateControls(form.LuaPage).OfType<TextBox>().Single(textBox => textBox.ReadOnly && textBox.Multiline),
+            })
+            {
+                logTextBox.Text = "历史日志第一行\r\n历史日志第二行";
+                logTextBox.SelectionStart = 2;
+                logTextBox.SelectionLength = 5;
+                string selectedLog = logTextBox.SelectedText;
+                LogTextBoxAppender.Append(logTextBox, ["最新日志"], 64 * 1024);
+                Require(logTextBox.SelectedText == selectedLog, "宏/Lua 日志追加时不得强制把部分选区扩展到日志底部");
+            }
+            form.MainTabs.SelectedTab = form.MainTabs.TabPages[0];
+            form.MainTabs.PerformLayout();
+            Application.DoEvents();
+            TextBox mainLogTextBox = form.LogTextBox;
+            mainLogTextBox.Text = string.Join(
+                Environment.NewLine,
+                Enumerable.Range(1, 80).Select(index => $"主日志历史 {index}")) + Environment.NewLine;
+            mainLogTextBox.Focus();
+            mainLogTextBox.SelectionStart = mainLogTextBox.TextLength;
+            mainLogTextBox.SelectionLength = 0;
+            mainLogTextBox.ScrollToCaret();
+            Application.DoEvents();
+            int mainLogFirstVisibleLineAtBottom = GetFirstVisibleLine(mainLogTextBox);
+            Require(mainLogFirstVisibleLineAtBottom > 0, "主捕获页日志测试未能建立位于底部的视图");
+            SetTextBoxInsertionPointWithoutScrolling(mainLogTextBox, 2);
+            Application.DoEvents();
+            Require(
+                GetFirstVisibleLine(mainLogTextBox) == mainLogFirstVisibleLineAtBottom,
+                "主捕获页日志测试未能保持历史插入点下的底部视图");
+            form.AppendLog("主捕获页底部跟随日志");
+            Require(
+                mainLogTextBox.SelectionLength == 0 && mainLogTextBox.SelectionStart == mainLogTextBox.TextLength,
+                "主捕获页日志在底部时不得因插入点位于历史位置而停止跟随");
+            Require(
+                GetFirstVisibleLine(mainLogTextBox) >= mainLogFirstVisibleLineAtBottom,
+                "主捕获页日志在底部且插入点位于历史位置时必须继续滚动到最新日志");
+            CheckLogTextBoxAppenderFollowAtBottom();
             string[] macroPageOptions = EnumerateControls(form.MacroPage).Select(control => control.Text).ToArray();
             Require(!macroPageOptions.Contains("开机启动") && !macroPageOptions.Contains("最小化到托盘") && !macroPageOptions.Contains("关闭到托盘"), "程序行为设置不得继续显示在宏页");
+            Require(
+                macroPageOptions.Contains("触发键：") &&
+                macroPageOptions.Contains("添加按键") &&
+                macroPageOptions.Contains("清空") &&
+                macroPageOptions.Contains("重命名") &&
+                macroPageOptions.Contains("启用宏"),
+                "宏页必须显示触发键选择器的按钮、重命名按钮和启用宏勾选框");
+            Require(form.MacroPage.EnabledCheckBox.Checked, "新建或空宏默认必须启用");
+            Require(form.MacroPage.MacroListBox.SelectedItem as string == "立即保存宏", "宏页未加载用于即时保存检查的宏");
+            form.MacroPage.ModeComboBox.SelectedIndex = 1;
+            AutomationProfile modeSavedProfile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+            Require(modeSavedProfile.Macros["立即保存宏"].Mode == MacroRunModes.Toggle, "切换宏模式后未立即保存");
+            form.MacroPage.EnabledCheckBox.Checked = false;
+            AutomationProfile enabledSavedProfile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+            Require(!enabledSavedProfile.Macros["立即保存宏"].Enabled, "启用宏开关变化后未立即保存");
+            Require(!automation.Settings.MinimizeToTray, "最小化到托盘默认必须关闭");
+            Require(form.Icon is not null && form.TrayIcon.Icon is not null, "主窗口和状态栏必须加载应用图标");
+            TableLayoutPanel chooserLayout = form.MacroPage.TriggerChooser.Controls.OfType<TableLayoutPanel>().Single();
+            Control displayControl = chooserLayout.GetControlFromPosition(0, 0) ?? throw new InvalidOperationException("触发键显示栏未加载");
+            Control keySelectorControl = chooserLayout.GetControlFromPosition(1, 0) ?? throw new InvalidOperationException("触发键选择下拉框未加载");
+            Control addKeyControl = chooserLayout.GetControlFromPosition(2, 0) ?? throw new InvalidOperationException("添加按键按钮未加载");
+            Control clearKeyControl = chooserLayout.GetControlFromPosition(3, 0) ?? throw new InvalidOperationException("清空按钮未加载");
+            Require(
+                new[] { displayControl.Height, keySelectorControl.Height, addKeyControl.Height, clearKeyControl.Height }.Distinct().Count() == 1,
+                $"触发键显示栏、选择下拉框、添加和清空按钮高度必须一致：显示={displayControl.Height}，选择={keySelectorControl.Height}，添加={addKeyControl.Height}，清空={clearKeyControl.Height}；类型={keySelectorControl.GetType().FullName}，AutoSize={keySelectorControl.AutoSize}，Dock={keySelectorControl.Dock}，最小={keySelectorControl.MinimumSize.Height}，最大={keySelectorControl.MaximumSize.Height}");
+            TableLayoutPanel optionsLayout = form.MacroPage.ModeComboBox.Parent as TableLayoutPanel
+                ?? throw new InvalidOperationException("模式选项布局未加载");
+            Require(
+                optionsLayout.ColumnStyles[1].Width < optionsLayout.ColumnStyles[3].Width,
+                $"模式选择下拉框必须短于启用宏区域：百分比={optionsLayout.ColumnStyles[1].Width}/{optionsLayout.ColumnStyles[3].Width}");
+            Point triggerStart = form.MacroPage.TriggerChooser.PointToScreen(Point.Empty);
+            Point modeStart = form.MacroPage.ModeComboBox.PointToScreen(Point.Empty);
+            Require(
+                Math.Abs(triggerStart.X - modeStart.X) <= 1,
+                $"模式选择下拉框左端必须与触发键显示栏对齐：触发={triggerStart.X}，模式={modeStart.X}");
             Require(form.SettingsPage.StartOnBootCheckBox.Text.StartsWith("开机启动", StringComparison.Ordinal), "设置页缺少开机启动选项");
             Require(form.SettingsPage.MinimizeToTrayCheckBox.Checked == automation.Settings.MinimizeToTray, "设置页最小化到托盘状态未从配置加载");
             Require(form.SettingsPage.CloseToTrayCheckBox.Checked == automation.Settings.CloseToTray, "设置页关闭到托盘状态未从配置加载");
             Require(form.SettingsPage.GenerateMovementAnalysisImageCheckBox.Checked == automation.Settings.GenerateMovementAnalysisImage, "设置页分析图片开关状态未从配置加载");
+            Require(!automation.Settings.GenerateMovementAnalysisImage, "新配置的分析图片开关默认必须关闭");
+            Require(form.OutputSensitivityTrackBar.Minimum == 30 && form.OutputSensitivityTrackBar.Maximum == 300 && form.OutputSensitivityTrackBar.Value == 100, "输出灵敏度滑块范围或默认值不正确");
+            Require(form.OutputSensitivityTextBox.Text == "1", "输出灵敏度输入框默认值必须为 1");
+            Require(form.OutputSensitivityDescriptionLabel.Text.Contains("实体鼠标、UDP、Lua、宏", StringComparison.Ordinal), "输出灵敏度说明未覆盖四类输入来源");
+            Label outputSensitivityLabel = EnumerateControls(form)
+                .OfType<Label>()
+                .Single(label => label.Text == "输出灵敏度");
+            Require(
+                outputSensitivityLabel.TextAlign == ContentAlignment.TopLeft &&
+                outputSensitivityLabel.Padding.Top == 2,
+                "输出灵敏度标签应在第一行上方对齐并保留完整字高");
+            form.MainTabs.SelectedIndex = 0;
+            form.MainTabs.PerformLayout();
+            Application.DoEvents();
+            FlowLayoutPanel udpOptionsLayout = EnumerateControls(form)
+                .OfType<FlowLayoutPanel>()
+                .Single(layout => layout.Controls.Contains(form.UdpSmoothingCheckBox));
+            Require(
+                udpOptionsLayout.Controls.Contains(form.AlwaysOutputUdpCheckBox) &&
+                form.UdpSmoothingCheckBox.Anchor == AnchorStyles.None &&
+                form.AlwaysOutputUdpCheckBox.Anchor == AnchorStyles.None &&
+                form.UdpSmoothingCheckBox.Visible &&
+                form.AlwaysOutputUdpCheckBox.Visible &&
+                form.UdpSmoothingCheckBox.Text == "UDP 平滑" &&
+                form.AlwaysOutputUdpCheckBox.Text == "始终开启 UDP 输出" &&
+                form.UdpSmoothingCheckBox.Width > 0 &&
+                form.AlwaysOutputUdpCheckBox.Width > 0 &&
+                form.UdpSmoothingCheckBox.Right <= udpOptionsLayout.ClientSize.Width &&
+                form.AlwaysOutputUdpCheckBox.Right <= udpOptionsLayout.ClientSize.Width &&
+                form.UdpSmoothingCheckBox.Left < form.AlwaysOutputUdpCheckBox.Left &&
+                form.AlwaysOutputUdpCheckBox.Right >= udpOptionsLayout.ClientSize.Width - 4,
+                $"两个 UDP 复选框及完整文字必须在当前行可见、不被裁切且整体靠右：" +
+                $"pos={form.UdpSmoothingCheckBox.Left}/{form.AlwaysOutputUdpCheckBox.Left}," +
+                $"right={form.AlwaysOutputUdpCheckBox.Right}/{udpOptionsLayout.ClientSize.Width}," +
+                $"anchor={form.UdpSmoothingCheckBox.Anchor}/{form.AlwaysOutputUdpCheckBox.Anchor}," +
+                $"flow={udpOptionsLayout.FlowDirection}");
             Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Checked, "本机固件刷写接口默认必须关闭");
             Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Enabled, "无串口刷写服务时设置页接口开关必须禁用");
+            Button firmwareConfirmButton = EnumerateControls(form.SettingsPage)
+                .OfType<Button>()
+                .Single(button => button.Text == "确定");
+            Require(
+                firmwareConfirmButton.BackColor == Color.FromArgb(237, 243, 250) &&
+                firmwareConfirmButton.ForeColor == Color.FromArgb(23, 35, 58),
+                "本地固件刷写确定按钮必须使用普通按钮样式");
             automation.Settings.GenerateMovementAnalysisImage = false;
             form.ProcessMovementRecordingForChecks(new MouseMovementRecording(
                 DateTime.UtcNow.AddSeconds(-1), DateTime.UtcNow, [3], [-2]));
@@ -1529,13 +2540,25 @@ static void CheckWindowLayout()
                 "模拟 UDP 默认频率必须为 100 Hz");
             Require(form.UdpSmoothingCheckBox.Checked, "UDP 平滑开关默认必须开启");
             Require(input.UdpSmoothingEnabled, "界面创建后 UDP 平滑状态应默认开启");
+            Require(form.AlwaysOutputUdpCheckBox.Checked, "始终 UDP 输出开关默认必须开启");
+            Require(input.AlwaysOutputUdpEnabled, "界面创建后始终 UDP 输出状态应默认开启");
+            form.AlwaysOutputUdpCheckBox.Checked = false;
+            Require(!input.AlwaysOutputUdpEnabled, "界面开关未关闭始终 UDP 输出");
+            form.AlwaysOutputUdpCheckBox.Checked = true;
+            Require(input.AlwaysOutputUdpEnabled, "界面开关未重新开启始终 UDP 输出");
             form.UdpSmoothingCheckBox.Checked = false;
             Require(!input.UdpSmoothingEnabled, "界面开关未关闭 UDP 平滑");
             form.UdpSmoothingCheckBox.Checked = true;
             Require(input.UdpSmoothingEnabled, "界面开关未重新开启 UDP 平滑");
             input.SetForwardingEnabled(true);
+            PumpUntilUi(
+                () => !form.UdpSmoothingCheckBox.Enabled,
+                "同步开启后的 ForwardingChanged UI 更新未完成");
             Require(!form.UdpSmoothingCheckBox.Enabled, "同步开启时 UDP 平滑开关必须禁用");
             input.SetForwardingEnabled(false);
+            PumpUntilUi(
+                () => form.UdpSmoothingCheckBox.Enabled,
+                "同步关闭后的 ForwardingChanged UI 更新未完成");
             Require(form.UdpSmoothingCheckBox.Enabled, "同步关闭后 UDP 平滑开关必须恢复可用");
             form.SimulatedUdpCheckBox.Checked = true;
             Require(input.SimulatedUdpInputEnabled, "界面开关未启用模拟 UDP 输入");
@@ -1582,8 +2605,11 @@ static void CheckWindowLayout()
             Require(allText.Contains("HOME", StringComparison.Ordinal), "界面未显示同步快捷键");
             Require(allText.Contains("END", StringComparison.Ordinal), "界面未显示结束快捷键");
             Require(allText.Contains("模拟 UDP", StringComparison.Ordinal), "界面未显示模拟 UDP 开关");
+            Require(allText.Contains("仅用于测试输入聚合、UDP 平滑和输出链路，不代表真实网络性能。", StringComparison.Ordinal), "模拟 UDP 行缺少实际用途说明");
             Require(allText.Contains("UDP 平滑", StringComparison.Ordinal), "界面未显示 UDP 平滑开关");
-            Require(allText.Contains("左右键同按", StringComparison.Ordinal), "界面未提示鼠标移动记录触发方式");
+            Require(allText.Contains("输出灵敏度", StringComparison.Ordinal), "界面未显示统一输出灵敏度控件");
+            Require(allText.Contains("发送到固件前处理最终", StringComparison.Ordinal), "界面未说明输出灵敏度生效位置");
+            Require(allText.Contains("始终开启 UDP 输出", StringComparison.Ordinal), "界面未显示始终开启 UDP 输出开关");
             Require(allText.Contains("本机固件刷写接口", StringComparison.Ordinal), "设置页未显示本机固件刷写接口开关");
             Require(allText.Contains("暂停自动跟随", StringComparison.Ordinal), "日志栏未提示滚动到上方后暂停自动跟随");
             CheckDarkSurfaceTextContrast(form);
@@ -1594,11 +2620,24 @@ static void CheckWindowLayout()
             form.ShowInTaskbar = false;
             form.Show();
             Application.DoEvents();
+            form.MainTabs.SelectedIndex = 0;
+            RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-capture.png"));
+            form.MainTabs.SelectedIndex = 1;
+            RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-macro.png"));
             form.MainTabs.SelectedIndex = 2;
             RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-lua-settings-update.png"));
             form.MainTabs.SelectedIndex = 3;
             RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-settings.png"));
-            Console.WriteLine("四页 UI 检查：设置已从宏页迁出；Lua 页含新增/删除配置；设置页含启动、托盘、分析图片和本机固件刷写接口开关。");
+            form.WindowState = FormWindowState.Normal;
+            form.ClientSize = new Size(1010, 710);
+            form.Close();
+            AutomationSettings savedWindowSettings = store.LoadSettings();
+            Require(
+                savedWindowSettings.WindowWidth == 1010 && savedWindowSettings.WindowHeight == 710,
+                $"关闭到托盘时窗口尺寸未保存：{savedWindowSettings.WindowWidth}x{savedWindowSettings.WindowHeight}");
+            automation.Settings.CloseToTray = false;
+            form.Close();
+            Console.WriteLine("四页 UI 检查：设置已从宏页迁出；宏/Lua 页含可复制接口说明和状态按钮；设置页含启动、托盘、分析图片、模拟 UDP 说明和本机固件刷写接口开关。");
             Directory.Delete(automationDirectory, true);
         }
         catch (Exception exception)
@@ -1613,6 +2652,73 @@ static void CheckWindowLayout()
     {
         throw new InvalidOperationException("窗口布局检查失败", failure);
     }
+}
+
+static void PumpUntilUi(Func<bool> condition, string timeoutMessage)
+{
+    long deadline = Environment.TickCount64 + 1000;
+    while (!condition())
+    {
+        Application.DoEvents();
+        if (Environment.TickCount64 >= deadline)
+        {
+            throw new InvalidOperationException(timeoutMessage);
+        }
+    }
+}
+
+static void CheckCopyableInterfaceDialog(Button trigger, string expectedTitle, string expectedText)
+{
+    Exception? failure = null;
+    bool closedByButton = false;
+    using System.Windows.Forms.Timer timer = new() { Interval = 20 };
+    timer.Tick += (_, _) =>
+    {
+        CopyableTextDialog? dialog = Application.OpenForms
+            .OfType<CopyableTextDialog>()
+            .SingleOrDefault();
+        if (dialog is null)
+        {
+            return;
+        }
+
+        try
+        {
+            Require(dialog.Text == expectedTitle, $"接口说明弹窗标题不正确：{dialog.Text}");
+            Require(
+                dialog.ContentTextBox.Multiline &&
+                dialog.ContentTextBox.ReadOnly &&
+                dialog.ContentTextBox.ScrollBars == ScrollBars.Both &&
+                dialog.ContentTextBox.ShortcutsEnabled,
+                "接口说明正文必须是只读、可选中复制、支持滚动的多行文本框");
+            Require(dialog.ContentTextBox.Text.Contains(expectedText, StringComparison.Ordinal), "接口说明正文未包含当前实际 API 文案");
+            dialog.ContentTextBox.Select(0, Math.Min(16, dialog.ContentTextBox.TextLength));
+            Require(dialog.ContentTextBox.SelectedText.Length > 0, "接口说明正文必须支持文本选择");
+            dialog.ContentTextBox.Copy();
+            Require(dialog.AcceptButton == dialog.CloseButton && dialog.CancelButton == dialog.CloseButton, "接口说明弹窗必须支持确认和 Esc 关闭");
+            dialog.CloseButton.PerformClick();
+            closedByButton = true;
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+            dialog.Close();
+        }
+        finally
+        {
+            timer.Stop();
+        }
+    };
+
+    timer.Start();
+    trigger.PerformClick();
+    timer.Stop();
+    if (failure is not null)
+    {
+        throw failure;
+    }
+    Require(closedByButton, $"点击“{expectedTitle}”按钮后未能通过关闭按钮关闭弹窗");
+    Console.WriteLine($"{expectedTitle}弹窗检查：实际点击打开；标题、只读多行正文、选择复制属性和关闭按钮均通过。");
 }
 
 static void RenderControlToPng(Control control, string path)
@@ -1630,6 +2736,61 @@ static int GetFirstVisibleLine(TextBox textBox)
 {
     const int emGetFirstVisibleLine = 0x00CE;
     return SendMessage(textBox.Handle, emGetFirstVisibleLine, IntPtr.Zero, IntPtr.Zero);
+}
+
+static void SetTextBoxInsertionPointWithoutScrolling(TextBox textBox, int position)
+{
+    const int emSetSel = 0x00B1;
+    SendMessage(textBox.Handle, emSetSel, new IntPtr(position), new IntPtr(position));
+}
+
+static void CheckLogTextBoxAppenderFollowAtBottom()
+{
+    using Form window = new()
+    {
+        ClientSize = new Size(360, 120),
+        StartPosition = FormStartPosition.Manual,
+        Location = new Point(-32000, -32000),
+        ShowInTaskbar = false,
+    };
+    using TextBox logTextBox = new()
+    {
+        Dock = DockStyle.Fill,
+        Multiline = true,
+        ReadOnly = true,
+        ScrollBars = ScrollBars.Vertical,
+        WordWrap = false,
+        Font = new Font("Cascadia Mono", 9),
+    };
+    window.Controls.Add(logTextBox);
+    window.Show();
+    Application.DoEvents();
+
+    logTextBox.Text = string.Join(
+        Environment.NewLine,
+        Enumerable.Range(1, 80).Select(index => $"历史日志 {index}")) + Environment.NewLine;
+    logTextBox.Focus();
+    logTextBox.SelectionStart = logTextBox.TextLength;
+    logTextBox.SelectionLength = 0;
+    logTextBox.ScrollToCaret();
+    Application.DoEvents();
+    Require(GetFirstVisibleLine(logTextBox) > 0, "测试未能建立位于底部的日志视图");
+
+    // 插入点回到历史位置后，视图仍保持底部；Append 必须继续跟随而不能依赖插入点。
+    int firstVisibleLineAtBottom = GetFirstVisibleLine(logTextBox);
+    SetTextBoxInsertionPointWithoutScrolling(logTextBox, 2);
+    Application.DoEvents();
+    Require(
+        GetFirstVisibleLine(logTextBox) == firstVisibleLineAtBottom,
+        "测试未能保持历史插入点下的日志底部视图");
+    LogTextBoxAppender.Append(logTextBox, ["底部跟随日志"], 64 * 1024);
+    Require(
+        logTextBox.SelectionLength == 0 && logTextBox.SelectionStart == logTextBox.TextLength,
+        "日志视图在底部时不得因插入点位于历史位置而停止跟随");
+    Require(
+        GetFirstVisibleLine(logTextBox) >= firstVisibleLineAtBottom,
+        "日志视图在底部且插入点位于历史位置时必须继续滚动到最新日志");
+    window.Close();
 }
 
 static IEnumerable<Control> EnumerateControls(Control root)
@@ -1790,6 +2951,7 @@ internal sealed class RecordingAutomationOutput : IAutomationOutput
     public void Wheel(int delta) => _actions.Enqueue($"wheel:{delta}");
     public void KeyDown(byte hidUsage) => _actions.Enqueue($"key:{hidUsage}:down");
     public void KeyUp(byte hidUsage) => _actions.Enqueue($"key:{hidUsage}:up");
+    public void ReleaseAll() => _actions.Enqueue("release-all");
 }
 
 internal static class EnumerableExtensions

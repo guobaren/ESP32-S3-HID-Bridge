@@ -8,6 +8,7 @@
     <AssemblyName>HidBridge.Host</AssemblyName>
     <RootNamespace>HidBridge.Host</RootNamespace>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <ApplicationIcon>app.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

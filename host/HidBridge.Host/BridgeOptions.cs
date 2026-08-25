@@ -16,9 +16,13 @@ internal sealed class BridgeOptions
     public string NetworkPresharedKey { get; init; } = string.Empty;
     public int ReconnectDelayMilliseconds { get; init; } = 1000;
     public int HeartbeatIntervalMilliseconds { get; init; } = 500;
-    public string DeviceLogPath { get; init; } = "artifacts/host-serial-{timestamp}.log";
+    public string DeviceLogPath { get; init; } = "log/device/host-serial-{timestamp}.log";
+    public int DeviceLogRetentionCount { get; init; } = LogFileRetention.DefaultMaxFileCount;
     public bool ShowDeviceLogInUi { get; init; }
-    public string HostLogPath { get; init; } = "artifacts/host-runtime-{timestamp}.log";
+    public string HostLogPath { get; init; } = "log/host/host-runtime-{timestamp}.log";
+    public int HostLogRetentionCount { get; init; } = LogFileRetention.DefaultMaxFileCount;
+    public string AutomationLogPath { get; init; } = "log/automation/automation-runtime-{timestamp}.log";
+    public int AutomationLogRetentionCount { get; init; } = LogFileRetention.DefaultMaxFileCount;
     // 默认监听 UDP 模拟鼠标命令。该接口不做身份认证，仅应部署在受信任网络。
     public bool RemoteInputEnabled { get; init; } = true;
     public string RemoteInputBindAddress { get; init; } = "0.0.0.0";
@@ -85,5 +89,9 @@ internal sealed class BridgeOptions
         {
             throw new InvalidDataException("firmwareFlashTimeoutSeconds 必须在 30..900 范围内。");
         }
+
+        LogFileRetention.Validate(nameof(options.HostLogRetentionCount), options.HostLogRetentionCount);
+        LogFileRetention.Validate(nameof(options.DeviceLogRetentionCount), options.DeviceLogRetentionCount);
+        LogFileRetention.Validate(nameof(options.AutomationLogRetentionCount), options.AutomationLogRetentionCount);
     }
 }

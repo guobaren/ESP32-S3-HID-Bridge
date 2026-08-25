@@ -36,7 +36,7 @@ int main(void)
     assert(esp_hid_nimble_should_use_directed_reconnect(true, 1));
     assert(!esp_hid_nimble_should_use_directed_reconnect(true, 0));
     assert(!esp_hid_nimble_should_use_directed_reconnect(false, 4));
-    assert(ESP_HID_DIRECTED_RECONNECT_BURSTS == 24);
+    assert(ESP_HID_DIRECTED_RECONNECT_BURSTS == 4);
 
     assert(esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
         ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT));
@@ -47,6 +47,18 @@ int main(void)
     assert(!esp_hid_nimble_rejected_connect_should_fall_back_to_undirected(
         ESP_HID_HCI_STATUS_UNSUPPORTED_REMOTE_FEATURE));
 
-    puts("BLE 连接策略测试通过：覆盖 HCI 状态、连接参数更新闸门及定向重连广播次数。");
+    /* DISCONNECT.reason 是 BLE_HS_HCI_ERR(status) 包装值，531 不能按 raw 19 处理。 */
+    assert(ESP_HID_NIMBLE_DISCONNECT_REASON_CONNECTION_SUPERVISION_TIMEOUT == 520);
+    assert(ESP_HID_NIMBLE_DISCONNECT_REASON_REMOTE_USER_TERMINATED == 531);
+    assert(esp_hid_nimble_disconnect_should_fall_back_to_undirected(520));
+    assert(esp_hid_nimble_disconnect_should_fall_back_to_undirected(531));
+    assert(!esp_hid_nimble_disconnect_should_fall_back_to_undirected(
+        ESP_HID_HCI_STATUS_CONNECTION_SUPERVISION_TIMEOUT));
+    assert(!esp_hid_nimble_disconnect_should_fall_back_to_undirected(
+        ESP_HID_HCI_STATUS_REMOTE_USER_TERMINATED));
+    assert(!esp_hid_nimble_disconnect_should_fall_back_to_undirected(
+        ESP_HID_NIMBLE_STATUS_SUCCESS));
+
+    puts("BLE 连接策略测试通过：覆盖 HCI 状态、连接参数更新闸门、4 轮定向重连及 NimBLE reason=531 回落。");
     return 0;
 }

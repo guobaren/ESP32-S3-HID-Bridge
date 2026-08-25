@@ -1,0 +1,49 @@
+name: Release build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-host:
+    name: Build Host Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build Host Release
+        shell: pwsh
+        run: dotnet build .\host\HidBridge.Host\HidBridge.Host.csproj -c Release
+
+      - name: Build Checks project
+        shell: pwsh
+        run: dotnet build .\tests\HidBridge.Host.Checks\HidBridge.Host.Checks.csproj -c Release
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $exe = Get-Item -LiteralPath .\HidBridge.Host.exe -ErrorAction Stop
+          if ($exe.Length -le 0) {
+            throw '根目录 Host EXE 为空。'
+          }
+          Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256
+
+      - name: Upload Host build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-S3-HID-Bridge-${{ github.ref_name }}
+          if-no-files-found: error
+          path: |
+            HidBridge.Host.exe
+            host/HidBridge.Host/bin/Release/net8.0-windows/**

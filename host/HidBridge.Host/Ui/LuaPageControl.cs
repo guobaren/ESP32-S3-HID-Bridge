@@ -5,17 +5,37 @@ namespace HidBridge.Host.Ui;
 
 internal sealed class LuaPageControl : UserControl
 {
+    private static readonly Color PageBackgroundColor = Color.FromArgb(242, 246, 251);
+    private static readonly Color CardSurfaceColor = Color.White;
+    private static readonly Color CardBorderColor = Color.FromArgb(211, 221, 234);
+    private static readonly Color PrimaryTextColor = Color.FromArgb(23, 35, 58);
+    private static readonly Color MutedTextColor = Color.FromArgb(82, 106, 139);
+    private static readonly Color AccentColor = Color.FromArgb(48, 105, 232);
     private const int LuaLogFlushIntervalMilliseconds = 100;
     private const int MaximumVisibleLuaLogCharacters = 64 * 1024;
     private const int MaximumPendingLuaLogLines = 2_000;
     private const int MaximumLuaLogLinesPerFlush = 500;
+    private const string LuaDocumentation =
+        "入口：function OnEvent(event, arg)\r\n\r\n" +
+        "键盘事件 arg 使用小写键名；驱动模拟的 F13-F24 可用 f13..f24 检测。\r\n\r\n" +
+        "move(dx, dy) / moveto(x, y)\r\n" +
+        "mouse(button, state) / wheel(delta)\r\n" +
+        "keydown(key) / keyup(key) / keypress(key[, ms])\r\n" +
+        "delay(ms) / sleep(ms) / Sleep(ms)（可取消，单位毫秒）\r\n" +
+        "randdelay(ms[, range]) / randsleep(ms[, range])\r\n" +
+        "IsPressed(arg) / DebugLog(fmt, ...) / ClearLog()\r\n\r\n" +
+        "鼠标参数：1 左键、2 中键、3 右键、4/5 侧键。\r\n" +
+        "键盘参数支持友好键名或 HID Usage；VK_CODES 表提供常见 VK。";
     private readonly AutomationController _controller;
     private readonly ComboBox _profileComboBox;
-    private readonly TextBox _editor;
+    private readonly LineNumberTextBox _editor;
+    private readonly LineNumberEditor _lineNumberEditor;
     private readonly Label _statusLabel;
     private readonly TextBox _logTextBox;
+    private readonly Button _checkButton;
     private readonly Button _startButton;
     private readonly Button _stopButton;
+    private readonly Button _apiButton;
     private readonly Button _addProfileButton;
     private readonly Button _deleteProfileButton;
     private readonly ConcurrentQueue<string> _pendingLogs = new();
@@ -29,55 +49,83 @@ internal sealed class LuaPageControl : UserControl
         _controller = controller;
         _profile = controller.ActiveProfile;
         Dock = DockStyle.Fill;
-        Padding = new Padding(10);
+        Padding = new Padding(18, 14, 18, 18);
+        BackColor = PageBackgroundColor;
 
         _profileComboBox = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
-            Width = 260,
+            Width = 190,
             AccessibleName = "当前 Lua 配置",
         };
-        _addProfileButton = new Button { Text = "新增配置", AutoSize = true };
-        _deleteProfileButton = new Button { Text = "删除配置", AutoSize = true };
+        _addProfileButton = CreateButton("新增配置");
+        _deleteProfileButton = CreateButton("删除配置");
         FlowLayoutPanel profileBar = new()
         {
-            Dock = DockStyle.Top,
-            Height = 40,
+            Dock = DockStyle.Right,
+            Width = 700,
+            Height = 44,
             WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(0, 3, 0, 0),
         };
-        profileBar.Controls.Add(new Label { Text = "配置：", AutoSize = true, Padding = new Padding(0, 7, 0, 0) });
+        profileBar.Controls.Add(new Label { Text = "配置", AutoSize = true, Padding = new Padding(0, 7, 8, 0), ForeColor = MutedTextColor });
         profileBar.Controls.Add(_profileComboBox);
         profileBar.Controls.Add(_addProfileButton);
         profileBar.Controls.Add(_deleteProfileButton);
-        profileBar.Controls.Add(new Label
+        Label profileHint = new()
         {
             Text = "切换配置后，非空 Lua 脚本自动启动",
             AutoSize = true,
             Padding = new Padding(12, 7, 0, 0),
-            ForeColor = Color.FromArgb(74, 88, 108),
-        });
-
-        _editor = new MultilinePasteTextBox
+            ForeColor = MutedTextColor,
+        };
+        profileBar.Controls.Add(profileHint);
+        Label pageTitle = new()
         {
-            Dock = DockStyle.Fill,
+            Text = "Lua 脚本",
+            Dock = DockStyle.Left,
+            Width = 240,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Font = new Font(Font.FontFamily, 16, FontStyle.Bold),
+            ForeColor = PrimaryTextColor,
+        };
+        Label pageStatus = new()
+        {
+            Text = "已保存",
+            Dock = DockStyle.Bottom,
+            Height = 22,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(19, 128, 88),
+        };
+        Panel header = new() { Dock = DockStyle.Top, Height = 60 };
+        header.Controls.Add(profileBar);
+        header.Controls.Add(pageStatus);
+        header.Controls.Add(pageTitle);
+
+        _editor = new LineNumberTextBox
+        {
             Multiline = true,
             AcceptsTab = true,
             ScrollBars = ScrollBars.Both,
             WordWrap = false,
             Font = new Font("Cascadia Mono", 10),
+            BackColor = Color.FromArgb(249, 251, 254),
+            ForeColor = PrimaryTextColor,
         };
+        _lineNumberEditor = new LineNumberEditor(_editor);
         _statusLabel = new Label
         {
             Dock = DockStyle.Bottom,
             Height = 34,
             TextAlign = ContentAlignment.MiddleLeft,
         };
-        Button docsButton = new() { Text = "接口说明", Dock = DockStyle.Fill };
-        Button checkButton = new() { Text = "检查", Dock = DockStyle.Fill };
-        Button saveButton = new() { Text = "保存并重载", Dock = DockStyle.Fill };
-        _startButton = new Button { Text = "启动", Dock = DockStyle.Fill };
-        _stopButton = new Button { Text = "停止", Dock = DockStyle.Fill };
-        Button clearButton = new() { Text = "清空日志", Dock = DockStyle.Fill };
+        _apiButton = CreateButton("接口说明");
+        _checkButton = CreateButton("检查");
+        Button saveButton = CreateButton("保存并重载");
+        _startButton = CreateButton("启动");
+        _stopButton = CreateButton("停止");
+        Button clearButton = CreateButton("清空日志");
         TableLayoutPanel buttons = new()
         {
             Dock = DockStyle.Bottom,
@@ -88,17 +136,32 @@ internal sealed class LuaPageControl : UserControl
         {
             buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / 6));
         }
-        buttons.Controls.Add(docsButton, 0, 0);
-        buttons.Controls.Add(checkButton, 1, 0);
+        foreach (Button button in new[] { _apiButton, _checkButton, saveButton, _startButton, _stopButton, clearButton })
+        {
+            button.Dock = DockStyle.Fill;
+            button.Margin = new Padding(2, 4, 2, 0);
+        }
+        buttons.Controls.Add(_apiButton, 0, 0);
+        buttons.Controls.Add(_checkButton, 1, 0);
         buttons.Controls.Add(saveButton, 2, 0);
         buttons.Controls.Add(_startButton, 3, 0);
         buttons.Controls.Add(_stopButton, 4, 0);
         buttons.Controls.Add(clearButton, 5, 0);
 
-        Panel editorPanel = new() { Dock = DockStyle.Fill };
-        editorPanel.Controls.Add(_editor);
+        Panel editorPanel = new() { Dock = DockStyle.Fill, Padding = new Padding(16), BackColor = CardSurfaceColor };
+        StyleCard(editorPanel);
+        Label editorTitle = new()
+        {
+            Text = "脚本编辑器",
+            Dock = DockStyle.Top,
+            Height = 32,
+            ForeColor = PrimaryTextColor,
+            Font = new Font(Font.FontFamily, 11, FontStyle.Bold),
+        };
+        editorPanel.Controls.Add(_lineNumberEditor);
         editorPanel.Controls.Add(_statusLabel);
         editorPanel.Controls.Add(buttons);
+        editorPanel.Controls.Add(editorTitle);
 
         _logTextBox = new TextBox
         {
@@ -108,30 +171,56 @@ internal sealed class LuaPageControl : UserControl
             ScrollBars = ScrollBars.Vertical,
             BackColor = Color.FromArgb(249, 250, 252),
             Font = new Font("Cascadia Mono", 9),
+            ForeColor = PrimaryTextColor,
+        };
+        TableLayoutPanel logPanel = new()
+        {
+            Dock = DockStyle.Fill,
+            RowCount = 2,
+            ColumnCount = 1,
+            Padding = new Padding(16, 10, 16, 14),
+            BackColor = PageBackgroundColor,
+        };
+        logPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        logPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        logPanel.Controls.Add(new Label
+        {
+            Text = "运行日志",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = PrimaryTextColor,
+            Font = new Font(Font.FontFamily, 11, FontStyle.Bold),
+        }, 0, 0);
+        logPanel.Controls.Add(_logTextBox, 0, 1);
+        logPanel.Paint += (_, eventArgs) =>
+        {
+            using Pen border = new(CardBorderColor);
+            eventArgs.Graphics.DrawRectangle(border, 0, 0, Math.Max(0, logPanel.Width - 1), Math.Max(0, logPanel.Height - 1));
         };
         SplitContainer split = new()
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Horizontal,
-            SplitterDistance = 480,
+            SplitterDistance = 450,
+            BackColor = PageBackgroundColor,
         };
         split.Panel1.Controls.Add(editorPanel);
-        split.Panel2.Controls.Add(_logTextBox);
+        split.Panel2.Controls.Add(logPanel);
 
         Controls.Add(split);
-        Controls.Add(profileBar);
+        Controls.Add(header);
 
         _profileComboBox.SelectedIndexChanged += (_, _) => SelectProfileFromUi();
         _addProfileButton.Click += (_, _) => AddProfile();
         _deleteProfileButton.Click += (_, _) => DeleteProfile();
-        docsButton.Click += (_, _) => ShowApiDocumentation();
-        checkButton.Click += (_, _) => CheckScript();
+        _apiButton.Click += (_, _) => ShowApiDocumentation();
+        _checkButton.Click += (_, _) => CheckScript();
         saveButton.Click += (_, _) => SaveScript();
         _startButton.Click += (_, _) => StartScript();
         _stopButton.Click += (_, _) => _controller.StopLua();
         clearButton.Click += (_, _) => ClearLog();
         _controller.ActiveProfileChanged += HandleActiveProfileChanged;
-        _controller.Log += AppendLog;
+        _controller.LuaLog += AppendLog;
         _controller.LuaLogCleared += ClearLog;
         _controller.LuaStateChanged += UpdateLuaState;
 
@@ -148,8 +237,34 @@ internal sealed class LuaPageControl : UserControl
 
     internal ComboBox ProfileComboBox => _profileComboBox;
     internal TextBox Editor => _editor;
+    internal Control LineNumberGutter => _lineNumberEditor.Gutter;
+    internal Label StatusLabel => _statusLabel;
+    internal Button CheckButton => _checkButton;
+    internal Button ApiButton => _apiButton;
+    internal Button StartButton => _startButton;
+    internal Button StopButton => _stopButton;
     internal Button AddProfileButton => _addProfileButton;
     internal Button DeleteProfileButton => _deleteProfileButton;
+
+    private static Button CreateButton(string text, bool primary = false) => new()
+    {
+        Text = text,
+        AutoSize = false,
+        BackColor = primary ? Color.FromArgb(48, 105, 232) : Color.FromArgb(237, 243, 250),
+        ForeColor = primary ? Color.White : PrimaryTextColor,
+        FlatStyle = FlatStyle.Standard,
+        UseVisualStyleBackColor = false,
+        MinimumSize = new Size(0, 34),
+    };
+
+    private static void StyleCard(Control control)
+    {
+        control.Paint += (_, eventArgs) =>
+        {
+            using Pen border = new(CardBorderColor);
+            eventArgs.Graphics.DrawRectangle(border, 0, 0, Math.Max(0, control.Width - 1), Math.Max(0, control.Height - 1));
+        };
+    }
 
     private void RefreshProfiles(string selected)
     {
@@ -192,7 +307,7 @@ internal sealed class LuaPageControl : UserControl
     private void LoadProfile(string name)
     {
         _profile = _controller.LoadProfile(name);
-        _editor.Text = NormalizeEditorNewlines(_profile.LuaScriptText);
+        _editor.Text = LuaScriptIndentation.Align(NormalizeEditorNewlines(_profile.LuaScriptText));
         _editor.Select(0, 0);
         _statusLabel.Text = _controller.LuaActive ? "运行中" : "未运行";
     }
@@ -234,13 +349,22 @@ internal sealed class LuaPageControl : UserControl
 
     private void CheckScript()
     {
-        (bool success, string message) = _controller.CheckLua(_editor.Text);
+        string aligned = LuaScriptIndentation.Align(_editor.Text);
+        (bool success, string message) = _controller.CheckLua(aligned);
+        if (success && !string.Equals(_editor.Text, aligned, StringComparison.Ordinal))
+        {
+            int selectionStart = Math.Min(_editor.SelectionStart, aligned.Length);
+            _editor.Text = aligned;
+            _editor.Select(selectionStart, 0);
+            message += "，已自动对齐缩进和空格（不改变换行）";
+        }
         _statusLabel.ForeColor = success ? Color.FromArgb(34, 125, 70) : Color.FromArgb(170, 42, 42);
         _statusLabel.Text = message;
     }
 
     private void SaveScript()
     {
+        _editor.Text = LuaScriptIndentation.Align(_editor.Text);
         _profile.LuaScriptText = _editor.Text;
         _controller.SaveProfile(_profile);
         CheckScript();
@@ -255,6 +379,7 @@ internal sealed class LuaPageControl : UserControl
         }
         catch (Exception exception)
         {
+            UpdateLuaState(_controller.LuaActive);
             _statusLabel.ForeColor = Color.FromArgb(170, 42, 42);
             _statusLabel.Text = exception.Message;
         }
@@ -262,18 +387,8 @@ internal sealed class LuaPageControl : UserControl
 
     private void ShowApiDocumentation()
     {
-        const string documentation =
-            "入口：function OnEvent(event, arg)\r\n\r\n" +
-            "键盘事件 arg 使用小写键名；驱动模拟的 F13-F24 可用 f13..f24 检测。\r\n\r\n" +
-            "move(dx, dy) / moveto(x, y)\r\n" +
-            "mouse(button, state) / wheel(delta)\r\n" +
-            "keydown(key) / keyup(key) / keypress(key[, ms])\r\n" +
-            "sleep(ms) / Sleep(ms)\r\n" +
-            "randdelay(ms[, range]) / randsleep(ms[, range])\r\n" +
-            "IsPressed(arg) / DebugLog(fmt, ...) / ClearLog()\r\n\r\n" +
-            "鼠标参数：1 左键、2 中键、3 右键、4/5 侧键。\r\n" +
-            "键盘参数支持友好键名或 HID Usage；VK_CODES 表提供常见 VK。";
-        MessageBox.Show(this, documentation, "Lua 接口说明", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        using CopyableTextDialog dialog = new("Lua 接口说明", LuaDocumentation);
+        dialog.ShowDialog(FindForm() ?? (IWin32Window)this);
     }
 
     private void UpdateLuaState(bool active) => RunOnUiThread(() =>
@@ -321,26 +436,7 @@ internal sealed class LuaPageControl : UserControl
             return;
         }
 
-        _logTextBox.AppendText(string.Join(Environment.NewLine, pending) + Environment.NewLine);
-        TrimVisibleLogIfNeeded();
-        _logTextBox.SelectionStart = _logTextBox.TextLength;
-        _logTextBox.SelectionLength = 0;
-        _logTextBox.ScrollToCaret();
-    }
-
-    private void TrimVisibleLogIfNeeded()
-    {
-        int overflow = _logTextBox.TextLength - MaximumVisibleLuaLogCharacters;
-        if (overflow <= 0)
-        {
-            return;
-        }
-
-        string text = _logTextBox.Text;
-        int firstCompleteLine = text.IndexOf('\n', overflow);
-        _logTextBox.Text = firstCompleteLine >= 0 && firstCompleteLine + 1 < text.Length
-            ? text[(firstCompleteLine + 1)..]
-            : string.Empty;
+        LogTextBoxAppender.Append(_logTextBox, pending, MaximumVisibleLuaLogCharacters);
     }
 
     private void ClearLog() => RunOnUiThread(() =>
@@ -380,25 +476,11 @@ internal sealed class LuaPageControl : UserControl
             _logFlushTimer.Stop();
             _logFlushTimer.Dispose();
             _controller.ActiveProfileChanged -= HandleActiveProfileChanged;
-            _controller.Log -= AppendLog;
+            _controller.LuaLog -= AppendLog;
             _controller.LuaLogCleared -= ClearLog;
             _controller.LuaStateChanged -= UpdateLuaState;
         }
         base.Dispose(disposing);
     }
 
-    private sealed class MultilinePasteTextBox : TextBox
-    {
-        private const int WmPaste = 0x0302;
-
-        protected override void WndProc(ref Message message)
-        {
-            if (message.Msg == WmPaste && Clipboard.ContainsText())
-            {
-                SelectedText = NormalizeEditorNewlines(Clipboard.GetText());
-                return;
-            }
-            base.WndProc(ref message);
-        }
-    }
 }

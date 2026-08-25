@@ -881,6 +881,12 @@ _Static_assert((int)BLE_ERR_REM_USER_CONN_TERM == ESP_HID_HCI_STATUS_REMOTE_USER
                "HCI remote user termination status changed");
 _Static_assert((int)BLE_ERR_UNSUPP_REM_FEATURE == ESP_HID_HCI_STATUS_UNSUPPORTED_REMOTE_FEATURE,
                "HCI unsupported remote feature status changed");
+_Static_assert(BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO) ==
+                   ESP_HID_NIMBLE_DISCONNECT_REASON_CONNECTION_SUPERVISION_TIMEOUT,
+               "NimBLE supervision timeout reason mapping changed");
+_Static_assert(BLE_HS_HCI_ERR(BLE_ERR_REM_USER_CONN_TERM) ==
+                   ESP_HID_NIMBLE_DISCONNECT_REASON_REMOTE_USER_TERMINATED,
+               "NimBLE remote termination reason mapping changed");
 
 #define GATT_SVR_SVC_HID_UUID 0x1812
 
@@ -1150,6 +1156,14 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
             s_skip_next_directed_reconnect_request = false;
             s_directed_reconnect_bursts_remaining = 0;
             ESP_LOGI(TAG, "USB HID 在线，跳过 BLE 断线后的广播和重连");
+        } else if (esp_hid_nimble_disconnect_should_fall_back_to_undirected(
+                       event->disconnect.reason)) {
+            s_skip_next_directed_reconnect_request = false;
+            s_directed_reconnect_bursts_remaining = 0;
+            ESP_LOGI(TAG,
+                     "disconnect reason=%d is a NimBLE-wrapped rejected connection; "
+                     "skip directed reconnect rearm and use undirected advertising",
+                     event->disconnect.reason);
         } else if (s_skip_next_directed_reconnect_request) {
             s_skip_next_directed_reconnect_request = false;
             s_directed_reconnect_bursts_remaining = 0;
@@ -1357,8 +1371,8 @@ esp_err_t esp_hid_ble_gap_adv_start(void)
     }
 
     /*
-     * 已绑定设备在约 30 秒窗口内持续使用高占空比定向广播，覆盖 Windows
-     * 蓝牙控制器重新上电后的慢启动阶段；窗口耗尽后自动回落普通广播。
+     * 已绑定设备在约 5 秒窗口内持续使用高占空比定向广播，覆盖 Windows
+     * 蓝牙控制器重新上电后的短暂慢启动阶段；窗口耗尽后自动回落普通广播。
      */
     memset(&adv_params, 0, sizeof adv_params);
     bool use_directed = esp_hid_nimble_should_use_directed_reconnect(

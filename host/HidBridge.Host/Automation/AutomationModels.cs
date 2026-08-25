@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using HidBridge.Host.Input;
 
 namespace HidBridge.Host.Automation;
 
@@ -26,6 +27,9 @@ internal sealed class MacroDefinition
     [JsonPropertyName("enabled")]
     public bool Enabled { get; set; } = true;
 
+    [JsonPropertyName("file")]
+    public string ScriptFile { get; set; } = string.Empty;
+
     [JsonIgnore]
     internal string Text { get; set; } = string.Empty;
 }
@@ -38,8 +42,17 @@ internal sealed class AutomationProfile
     [JsonPropertyName("apps")]
     public List<string> Apps { get; set; } = [];
 
-    [JsonPropertyName("lua_script_text")]
+    [JsonIgnore]
     public string LuaScriptText { get; set; } = string.Empty;
+
+    [JsonPropertyName("lua_script_file")]
+    public string LuaScriptFile { get; set; } = "lua/main.txt";
+
+    // 仅用于读取旧版 profile.json。加载后会迁移到 lua_script_file 指向的 txt，
+    // 保存新格式时该字段保持 null，不再把脚本正文写回 JSON。
+    [JsonPropertyName("lua_script_text")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LegacyLuaScriptText { get; set; }
 
     [JsonPropertyName("macros")]
     public Dictionary<string, MacroDefinition> Macros { get; set; } =
@@ -50,9 +63,13 @@ internal sealed class AutomationSettings
 {
     public string ActiveProfile { get; set; } = AutomationProfileStore.GlobalProfile;
     public bool StartOnBoot { get; set; }
-    public bool MinimizeToTray { get; set; } = true;
+    public bool MinimizeToTray { get; set; }
     public bool CloseToTray { get; set; } = true;
-    public bool GenerateMovementAnalysisImage { get; set; } = true;
+    public bool GenerateMovementAnalysisImage { get; set; }
+    public double OutputSensitivity { get; set; } = MouseOutputSensitivity.Default;
+    public bool AlwaysOutputUdpEnabled { get; set; } = true;
+    public bool SimulatedUdpInputEnabled { get; set; }
+    public int SimulatedUdpInputFrequencyHz { get; set; } = 100;
     public bool FirmwareUpdateApiEnabled { get; set; }
     public string FirmwareManifestPath { get; set; } = string.Empty;
     public int WindowWidth { get; set; } = 1080;

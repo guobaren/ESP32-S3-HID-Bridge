@@ -1,5 +1,4 @@
 using System.Drawing;
-using System.Runtime.InteropServices;
 using HidBridge.Host.Automation;
 using HidBridge.Host.FirmwareUpdate;
 using HidBridge.Host.Input;
@@ -8,11 +7,15 @@ namespace HidBridge.Host.Ui;
 
 internal sealed class BridgeMainForm : Form
 {
-    private static readonly Color DeepSurfaceColor = Color.FromArgb(24, 31, 42);
-    private static readonly Color PrimaryTextOnDeepSurface = Color.FromArgb(245, 248, 252);
-    private static readonly Color SecondaryTextOnDeepSurface = Color.FromArgb(190, 202, 218);
-    private static readonly Color SuccessTextOnDeepSurface = Color.FromArgb(85, 224, 164);
-    private static readonly Color DangerTextOnDeepSurface = Color.FromArgb(255, 154, 154);
+    private static readonly Color PageBackgroundColor = Color.FromArgb(242, 246, 251);
+    private static readonly Color CardSurfaceColor = Color.White;
+    private static readonly Color CardBorderColor = Color.FromArgb(211, 221, 234);
+    private static readonly Color AccentColor = Color.FromArgb(48, 105, 232);
+    private static readonly Color DeepSurfaceColor = CardSurfaceColor;
+    private static readonly Color PrimaryTextOnDeepSurface = Color.FromArgb(23, 35, 58);
+    private static readonly Color SecondaryTextOnDeepSurface = Color.FromArgb(82, 106, 139);
+    private static readonly Color SuccessTextOnDeepSurface = Color.FromArgb(19, 128, 88);
+    private static readonly Color DangerTextOnDeepSurface = Color.FromArgb(157, 91, 35);
 
     private readonly InputForwarder _input;
     private readonly AutomationController _automation;
@@ -20,13 +23,16 @@ internal sealed class BridgeMainForm : Form
     private readonly FirmwareUpdateApiServer? _firmwareUpdateApi;
     private readonly FirmwareFlashService? _firmwareFlash;
     private readonly MouseCursorLock _cursorLock = new();
+    private readonly bool _enableCursorLock;
     private readonly MouseCaptureSurface _captureSurface;
     private readonly Label _statusLabel;
     private readonly TextBox _logTextBox;
     private readonly ComboBox _logModeComboBox;
-    private readonly CheckBox _simulatedUdpCheckBox;
-    private readonly ComboBox _simulatedUdpFrequencyComboBox;
     private readonly CheckBox _udpSmoothingCheckBox;
+    private readonly CheckBox _alwaysOutputUdpCheckBox;
+    private readonly TrackBar _outputSensitivityTrackBar;
+    private readonly TextBox _outputSensitivityTextBox;
+    private readonly Label _outputSensitivityDescriptionLabel;
     private readonly System.Windows.Forms.Timer _logFlushTimer;
     private readonly SplitContainer _split;
     private readonly TabControl _tabs;
@@ -35,16 +41,8 @@ internal sealed class BridgeMainForm : Form
     private readonly SettingsPageControl _settingsPage;
     private readonly NotifyIcon _notifyIcon;
     private readonly List<string> _pendingLogs = [];
-    private const int EmGetFirstVisibleLine = 0x00CE;
-    private const int EmLineScroll = 0x00B6;
+    private bool _updatingOutputSensitivity;
     private const int MaxVisibleLogCharacters = 500_000;
-
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    private static extern int SendMessage(
-        IntPtr hWnd,
-        int message,
-        IntPtr wParam,
-        IntPtr lParam);
 
     private bool _closing;
     private bool _forceClose;
@@ -55,20 +53,29 @@ internal sealed class BridgeMainForm : Form
         string endpointDescription,
         RuntimeLogSettings? logSettings = null,
         FirmwareUpdateApiServer? firmwareUpdateApi = null,
-        FirmwareFlashService? firmwareFlash = null)
+        FirmwareFlashService? firmwareFlash = null,
+        bool enableCursorLock = true)
     {
         _input = input;
         _automation = automation;
+        _enableCursorLock = enableCursorLock;
+        double configuredOutputSensitivity = MouseOutputSensitivity.Clamp(automation.Settings.OutputSensitivity);
+        _automation.Settings.OutputSensitivity = configuredOutputSensitivity;
+        _input.ConfigureOutputSensitivity(configuredOutputSensitivity);
+        _input.ConfigureAlwaysOutputUdp(automation.Settings.AlwaysOutputUdpEnabled);
         _logSettings = logSettings ?? new RuntimeLogSettings(RuntimeLogMode.Reduced);
         _firmwareUpdateApi = firmwareUpdateApi;
         _firmwareFlash = firmwareFlash;
         Text = "ESP32-S3 HID Bridge - 同步已关闭";
+        Icon applicationIcon = LoadApplicationIcon();
+        Icon = applicationIcon;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(760, 560);
+        MinimumSize = new Size(900, 640);
         ClientSize = new Size(
-            Math.Max(960, automation.Settings.WindowWidth),
-            Math.Max(640, automation.Settings.WindowHeight));
+            Math.Max(1024, automation.Settings.WindowWidth),
+            Math.Max(700, automation.Settings.WindowHeight));
         Font = new Font("Microsoft YaHei UI", 10, FontStyle.Regular);
+        BackColor = PageBackgroundColor;
 
         _captureSurface = new MouseCaptureSurface();
         _statusLabel = new Label
@@ -76,6 +83,8 @@ internal sealed class BridgeMainForm : Form
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = true,
+            AutoSize = false,
+            Margin = new Padding(0),
             Text = "同步已关闭",
             ForeColor = SecondaryTextOnDeepSurface,
         };
@@ -85,52 +94,39 @@ internal sealed class BridgeMainForm : Form
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleRight,
             AutoEllipsis = true,
+            AutoSize = false,
+            Margin = new Padding(0),
             Text = endpointDescription,
             ForeColor = SecondaryTextOnDeepSurface,
         };
 
-        _simulatedUdpCheckBox = new CheckBox
-        {
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Text = "模拟 UDP",
-            AccessibleName = "模拟 UDP 输入开关",
-            BackColor = DeepSurfaceColor,
-            ForeColor = PrimaryTextOnDeepSurface,
-            Checked = false,
-            UseVisualStyleBackColor = false,
-        };
-        _simulatedUdpFrequencyComboBox = new ComboBox
-        {
-            Dock = DockStyle.Fill,
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            AccessibleName = "模拟 UDP 输入频率",
-            FormattingEnabled = true,
-            Enabled = false,
-            BackColor = Color.FromArgb(249, 250, 252),
-            ForeColor = Color.FromArgb(38, 47, 61),
-        };
-        _simulatedUdpFrequencyComboBox.Items.AddRange(
-            SimulatedUdpMouseInput.SupportedFrequencies.Cast<object>().ToArray());
-        _simulatedUdpFrequencyComboBox.Format += (_, eventArgs) =>
-        {
-            if (eventArgs.ListItem is int frequencyHz)
-            {
-                eventArgs.Value = FormatSimulatedUdpFrequency(frequencyHz);
-            }
-        };
-        _simulatedUdpFrequencyComboBox.SelectedItem = 100;
         _udpSmoothingCheckBox = new CheckBox
         {
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleCenter,
+            AutoSize = true,
+            Height = 34,
+            Margin = new Padding(0, 0, 8, 0),
+            TextAlign = ContentAlignment.MiddleLeft,
             Text = "UDP 平滑",
             AccessibleName = "UDP 平滑功能开关",
             AccessibleDescription = "请先按 HOME 关闭同步，再切换 UDP 平滑。",
             Checked = true,
-            BackColor = DeepSurfaceColor,
+            BackColor = CardSurfaceColor,
             ForeColor = PrimaryTextOnDeepSurface,
-            UseVisualStyleBackColor = false,
+            UseVisualStyleBackColor = true,
+        };
+        _alwaysOutputUdpCheckBox = new CheckBox
+        {
+            AutoSize = true,
+            Height = 34,
+            Margin = new Padding(0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Text = "始终开启 UDP 输出",
+            AccessibleName = "始终开启 UDP 输出",
+            AccessibleDescription = "开启后，即使 HOME 关闭实体鼠标捕获，局域网 UDP 输入仍可发送到 ESP32；不会开启本机鼠标或键盘捕获。",
+            Checked = automation.Settings.AlwaysOutputUdpEnabled,
+            BackColor = CardSurfaceColor,
+            ForeColor = PrimaryTextOnDeepSurface,
+            UseVisualStyleBackColor = true,
         };
         _udpSmoothingCheckBox.CheckedChanged += (_, _) =>
         {
@@ -139,87 +135,175 @@ internal sealed class BridgeMainForm : Form
                 ? "UDP 平滑已开启：真实和模拟 UDP 移动分摊到固定 20 个 1 ms 槽，最大计划尾部 20 ms。"
                 : "UDP 平滑已关闭：真实和模拟 UDP 移动跳过低延迟分摊，直接进入 1000 Hz 报告聚合。");
         };
-        _simulatedUdpCheckBox.CheckedChanged += (_, _) =>
+        _alwaysOutputUdpCheckBox.CheckedChanged += (_, _) =>
         {
-            int frequencyHz = GetSelectedSimulatedUdpFrequency();
-            _simulatedUdpFrequencyComboBox.Enabled = _simulatedUdpCheckBox.Checked;
-            _input.ConfigureSimulatedUdpInput(_simulatedUdpCheckBox.Checked, frequencyHz);
-            AppendLog(_simulatedUdpCheckBox.Checked
-                ? $"模拟 UDP 输入已开启：源频率={FormatSimulatedUdpFrequency(frequencyHz)}；移动和滚轮进入 UDP 公共后续链路，按钮保持即时发送。"
-                : "模拟 UDP 输入已关闭：实体鼠标恢复直接进入 1000 Hz 聚合链路。");
-        };
-        _simulatedUdpFrequencyComboBox.SelectedIndexChanged += (_, _) =>
-        {
-            int frequencyHz = GetSelectedSimulatedUdpFrequency();
-            _input.ConfigureSimulatedUdpInput(_simulatedUdpCheckBox.Checked, frequencyHz);
-            if (_simulatedUdpCheckBox.Checked)
+            _automation.Settings.AlwaysOutputUdpEnabled = _alwaysOutputUdpCheckBox.Checked;
+            _input.ConfigureAlwaysOutputUdp(_alwaysOutputUdpCheckBox.Checked);
+            try
             {
-                AppendLog($"模拟 UDP 输入频率已切换为 {FormatSimulatedUdpFrequency(frequencyHz)}。");
+                _automation.SaveSettings();
+                AppendLog(_alwaysOutputUdpCheckBox.Checked
+                    ? "始终开启 UDP 输出已开启：HOME 关闭时仍允许局域网 UDP 输入发送到 ESP32。"
+                    : "始终开启 UDP 输出已关闭：局域网 UDP 输入仅在 HOME 同步开启时发送。");
             }
+            catch (Exception exception)
+            {
+                AppendLog($"始终开启 UDP 输出设置保存失败：{exception.Message}");
+            }
+        };
+
+        _outputSensitivityTrackBar = new TrackBar
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = false,
+            Minimum = (int)(MouseOutputSensitivity.Minimum * MouseOutputSensitivity.TrackBarScale),
+            Maximum = (int)(MouseOutputSensitivity.Maximum * MouseOutputSensitivity.TrackBarScale),
+            TickFrequency = 30,
+            TickStyle = TickStyle.BottomRight,
+            Value = MouseOutputSensitivity.ToTrackBarValue(configuredOutputSensitivity),
+            AccessibleName = "统一输出灵敏度",
+            AccessibleDescription = "在发送到固件前按比例处理最终 X/Y 相对移动，范围 0.3 到 3.0。",
+        };
+        _outputSensitivityTextBox = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = HorizontalAlignment.Center,
+            Text = MouseOutputSensitivity.Format(configuredOutputSensitivity),
+            AccessibleName = "统一输出灵敏度数值",
+            AccessibleDescription = "可直接输入 0.3 到 3.0 的灵敏度数值。",
+            Margin = new Padding(0, 3, 0, 3),
+        };
+        _outputSensitivityTrackBar.ValueChanged += (_, _) =>
+            ApplyOutputSensitivity(
+                MouseOutputSensitivity.FromTrackBarValue(_outputSensitivityTrackBar.Value),
+                persist: false);
+        _outputSensitivityTrackBar.MouseUp += (_, _) => PersistOutputSensitivity();
+        _outputSensitivityTrackBar.KeyUp += (_, _) => PersistOutputSensitivity();
+        _outputSensitivityTextBox.KeyDown += (_, eventArgs) =>
+        {
+            if (eventArgs.KeyCode != Keys.Enter)
+            {
+                return;
+            }
+            CommitOutputSensitivityText();
+            eventArgs.SuppressKeyPress = true;
+            eventArgs.Handled = true;
+        };
+        _outputSensitivityTextBox.Leave += (_, _) => CommitOutputSensitivityText();
+
+        TableLayoutPanel sensitivityControls = new()
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            Margin = new Padding(0),
+            Padding = new Padding(0),
+        };
+        sensitivityControls.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 88));
+        sensitivityControls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        sensitivityControls.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58));
+        sensitivityControls.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.TopLeft,
+            Padding = new Padding(0, 2, 0, 0),
+            Text = "输出灵敏度",
+            ForeColor = PrimaryTextOnDeepSurface,
+        }, 0, 0);
+        sensitivityControls.Controls.Add(_outputSensitivityTrackBar, 1, 0);
+        sensitivityControls.Controls.Add(_outputSensitivityTextBox, 2, 0);
+        _outputSensitivityDescriptionLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Text = "发送到固件前处理最终 X/Y 移动；覆盖实体鼠标、UDP、Lua、宏，滚轮和按键不变。",
+            ForeColor = SecondaryTextOnDeepSurface,
+            AutoEllipsis = true,
+            AccessibleName = "统一输出灵敏度说明",
         };
 
         TableLayoutPanel shortcutBar = new()
         {
             Dock = DockStyle.Top,
-            Height = 46,
-            Padding = new Padding(14, 4, 14, 4),
-            ColumnCount = 6,
-            BackColor = DeepSurfaceColor,
+            Height = 48,
+            Padding = new Padding(14, 5, 14, 5),
+            ColumnCount = 3,
+            RowCount = 1,
+            AutoSize = false,
+            BackColor = CardSurfaceColor,
             ForeColor = PrimaryTextOnDeepSurface,
         };
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18));
         shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24));
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 14));
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 11));
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 13));
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+        shortcutBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         shortcutBar.Controls.Add(_statusLabel, 0, 0);
-        shortcutBar.Controls.Add(new Label
+        // FlowDirection=RightToLeft 让两个开关在中间列整体靠右，同时保留平滑在左、始终输出在右。
+        // 与原先“百分比空白列 + AutoSize 列”的嵌套 TableLayoutPanel 不同，FlowLayoutPanel 会按
+        // 控件首选宽度布局，避免 DPI 或端点文本变化时把 CheckBox 的文字挤成不可见区域。
+        FlowLayoutPanel udpOptionsBar = new()
         {
             Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Text = "HOME：开启 / 关闭同步",
-            ForeColor = PrimaryTextOnDeepSurface,
-        }, 1, 0);
-        shortcutBar.Controls.Add(_simulatedUdpCheckBox, 2, 0);
-        shortcutBar.Controls.Add(_simulatedUdpFrequencyComboBox, 3, 0);
-        shortcutBar.Controls.Add(_udpSmoothingCheckBox, 4, 0);
-        shortcutBar.Controls.Add(endpointLabel, 5, 0);
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            AutoSize = false,
+            Margin = new Padding(0),
+            Padding = new Padding(0),
+        };
+        _udpSmoothingCheckBox.Anchor = AnchorStyles.None;
+        _alwaysOutputUdpCheckBox.Anchor = AnchorStyles.None;
+        udpOptionsBar.Controls.Add(_alwaysOutputUdpCheckBox);
+        udpOptionsBar.Controls.Add(_udpSmoothingCheckBox);
+        shortcutBar.Controls.Add(udpOptionsBar, 1, 0);
+        shortcutBar.Controls.Add(endpointLabel, 2, 0);
 
         TableLayoutPanel endingBar = new()
         {
             Dock = DockStyle.Bottom,
-            Height = 34,
-            Padding = new Padding(14, 0, 14, 4),
+            Height = 70,
+            Padding = new Padding(14, 7, 14, 5),
+            RowCount = 2,
             ColumnCount = 2,
-            BackColor = DeepSurfaceColor,
+            BackColor = CardSurfaceColor,
             ForeColor = SecondaryTextOnDeepSurface,
         };
-        endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
-        endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
-        endingBar.Controls.Add(new Label
-        {
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Text = "左右键同按开始记录；全部松开 3 秒后生成分析图",
-            ForeColor = SecondaryTextOnDeepSurface,
-        }, 0, 0);
-        endingBar.Controls.Add(new Label
+        endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
+        endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
+        endingBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        endingBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        endingBar.Controls.Add(sensitivityControls, 0, 0);
+        endingBar.Controls.Add(_outputSensitivityDescriptionLabel, 0, 1);
+        Label endingShortcutLabel = new()
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleRight,
-            Text = "END：结束程序",
+            Text = "HOME：开启 / 关闭同步    END：结束程序",
             ForeColor = DangerTextOnDeepSurface,
-        }, 1, 0);
+        };
+        endingBar.Controls.Add(endingShortcutLabel, 1, 0);
+        endingBar.SetRowSpan(endingShortcutLabel, 2);
 
         Panel capturePanel = new()
         {
             Dock = DockStyle.Fill,
-            BackColor = DeepSurfaceColor,
+            BackColor = PageBackgroundColor,
             ForeColor = PrimaryTextOnDeepSurface,
+            Padding = new Padding(14, 12, 14, 14),
         };
-        capturePanel.Controls.Add(_captureSurface);
-        capturePanel.Controls.Add(endingBar);
+        Panel captureCard = new()
+        {
+            Dock = DockStyle.Fill,
+            BackColor = CardSurfaceColor,
+            Padding = new Padding(16),
+        };
+        captureCard.Paint += (_, eventArgs) =>
+        {
+            using Pen border = new(CardBorderColor);
+            eventArgs.Graphics.DrawRectangle(border, 0, 0, Math.Max(0, captureCard.Width - 1), Math.Max(0, captureCard.Height - 1));
+        };
+        captureCard.Controls.Add(_captureSurface);
+        captureCard.Controls.Add(endingBar);
+        capturePanel.Controls.Add(captureCard);
         capturePanel.Controls.Add(shortcutBar);
 
         _logTextBox = new TextBox
@@ -266,7 +350,8 @@ internal sealed class BridgeMainForm : Form
             Dock = DockStyle.Fill,
             RowCount = 2,
             ColumnCount = 2,
-            Padding = new Padding(10, 7, 10, 10),
+            Padding = new Padding(14, 10, 14, 14),
+            BackColor = PageBackgroundColor,
         };
         logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
         logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
@@ -276,6 +361,11 @@ internal sealed class BridgeMainForm : Form
         logPanel.Controls.Add(_logModeComboBox, 1, 0);
         logPanel.Controls.Add(_logTextBox, 0, 1);
         logPanel.SetColumnSpan(_logTextBox, 2);
+        logPanel.Paint += (_, eventArgs) =>
+        {
+            using Pen border = new(CardBorderColor);
+            eventArgs.Graphics.DrawRectangle(border, 0, 0, Math.Max(0, logPanel.Width - 1), Math.Max(0, logPanel.Height - 1));
+        };
 
         _split = new SplitContainer
         {
@@ -283,27 +373,85 @@ internal sealed class BridgeMainForm : Form
             Orientation = Orientation.Horizontal,
             IsSplitterFixed = true,
             SplitterWidth = 5,
+            BackColor = PageBackgroundColor,
         };
+        _split.Panel1.BackColor = PageBackgroundColor;
+        _split.Panel2.BackColor = PageBackgroundColor;
         _split.Panel1.Controls.Add(capturePanel);
         _split.Panel2.Controls.Add(logPanel);
 
         _macroPage = new MacroPageControl(_automation);
         _luaPage = new LuaPageControl(_automation);
-        _settingsPage = new SettingsPageControl(_automation, firmwareUpdateApi, firmwareFlash);
+        _settingsPage = new SettingsPageControl(
+            _automation,
+            firmwareUpdateApi,
+            firmwareFlash,
+            (enabled, frequencyHz) =>
+            {
+                _input.ConfigureSimulatedUdpInput(enabled, frequencyHz);
+                AppendLog(enabled
+                    ? $"模拟 UDP 输入已开启：源频率={FormatSimulatedUdpFrequency(frequencyHz)}；仅用于测试，移动和滚轮进入 UDP 公共后续链路。"
+                    : "模拟 UDP 输入已关闭：测试源停止，实体鼠标恢复直接进入 1000 Hz 聚合链路。");
+            });
         _tabs = new TabControl
         {
             Dock = DockStyle.Fill,
-            Padding = new Point(16, 6),
+            Padding = Point.Empty,
+            BackColor = CardSurfaceColor,
+            ForeColor = PrimaryTextOnDeepSurface,
+            DrawMode = TabDrawMode.OwnerDrawFixed,
+            SizeMode = TabSizeMode.Fixed,
+            ItemSize = new Size(96, 42),
         };
         TabPage captureTab = new("鼠标捕获");
+        captureTab.BackColor = PageBackgroundColor;
+        captureTab.UseVisualStyleBackColor = false;
         captureTab.Controls.Add(_split);
         TabPage macroTab = new("宏");
+        macroTab.BackColor = PageBackgroundColor;
+        macroTab.UseVisualStyleBackColor = false;
         macroTab.Controls.Add(_macroPage);
         TabPage luaTab = new("Lua");
+        luaTab.BackColor = PageBackgroundColor;
+        luaTab.UseVisualStyleBackColor = false;
         luaTab.Controls.Add(_luaPage);
         TabPage settingsTab = new("设置");
+        settingsTab.BackColor = PageBackgroundColor;
+        settingsTab.UseVisualStyleBackColor = false;
         settingsTab.Controls.Add(_settingsPage);
         _tabs.TabPages.AddRange([captureTab, macroTab, luaTab, settingsTab]);
+        _tabs.DrawItem += (_, eventArgs) =>
+        {
+            bool selected = eventArgs.Index == _tabs.SelectedIndex;
+            using Brush background = new SolidBrush(selected ? CardSurfaceColor : PageBackgroundColor);
+            Color foregroundColor = selected ? AccentColor : SecondaryTextOnDeepSurface;
+            eventArgs.Graphics.FillRectangle(background, eventArgs.Bounds);
+            TextRenderer.DrawText(
+                eventArgs.Graphics,
+                _tabs.TabPages[eventArgs.Index].Text,
+                Font,
+                eventArgs.Bounds,
+                foregroundColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            if (selected)
+            {
+                using Pen underline = new(AccentColor, 2);
+                eventArgs.Graphics.DrawLine(
+                    underline,
+                    eventArgs.Bounds.Left + 12,
+                    eventArgs.Bounds.Bottom - 2,
+                    eventArgs.Bounds.Right - 12,
+                    eventArgs.Bounds.Bottom - 2);
+            }
+        };
+        _tabs.SelectedIndexChanged += (_, _) =>
+        {
+            if (_tabs.SelectedIndex == 3)
+            {
+                _settingsPage.ResetScrollPosition();
+            }
+            _tabs.Invalidate();
+        };
         Controls.Add(_tabs);
         ApplySplitLayout();
 
@@ -313,7 +461,7 @@ internal sealed class BridgeMainForm : Form
         trayMenu.Items.Add("退出", null, (_, _) => ForceClose());
         _notifyIcon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = (Icon)applicationIcon.Clone(),
             Text = "ESP32-S3 HID Bridge",
             ContextMenuStrip = trayMenu,
             Visible = true,
@@ -331,7 +479,7 @@ internal sealed class BridgeMainForm : Form
         Resize += (_, _) =>
         {
             ApplySplitLayout();
-            if (_input.ForwardingEnabled)
+            if (_enableCursorLock && _input.ForwardingEnabled)
             {
                 ApplyCursorLock();
             }
@@ -340,20 +488,26 @@ internal sealed class BridgeMainForm : Form
                 Hide();
             }
         };
+        ResizeEnd += (_, _) => SaveWindowSize();
         FormClosing += OnFormClosing;
     }
 
     internal TextBox LogTextBox => _logTextBox;
     internal ComboBox LogModeComboBox => _logModeComboBox;
-    internal CheckBox SimulatedUdpCheckBox => _simulatedUdpCheckBox;
-    internal ComboBox SimulatedUdpFrequencyComboBox => _simulatedUdpFrequencyComboBox;
+    internal CheckBox SimulatedUdpCheckBox => _settingsPage.SimulatedUdpCheckBox;
+    internal ComboBox SimulatedUdpFrequencyComboBox => _settingsPage.SimulatedUdpFrequencyComboBox;
     internal CheckBox UdpSmoothingCheckBox => _udpSmoothingCheckBox;
+    internal CheckBox AlwaysOutputUdpCheckBox => _alwaysOutputUdpCheckBox;
+    internal TrackBar OutputSensitivityTrackBar => _outputSensitivityTrackBar;
+    internal TextBox OutputSensitivityTextBox => _outputSensitivityTextBox;
+    internal Label OutputSensitivityDescriptionLabel => _outputSensitivityDescriptionLabel;
     internal MouseCaptureSurface CaptureSurface => _captureSurface;
     internal SplitContainer MainSplit => _split;
     internal TabControl MainTabs => _tabs;
     internal MacroPageControl MacroPage => _macroPage;
     internal LuaPageControl LuaPage => _luaPage;
     internal SettingsPageControl SettingsPage => _settingsPage;
+    internal NotifyIcon TrayIcon => _notifyIcon;
     internal void ProcessMovementRecordingForChecks(MouseMovementRecording recording) =>
         InputOnMovementRecordingCompleted(recording);
 
@@ -417,94 +571,7 @@ internal sealed class BridgeMainForm : Form
 
     private void AppendLogBatch(IReadOnlyList<string> lines)
     {
-        if (_logTextBox.IsDisposed || lines.Count == 0)
-        {
-            return;
-        }
-
-        bool followLatest = ShouldFollowLatestLog();
-        int selectionStart = _logTextBox.SelectionStart;
-        int selectionLength = _logTextBox.SelectionLength;
-        int firstVisibleLine = GetFirstVisibleLine();
-        _logTextBox.AppendText(string.Join(Environment.NewLine, lines) + Environment.NewLine);
-        TrimVisibleLogIfNeeded(followLatest);
-
-        if (followLatest)
-        {
-            _logTextBox.SelectionStart = _logTextBox.TextLength;
-            _logTextBox.SelectionLength = 0;
-            _logTextBox.ScrollToCaret();
-            return;
-        }
-
-        // AppendText 可能自行把原生 TextBox 滚动到末尾；仅恢复选区仍会让用户
-        // 看到的历史位置跳变，因此同时恢复 EM_GETFIRSTVISIBLELINE 对应的首行。
-        int restoredStart = Math.Min(selectionStart, _logTextBox.TextLength);
-        _logTextBox.SelectionStart = restoredStart;
-        _logTextBox.SelectionLength = Math.Min(
-            selectionLength,
-            _logTextBox.TextLength - restoredStart);
-        RestoreFirstVisibleLine(firstVisibleLine);
-    }
-
-
-    private void TrimVisibleLogIfNeeded(bool followLatest)
-    {
-        int excess = _logTextBox.TextLength - MaxVisibleLogCharacters;
-        if (!followLatest || excess <= 0)
-        {
-            return;
-        }
-
-        int cutAt = _logTextBox.Text.IndexOf('\n', excess);
-        if (cutAt < 0)
-        {
-            return;
-        }
-
-        _logTextBox.Select(0, cutAt + 1);
-        _logTextBox.SelectedText = string.Empty;
-    }
-
-    private int GetFirstVisibleLine()
-    {
-        return SendMessage(
-            _logTextBox.Handle,
-            EmGetFirstVisibleLine,
-            IntPtr.Zero,
-            IntPtr.Zero);
-    }
-
-    private void RestoreFirstVisibleLine(int firstVisibleLine)
-    {
-        if (firstVisibleLine < 0)
-        {
-            return;
-        }
-
-        int currentFirstVisibleLine = GetFirstVisibleLine();
-        int lineDelta = firstVisibleLine - currentFirstVisibleLine;
-        if (lineDelta != 0)
-        {
-            SendMessage(
-                _logTextBox.Handle,
-                EmLineScroll,
-                IntPtr.Zero,
-                new IntPtr(lineDelta));
-        }
-    }
-
-    private bool ShouldFollowLatestLog()
-    {
-        if (_logTextBox.SelectionLength > 0 || _logTextBox.TextLength == 0)
-        {
-            return _logTextBox.SelectionLength == 0;
-        }
-
-        int lastCharacterIndex = _logTextBox.TextLength - 1;
-        Point lastCharacterPosition = _logTextBox.GetPositionFromCharIndex(lastCharacterIndex);
-        int visibleBottom = _logTextBox.ClientSize.Height - _logTextBox.Font.Height + 4;
-        return lastCharacterPosition.Y <= visibleBottom;
+        LogTextBoxAppender.Append(_logTextBox, lines, MaxVisibleLogCharacters);
     }
 
     private void ApplySplitLayout()
@@ -536,10 +603,10 @@ internal sealed class BridgeMainForm : Form
         _statusLabel.ForeColor = enabled ? SuccessTextOnDeepSurface : SecondaryTextOnDeepSurface;
         Text = enabled ? "ESP32-S3 HID Bridge - 同步已开启" : "ESP32-S3 HID Bridge - 同步已关闭";
         AppendLog(enabled
-            ? $"键鼠同步已开启，鼠标已锁定到上半区中心；UDP 平滑={(_input.UdpSmoothingEnabled ? "开启" : "关闭")}，切换前请先按 HOME 关闭同步。"
-            : "键鼠同步已关闭，本机输入已恢复；现在可以切换 UDP 平滑。");
+            ? $"键鼠同步已开启，鼠标已锁定到上半区中心；UDP 平滑={(_input.UdpSmoothingEnabled ? "开启" : "关闭")}，始终 UDP 输出={(_input.AlwaysOutputUdpEnabled ? "开启" : "关闭")}。"
+            : $"键鼠同步已关闭，本机输入已恢复；UDP 平滑可切换，始终 UDP 输出={(_input.AlwaysOutputUdpEnabled ? "开启" : "关闭")}。");
 
-        if (enabled)
+        if (enabled && _enableCursorLock)
         {
             ApplyCursorLock();
         }
@@ -580,15 +647,14 @@ internal sealed class BridgeMainForm : Form
         }
         if (!_forceClose && eventArgs.CloseReason == CloseReason.UserClosing && _automation.Settings.CloseToTray)
         {
+            SaveWindowSize();
             eventArgs.Cancel = true;
             Hide();
             return;
         }
 
+        SaveWindowSize();
         _closing = true;
-        _automation.Settings.WindowWidth = Math.Max(MinimumSize.Width, RestoreBounds.Width);
-        _automation.Settings.WindowHeight = Math.Max(MinimumSize.Height, RestoreBounds.Height);
-        _automation.SaveSettings();
         _notifyIcon.Visible = false;
         _logFlushTimer.Stop();
         FlushPendingLogs();
@@ -596,6 +662,37 @@ internal sealed class BridgeMainForm : Form
         _input.MovementRecordingStarted -= InputOnMovementRecordingStarted;
         _input.MovementRecordingCompleted -= InputOnMovementRecordingCompleted;
         _input.Stop();
+    }
+
+    private void SaveWindowSize()
+    {
+        if (IsDisposed || _closing)
+        {
+            return;
+        }
+
+        int nonClientWidth = Math.Max(0, Width - ClientSize.Width);
+        int nonClientHeight = Math.Max(0, Height - ClientSize.Height);
+        int width;
+        int height;
+        if (WindowState == FormWindowState.Normal)
+        {
+            width = ClientSize.Width;
+            height = ClientSize.Height;
+        }
+        else
+        {
+            width = RestoreBounds.Width - nonClientWidth;
+            height = RestoreBounds.Height - nonClientHeight;
+        }
+
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+        _automation.Settings.WindowWidth = Math.Max(MinimumSize.Width, width);
+        _automation.Settings.WindowHeight = Math.Max(MinimumSize.Height, height);
+        _automation.SaveSettings();
     }
 
     private void RestoreFromTray()
@@ -621,8 +718,72 @@ internal sealed class BridgeMainForm : Form
         base.Dispose(disposing);
     }
 
-    private int GetSelectedSimulatedUdpFrequency() =>
-        _simulatedUdpFrequencyComboBox.SelectedItem is int frequencyHz ? frequencyHz : 100;
+    private static Icon LoadApplicationIcon()
+    {
+        try
+        {
+            return Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+        }
+        catch
+        {
+            return SystemIcons.Application;
+        }
+    }
+
+    private void CommitOutputSensitivityText()
+    {
+        if (!MouseOutputSensitivity.TryParse(_outputSensitivityTextBox.Text, out double value))
+        {
+            _outputSensitivityTextBox.Text = MouseOutputSensitivity.Format(_automation.Settings.OutputSensitivity);
+            return;
+        }
+
+        ApplyOutputSensitivity(value, persist: true);
+    }
+
+    private void ApplyOutputSensitivity(double value, bool persist)
+    {
+        if (_closing || _updatingOutputSensitivity)
+        {
+            return;
+        }
+
+        double normalized = MouseOutputSensitivity.Clamp(value);
+        _automation.Settings.OutputSensitivity = normalized;
+        _input.ConfigureOutputSensitivity(normalized);
+        _updatingOutputSensitivity = true;
+        try
+        {
+            _outputSensitivityTrackBar.Value = MouseOutputSensitivity.ToTrackBarValue(normalized);
+            _outputSensitivityTextBox.Text = MouseOutputSensitivity.Format(normalized);
+        }
+        finally
+        {
+            _updatingOutputSensitivity = false;
+        }
+
+        if (persist)
+        {
+            PersistOutputSensitivity();
+        }
+    }
+
+    private void PersistOutputSensitivity()
+    {
+        if (_closing)
+        {
+            return;
+        }
+
+        try
+        {
+            _automation.SaveSettings();
+        }
+        catch (Exception exception)
+        {
+            AppendLog($"输出灵敏度保存失败：{exception.Message}");
+        }
+    }
 
     private static string FormatSimulatedUdpFrequency(int frequencyHz) =>
         frequencyHz == SimulatedUdpMouseInput.UnlimitedFrequencyHz
@@ -673,6 +834,11 @@ internal sealed class BridgeMainForm : Form
 
     private void ApplyCursorLock()
     {
+        if (!_enableCursorLock)
+        {
+            return;
+        }
+
         Rectangle screenBounds = _captureSurface.RectangleToScreen(_captureSurface.ClientRectangle);
         Point center = new(screenBounds.Left + screenBounds.Width / 2, screenBounds.Top + screenBounds.Height / 2);
         try
