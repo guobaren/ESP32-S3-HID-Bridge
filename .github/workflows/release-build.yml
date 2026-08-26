@@ -103,7 +103,7 @@ jobs:
             Write-Host ("兼容旧版两段标签：{0} -> {1}" -f $publicTag, $packageTag)
           }
 
-          & .\scripts\Publish-GitHubRelease.ps1 -Tag $packageTag -SkipHostBuild -PackageOnly
+          & .\scripts\Publish-GitHubRelease.ps1 -Tag $packageTag -PackageOnly
           if ($LASTEXITCODE -ne 0) {
             throw ("发布件打包失败，退出码：{0}" -f $LASTEXITCODE)
           }
