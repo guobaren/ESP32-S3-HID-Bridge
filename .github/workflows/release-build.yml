@@ -95,7 +95,30 @@ jobs:
         shell: pwsh
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-        run: .\scripts\Publish-GitHubRelease.ps1 -Tag $env:RELEASE_TAG -SkipHostBuild -PackageOnly
+        run: |
+          $publicTag = $env:RELEASE_TAG
+          $packageTag = $publicTag
+          if ($publicTag -match '^v\d+\.\d+$') {
+            $packageTag = "${publicTag}.0"
+            Write-Host ("兼容旧版两段标签：{0} -> {1}" -f $publicTag, $packageTag)
+          }
+
+          & .\scripts\Publish-GitHubRelease.ps1 -Tag $packageTag -SkipHostBuild -PackageOnly
+          if ($LASTEXITCODE -ne 0) {
+            throw ("发布件打包失败，退出码：{0}" -f $LASTEXITCODE)
+          }
+
+          if ($packageTag -ne $publicTag) {
+            $generatedZip = Join-Path $PWD ("dist\ESP32-S3-HID-Bridge-{0}.zip" -f $packageTag)
+            $publicZip = Join-Path $PWD ("dist\ESP32-S3-HID-Bridge-{0}.zip" -f $publicTag)
+            $generatedHash = "{0}.sha256" -f $generatedZip
+            $publicHash = "{0}.sha256" -f $publicZip
+            $hashText = Get-Content -LiteralPath $generatedHash -Raw
+            $hashText = $hashText.Replace((Split-Path -Leaf $generatedZip), (Split-Path -Leaf $publicZip))
+            [System.IO.File]::WriteAllText($generatedHash, $hashText, [System.Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $generatedZip -Destination $publicZip -Force
+            Move-Item -LiteralPath $generatedHash -Destination $publicHash -Force
+          }
 
       - name: Verify release outputs
         shell: pwsh
