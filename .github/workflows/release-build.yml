@@ -4,23 +4,84 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package
+        required: true
+        default: v0.1
+      source_ref:
+        description: Git ref to build
+        required: true
+        default: main
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_SOURCE_REF: ${{ inputs.source_ref || github.ref }}
 
 jobs:
-  build-host:
-    name: Build Host Release
+  build-firmware:
+    name: Build ESP32-S3 firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          submodules: recursive
+
+      - name: Build firmware
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32s3
+          path: firmware
+
+      - name: Upload firmware inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-inputs
+          if-no-files-found: error
+          path: |
+            firmware/build/flasher_args.json
+            firmware/build/bootloader/bootloader.bin
+            firmware/build/partition_table/partition-table.bin
+            firmware/build/esp32_s3_hid_bridge.bin
+
+  build-package:
+    name: Build and package release
+    needs: build-firmware
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download firmware inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-inputs
+          path: firmware/build
+
+      - name: Build embedded esptool
+        shell: pwsh
+        run: .\scripts\build-embedded-esptool.ps1
 
       - name: Build Host Release
         shell: pwsh
@@ -30,20 +91,38 @@ jobs:
         shell: pwsh
         run: dotnet build .\tests\HidBridge.Host.Checks\HidBridge.Host.Checks.csproj -c Release
 
-      - name: Verify build outputs
+      - name: Generate release directory and ZIP
         shell: pwsh
-        run: |
-          $exe = Get-Item -LiteralPath .\HidBridge.Host.exe -ErrorAction Stop
-          if ($exe.Length -le 0) {
-            throw '根目录 Host EXE 为空。'
-          }
-          Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: .\scripts\Publish-GitHubRelease.ps1 -Tag $env:RELEASE_TAG -SkipHostBuild -PackageOnly
 
-      - name: Upload Host build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ESP32-S3-HID-Bridge-${{ github.ref_name }}
-          if-no-files-found: error
-          path: |
-            HidBridge.Host.exe
-            host/HidBridge.Host/bin/Release/net8.0-windows/**
+      - name: Verify release outputs
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $zip = Get-Item -LiteralPath (Join-Path $PWD ("dist\ESP32-S3-HID-Bridge-{0}.zip" -f $env:RELEASE_TAG)) -ErrorAction Stop
+          $hash = Get-Item -LiteralPath ("{0}.sha256" -f $zip.FullName) -ErrorAction Stop
+          $releaseFiles = @(Get-ChildItem -LiteralPath .\release -File -Recurse)
+          if ($releaseFiles.Count -eq 0) {
+            throw 'release 目录为空。'
+          }
+          Write-Host ("release 文件数：{0}" -f $releaseFiles.Count)
+          Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256
+          Get-Content -LiteralPath $hash.FullName
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $zip = "dist\ESP32-S3-HID-Bridge-$env:RELEASE_TAG.zip"
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $zip --repo $env:GITHUB_REPOSITORY --clobber
+          }
+          else {
+            gh release create $env:RELEASE_TAG $zip --repo $env:GITHUB_REPOSITORY --title "ESP32-S3 HID Bridge $env:RELEASE_TAG" --generate-notes
+          }
