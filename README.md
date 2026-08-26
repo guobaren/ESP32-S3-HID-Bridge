@@ -194,7 +194,7 @@ release/
     -NotesFile .\docs\release-notes-v1.2.3.md -Prerelease
 ```
 
-可用参数：`Tag`（必填，`vX.Y.Z`/预发布后缀）、`Title`、`NotesFile`（缺省使用
+可用参数：`Tag`（必填，`vX.Y` 或 `vX.Y.Z`/预发布后缀）、`Title`、`NotesFile`（缺省使用
 `--generate-notes`）、`Repo`、`Target`、`Draft`、`Prerelease`、`BuildFirmware`、
 `SkipHostBuild`、`AllowDirty` 和 `PackageOnly`。脚本只会删除 `dist/` 下当前 Tag 对应的
 ZIP/哈希文件；不会递归清理其他发布产物，也不会自动创建或覆盖已有 GitHub Release。
