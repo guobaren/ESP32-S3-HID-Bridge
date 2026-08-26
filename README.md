@@ -366,6 +366,37 @@ Lua 详细诊断日志写入 EXE 同目录的 `log/automation/automation-runtime
 - 主界面「UDP 平滑」开关可临时关闭分摊做 A/B；「始终开启 UDP 输出」默认开启，关闭 HOME 时仍允许网络 UDP 输入输出到 ESP32，关闭后网络 UDP 仅在 HOME 同步开启时输出。
 - 设置页的「模拟 UDP 输入（测试）」默认关闭；启用后可把实体鼠标按 30/60/100/140/200/500 Hz/无上限分桶成模拟 UDP 源，仅用于测试输入聚合、平滑和输出链路，不代表真实网络性能。
 
+### Python 调用示范
+
+项目在 `tools/esp32_move.py` 内提供自己的 `Esp32MouseSender` 调用库，
+`tools/send-remote-mouse-sample.py` 使用该库发送命令，不依赖外部项目路径。目标 IP、端口和
+正方形参数都直接写在 `send-remote-mouse-sample.py` 顶部，不读取命令行参数或其他外部输入。
+
+先编辑脚本顶部的 `TARGET_HOST`、`TARGET_PORT`、`SQUARE_SIDE_PIXELS`、
+`MOVE_STEP_PIXELS` 和 `MOVE_INTERVAL_SECONDS`，然后直接运行：
+
+```powershell
+python .\tools\send-remote-mouse-sample.py
+```
+
+当前默认示范会顺时针分四条边发送一个边长 `100`、步长 `100` 的正方形，每条边发送
+一次相对移动命令；每条边前暂停 `10 ms`，命令间隔为 `1 ms`。运行后可能导致目标鼠标移动。
+
+调用库的最小用法为：
+
+```python
+from tools.esp32_move import Esp32MouseSender
+
+sender = Esp32MouseSender("192.168.1.20", 24814)
+try:
+    sender.move(10, 0)
+    sender.move(0, 10)
+finally:
+    sender.close()
+```
+
+本轮只执行了源码检查和不连接网络的正方形纯逻辑检查，没有在本机执行正方形发送演示。
+
 ## 统一输出灵敏度
 
 鼠标捕获页底部的「输出灵敏度」是发送到固件前的最后一道 X/Y 相对移动处理。左侧滑块可在 `0.3` 到 `3.0` 之间拖动，右侧输入框也可直接输入数值；`1` 表示保持原始移动量，小于 `1` 会降低输出，大于 `1` 会放大输出。输入超出范围时会自动限制到边界，输入无效时恢复上一次有效值。

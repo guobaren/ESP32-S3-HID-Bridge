@@ -28,6 +28,11 @@ host/HidBridge.Host/EmbeddedAssets/esptool.exe
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Python 临时文件
+**/__pycache__/
+*.py[cod]
+
 /HidBridge.Host.exe
 /bridge.local.json
 /automation.settings.json

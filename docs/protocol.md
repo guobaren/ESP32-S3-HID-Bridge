@@ -62,4 +62,23 @@ UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流
 - BLE HID 输出由固件以 10 ms 节拍合并主机报告，因此 20 ms 主机平滑窗通常映射为约 2–3 个 BLE 报告；USB HID 不受 BLE 节拍限制。该差异不改变协议字段和位移总量。
 - 监听停止、程序退出或关闭“始终开启 UDP 输出”时不保留远端待发送状态，并继续走现有 `ReleaseAll` 清理路径；仅按 HOME 关闭同步不会阻断该开关允许的后续 UDP 输入。
 
+### Python 调用示范
+
+项目内 `tools/esp32_move.py` 提供 `Esp32MouseSender`：
+
+```python
+from tools.esp32_move import Esp32MouseSender
+
+sender = Esp32MouseSender("192.168.1.20", 24814)
+try:
+    sender.move(25, -10, wheel=0, pan=0)
+finally:
+    sender.close()
+```
+
+仓库中的 `tools/send-remote-mouse-sample.py` 使用项目内调用库，目标 IP、端口和正方形参数直接
+写在脚本顶部，不读取命令行或其他外部输入。默认按顺时针分四条边发送边长 `100`、步长
+`100` 的正方形；实际发送模式、本机 Host 接收、ESP32 接收和目标 HID 行为需要在具备目标
+设备时单独验证。
+
 主机设置页的“模拟 UDP 输入（测试）”模式不会改变上述网络数据报格式，也不会向本机 UDP socket 发送回环数据报，默认关闭。它先按所选 `30/60/100/140/200/500 Hz` 最大频率整合实体鼠标移动和滚轮；选择“无上限”时，每个原始事件直接形成一条内部模拟 UDP 命令。结果提交到与网络命令相同的公共 UDP 后续入口。频率只属于测试源；“UDP 平滑”开启时两类输入都执行固定 10 槽分摊，关闭时都跳过该步骤，之后的 500 Hz 提交和 BLE 10 ms 合并仍一致。按钮转换因不属于 UDP JSON 字段而继续即时进入鼠标报告队列。
