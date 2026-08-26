@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Drawing;
@@ -58,6 +59,12 @@ if (args.Any(argument => argument.Equals("--lua-runtime-only", StringComparison.
     return;
 }
 
+if (args.Any(argument => argument.Equals("--kmbox-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckKmboxNetCompatibility();
+    return;
+}
+
 CheckMouseReportCodec();
 CheckCh341DriverSupport();
 CheckMouseAggregation();
@@ -85,6 +92,7 @@ CheckCursorLockGeometry();
 CheckUiLogWriter();
 CheckLogFileRetention();
 CheckRemoteInputUdpPath();
+CheckKmboxNetCompatibility();
 CheckFirmwareUpdateApiPolicy();
 CheckFirmwareUpdateApiLoopback();
 CheckAutomationProfilesAndRuntime();
@@ -1536,11 +1544,7 @@ static void CheckRemoteInputUdpPath()
     using RemoteInputServer server = new(
         "127.0.0.1",
         0,
-        command => input.TryInjectMouseMovement(
-            command.DeltaX,
-            command.DeltaY,
-            command.Wheel,
-            command.Pan));
+        input);
     server.Start();
 
     using UdpClient client = new();
@@ -1597,6 +1601,190 @@ static void CheckRemoteInputUdpPath()
         transport.MouseReports().Length == disabledReportCount,
         "关闭始终 UDP 输出后，同步关闭时不得继续发送 UDP 模拟输入");
 }
+
+static void CheckKmboxNetCompatibility()
+{
+    DisplayAddressCandidate[] addressCandidates =
+    [
+        new(System.Net.IPAddress.Parse("172.31.255.1"), HasDefaultGateway: false, IsVirtual: true),
+        new(System.Net.IPAddress.Parse("192.168.3.47"), HasDefaultGateway: true, IsVirtual: false),
+        new(System.Net.IPAddress.Parse("169.254.157.120"), HasDefaultGateway: false, IsVirtual: false),
+    ];
+    Require(
+        RemoteInputServer.SelectDisplayAddress(
+            addressCandidates,
+            System.Net.IPAddress.Parse("172.31.255.1")).Equals(System.Net.IPAddress.Parse("192.168.3.47")),
+        "局域网显示地址必须优先选择带默认网关的实体网卡，而不是 VPN/TUN 的 172 地址");
+    DisplayAddressCandidate[] hyperVHostCandidates =
+    [
+        new(System.Net.IPAddress.Parse("192.168.3.50"), HasDefaultGateway: true, IsVirtual: true),
+        new(System.Net.IPAddress.Parse("172.22.112.1"), HasDefaultGateway: false, IsVirtual: true),
+    ];
+    Require(
+        RemoteInputServer.SelectDisplayAddress(
+            hyperVHostCandidates,
+            System.Net.IPAddress.Parse("192.168.3.50")).Equals(System.Net.IPAddress.Parse("192.168.3.50")),
+        "承载默认网关的 Hyper-V vEthernet 必须作为有效局域网地址，不能回退到 127.0.0.1");
+
+    const uint mac = 0xaf425414;
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    using (RemoteInputServer displayServer = new("0.0.0.0", 0, input))
+    {
+        Console.WriteLine($"当前机器通配监听展示地址：{displayServer.DisplayEndpoint}");
+    }
+    input.SetForwardingEnabled(true);
+    using RemoteInputServer server = new("127.0.0.1", 0, input);
+    server.Start();
+    using UdpClient client = new();
+    client.Client.ReceiveTimeout = 2000;
+
+    byte[] connect = BuildKmboxPacket(mac, 0x11223344, 0, KmboxNetProtocol.ConnectCommand, 16);
+    SendKmboxAndRequireAck(client, server.Port, connect, 0, KmboxNetProtocol.ConnectCommand);
+
+    byte[] autoMove = BuildKmboxPacket(mac, 20, 1, KmboxNetProtocol.MouseAutoMoveCommand, 72);
+    BinaryPrimitives.WriteInt32LittleEndian(autoMove.AsSpan(16), 1);
+    BinaryPrimitives.WriteInt32LittleEndian(autoMove.AsSpan(20), 12);
+    BinaryPrimitives.WriteInt32LittleEndian(autoMove.AsSpan(24), -7);
+    SendKmboxAndRequireAck(client, server.Port, autoMove, 1, KmboxNetProtocol.MouseAutoMoveCommand);
+
+    byte[] bezierMove = BuildKmboxPacket(mac, 30, 2, KmboxNetProtocol.BezierMoveCommand, 72);
+    BinaryPrimitives.WriteInt32LittleEndian(bezierMove.AsSpan(16), 1);
+    BinaryPrimitives.WriteInt32LittleEndian(bezierMove.AsSpan(20), -2);
+    BinaryPrimitives.WriteInt32LittleEndian(bezierMove.AsSpan(24), 3);
+    SendKmboxAndRequireAck(client, server.Port, bezierMove, 2, KmboxNetProtocol.BezierMoveCommand);
+
+    DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline &&
+           (transport.MouseReports().Sum(report => (long)report.X) != 10 ||
+            transport.MouseReports().Sum(report => (long)report.Y) != -4))
+    {
+        Thread.Sleep(5);
+    }
+    MouseReport[] mouseReports = transport.MouseReports();
+    Require(mouseReports.Sum(report => (long)report.X) == 10, "kmboxNet move_auto/bezier X 未统一进入现有 move 链路");
+    Require(mouseReports.Sum(report => (long)report.Y) == -4, "kmboxNet move_auto/bezier Y 未统一进入现有 move 链路");
+    Require(mouseReports.Any(report => (report.Buttons & 1) != 0), "kmboxNet 鼠标按钮状态未进入 HID 报告");
+
+    byte[] keyboard = BuildKmboxPacket(mac, 0x55667788, 3, KmboxNetProtocol.KeyboardAllCommand, 28);
+    keyboard[16] = 1;
+    keyboard[18] = 4;
+    SendKmboxAndRequireAck(client, server.Port, keyboard, 3, KmboxNetProtocol.KeyboardAllCommand);
+    deadline = DateTime.UtcNow.AddSeconds(2);
+    while (DateTime.UtcNow < deadline && transport.KeyboardReports().Length == 0)
+    {
+        Thread.Sleep(5);
+    }
+    byte[] keyboardReport = transport.KeyboardReports().Last();
+    Require(keyboardReport[0] == 1 && keyboardReport.Contains((byte)4), "kmboxNet 键盘完整状态未进入现有 HID 接口");
+
+    byte[] traceOff = BuildKmboxPacket(mac, 0, 4, KmboxNetProtocol.TraceCommand, 16);
+    SendKmboxAndRequireAck(client, server.Port, traceOff, 4, KmboxNetProtocol.TraceCommand);
+    Require(!input.UdpSmoothingEnabled, "kmboxNet trace(0, 0) 未关闭当前 UDP 平滑");
+    byte[] traceOn = BuildKmboxPacket(mac, (3u << 24) | 80, 5, KmboxNetProtocol.TraceCommand, 16);
+    SendKmboxAndRequireAck(client, server.Port, traceOn, 5, KmboxNetProtocol.TraceCommand);
+    Require(input.UdpSmoothingEnabled, "kmboxNet trace(3, 80) 未开启当前 UDP 平滑");
+
+    using UdpClient monitor = new(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+    monitor.Client.ReceiveTimeout = 2000;
+    int monitorPort = ((System.Net.IPEndPoint)monitor.Client.LocalEndPoint!).Port;
+    byte[] monitorCommand = BuildKmboxPacket(
+        mac,
+        0xaa550000u | unchecked((ushort)monitorPort),
+        6,
+        KmboxNetProtocol.MonitorCommand,
+        16);
+    SendKmboxAndRequireAck(client, server.Port, monitorCommand, 6, KmboxNetProtocol.MonitorCommand);
+    input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+    {
+        Buttons = NativeMethods.RawMouseButton4Down,
+    });
+    System.Net.IPEndPoint monitorSource = new(System.Net.IPAddress.Any, 0);
+    byte[] monitorReport = monitor.Receive(ref monitorSource);
+    Require(monitorReport.Length == 21, "kmboxNet monitor 回传必须为 21 字节鼠标+键盘状态");
+    Require((monitorReport[1] & 0x08) != 0, "kmboxNet isdown_side1 所需的实体侧键状态未回传");
+
+    byte[] mask = BuildKmboxPacket(mac, 0x00000421, 7, KmboxNetProtocol.MaskCommand, 16);
+    SendKmboxAndRequireAck(client, server.Port, mask, 7, KmboxNetProtocol.MaskCommand);
+    Require(input.KmboxMouseMaskForChecks == 0x21, "kmboxNet 鼠标 mask 位图未应用");
+    Require(input.IsKmboxKeyMaskedForChecks(4), "kmboxNet mask_keyboard 未应用");
+    byte[] unmaskKey = BuildKmboxPacket(mac, 0x00000421, 8, KmboxNetProtocol.UnmaskCommand, 16);
+    SendKmboxAndRequireAck(client, server.Port, unmaskKey, 8, KmboxNetProtocol.UnmaskCommand);
+    Require(!input.IsKmboxKeyMaskedForChecks(4), "kmboxNet unmask_keyboard 未应用");
+    byte[] unmaskAll = BuildKmboxPacket(mac, 0, 9, KmboxNetProtocol.UnmaskCommand, 16);
+    SendKmboxAndRequireAck(client, server.Port, unmaskAll, 9, KmboxNetProtocol.UnmaskCommand);
+    Require(input.KmboxMouseMaskForChecks == 0, "kmboxNet unmask_all 未清除鼠标 mask");
+
+    byte[] encryptedMouse = BuildKmboxPacket(mac, 0x12345678, 10, KmboxNetProtocol.MouseMoveCommand, 128);
+    BinaryPrimitives.WriteInt32LittleEndian(encryptedMouse.AsSpan(20), 5);
+    BinaryPrimitives.WriteInt32LittleEndian(encryptedMouse.AsSpan(24), -5);
+    EncryptKmboxPacket(encryptedMouse, mac);
+    SendKmboxAndRequireAck(client, server.Port, encryptedMouse, 10, KmboxNetProtocol.MouseMoveCommand);
+
+    Console.WriteLine(
+        "kmboxNet 兼容检查：实体网卡优先且支持带网关的 Hyper-V LAN、init/ACK、明文与加密输入、move_auto/bezier 统一移动、" +
+        "键盘、trace 平滑映射、monitor 21 字节状态、mask/unmask 均通过纯逻辑/记录传输验证。");
+}
+
+static byte[] BuildKmboxPacket(uint mac, uint random, uint index, uint command, int length)
+{
+    byte[] packet = new byte[length];
+    BinaryPrimitives.WriteUInt32LittleEndian(packet, mac);
+    BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(4), random);
+    BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(8), index);
+    BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(12), command);
+    return packet;
+}
+
+static void SendKmboxAndRequireAck(
+    UdpClient client,
+    int serverPort,
+    byte[] packet,
+    uint expectedIndex,
+    uint expectedCommand)
+{
+    client.Send(packet, packet.Length, "127.0.0.1", serverPort);
+    System.Net.IPEndPoint source = new(System.Net.IPAddress.Any, 0);
+    byte[] acknowledgement = client.Receive(ref source);
+    Require(acknowledgement.Length == 16, "kmboxNet ACK 必须为 16 字节");
+    Require(BinaryPrimitives.ReadUInt32LittleEndian(acknowledgement.AsSpan(8)) == expectedIndex, "kmboxNet ACK index 不匹配");
+    Require(BinaryPrimitives.ReadUInt32LittleEndian(acknowledgement.AsSpan(12)) == expectedCommand, "kmboxNet ACK cmd 不匹配");
+}
+
+static void EncryptKmboxPacket(Span<byte> packet, uint mac)
+{
+    Span<uint> values = stackalloc uint[32];
+    for (int index = 0; index < values.Length; index++)
+    {
+        values[index] = BinaryPrimitives.ReadUInt32LittleEndian(packet[(index * 4)..]);
+    }
+    Span<uint> key = stackalloc uint[4];
+    key[0] = BinaryPrimitives.ReverseEndianness(mac);
+    const uint delta = 2654435769;
+    uint sum = 0;
+    uint z = values[^1];
+    for (int round = 0; round < 6; round++)
+    {
+        sum = unchecked(sum + delta);
+        uint e = (sum >> 2) & 3;
+        int position;
+        for (position = 0; position < values.Length - 1; position++)
+        {
+            uint y = values[position + 1];
+            z = values[position] = unchecked(values[position] + KmboxMix(sum, y, z, position, e, key));
+        }
+        uint first = values[0];
+        z = values[^1] = unchecked(values[^1] + KmboxMix(sum, first, z, position, e, key));
+    }
+    for (int index = 0; index < values.Length; index++)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(packet[(index * 4)..], values[index]);
+    }
+}
+
+static uint KmboxMix(uint sum, uint y, uint z, int position, uint e, ReadOnlySpan<uint> key) =>
+    unchecked(((z >> 5 ^ y << 2) + (y >> 3 ^ z << 4)) ^
+        ((sum ^ y) + (key[(position & 3) ^ (int)e] ^ z)));
 
 static void CheckFirmwareUpdateApiPolicy()
 {
@@ -2299,7 +2487,12 @@ static void CheckWindowLayout()
             store.SaveProfile(uiProfile);
             using AutomationController automation = new(store, input, new RecordingAutomationOutput());
             // 该布局检查只验证离屏控件和 RecordingAutomationOutput；禁止把测试光标移到真实桌面。
-            using BridgeMainForm form = new(input, automation, "测试端点", enableCursorLock: false);
+            using BridgeMainForm form = new(
+                input,
+                automation,
+                "测试端点",
+                enableCursorLock: false,
+                lanEndpointDescription: "UDP 192.168.1.20:24814");
             _ = form.Handle;
             form.PerformLayout();
             double upperRatio = form.MainSplit.SplitterDistance / (double)form.MainSplit.ClientSize.Height;
@@ -2480,6 +2673,14 @@ static void CheckWindowLayout()
             form.MainTabs.SelectedIndex = 0;
             form.MainTabs.PerformLayout();
             Application.DoEvents();
+            Require(
+                form.LanEndpointLabel.Visible &&
+                form.LanEndpointLabel.Text == "UDP 192.168.1.20:24814" &&
+                form.LanEndpointLabel.Height == form.SyncStatusLabel.Height &&
+                form.LanEndpointLabel.Top == form.SyncStatusLabel.Top &&
+                form.LanEndpointLabel.Width >= 150,
+                $"左上角必须显示与同步状态同高且未裁切的局域网 UDP 监听 IP 和端口：" +
+                $"status={form.SyncStatusLabel.Bounds},lan={form.LanEndpointLabel.Bounds}");
             FlowLayoutPanel udpOptionsLayout = EnumerateControls(form)
                 .OfType<FlowLayoutPanel>()
                 .Single(layout => layout.Controls.Contains(form.UdpSmoothingCheckBox));

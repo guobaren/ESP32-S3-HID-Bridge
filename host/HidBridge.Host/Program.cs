@@ -87,11 +87,7 @@ internal static class Program
                 remoteInput = new RemoteInputServer(
                     options.RemoteInputBindAddress,
                     options.RemoteInputPort,
-                    command => input.TryInjectMouseMovement(
-                        command.DeltaX,
-                        command.DeltaY,
-                        command.Wheel,
-                        command.Pan));
+                    input);
             }
 
             string endpoint = simulationOptions.Enabled
@@ -103,7 +99,14 @@ internal static class Program
                         ? $"串口 @ {options.BaudRate}"
                         : $"串口 {options.PortName} @ {options.BaudRate}";
 
-            using BridgeMainForm form = new(input, automation, endpoint, logSettings, firmwareUpdateApi, firmwareFlash);
+            using BridgeMainForm form = new(
+                input,
+                automation,
+                endpoint,
+                logSettings,
+                firmwareUpdateApi,
+                firmwareFlash,
+                lanEndpointDescription: remoteInput?.DisplayEndpoint);
             logWriter.Attach(form.AppendLog);
             Console.WriteLine($"目标端点：{endpoint}");
             Console.WriteLine($"本地实时日志：{logWriter.FilePath}");

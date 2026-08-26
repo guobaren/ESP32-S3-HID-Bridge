@@ -63,6 +63,23 @@ internal sealed class UdpMouseSmoother
         return !delta.IsZero;
     }
 
+    internal MouseDelta Drain()
+    {
+        MouseDelta total = default;
+        for (int index = 0; index < SmoothingSlots; index++)
+        {
+            if (TryDequeue(out MouseDelta delta))
+            {
+                total = new MouseDelta(
+                    total.X + delta.X,
+                    total.Y + delta.Y,
+                    total.Wheel + delta.Wheel,
+                    total.Pan + delta.Pan);
+            }
+        }
+        return total;
+    }
+
     internal UdpMouseSmootherStatistics GetStatistics() => new(
         SmoothingSlots,
         _scheduled.Count(slot => !slot.IsZero),

@@ -253,6 +253,34 @@ internal sealed class MouseReportPump : IDisposable
         }
     }
 
+    internal void SendRemoteKeyboard(ReadOnlySpan<byte> report)
+    {
+        lock (_sendLock)
+        {
+            if (Enabled || AlwaysOutputUdpEnabled)
+            {
+                _transport.Send(MessageType.KeyboardReport, report);
+            }
+        }
+    }
+
+    internal void SetRemoteButtons(byte buttons)
+    {
+        lock (_stateLock)
+        {
+            if ((!_enabled && !_alwaysOutputUdp) || _disposed)
+            {
+                return;
+            }
+            byte latestButtons = _buttonStates.Count == 0 ? _lastSubmittedButtons : _buttonStates.Last();
+            if (latestButtons != buttons)
+            {
+                _buttonStates.Enqueue(buttons);
+                _buttonTransitionCount++;
+            }
+        }
+    }
+
     internal void ResetAndSendRelease(bool enabledAfterRelease)
     {
         lock (_sendLock)
@@ -346,6 +374,28 @@ internal sealed class MouseReportPump : IDisposable
                     return;
                 }
 
+                _udpMouseSmoother.Reset();
+                _udpSmoothingEnabled = enabled;
+            }
+        }
+    }
+
+    internal void ConfigureUdpSmoothingFromRemote(bool enabled)
+    {
+        lock (_sendLock)
+        {
+            lock (_stateLock)
+            {
+                if (_disposed || _udpSmoothingEnabled == enabled)
+                {
+                    return;
+                }
+
+                MouseDelta pending = _udpMouseSmoother.Drain();
+                _pendingX += pending.X;
+                _pendingY += pending.Y;
+                _pendingWheel += pending.Wheel;
+                _pendingPan += pending.Pan;
                 _udpMouseSmoother.Reset();
                 _udpSmoothingEnabled = enabled;
             }

@@ -9,7 +9,7 @@
 - 原生 USB：固定枚举「键盘 + 相对触摸板」HID-only，不依赖启动期 UART 帧
 - BLE HID 键盘/鼠标输出，NimBLE Just Works 配对 + 绑定密钥持久化
 - USB/BLE 双输出活动链路锁定与 100 ms 失活切换，切换前后自动 ReleaseAll
-- 局域网 UDP 模拟鼠标输入（默认 0.0.0.0:24814，20 ms 平滑分摊）
+- 局域网 UDP 模拟输入（默认 0.0.0.0:24814，兼容 JSON 与 kmboxNet，20 ms 平滑分摊）
 - 宏（多段脚本）与 Lua 脚本（OnEvent 事件模型）
 - 鼠标移动记录与分析图（左右键同按触发）
 - 固件刷写双入口：设置页本地刷写 + 本机 HTTP 接口，均使用内置独立 esptool，无需 Python
@@ -353,18 +353,38 @@ Lua 详细诊断日志写入 EXE 同目录的 `log/automation/automation-runtime
 
 ## UDP 模拟鼠标接口
 
-主机 EXE 默认监听 UDP 0.0.0.0:24814，接收 UTF-8 JSON 相对移动命令（默认开启“始终开启 UDP 输出”时，即使 HOME 关闭也会发送到 ESP32；不直接移动本机光标）：
+主机 EXE 默认监听 UDP 0.0.0.0:24814，同一端口自动识别 UTF-8 JSON 和 kmboxNet 二进制协议。鼠标捕获页左上角会显示其他电脑实际可填写的局域网 IP 和端口。默认开启“始终开启 UDP 输出”时，即使 HOME 关闭也会发送到 ESP32；UDP 输入不会直接移动运行 EXE 电脑的光标。
 
 ```json
 {"dx":12,"dy":-4,"wheel":0,"pan":0}
 ```
 
 - dx/dy 范围 -32768..32767，wheel/pan 范围 -128..127，四项不能全零。
-- 命令分摊到固定 10 个 2 ms 槽（20 ms 低延迟平滑），连续输入在槽内合并。
+- 命令分摊到固定 20 个 1 ms 槽（20 ms 低延迟平滑），连续输入在槽内合并。
 - 无身份认证：仅应在受信任网络使用；只做本机测试可把 remoteInputBindAddress 改为 127.0.0.1。
 - 可选发送示例：tools/send-remote-mouse.ps1 -HostAddress 192.168.1.20 -Port 24814 -Dx 25 -Dy -10。
 - 主界面「UDP 平滑」开关可临时关闭分摊做 A/B；「始终开启 UDP 输出」默认开启，关闭 HOME 时仍允许网络 UDP 输入输出到 ESP32，关闭后网络 UDP 仅在 HOME 同步开启时输出。
 - 设置页的「模拟 UDP 输入（测试）」默认关闭；启用后可把实体鼠标按 30/60/100/140/200/500 Hz/无上限分桶成模拟 UDP 源，仅用于测试输入聚合、平滑和输出链路，不代表真实网络性能。
+
+### kmboxNet 兼容调用
+
+可以继续使用 `kmboxnet-main/python_pyd` 中与 Python 版本匹配的 `kmNet.cp*.pyd`，调用名称不变，只需把 IP 和端口指向主界面左上角显示的监听地址。UUID 仍按原来的 8 位十六进制字符串传入：
+
+```python
+import kmNet
+
+kmNet.init("192.168.1.20", "24814", "AF425414")
+kmNet.move(10, -5)
+kmNet.wheel(1)
+```
+
+兼容范围包括明文/加密鼠标与键盘输入、按钮、滚轮、`mouse_all`、`move_auto`、贝塞尔移动、`monitor/isdown_*`、`mask/unmask` 和 `trace`。其中：
+
+- 所有 move 类调用忽略原盒子的轨迹参数，统一提交到现有 UDP move 链路。
+- `trace(type, value)` 只映射为当前 20 ms UDP 平滑开关：`value > 0` 开启，否则关闭。
+- `monitor(port)` 不改变 EXE 的捕获状态，只登记原版 pyd 接收 21 字节实体键鼠状态的回传端口；`isdown_*` 继续读取 pyd 的本地状态缓存。
+- `mask_*` 过滤实体键鼠到 ESP32 的转发，但 monitor 仍能看到被屏蔽的物理状态。
+- `reboot`、`setconfig`、`setvidpid` 和 LCD 接口没有主机端等价设备，本版不处理。
 
 ### Python 调用示范
 
@@ -455,7 +475,7 @@ finally:
 
 ### UDP 平滑与安全边界
 
-- 默认监听 `0.0.0.0:24814`，JSON 字段为 `dx`、`dy`、`wheel`、`pan`；范围分别为 `-32768..32767`、`-128..127`，四项全零的数据报拒绝并应由发送端在复用 socket 的前提下跳过。
+- 默认监听 `0.0.0.0:24814`，同端口接受 JSON 和 kmboxNet 二进制包；JSON 字段为 `dx`、`dy`、`wheel`、`pan`，范围分别为 `-32768..32767`、`-128..127`，四项全零的数据报拒绝并应由发送端在复用 socket 的前提下跳过。
 - 平滑器使用固定 20 个 1 ms 槽覆盖最多 20 ms 尾部，整数位移在槽间守恒且不无界积压；关闭“UDP 平滑”只用于 A/B 对比。
 - “模拟 UDP 输入（测试）”位于设置页且默认关闭，可按 30/60/100/140/200/500 Hz 或无上限生成测试源；模拟结果不能替代真实 USB/BLE 和目标端 Raw Input 验收。
 - 当前 UDP 入口没有身份认证、计数器或时间窗防重放，只适用于受信任局域网；本机测试应将 `remoteInputBindAddress` 改为 `127.0.0.1`。

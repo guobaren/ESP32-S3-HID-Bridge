@@ -26,6 +26,7 @@ internal sealed class BridgeMainForm : Form
     private readonly bool _enableCursorLock;
     private readonly MouseCaptureSurface _captureSurface;
     private readonly Label _statusLabel;
+    private readonly Label _lanEndpointLabel;
     private readonly TextBox _logTextBox;
     private readonly ComboBox _logModeComboBox;
     private readonly CheckBox _udpSmoothingCheckBox;
@@ -54,7 +55,8 @@ internal sealed class BridgeMainForm : Form
         RuntimeLogSettings? logSettings = null,
         FirmwareUpdateApiServer? firmwareUpdateApi = null,
         FirmwareFlashService? firmwareFlash = null,
-        bool enableCursorLock = true)
+        bool enableCursorLock = true,
+        string? lanEndpointDescription = null)
     {
         _input = input;
         _automation = automation;
@@ -87,6 +89,18 @@ internal sealed class BridgeMainForm : Form
             Margin = new Padding(0),
             Text = "同步已关闭",
             ForeColor = SecondaryTextOnDeepSurface,
+        };
+
+        _lanEndpointLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            AutoEllipsis = true,
+            AutoSize = false,
+            Margin = new Padding(12, 0, 0, 0),
+            Text = lanEndpointDescription ?? "局域网 UDP 未启用",
+            ForeColor = SecondaryTextOnDeepSurface,
+            AccessibleName = "局域网 UDP 监听地址",
         };
 
         Label endpointLabel = new()
@@ -233,11 +247,24 @@ internal sealed class BridgeMainForm : Form
             BackColor = CardSurfaceColor,
             ForeColor = PrimaryTextOnDeepSurface,
         };
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24));
-        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
         shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
+        shortcutBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24));
         shortcutBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        shortcutBar.Controls.Add(_statusLabel, 0, 0);
+        TableLayoutPanel statusBar = new()
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = new Padding(0),
+            Padding = new Padding(0),
+        };
+        statusBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+        statusBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        statusBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        statusBar.Controls.Add(_statusLabel, 0, 0);
+        statusBar.Controls.Add(_lanEndpointLabel, 1, 0);
+        shortcutBar.Controls.Add(statusBar, 0, 0);
         // FlowDirection=RightToLeft 让两个开关在中间列整体靠右，同时保留平滑在左、始终输出在右。
         // 与原先“百分比空白列 + AutoSize 列”的嵌套 TableLayoutPanel 不同，FlowLayoutPanel 会按
         // 控件首选宽度布局，避免 DPI 或端点文本变化时把 CheckBox 的文字挤成不可见区域。
@@ -498,6 +525,8 @@ internal sealed class BridgeMainForm : Form
     internal ComboBox SimulatedUdpFrequencyComboBox => _settingsPage.SimulatedUdpFrequencyComboBox;
     internal CheckBox UdpSmoothingCheckBox => _udpSmoothingCheckBox;
     internal CheckBox AlwaysOutputUdpCheckBox => _alwaysOutputUdpCheckBox;
+    internal Label SyncStatusLabel => _statusLabel;
+    internal Label LanEndpointLabel => _lanEndpointLabel;
     internal TrackBar OutputSensitivityTrackBar => _outputSensitivityTrackBar;
     internal TextBox OutputSensitivityTextBox => _outputSensitivityTextBox;
     internal Label OutputSensitivityDescriptionLabel => _outputSensitivityDescriptionLabel;

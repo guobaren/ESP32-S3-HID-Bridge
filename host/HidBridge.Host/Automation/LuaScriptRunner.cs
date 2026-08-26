@@ -10,6 +10,7 @@ internal sealed class LuaScriptRunner : IDisposable
     private readonly object _stateLock = new();
     private readonly IAutomationOutput _output;
     private readonly Action<string> _log;
+    private readonly Action<string> _diagnosticLog;
     private readonly Action _clearLog;
     private readonly HashSet<uint> _heldPhysicalKeys = [];
     private readonly HashSet<int> _pressedButtons = [];
@@ -30,6 +31,7 @@ internal sealed class LuaScriptRunner : IDisposable
     {
         _output = output;
         _log = log;
+        _diagnosticLog = diagnosticLog;
         _clearLog = clearLog;
     }
 
@@ -105,6 +107,7 @@ internal sealed class LuaScriptRunner : IDisposable
         {
             object argument = AutomationKeyMap.GetLuaEventArgument(input.VirtualKey);
             string eventName = input.Pressed ? "pressed" : "released";
+            _diagnosticLog($"[LuaEvent] event={eventName} arg={argument}");
             events.Add((
                 eventName,
                 argument));
