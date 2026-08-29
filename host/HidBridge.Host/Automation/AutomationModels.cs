@@ -72,6 +72,7 @@ internal sealed class AutomationSettings
     public int SimulatedUdpInputFrequencyHz { get; set; } = 100;
     public bool FirmwareUpdateApiEnabled { get; set; }
     public string FirmwareManifestPath { get; set; } = string.Empty;
+    public string FirmwareFlashPortName { get; set; } = string.Empty;
     public int WindowWidth { get; set; } = 1080;
     public int WindowHeight { get; set; } = 760;
 }

@@ -1,6 +1,7 @@
 using HidBridge.Host.Automation;
 using HidBridge.Host.FirmwareUpdate;
 using HidBridge.Host.Input;
+using HidBridge.Host.Transport;
 
 namespace HidBridge.Host.Ui;
 
@@ -26,6 +27,8 @@ internal sealed class SettingsPageControl : UserControl
     private readonly Action<bool, int>? _configureSimulatedUdp;
     private readonly Panel _cards;
     private TextBox _firmwareFileTextBox = null!;
+    private ComboBox _firmwarePortComboBox = null!;
+    private Button _refreshFirmwarePortsButton = null!;
     private Button _browseFirmwareButton = null!;
     private Button _confirmFlashButton = null!;
     private readonly Label _statusLabel;
@@ -211,6 +214,8 @@ internal sealed class SettingsPageControl : UserControl
     internal CheckBox FirmwareUpdateApiCheckBox => _firmwareUpdateApiCheckBox;
     internal CheckBox SimulatedUdpCheckBox => _simulatedUdpCheckBox;
     internal ComboBox SimulatedUdpFrequencyComboBox => _simulatedUdpFrequencyComboBox;
+    internal ComboBox FirmwarePortComboBox => _firmwarePortComboBox;
+    internal Button RefreshFirmwarePortsButton => _refreshFirmwarePortsButton;
     internal void ResetScrollPosition() => _cards.AutoScrollPosition = Point.Empty;
 
     private Panel BuildSimulatedUdpPanel()
@@ -278,7 +283,7 @@ internal sealed class SettingsPageControl : UserControl
         Panel panel = new()
         {
             Dock = DockStyle.Top,
-            Height = 285,
+            Height = 357,
             Padding = new Padding(16),
             BackColor = CardSurfaceColor,
         };
@@ -287,12 +292,44 @@ internal sealed class SettingsPageControl : UserControl
         Label sectionTitle = CreateSectionTitle("本地固件刷写");
         Label sectionDescription = new()
         {
-            Text = "选择本机 JSON 刷写清单；清单中的相对镜像路径按 JSON 所在目录解析。点“确定”后弹窗确认并打开进度日志窗口。远程 API 使用请求中单独指定的 JSON。",
+            Text = "在本模块选择刷写串口和本机 JSON 清单；刷写直接使用所选 COM，不要求应用层握手。远程 API 使用请求中单独指定的串口和 JSON。",
             Dock = DockStyle.Top,
             Height = 44,
             ForeColor = MutedTextColor,
         };
         Panel apiOption = WrapOption(_firmwareUpdateApiCheckBox);
+        _firmwarePortComboBox = new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            Height = 30,
+            DropDownStyle = ComboBoxStyle.DropDown,
+            FormattingEnabled = true,
+            Enabled = _firmwareFlash is not null,
+            AccessibleName = "固件刷写串口",
+        };
+        _firmwarePortComboBox.TextChanged += (_, _) =>
+            _confirmFlashButton.Enabled = CanStartFlash();
+        _refreshFirmwarePortsButton = new Button
+        {
+            Text = "刷新端口",
+            AutoSize = true,
+            Enabled = _firmwareFlash is not null,
+            BackColor = Color.FromArgb(237, 243, 250),
+            ForeColor = PrimaryTextColor,
+            UseVisualStyleBackColor = false,
+        };
+        _refreshFirmwarePortsButton.Click += (_, _) => RefreshFirmwarePorts(showStatus: true);
+        TableLayoutPanel portRow = new()
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Padding = new Padding(0),
+        };
+        portRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        portRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        portRow.Controls.Add(_firmwarePortComboBox, 0, 0);
+        portRow.Controls.Add(_refreshFirmwarePortsButton, 1, 0);
         _firmwareFileTextBox = new TextBox
         {
             Dock = DockStyle.Top,
@@ -354,16 +391,25 @@ internal sealed class SettingsPageControl : UserControl
             Height = 22,
             ForeColor = MutedTextColor,
         };
+        Label portLabel = new()
+        {
+            Text = "刷写串口（可选择或输入，例如 COM3）",
+            Dock = DockStyle.Fill,
+            Height = 22,
+            ForeColor = MutedTextColor,
+        };
         TableLayoutPanel content = new()
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = unavailable is null ? 6 : 7,
+            RowCount = unavailable is null ? 8 : 9,
             Padding = new Padding(0),
         };
         content.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         content.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         content.RowStyles.Add(new RowStyle(SizeType.Absolute, 56));
+        content.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+        content.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         content.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
         content.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         content.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
@@ -374,12 +420,14 @@ internal sealed class SettingsPageControl : UserControl
         content.Controls.Add(sectionTitle, 0, 0);
         content.Controls.Add(sectionDescription, 0, 1);
         content.Controls.Add(apiOption, 0, 2);
-        content.Controls.Add(manifestLabel, 0, 3);
-        content.Controls.Add(_firmwareFileTextBox, 0, 4);
-        content.Controls.Add(buttonRow, 0, 5);
+        content.Controls.Add(portLabel, 0, 3);
+        content.Controls.Add(portRow, 0, 4);
+        content.Controls.Add(manifestLabel, 0, 5);
+        content.Controls.Add(_firmwareFileTextBox, 0, 6);
+        content.Controls.Add(buttonRow, 0, 7);
         if (unavailable is not null)
         {
-            content.Controls.Add(unavailable, 0, 6);
+            content.Controls.Add(unavailable, 0, 8);
         }
         panel.Controls.Add(content);
         return panel;
@@ -403,7 +451,7 @@ internal sealed class SettingsPageControl : UserControl
             _controller.Settings.FirmwareManifestPath = Path.GetFullPath(dialog.FileName);
             _controller.SaveSettings();
             _firmwareFileTextBox.Text = _controller.Settings.FirmwareManifestPath;
-            _confirmFlashButton.Enabled = true;
+            _confirmFlashButton.Enabled = CanStartFlash();
             _statusLabel.ForeColor = Color.FromArgb(34, 125, 70);
             _statusLabel.Text = "已保存固件 JSON 清单";
         }
@@ -425,16 +473,29 @@ internal sealed class SettingsPageControl : UserControl
             MessageBox.Show(this, "请先选择有效的 JSON 刷写清单。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        string portName;
+        try
+        {
+            portName = SerialBridge.NormalizeFirmwarePortName(_firmwarePortComboBox.Text);
+        }
+        catch (ArgumentException exception)
+        {
+            MessageBox.Show(this, exception.Message, "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        string[] availablePorts = _firmwareFlash.GetAvailablePortNames();
+        if (!availablePorts.Contains(portName, StringComparer.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(this, $"所选串口 {portName} 当前不存在，请刷新端口后重试。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
         if (_firmwareFlash.GetSnapshot().State == "running")
         {
             MessageBox.Show(this, "已有刷写任务正在进行，请等待其结束后再试。", "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        string message = "即将刷写固件到开发板：" + Environment.NewLine
-            + file + Environment.NewLine + Environment.NewLine
-            + "请确认开发板已连接；刷写期间将暂停键鼠同步转发。" + Environment.NewLine
-            + "确定开始刷写吗？";
+        string message = BuildFirmwareFlashConfirmation(file, portName, availablePorts);
         DialogResult confirm = MessageBox.Show(
             this,
             message,
@@ -446,12 +507,85 @@ internal sealed class SettingsPageControl : UserControl
             return;
         }
 
-        if (!_firmwareFlash.TryStartFromManifest(file, out FirmwareFlashSnapshot snapshot))
+        _controller.Settings.FirmwareFlashPortName = portName;
+        _controller.SaveSettings();
+        if (!_firmwareFlash.TryStartFromManifest(file, portName, out FirmwareFlashSnapshot snapshot))
         {
             MessageBox.Show(this, snapshot.Message, "固件刷写", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         new FirmwareFlashDialog(_firmwareFlash).Show(this);
+    }
+
+    private bool CanStartFlash() =>
+        _firmwareFlash is not null &&
+        File.Exists(_firmwareFileTextBox.Text.Trim()) &&
+        !string.IsNullOrWhiteSpace(_firmwarePortComboBox.Text);
+
+    private void RefreshFirmwarePorts(bool showStatus)
+    {
+        if (_firmwareFlash is null)
+        {
+            return;
+        }
+        string previous = _firmwarePortComboBox.Text.Trim();
+        string[] ports = _firmwareFlash.GetAvailablePortNames();
+        string? connected = _firmwareFlash.GetConnectedPortName();
+        _firmwarePortComboBox.BeginUpdate();
+        try
+        {
+            _firmwarePortComboBox.Items.Clear();
+            _firmwarePortComboBox.Items.AddRange(ports.Cast<object>().ToArray());
+            _firmwarePortComboBox.Text = SelectFirmwarePort(previous, connected, ports);
+        }
+        finally
+        {
+            _firmwarePortComboBox.EndUpdate();
+        }
+        _confirmFlashButton.Enabled = CanStartFlash();
+        if (showStatus)
+        {
+            _statusLabel.ForeColor = ports.Length == 0 ? ErrorColor : SuccessColor;
+            _statusLabel.Text = ports.Length switch
+            {
+                0 => "未检测到可用串口",
+                1 => $"检测到串口 {ports[0]}",
+                _ => $"检测到 {ports.Length} 个串口，请确认当前选择",
+            };
+        }
+    }
+
+    internal static string SelectFirmwarePort(
+        string? previous,
+        string? connected,
+        IReadOnlyList<string> availablePorts)
+    {
+        string? connectedAvailable = availablePorts.FirstOrDefault(
+            port => port.Equals(connected, StringComparison.OrdinalIgnoreCase));
+        if (connectedAvailable is not null)
+        {
+            return connectedAvailable;
+        }
+        string? previousAvailable = availablePorts.FirstOrDefault(
+            port => port.Equals(previous, StringComparison.OrdinalIgnoreCase));
+        return previousAvailable ?? availablePorts.FirstOrDefault() ?? string.Empty;
+    }
+
+    internal static string BuildFirmwareFlashConfirmation(
+        string manifestPath,
+        string portName,
+        IReadOnlyList<string> availablePorts)
+    {
+        string multiplePortsWarning = availablePorts.Count > 1
+            ? "检测到多个串口：" + string.Join("、", availablePorts) + Environment.NewLine
+              + $"本次只会刷写已选择的 {portName}，请确认没有选错设备。" + Environment.NewLine + Environment.NewLine
+            : string.Empty;
+        return "即将刷写固件到开发板：" + Environment.NewLine
+            + $"串口：{portName}" + Environment.NewLine
+            + $"清单：{manifestPath}" + Environment.NewLine + Environment.NewLine
+            + multiplePortsWarning
+            + "请确认开发板已连接；刷写期间将暂停键鼠同步转发。" + Environment.NewLine
+            + "确定开始刷写吗？";
     }
 
     private static CheckBox CreateOption(string title, string description, int height = 50) => new()
@@ -567,8 +701,9 @@ internal sealed class SettingsPageControl : UserControl
         _firmwareUpdateApiCheckBox.Checked =
             _firmwareUpdateApi is not null && _controller.Settings.FirmwareUpdateApiEnabled;
         _firmwareFileTextBox.Text = _controller.Settings.FirmwareManifestPath;
-        _confirmFlashButton.Enabled = _firmwareFlash is not null &&
-            File.Exists(_controller.Settings.FirmwareManifestPath);
+        _firmwarePortComboBox.Text = _controller.Settings.FirmwareFlashPortName;
+        RefreshFirmwarePorts(showStatus: false);
+        _confirmFlashButton.Enabled = CanStartFlash();
         _loading = false;
         ApplySimulatedUdpSettings();
     }
@@ -585,6 +720,7 @@ internal sealed class SettingsPageControl : UserControl
         _controller.Settings.GenerateMovementAnalysisImage = _generateMovementAnalysisImageCheckBox.Checked;
         _controller.Settings.FirmwareUpdateApiEnabled =
             _firmwareUpdateApi is not null && _firmwareUpdateApiCheckBox.Checked;
+        _controller.Settings.FirmwareFlashPortName = _firmwarePortComboBox.Text.Trim();
         ApplySimulatedUdpSettings();
         try
         {

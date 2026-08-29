@@ -5,9 +5,12 @@ using System.Text.Json;
 
 namespace HidBridge.Host.FirmwareUpdate;
 
-internal delegate bool FirmwareFlashStarter(string manifestPath, out FirmwareFlashSnapshot snapshot);
+internal delegate bool FirmwareFlashStarter(
+    string manifestPath,
+    string portName,
+    out FirmwareFlashSnapshot snapshot);
 
-internal sealed record FirmwareFlashRequest(string ManifestPath);
+internal sealed record FirmwareFlashRequest(string ManifestPath, string PortName);
 
 internal sealed class FirmwareUpdateApiServer : IDisposable
 {
@@ -226,7 +229,16 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                             .ConfigureAwait(false);
                         return;
                     }
-                    bool started = _tryStart(request.ManifestPath, out FirmwareFlashSnapshot snapshot);
+                    if (string.IsNullOrWhiteSpace(request.PortName))
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "port_name_required" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    bool started = _tryStart(
+                        request.ManifestPath,
+                        request.PortName,
+                        out FirmwareFlashSnapshot snapshot);
                     int responseCode = started
                         ? 202
                         : snapshot.State == "failed" && string.IsNullOrEmpty(snapshot.JobId)

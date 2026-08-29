@@ -82,7 +82,7 @@ Driver Store 已有驱动、设备已正常工作或 Driver Store 探测失败�
 - `HidBridge.Host` 使用 `WH_KEYBOARD_LL`、`WH_MOUSE_LL` 和鼠标 Raw Input 捕获实体输入；捕获线程只做快速入队，独立分发线程负责状态更新、Lua/宏事件和报告发送。
 - `MouseReportPump` 以 1000 Hz / 1 ms 为发送上限，连续相对移动在队列中合并，按钮、滚轮和键盘边沿保持顺序；Windows 调度不保证每份报告严格间隔 1 ms。
 - `SerialBridge` 通过 `DeviceProbe`/`DeviceHello` 自动发现串口并建立二进制会话；主机负责发送 `ReleaseAll`、维护输入租约和记录诊断日志。
-- 固件刷写设置页与 Loopback API 共用校验和刷写服务，但各自提供本机 JSON 清单路径；EXE 不内嵌固件镜像。
+- 固件刷写设置页与 Loopback API 共用校验和刷写服务，但各自提供本机 JSON 清单路径和串口；EXE 不内嵌固件镜像。
 - 普通键鼠捕获转发路径不创建虚拟 HID 设备；UDP、Lua/宏等自动化路径属于主动输出路径，不能据此推断为“完全没有本机输入注入”。
 
 ### 固件端职责
@@ -210,14 +210,14 @@ ZIP/哈希文件；不会递归清理其他发布产物，也不会自动创建�
 
 控制软件可以在不退出进程的情况下释放串口刷写固件，刷写完成后自动恢复连接。两个入口**最终都调用内置的独立版 esptool.exe**（构建时嵌入 exe，目标机无需安装 Python / ESP-IDF 环境；首次刷写时解压到 %LOCALAPPDATA%/HidBridge/embedded 缓存）。
 
-EXE 不内嵌固件。设置页和远程 API 各自指定运行控制软件电脑上的 JSON 清单；两者只共用清单校验、esptool 调用和串口恢复逻辑。
+EXE 不内嵌固件。设置页和远程 API 各自指定运行控制软件电脑上的 JSON 清单与串口；两者只共用清单校验、esptool 调用和串口恢复逻辑。刷写串口不要求应用固件先完成 HID Bridge 握手，便于应用固件异常时恢复。
 
 ### 方式一：设置页本地刷写（手动，推荐）
 
-1. 运行 HidBridge.Host.exe，确认日志显示已连接串口。
-2. 打开「设置」页，底部「本地固件刷写」区，点「选择 JSON」。
-3. 选择三段完整刷写清单；清单里的相对镜像路径按 JSON 所在目录解析，可按标准子目录（bootloader/、partition_table/）或与清单同目录平铺放置。
-4. 点「确定」→ 弹窗二次确认 → 打开小日志窗口实时显示 esptool 进度（百分比、哈希校验、RTS 复位），完成后显示「刷写完成」。
+1. 运行 HidBridge.Host.exe，打开「设置」页底部的「本地固件刷写」模块。
+2. 在模块内选择或输入刷写串口（例如 `COM3`）；点「刷新端口」可重新枚举。默认优先当前已连接串口，其次使用上次选择或端口列表首项。
+3. 点「选择 JSON」并选择三段完整刷写清单；清单里的相对镜像路径按 JSON 所在目录解析，可按标准子目录（bootloader/、partition_table/）或与清单同目录平铺放置。
+4. 点「确定」→ 弹窗确认 → 打开小日志窗口实时显示 esptool 进度。检测到多个串口时，确认窗口会列出全部串口和本次所选端口，确认后只刷写该端口。
 
 ### 方式二：远端刷写接口（远程调用）
 
@@ -229,7 +229,10 @@ EXE 不内嵌固件。设置页和远程 API 各自指定运行控制软件电�
 
 ```powershell
 $headers = @{ 'X-HidBridge-Action' = 'flash-firmware' }
-$body = @{ manifestPath = 'D:\ESP32-S3-HID-Bridge\firmware\build\flasher_args.json' } | ConvertTo-Json
+$body = @{
+    manifestPath = 'D:\ESP32-S3-HID-Bridge\firmware\build\flasher_args.json'
+    portName = 'COM3'
+} | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:24815/api/v1/firmware/flash' -Headers $headers -ContentType 'application/json' -Body $body
 ```
 
@@ -241,7 +244,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:24815/api/v1/firmware/status'
 
 状态 state 取值：`idle`（未执行）/ `running`（释放串口、刷写或恢复中）/ `succeeded`（三段哈希校验 + RTS 复位 + 串口恢复通过）/ `failed`（原因见 message，退出码见 exitCode）。重复提交时不会并发执行，返回 HTTP 409 和当前任务状态。
 
-**安全边界**：只绑定 127.0.0.1；POST 必须携带确认头，并在 JSON 正文中指定本机 `manifestPath`；不接受固件上传、串口名或命令行参数；清单必须且只能包含 0x0、0x8000、0x10000 三段且镜像位于 JSON 所在目录内；刷写期间独占串口并暂停同步，程序退出时等待 esptool 安全结束。成功后日志输出「固件刷写最终摘要」（三段 SHA-256、设备校验计数、RTS 复位结果）。
+**安全边界**：只绑定 127.0.0.1；POST 必须携带确认头，并在 JSON 正文中指定本机 `manifestPath` 和 `portName`；不接受固件上传或命令行参数。串口必须是当前存在的 `COM` 加正整数；清单必须且只能包含 0x0、0x8000、0x10000 三段且镜像位于 JSON 所在目录内；刷写期间独占所选串口并暂停同步，程序退出时等待 esptool 安全结束。成功后日志输出「固件刷写最终摘要」（三段 SHA-256、设备校验计数、RTS 复位结果）。
 
 ### 内置 esptool 的重新构建
 

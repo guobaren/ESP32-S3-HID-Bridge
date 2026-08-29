@@ -46,9 +46,17 @@ internal sealed class FirmwareFlashService : IDisposable
     }
 
     /// <summary>从调用方指定的本地 JSON 清单创建计划并启动刷写。</summary>
-    internal bool TryStartFromManifest(string manifestPath, out FirmwareFlashSnapshot snapshot)
+    internal string[] GetAvailablePortNames() => SerialBridge.GetAvailablePortNames();
+
+    internal string? GetConnectedPortName() => _serialBridge.GetConnectedPortName();
+
+    internal bool TryStartFromManifest(
+        string manifestPath,
+        string portName,
+        out FirmwareFlashSnapshot snapshot)
     {
         FirmwareFlashPlan plan;
+        string selectedPort;
         try
         {
             if (string.IsNullOrWhiteSpace(manifestPath) || !Path.IsPathFullyQualified(manifestPath))
@@ -56,6 +64,11 @@ internal sealed class FirmwareFlashService : IDisposable
                 throw new ArgumentException("JSON 刷写清单必须使用本机绝对路径。", nameof(manifestPath));
             }
             plan = FirmwareFlashPlan.LoadFromManifest(manifestPath);
+            selectedPort = SerialBridge.NormalizeFirmwarePortName(portName);
+            if (!GetAvailablePortNames().Contains(selectedPort, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new IOException($"所选刷写串口 {selectedPort} 当前不存在。");
+            }
         }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or ArgumentException or JsonException)
@@ -74,11 +87,14 @@ internal sealed class FirmwareFlashService : IDisposable
             }
             return false;
         }
-        return TryStart(plan, out snapshot);
+        return TryStart(plan, selectedPort, out snapshot);
     }
 
     /// <summary>使用已校验的刷写计划启动底层任务。</summary>
-    internal bool TryStart(FirmwareFlashPlan plan, out FirmwareFlashSnapshot snapshot)
+    internal bool TryStart(
+        FirmwareFlashPlan plan,
+        string portName,
+        out FirmwareFlashSnapshot snapshot)
     {
         lock (_sync)
         {
@@ -97,14 +113,14 @@ internal sealed class FirmwareFlashService : IDisposable
                 DateTimeOffset.Now,
                 null,
                 null,
-                null);
-            _activeTask = Task.Run(() => RunAsync(jobId, plan));
+                portName);
+            _activeTask = Task.Run(() => RunAsync(jobId, plan, portName));
             snapshot = _snapshot;
             return true;
         }
     }
 
-    private async Task RunAsync(string jobId, FirmwareFlashPlan plan)
+    private async Task RunAsync(string jobId, FirmwareFlashPlan plan, string selectedPortName)
     {
         bool restoreForwarding = _input.ForwardingEnabled;
         SerialBridge.FirmwareUpdatePortLease? lease = null;
@@ -114,7 +130,7 @@ internal sealed class FirmwareFlashService : IDisposable
         {
             _input.DisableForwarding();
             await Task.Delay(100).ConfigureAwait(false);
-            lease = _serialBridge.AcquireFirmwareUpdatePort();
+            lease = _serialBridge.AcquireFirmwareUpdatePort(selectedPortName);
             portName = lease.PortName;
             SetRunning(jobId, $"正在通过 {portName} 刷写固件。", portName);
             WriteLog(

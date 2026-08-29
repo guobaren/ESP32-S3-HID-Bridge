@@ -77,6 +77,7 @@ CheckMouseStatisticsLoggingDoesNotBlockPump();
 CheckStatisticsActivityGate();
 CheckMouseMovementRecordingAndChart();
 CheckSerialDiscoveryProtocol();
+CheckSerialHeartbeatGate();
 CheckWiFiBoardTransportDisabled();
 CheckDeviceLogPolicy();
 CheckDeviceTraceRealtimePersistence();
@@ -833,6 +834,16 @@ static void CheckDeviceLogPolicy()
     Require(
         SerialBridge.ShouldPersistDeviceLog(true, "I (1) NIMBLE_HIDD: notify report=mouse"),
         "完整模式必须保留全部设备日志");
+}
+
+static void CheckSerialHeartbeatGate()
+{
+    int active = 0;
+    Require(SerialBridge.TryEnterHeartbeat(ref active), "首个串口心跳必须进入执行区");
+    Require(!SerialBridge.TryEnterHeartbeat(ref active), "前一个串口心跳未结束时不得重入并积累探测任务");
+    SerialBridge.ExitHeartbeat(ref active);
+    Require(SerialBridge.TryEnterHeartbeat(ref active), "串口心跳结束后必须允许下一次执行");
+    SerialBridge.ExitHeartbeat(ref active);
 }
 
 static void CheckInputSuppressionPolicy()
@@ -1790,6 +1801,35 @@ static void CheckFirmwareUpdateApiPolicy()
 {
     Require(!new AutomationSettings().FirmwareUpdateApiEnabled, "本机固件刷写接口必须默认关闭");
     Require(string.IsNullOrEmpty(new AutomationSettings().FirmwareManifestPath), "本地固件 JSON 默认不得指向隐式镜像");
+    Require(string.IsNullOrEmpty(new AutomationSettings().FirmwareFlashPortName), "本地刷写串口默认不得写死");
+    Require(SerialBridge.NormalizeFirmwarePortName(" com03 ") == "COM3", "刷写串口名称未规范化");
+    bool invalidPortRejected = false;
+    try
+    {
+        _ = SerialBridge.NormalizeFirmwarePortName("USB0");
+    }
+    catch (ArgumentException)
+    {
+        invalidPortRejected = true;
+    }
+    Require(invalidPortRejected, "刷写串口必须拒绝非 COM 名称");
+    Require(
+        SettingsPageControl.SelectFirmwarePort("COM7", "COM3", ["COM3", "COM7"]) == "COM3",
+        "刷写串口默认选择未优先使用当前连接");
+    Require(
+        SettingsPageControl.SelectFirmwarePort("COM7", null, ["COM3", "COM7"]) == "COM7",
+        "没有当前连接时未复用仍存在的上次选择");
+    Require(
+        SettingsPageControl.SelectFirmwarePort("COM9", null, ["COM3", "COM7"]) == "COM3",
+        "上次选择已消失时未回退到端口列表首项");
+    string multiplePortConfirmation = SettingsPageControl.BuildFirmwareFlashConfirmation(
+        "D:\\firmware\\flasher_args.json",
+        "COM7",
+        ["COM3", "COM7"]);
+    Require(
+        multiplePortConfirmation.Contains("检测到多个串口：COM3、COM7", StringComparison.Ordinal) &&
+        multiplePortConfirmation.Contains("只会刷写已选择的 COM7", StringComparison.Ordinal),
+        "多串口刷写确认未列出全部端口和当前选择");
     BridgeOptions options = new();
     Require(options.FirmwareUpdateApiPort == 24815, "本机固件刷写接口默认端口应为 24815");
     BridgeOptions.Validate(options);
@@ -1871,10 +1911,12 @@ static void CheckFirmwareUpdateApiLoopback()
         null,
         null);
     string? requestedManifestPath = null;
-    bool TryStart(string manifestPath, out FirmwareFlashSnapshot current)
+    string? requestedPortName = null;
+    bool TryStart(string manifestPath, string portName, out FirmwareFlashSnapshot current)
     {
         Interlocked.Increment(ref started);
         requestedManifestPath = manifestPath;
+        requestedPortName = portName;
         current = snapshot with { State = "running" };
         return true;
     }
@@ -1904,17 +1946,28 @@ static void CheckFirmwareUpdateApiLoopback()
         "远程刷写未指定 JSON 路径时必须返回 400");
     Require(started == 0, "缺少 JSON 路径时不得调用刷写任务");
 
+    using HttpRequestMessage missingPort = new(HttpMethod.Post, "/api/v1/firmware/flash");
+    missingPort.Headers.Add(FirmwareUpdateApiServer.ConfirmationHeaderName, FirmwareUpdateApiServer.ConfirmationHeaderValue);
+    string manifestPath = Path.GetFullPath("firmware/build/flasher_args.json");
+    missingPort.Content = new StringContent(
+        JsonSerializer.Serialize(new { manifestPath }),
+        Encoding.UTF8,
+        "application/json");
+    HttpResponseMessage missingPortResponse = client.Send(missingPort);
+    Require(missingPortResponse.StatusCode == System.Net.HttpStatusCode.BadRequest, "远程刷写未指定串口时必须返回 400");
+    Require(started == 0, "缺少串口时不得调用刷写任务");
+
     using HttpRequestMessage request = new(HttpMethod.Post, "/api/v1/firmware/flash");
     request.Headers.Add(FirmwareUpdateApiServer.ConfirmationHeaderName, FirmwareUpdateApiServer.ConfirmationHeaderValue);
-    string manifestPath = Path.GetFullPath("firmware/build/flasher_args.json");
     request.Content = new StringContent(
-        JsonSerializer.Serialize(new { manifestPath }),
+        JsonSerializer.Serialize(new { manifestPath, portName = "COM7" }),
         Encoding.UTF8,
         "application/json");
     HttpResponseMessage accepted = client.Send(request);
     Require(accepted.StatusCode == System.Net.HttpStatusCode.Accepted, "合法刷写请求未返回 202");
     Require(started == 1, "合法刷写请求必须且只能启动一次任务");
     Require(requestedManifestPath == manifestPath, "远程刷写 API 未将请求指定的 JSON 路径传给底层刷写工具");
+    Require(requestedPortName == "COM7", "远程刷写 API 未将请求指定的串口传给底层刷写工具");
     server.SetEnabled(false);
     Require(!server.Enabled, "设置关闭后固件刷写 API 必须停止监听");
 }
@@ -2705,6 +2758,11 @@ static void CheckWindowLayout()
                 $"flow={udpOptionsLayout.FlowDirection}");
             Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Checked, "本机固件刷写接口默认必须关闭");
             Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Enabled, "无串口刷写服务时设置页接口开关必须禁用");
+            Require(
+                form.SettingsPage.FirmwarePortComboBox.DropDownStyle == ComboBoxStyle.DropDown &&
+                !form.SettingsPage.FirmwarePortComboBox.Enabled &&
+                !form.SettingsPage.RefreshFirmwarePortsButton.Enabled,
+                "本地刷写模块必须包含可输入串口选择栏和刷新按钮，非串口模式下应禁用");
             Button firmwareConfirmButton = EnumerateControls(form.SettingsPage)
                 .OfType<Button>()
                 .Single(button => button.Text == "确定");
@@ -2837,8 +2895,18 @@ static void CheckWindowLayout()
                 savedWindowSettings.WindowWidth == 1010 && savedWindowSettings.WindowHeight == 710,
                 $"关闭到托盘时窗口尺寸未保存：{savedWindowSettings.WindowWidth}x{savedWindowSettings.WindowHeight}");
             automation.Settings.CloseToTray = false;
-            form.Close();
-            Console.WriteLine("四页 UI 检查：设置已从宏页迁出；宏/Lua 页含可复制接口说明和状态按钮；设置页含启动、托盘、分析图片、模拟 UDP 说明和本机固件刷写接口开关。");
+            using Form auxiliary = new()
+            {
+                StartPosition = FormStartPosition.Manual,
+                Location = new Point(-32000, -32000),
+                ShowInTaskbar = false,
+            };
+            auxiliary.Show(form);
+            form.ForceCloseForChecks();
+            Application.DoEvents();
+            Require(form.IsDisposed, "托盘明确退出后主窗口未关闭");
+            Require(auxiliary.IsDisposed, "托盘明确退出后附属窗口未关闭");
+            Console.WriteLine("四页 UI 检查：设置已从宏页迁出；宏/Lua 页含可复制接口说明和状态按钮；刷写模块含可输入串口选择与刷新；托盘退出会关闭主窗口和附属窗口。");
             Directory.Delete(automationDirectory, true);
         }
         catch (Exception exception)

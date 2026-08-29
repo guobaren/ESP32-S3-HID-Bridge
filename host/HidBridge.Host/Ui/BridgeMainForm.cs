@@ -537,6 +537,7 @@ internal sealed class BridgeMainForm : Form
     internal LuaPageControl LuaPage => _luaPage;
     internal SettingsPageControl SettingsPage => _settingsPage;
     internal NotifyIcon TrayIcon => _notifyIcon;
+    internal void ForceCloseForChecks() => ForceClose();
     internal void ProcessMovementRecordingForChecks(MouseMovementRecording recording) =>
         InputOnMovementRecordingCompleted(recording);
 
@@ -682,15 +683,52 @@ internal sealed class BridgeMainForm : Form
             return;
         }
 
-        SaveWindowSize();
+        try
+        {
+            SaveWindowSize();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"退出时保存窗口尺寸失败，将继续关闭：{exception.Message}");
+        }
         _closing = true;
         _notifyIcon.Visible = false;
         _logFlushTimer.Stop();
         FlushPendingLogs();
         _cursorLock.Release();
+        foreach (Form ownedForm in OwnedForms.ToArray())
+        {
+            try
+            {
+                ownedForm.Close();
+                if (!ownedForm.IsDisposed)
+                {
+                    ownedForm.Dispose();
+                }
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"退出时关闭附属窗口失败，将继续关闭主窗口：{exception.Message}");
+                ownedForm.Dispose();
+            }
+        }
         _input.MovementRecordingStarted -= InputOnMovementRecordingStarted;
         _input.MovementRecordingCompleted -= InputOnMovementRecordingCompleted;
-        _input.Stop();
+        try
+        {
+            _input.Stop();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"退出时停止输入捕获失败，将继续关闭主窗口：{exception.Message}");
+        }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _notifyIcon.Visible = false;
+        base.OnFormClosed(e);
+        Application.ExitThread();
     }
 
     private void SaveWindowSize()

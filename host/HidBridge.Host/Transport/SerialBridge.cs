@@ -30,6 +30,8 @@ internal sealed class SerialBridge : IBridgeTransport
     private readonly object _sync = new();
     private readonly System.Threading.Timer _heartbeatTimer;
     private SerialPort? _port;
+    private string? _connectedPortName;
+    private int _heartbeatActive;
     private DateTime _nextConnectAttemptUtc;
     private bool _sessionStarted;
     private bool _firmwareUpdateLeaseActive;
@@ -44,11 +46,32 @@ internal sealed class SerialBridge : IBridgeTransport
         _options = options;
         _logSettings = logSettings;
         _heartbeatTimer = new System.Threading.Timer(
-            _ => Send(MessageType.Ping, ReadOnlySpan<byte>.Empty),
+            _ => HeartbeatTick(),
             null,
             TimeSpan.Zero,
             TimeSpan.FromMilliseconds(options.HeartbeatIntervalMilliseconds));
     }
+
+    private void HeartbeatTick()
+    {
+        if (!TryEnterHeartbeat(ref _heartbeatActive))
+        {
+            return;
+        }
+
+        try
+        {
+            Send(MessageType.Ping, ReadOnlySpan<byte>.Empty);
+        }
+        finally
+        {
+            ExitHeartbeat(ref _heartbeatActive);
+        }
+    }
+
+    internal static bool TryEnterHeartbeat(ref int active) => Interlocked.Exchange(ref active, 1) == 0;
+
+    internal static void ExitHeartbeat(ref int active) => Volatile.Write(ref active, 0);
 
     public void Send(MessageType type, ReadOnlySpan<byte> payload)
     {
@@ -125,6 +148,7 @@ internal sealed class SerialBridge : IBridgeTransport
                 }
 
                 _port = candidate;
+                Volatile.Write(ref _connectedPortName, portName);
                 StartDeviceTrace(candidate, portName);
                 Console.WriteLine($"已连接 {portName}。");
                 return true;
@@ -441,12 +465,21 @@ internal sealed class SerialBridge : IBridgeTransport
         }
         finally
         {
+            Volatile.Write(ref _connectedPortName, null);
             _port = null;
             _sessionStarted = false;
         }
     }
 
-    internal FirmwareUpdatePortLease AcquireFirmwareUpdatePort()
+    internal string? GetConnectedPortName() => Volatile.Read(ref _connectedPortName);
+
+    internal static string[] GetAvailablePortNames() =>
+        SerialPort.GetPortNames()
+            .OrderBy(GetPortNumber)
+            .ThenBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    internal FirmwareUpdatePortLease AcquireFirmwareUpdatePort(string portName)
     {
         lock (_sync)
         {
@@ -455,17 +488,30 @@ internal sealed class SerialBridge : IBridgeTransport
             {
                 throw new InvalidOperationException("固件刷写已经占用串口。");
             }
-            if (!EnsureConnected() || _port?.IsOpen != true)
+            string selectedPort = NormalizeFirmwarePortName(portName);
+            if (!GetAvailablePortNames().Contains(selectedPort, StringComparer.OrdinalIgnoreCase))
             {
-                throw new IOException("未连接到可刷写的 HID Bridge 串口。");
+                throw new IOException($"所选刷写串口 {selectedPort} 当前不存在。");
             }
 
-            string portName = _port.PortName;
             _firmwareUpdateLeaseActive = true;
             ClosePort();
-            Console.WriteLine($"已释放 {portName} 给固件刷写任务独占使用。");
-            return new FirmwareUpdatePortLease(this, portName);
+            Console.WriteLine($"已暂停控制串口连接，将 {selectedPort} 交给固件刷写任务独占使用。");
+            return new FirmwareUpdatePortLease(this, selectedPort);
         }
+    }
+
+    internal static string NormalizeFirmwarePortName(string? portName)
+    {
+        string normalized = portName?.Trim().ToUpperInvariant() ?? string.Empty;
+        if (normalized.Length <= 3 ||
+            !normalized.StartsWith("COM", StringComparison.Ordinal) ||
+            !int.TryParse(normalized.AsSpan(3), out int number) ||
+            number <= 0)
+        {
+            throw new ArgumentException("刷写串口必须是 COM 加正整数，例如 COM3。", nameof(portName));
+        }
+        return $"COM{number}";
     }
 
     internal async Task<bool> WaitForConnectionAsync(TimeSpan timeout, CancellationToken cancellationToken)
