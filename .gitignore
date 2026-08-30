@@ -38,6 +38,7 @@ Thumbs.db
 /automation.settings.json
 /profiles/
 /artifacts/
+tools/artifacts/
 /log/
 /release/
 /dist/

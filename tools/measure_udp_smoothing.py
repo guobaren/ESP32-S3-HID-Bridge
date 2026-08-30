@@ -11,7 +11,6 @@ import ctypes
 import csv
 import json
 import socket
-import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -51,49 +50,13 @@ def cursor_position() -> tuple[int, int]:
 
 
 def restore_cursor(x: int, y: int) -> None:
-    if not _USER32.SetCursorPos(x, y):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
-class Sampler:
-    def __init__(self, interval_us: int = 1_000) -> None:
-        self.interval_us = interval_us
-        self._samples: list[Sample] = []
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._start_ns = 0
-
-    @property
-    def samples(self) -> list[Sample]:
-        return list(self._samples)
-
-    def start(self) -> None:
-        self._start_ns = time.perf_counter_ns()
-        self._thread = threading.Thread(target=self._run, name="cursor-1ms-sampler", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-            if self._thread.is_alive():
-                raise RuntimeError("鼠标采样线程未在 2 秒内退出")
-
-    def elapsed_us(self) -> int:
-        return (time.perf_counter_ns() - self._start_ns) // 1_000
-
-    def _run(self) -> None:
-        next_us = 0
-        while not self._stop.is_set():
-            now_us = self.elapsed_us()
-            if now_us < next_us:
-                remaining_us = next_us - now_us
-                if remaining_us > 200:
-                    time.sleep((remaining_us - 100) / 1_000_000)
-                continue
-            x, y = cursor_position()
-            self._samples.append(Sample(now_us, x, y))
-            next_us += self.interval_us
+    for _ in range(20):
+        _USER32.SetCursorPos(x, y)
+        if cursor_position() == (x, y):
+            return
+        time.sleep(0.001)
+    current = cursor_position()
+    raise RuntimeError(f"无法恢复鼠标位置：目标=({x},{y})，当前=({current[0]},{current[1]})")
 
 
 class UdpSender:
@@ -112,14 +75,8 @@ class UdpSender:
         self._socket.close()
 
 
-def wait_us(sampler: Sampler, duration_us: int) -> None:
-    deadline = sampler.elapsed_us() + duration_us
-    while sampler.elapsed_us() < deadline:
-        time.sleep(0.0002)
-
-
-def send_command(sender: UdpSender, sampler: Sampler, commands: list[Command], dx: int, dy: int) -> None:
-    sent_us = sampler.elapsed_us()
+def send_command(sender: UdpSender, start_ns: int, commands: list[Command], dx: int, dy: int) -> None:
+    sent_us = (time.perf_counter_ns() - start_ns) // 1_000
     sender.send(dx, dy)
     commands.append(Command(len(commands) + 1, sent_us, dx, dy))
 
@@ -244,23 +201,28 @@ def write_csv(path: Path, samples: list[Sample]) -> None:
 
 def run_case(name: str, sender: UdpSender, settle_us: int, interval_us: int, count: int) -> tuple[dict, list[Sample], list[Command], int]:
     start_x, start_y = cursor_position()
-    sampler = Sampler()
     commands: list[Command] = []
-    sampler.start()
-    try:
-        wait_us(sampler, settle_us)
-        for _ in range(count):
-            send_command(sender, sampler, commands, 20, 0)
-            if count > 1:
-                wait_us(sampler, interval_us)
-        wait_us(sampler, 100_000)
-        samples = sampler.samples
-    finally:
-        sampler.stop()
-        if commands:
-            sender.send(-20 * count, 0)
+    start_ns = time.perf_counter_ns()
+    send_deadlines_us = [settle_us + index * interval_us for index in range(count)]
+    end_us = settle_us + (count - 1) * interval_us + 80_000
+    next_sample_us = 0
+    samples: list[Sample] = []
+    next_command = 0
+    while next_sample_us <= end_us:
+        now_us = (time.perf_counter_ns() - start_ns) // 1_000
+        while next_command < count and now_us >= send_deadlines_us[next_command]:
+            send_command(sender, start_ns, commands, 20, 0)
+            next_command += 1
+        if now_us >= next_sample_us:
+            x, y = cursor_position()
+            samples.append(Sample(now_us, x, y))
+            next_sample_us += 1_000
+        # 采样和发送调度路径禁止 sleep：Windows 的线程睡眠粒度可能约为 15.6 ms，
+        # 会直接跳过多个 1 ms 桶。这里使用 perf_counter_ns() 忙等到下一个绝对时间点。
+    if commands:
+        sender.send(-20 * count, 0)
         time.sleep(0.08)
-        restore_cursor(start_x, start_y)
+    restore_cursor(start_x, start_y)
     end_x, end_y = cursor_position()
     targets = [start_x + 20 * index for index in range(1, count + 1)]
     result = command_metrics(samples, commands, start_x, targets, start_x + 20 * count)
