@@ -1010,7 +1010,7 @@ internal sealed class InputForwarder : IDisposable
                 forwardedWheel,
                 forwardedPan);
         }
-        // 与键盘相同，先把实体按钮的新状态交给 1000 Hz 报告泵，再执行 Lua/宏回调。
+        // 与键盘相同，先把实体按钮的新状态交给 500 Hz 报告泵，再执行 Lua/宏回调。
         NotifyMouseButtonTransitions(flags);
     }
 

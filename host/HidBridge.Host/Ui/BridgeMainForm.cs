@@ -146,8 +146,8 @@ internal sealed class BridgeMainForm : Form
         {
             _input.ConfigureUdpSmoothing(_udpSmoothingCheckBox.Checked);
             AppendLog(_udpSmoothingCheckBox.Checked
-                ? "UDP 平滑已开启：真实和模拟 UDP 移动分摊到固定 20 个 1 ms 槽，最大计划尾部 20 ms。"
-                : "UDP 平滑已关闭：真实和模拟 UDP 移动跳过低延迟分摊，直接进入 1000 Hz 报告聚合。");
+                ? "UDP 平滑已开启：EXE 以 500 Hz 聚合发送，开发板按 5 个 1 ms 槽输出。"
+                : "UDP 平滑已关闭：EXE 以 500 Hz 聚合发送，开发板在下一 USB 周期直接输出。");
         };
         _alwaysOutputUdpCheckBox.CheckedChanged += (_, _) =>
         {
@@ -418,7 +418,7 @@ internal sealed class BridgeMainForm : Form
                 _input.ConfigureSimulatedUdpInput(enabled, frequencyHz);
                 AppendLog(enabled
                     ? $"模拟 UDP 输入已开启：源频率={FormatSimulatedUdpFrequency(frequencyHz)}；仅用于测试，移动和滚轮进入 UDP 公共后续链路。"
-                    : "模拟 UDP 输入已关闭：测试源停止，实体鼠标恢复直接进入 1000 Hz 聚合链路。");
+                    : "模拟 UDP 输入已关闭：测试源停止，实体鼠标恢复直接进入 500 Hz 聚合链路。");
             });
         _tabs = new TabControl
         {

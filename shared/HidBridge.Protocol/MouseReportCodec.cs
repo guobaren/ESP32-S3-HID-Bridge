@@ -9,9 +9,16 @@ public readonly record struct MouseReport(
     sbyte Wheel,
     sbyte Pan);
 
+public readonly record struct BridgeMouseReport(
+    MouseReport Report,
+    byte FirmwareSmoothingSlots);
+
 public static class MouseReportCodec
 {
     public const int Length = 7;
+    public const int BridgeLength = 8;
+    public const byte FirmwareSmoothingDisabled = 0;
+    public const byte FirmwareSmoothingSlots = 5;
 
     public static byte[] Encode(byte buttons, short x, short y, sbyte wheel, sbyte pan)
     {
@@ -39,5 +46,55 @@ public static class MouseReportCodec
             unchecked((sbyte)payload[5]),
             unchecked((sbyte)payload[6]));
         return true;
+    }
+
+    public static byte[] EncodeBridge(
+        byte buttons,
+        short x,
+        short y,
+        sbyte wheel,
+        sbyte pan,
+        byte firmwareSmoothingSlots)
+    {
+        ValidateFirmwareSmoothingSlots(firmwareSmoothingSlots);
+        byte[] payload = new byte[BridgeLength];
+        Encode(buttons, x, y, wheel, pan).CopyTo(payload, 0);
+        payload[^1] = firmwareSmoothingSlots;
+        return payload;
+    }
+
+    public static bool TryDecodeBridge(
+        ReadOnlySpan<byte> payload,
+        out BridgeMouseReport report)
+    {
+        report = default;
+        if (payload.Length != BridgeLength ||
+            !TryDecode(payload[..Length], out MouseReport mouseReport))
+        {
+            return false;
+        }
+
+        byte firmwareSmoothingSlots = payload[^1];
+        if (!IsValidFirmwareSmoothingSlots(firmwareSmoothingSlots))
+        {
+            return false;
+        }
+
+        report = new BridgeMouseReport(mouseReport, firmwareSmoothingSlots);
+        return true;
+    }
+
+    private static bool IsValidFirmwareSmoothingSlots(byte value) =>
+        value is FirmwareSmoothingDisabled or FirmwareSmoothingSlots;
+
+    private static void ValidateFirmwareSmoothingSlots(byte value)
+    {
+        if (!IsValidFirmwareSmoothingSlots(value))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                "固件平滑槽数只能是 0 或 5。");
+        }
     }
 }

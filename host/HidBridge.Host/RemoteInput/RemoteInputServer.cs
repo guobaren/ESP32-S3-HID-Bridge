@@ -57,7 +57,7 @@ internal sealed class RemoteInputServer : IDisposable
         Console.WriteLine(
             $"局域网模拟输入已监听 UDP {GetLocalEndpoint()}；" +
             "是否在 HOME 关闭时继续输出由主界面“始终开启 UDP 输出”决定；" +
-            "是否启用固定 20 ms 低延迟平滑由主界面开关决定。");
+            "是否启用开发板 5 槽低延迟平滑由主界面开关决定。");
         _receiveTask = Task.Run(ReceiveLoopAsync);
     }
 

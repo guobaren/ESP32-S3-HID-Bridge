@@ -9,7 +9,7 @@ namespace HidBridge.Host.Input;
 
 internal sealed class MouseReportPump : IDisposable
 {
-    private const int OutputFrequencyHz = 1000;
+    private const int OutputFrequencyHz = 500;
     private const int OutputIntervalMilliseconds = 1000 / OutputFrequencyHz;
     private const uint CreateWaitableTimerHighResolution = 0x00000002;
     private const uint TimerAllAccess = 0x001F0003;
@@ -113,7 +113,7 @@ internal sealed class MouseReportPump : IDisposable
         _senderThread = new Thread(SenderLoop)
         {
             IsBackground = true,
-            Name = "HidBridge.Mouse1000Hz",
+            Name = "HidBridge.Mouse500Hz",
             Priority = ThreadPriority.AboveNormal,
         };
         _senderThread.Start();
@@ -391,11 +391,6 @@ internal sealed class MouseReportPump : IDisposable
                     return;
                 }
 
-                MouseDelta pending = _udpMouseSmoother.Drain();
-                _pendingX += pending.X;
-                _pendingY += pending.Y;
-                _pendingWheel += pending.Wheel;
-                _pendingPan += pending.Pan;
                 _udpMouseSmoother.Reset();
                 _udpSmoothingEnabled = enabled;
             }
@@ -470,17 +465,6 @@ internal sealed class MouseReportPump : IDisposable
                         RouteUdpDeltaLocked(simulatedDelta);
                     }
 
-                    if (_udpSmoothingEnabled &&
-                        _udpMouseSmoother.TryDequeue(out MouseDelta remoteDelta))
-                    {
-                        _pendingX += remoteDelta.X;
-                        _pendingY += remoteDelta.Y;
-                        _pendingWheel += remoteDelta.Wheel;
-                        _pendingPan += remoteDelta.Pan;
-                        _maxPendingX = Math.Max(_maxPendingX, Math.Abs(_pendingX));
-                        _maxPendingY = Math.Max(_maxPendingY, Math.Abs(_pendingY));
-                    }
-
                     ApplyOutputSensitivityLocked();
 
                     bool hasButtonTransition = _buttonStates.Count > 0;
@@ -500,7 +484,15 @@ internal sealed class MouseReportPump : IDisposable
                         _submittedX += x;
                         _submittedY += y;
                         _submittedReportCount++;
-                        payload = MouseReportCodec.Encode(buttons, x, y, wheel, pan);
+                        payload = MouseReportCodec.EncodeBridge(
+                            buttons,
+                            x,
+                            y,
+                            wheel,
+                            pan,
+                            _udpSmoothingEnabled
+                                ? MouseReportCodec.FirmwareSmoothingSlots
+                                : MouseReportCodec.FirmwareSmoothingDisabled);
                         submittedReport = new MouseReport(buttons, x, y, wheel, pan);
                         RecordSubmittedIntervalLocked(Stopwatch.GetTimestamp());
                     }
@@ -623,7 +615,7 @@ internal sealed class MouseReportPump : IDisposable
     }
 
     private static string FormatStatistics(MouseStatisticsSnapshot statistics) =>
-        $"鼠标统计（1000 Hz）：原始事件={statistics.RawEventCount}，采集位移=({statistics.CapturedX},{statistics.CapturedY})，" +
+        $"鼠标统计（500 Hz）：原始事件={statistics.RawEventCount}，采集位移=({statistics.CapturedX},{statistics.CapturedY})，" +
         $"已提交报告={statistics.SubmittedReportCount}，已提交位移=({statistics.SubmittedX},{statistics.SubmittedY})，" +
         $"待发送=({statistics.PendingX},{statistics.PendingY})，按钮转换={statistics.ButtonTransitionCount}，" +
         $"按钮待发送={statistics.PendingButtonTransitions}，最大积压=({statistics.MaxPendingX},{statistics.MaxPendingY})，" +
@@ -645,8 +637,7 @@ internal sealed class MouseReportPump : IDisposable
 
         if (_udpSmoothingEnabled)
         {
-            _udpMouseSmoother.Enqueue(delta);
-            return;
+            _udpMouseSmoother.Record(delta);
         }
 
         _pendingX += delta.X;

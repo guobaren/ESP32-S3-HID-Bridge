@@ -95,7 +95,7 @@ CheckLogFileRetention();
 CheckRemoteInputUdpPath();
 CheckKmboxNetCompatibility();
 CheckFirmwareUpdateApiPolicy();
-CheckFirmwareUpdateApiLoopback();
+CheckFirmwareUpdateApiLan();
 CheckAutomationProfilesAndRuntime();
 CheckLuaRuntimeFeatures();
 CheckExternalProfileStorageAndLuaIndentation();
@@ -105,7 +105,7 @@ CheckTriggerForwardingIntegration();
 CheckToggleMacroStopsOnSecondPress();
 CheckHotkeyChooserControl();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、1000 Hz 聚合、可选频率模拟 UDP、UDP 平滑和始终输出开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、本机固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、固件 5 槽平滑标记和始终输出开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、局域网固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
 
 static void CheckMouseReportCodec()
 {
@@ -119,6 +119,22 @@ static void CheckMouseReportCodec()
     Require(payload.Length == MouseReportCodec.Length, "鼠标报告长度应为 7 字节");
     Require(MouseReportCodec.TryDecode(payload, out MouseReport actual), "鼠标报告应能解码");
     Require(actual == expected, "16 位鼠标报告往返结果不一致");
+
+    byte[] bridgePayload = MouseReportCodec.EncodeBridge(
+        expected.Buttons,
+        expected.X,
+        expected.Y,
+        expected.Wheel,
+        expected.Pan,
+        MouseReportCodec.FirmwareSmoothingSlots);
+    Require(bridgePayload.Length == MouseReportCodec.BridgeLength, "桥接鼠标报告长度应为 8 字节");
+    Require(
+        MouseReportCodec.TryDecodeBridge(bridgePayload, out BridgeMouseReport bridgeReport),
+        "桥接鼠标报告应能解码");
+    Require(bridgeReport.Report == expected, "桥接鼠标报告位移往返结果不一致");
+    Require(
+        bridgeReport.FirmwareSmoothingSlots == MouseReportCodec.FirmwareSmoothingSlots,
+        "桥接鼠标报告未携带固件 5 槽配置");
 
     FrameCodec codec = new();
     byte[] frame = codec.Encode(MessageType.MouseReport, payload);
@@ -172,11 +188,11 @@ static void CheckMouseAggregation()
         Thread.Sleep(5);
     }
     long[] timestamps = transport.MouseTimestamps().Skip(timingStart).Take(20).ToArray();
-    Require(timestamps.Length == 20, "1000 Hz 发送线程未送完按钮测试序列");
+    Require(timestamps.Length == 20, "500 Hz 发送线程未送完按钮测试序列");
     double elapsedMilliseconds =
         (timestamps[^1] - timestamps[0]) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-    Require(elapsedMilliseconds >= 15, "报告被集中突发发送，未遵守 1000 Hz 上限");
-    Require(elapsedMilliseconds < 500, "1000 Hz 发送线程出现异常长时间停顿");
+    Require(elapsedMilliseconds >= 30, "报告被集中突发发送，未遵守 500 Hz 上限");
+    Require(elapsedMilliseconds < 500, "500 Hz 发送线程出现异常长时间停顿");
 
     pump.ResetAndSendRelease(false);
     int countAfterStop = transport.MouseReports().Length;
@@ -247,8 +263,8 @@ static void CheckSimulatedUdpInputAggregation()
     using MouseReportPump pump = new(transport);
     pump.ConfigureSimulatedUdpInput(true, 100);
     pump.ResetAndSendRelease(true);
-    Require(pump.SimulatedUdpInputEnabled, "1000 Hz 泵未保持模拟 UDP 开关状态");
-    Require(pump.SimulatedUdpInputFrequencyHz == 100, "1000 Hz 泵未保持模拟 UDP 频率");
+    Require(pump.SimulatedUdpInputEnabled, "500 Hz 泵未保持模拟 UDP 开关状态");
+    Require(pump.SimulatedUdpInputFrequencyHz == 100, "500 Hz 泵未保持模拟 UDP 频率");
 
     pump.Accumulate(1, true, 0, 0, 0, 0);
     DateTime deadline = DateTime.UtcNow.AddSeconds(2);
@@ -540,7 +556,7 @@ static void CheckMouseMovementRecordingAndChart()
     pump.ResetAndSendRelease(true);
     pump.Accumulate(3, true, -9, 4, 0, 0);
     pump.Accumulate(0, true, 0, 0, 0, 0);
-    Require(completed.Wait(TimeSpan.FromSeconds(2)), "实际 1000 Hz 发送链路未触发移动记录完成事件");
+    Require(completed.Wait(TimeSpan.FromSeconds(2)), "实际 500 Hz 发送链路未触发移动记录完成事件");
     Require(startedCount == 1, "实际发送链路的移动记录开始事件次数不正确");
     MouseMovementRecording actualEmitted = emittedRecording
         ?? throw new InvalidOperationException("实际发送链路未返回移动记录");
@@ -550,127 +566,35 @@ static void CheckMouseMovementRecordingAndChart()
     Console.WriteLine(
         $"鼠标移动记录检查：状态机 X=[{string.Join(',', recording.XValues)}]，" +
         $"Y=[{string.Join(',', recording.YValues)}]；分析图=1600x800，X 时间顺序=底部到顶部并显示正负零轴；" +
-        $"1000 Hz 实际发送链路 X=[{string.Join(',', actualEmitted.XValues)}]，" +
+        $"500 Hz 实际发送链路 X=[{string.Join(',', actualEmitted.XValues)}]，" +
         $"Y=[{string.Join(',', actualEmitted.YValues)}]。");
 }
 
 static void CheckUdpMouseSmoothing()
 {
     UdpMouseSmoother smoother = new();
-    smoother.Enqueue(new MouseDelta(50, -7, 5, -5));
+    smoother.Record(new MouseDelta(50, -7, 5, -5));
     UdpMouseSmootherStatistics statistics = smoother.GetStatistics();
-    Require(statistics.SmoothingSlots == 20, "UDP 低延迟平滑窗必须为 20 个 1 ms 槽");
-    Require(statistics.PendingSlots == 20, "首条 UDP 命令必须立即分摊到 20 个发送槽");
-
-    List<MouseDelta> parts = [];
-    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots; index++)
-    {
-        Require(smoother.TryDequeue(out MouseDelta part), $"UDP 平滑第 {index + 1} 槽没有输出");
-        parts.Add(part);
-    }
-    Require(parts[0].X == 3, "首条快速移动不应整包跳变，首槽应仅输出 X=3");
-    Require(parts.Sum(part => part.X) == 50, "UDP 平滑后的 X 总位移不守恒");
-    Require(parts.Sum(part => part.Y) == -7, "UDP 平滑后的负 Y 总位移不守恒");
-    Require(parts.Sum(part => part.Wheel) == 5, "UDP 平滑后的滚轮总量不守恒");
-    Require(parts.Sum(part => part.Pan) == -5, "UDP 平滑后的负横向滚轮总量不守恒");
-    Require(smoother.GetStatistics().PendingSlots == 0, "20 槽输出后不应残留平滑积压");
-
-    smoother.Reset();
-    Require(!smoother.TryDequeue(out _), "重置 UDP 平滑器后不得继续发送旧移动");
-    smoother.Reset();
-    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots; index++)
-    {
-        smoother.Enqueue(new MouseDelta(1, -1, 0, 0));
-    }
-    List<MouseDelta> smallBurst = [];
-    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots; index++)
-    {
-        Require(smoother.TryDequeue(out MouseDelta smallPart), "20 条小步输入未覆盖全部平滑槽");
-        smallBurst.Add(smallPart);
-    }
-    Require(
-        smallBurst.All(delta => delta.X == 1 && delta.Y == -1),
-        $"10 条小步输入应均匀分散为每槽 (1,-1)，实际={string.Join(";", smallBurst)}");
-
-    smoother.Reset();
-    List<MouseDelta> continuous = [];
-    for (int index = 0; index < 100; index++)
-    {
-        smoother.Enqueue(new MouseDelta(40, -20, 0, 0));
-        Require(smoother.TryDequeue(out MouseDelta output), "连续输入的当前 1 ms 槽没有输出");
-        continuous.Add(output);
-    }
-    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots - 1; index++)
-    {
-        Require(smoother.TryDequeue(out MouseDelta tail), "连续输入停止后的平滑尾部提前中断");
-        continuous.Add(tail);
-    }
-    Require(
-        continuous.Take(20).Select(delta => delta.X).SequenceEqual(
-            [2L, 4L, 6L, 8L, 10L, 12L, 14L, 16L, 18L, 20L, 22L, 24L, 26L, 28L, 30L, 32L, 34L, 36L, 38L, 40L]),
-        $"连续移动启动斜坡不正确：{string.Join(',', continuous.Take(20).Select(delta => delta.X))}");
-    Require(
-        continuous.TakeLast(19).Select(delta => delta.X).SequenceEqual(
-            [38L, 36L, 34L, 32L, 30L, 28L, 26L, 24L, 22L, 20L, 18L, 16L, 14L, 12L, 10L, 8L, 6L, 4L, 2L]),
-        $"连续移动停止尾部不正确：{string.Join(',', continuous.TakeLast(19).Select(delta => delta.X))}");
-    Require(continuous.Sum(delta => delta.X) == 4_000, "连续输入平滑后的 X 总位移不守恒");
-    Require(continuous.Sum(delta => delta.Y) == -2_000, "连续输入平滑后的 Y 总位移不守恒");
-    Require(smoother.GetStatistics().PendingSlots == 0, "连续输入停止 19 槽后仍有平滑积压");
-
-    smoother.Reset();
-    for (int index = 0; index < 1_000; index++)
-    {
-        smoother.Enqueue(new MouseDelta(10, -10, 0, 0));
-    }
-    statistics = smoother.GetStatistics();
-    Require(statistics.PendingSlots == 20, "突发输入只能占用固定 20 个未来槽");
-    Require(statistics.OverlappingCommands == 999, "突发输入重叠分摊计数不正确");
-    long burstX = 0;
-    long burstY = 0;
-    for (int index = 0; index < UdpMouseSmoother.SmoothingSlots; index++)
-    {
-        Require(smoother.TryDequeue(out MouseDelta burstPart), "突发输入固定槽提前中断");
-        burstX += burstPart.X;
-        burstY += burstPart.Y;
-    }
-    Require(burstX == 10_000 && burstY == -10_000, "突发输入固定槽合并后总位移不守恒");
+    Require(statistics.SmoothingSlots == 5, "固件 UDP 平滑窗必须为 5 个 1 ms 槽");
+    Require(statistics.PendingSlots == 0, "Host 不得再保留平滑发送槽");
+    Require(statistics.EnqueuedCommands == 1, "Host 应记录已转交固件平滑的 UDP 命令");
 
     RecordingTransport transport = new();
     using MouseReportPump pump = new(transport);
     pump.ResetAndSendRelease(true);
-    long injectedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
     pump.AccumulateRemote(40, -20, 20, -20);
     DateTime deadline = DateTime.UtcNow.AddSeconds(2);
-    while (DateTime.UtcNow < deadline && transport.MouseReports().Length < 20)
+    while (DateTime.UtcNow < deadline && transport.BridgeMouseReports().Length == 0)
     {
         Thread.Sleep(2);
     }
-    MouseReport[] actual = transport.MouseReports();
-    Require(actual.Length == 20, $"1000 Hz 实际低延迟平滑链路报告数不正确：{actual.Length}");
-    Require(actual.All(report => report.X == 2), "实际链路未从首条命令开始按 X=2 平滑输出");
-    Require(actual.Sum(report => (long)report.X) == 40, "实际平滑链路 X 总位移不守恒");
-    Require(actual.Sum(report => (long)report.Y) == -20, "实际平滑链路 Y 总位移不守恒");
-    Require(actual.Sum(report => (long)report.Wheel) == 20, "实际平滑链路滚轮总量不守恒");
-    Require(actual.Sum(report => (long)report.Pan) == -20, "实际平滑链路横向滚轮总量不守恒");
-    long[] actualTimestamps = transport.MouseTimestamps().TakeLast(20).ToArray();
-    double completionMilliseconds =
-        (actualTimestamps[^1] - injectedTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-    double maximumReportGapMilliseconds = actualTimestamps
-        .Zip(actualTimestamps.Skip(1), (previous, current) =>
-            (current - previous) * 1000.0 / System.Diagnostics.Stopwatch.Frequency)
-        .Max();
-    Require(
-        completionMilliseconds < 100,
-        $"实际低延迟平滑尾部超过 100 ms：{completionMilliseconds:F1} ms");
-    Require(
-        maximumReportGapMilliseconds < 50,
-        $"实际低延迟平滑报告出现超过 50 ms 的间隔：{maximumReportGapMilliseconds:F1} ms");
+    BridgeMouseReport[] actual = transport.BridgeMouseReports();
+    Require(actual.Length == 1, $"Host 应把单条 UDP 命令聚合为 1 个 500 Hz 桥接报告，实际={actual.Length}");
+    Require(actual[0].Report == new MouseReport(0, 40, -20, 20, -20), "桥接报告位移总量不正确");
+    Require(actual[0].FirmwareSmoothingSlots == 5, "桥接报告未要求固件执行 5 槽平滑");
     Console.WriteLine(
-        "UDP 低延迟平滑检查：首条 (50,-7,5,-5) 立即分摊为 20 槽且首槽 X=3；" +
-        "同一泵周期 20 条 (1,-1) 均匀分散为每槽 (1,-1)；" +
-        "连续 100 个输入只保留 19 槽尾部，总量 X=4000/Y=-2000；" +
-        "1000 条突发输入仍固定 20 槽；1000 Hz 实际链路输出 20 份且总量守恒，" +
-        $"实际尾部完成={completionMilliseconds:F1} ms，最大报告间隔={maximumReportGapMilliseconds:F1} ms。");
+        "UDP 平滑职责检查：Host 以单个 500 Hz 桥接报告发送完整位移并携带 slots=5；" +
+        "实际 1 ms 分摊和连续命令重叠由固件纯 C 测试验证。");
 }
 
 static void CheckStatisticsActivityGate()
@@ -725,31 +649,23 @@ static void CheckMouseStatisticsLoggingDoesNotBlockPump()
         long injectedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         pump.AccumulateRemote(100, -50, 0, 0);
         DateTime deadline = DateTime.UtcNow.AddSeconds(1);
-        while (DateTime.UtcNow < deadline && transport.MouseReports().Length - reportsBefore < 20)
+        while (DateTime.UtcNow < deadline && transport.MouseReports().Length == reportsBefore)
         {
             Thread.Sleep(2);
         }
 
-        MouseReport[] actual = transport.MouseReports().Skip(reportsBefore).Take(20).ToArray();
-        Require(actual.Length == 20, $"统计日志阻塞期间报告数不正确：{actual.Length}");
+        MouseReport[] actual = transport.MouseReports().Skip(reportsBefore).ToArray();
+        Require(actual.Length == 1, $"统计日志阻塞期间 Host 应发送一个聚合报告，实际={actual.Length}");
         Require(actual.Sum(report => (long)report.X) == 100, "统计日志阻塞期间 X 位移不守恒");
         Require(actual.Sum(report => (long)report.Y) == -50, "统计日志阻塞期间 Y 位移不守恒");
-        long[] timestamps = transport.MouseTimestamps().Skip(reportsBefore).Take(20).ToArray();
+        long[] timestamps = transport.MouseTimestamps().Skip(reportsBefore).ToArray();
         double completionMilliseconds =
             (timestamps[^1] - injectedTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-        double maximumGapMilliseconds = timestamps
-            .Zip(timestamps.Skip(1), (previous, current) =>
-                (current - previous) * 1000.0 / System.Diagnostics.Stopwatch.Frequency)
-            .Max();
         Require(
-            completionMilliseconds < 100,
-            $"统计日志阻塞拖慢 1000 Hz 输出尾部：{completionMilliseconds:F1} ms");
-        Require(
-            maximumGapMilliseconds < 50,
-            $"统计日志阻塞造成报告间隔过大：{maximumGapMilliseconds:F1} ms");
+            completionMilliseconds < 50,
+            $"统计日志阻塞拖慢 500 Hz 聚合输出：{completionMilliseconds:F1} ms");
         Console.WriteLine(
-            $"鼠标统计异步检查：日志线程阻塞时 20 份报告仍完成，尾部={completionMilliseconds:F1} ms，" +
-            $"最大间隔={maximumGapMilliseconds:F1} ms。 ");
+            $"鼠标统计异步检查：日志线程阻塞时单份 500 Hz 聚合报告仍完成，耗时={completionMilliseconds:F1} ms。 ");
     }
     finally
     {
@@ -1799,7 +1715,7 @@ static uint KmboxMix(uint sum, uint y, uint z, int position, uint e, ReadOnlySpa
 
 static void CheckFirmwareUpdateApiPolicy()
 {
-    Require(!new AutomationSettings().FirmwareUpdateApiEnabled, "本机固件刷写接口必须默认关闭");
+    Require(!new AutomationSettings().FirmwareUpdateApiEnabled, "局域网固件刷写接口必须默认关闭");
     Require(string.IsNullOrEmpty(new AutomationSettings().FirmwareManifestPath), "本地固件 JSON 默认不得指向隐式镜像");
     Require(string.IsNullOrEmpty(new AutomationSettings().FirmwareFlashPortName), "本地刷写串口默认不得写死");
     Require(SerialBridge.NormalizeFirmwarePortName(" com03 ") == "COM3", "刷写串口名称未规范化");
@@ -1831,7 +1747,7 @@ static void CheckFirmwareUpdateApiPolicy()
         multiplePortConfirmation.Contains("只会刷写已选择的 COM7", StringComparison.Ordinal),
         "多串口刷写确认未列出全部端口和当前选择");
     BridgeOptions options = new();
-    Require(options.FirmwareUpdateApiPort == 24815, "本机固件刷写接口默认端口应为 24815");
+    Require(options.FirmwareUpdateApiPort == 24815, "局域网固件刷写接口默认端口应为 24815");
     BridgeOptions.Validate(options);
     string manifestPath = Path.GetFullPath("firmware/build/flasher_args.json");
     FirmwareFlashPlan plan = FirmwareFlashPlan.LoadFromManifest(manifestPath);
@@ -1899,7 +1815,7 @@ static void CheckFirmwareUpdateApiPolicy()
         "固件刷写接口必须拒绝 GET/POST 以外的方法");
 }
 
-static void CheckFirmwareUpdateApiLoopback()
+static void CheckFirmwareUpdateApiLan()
 {
     int started = 0;
     FirmwareFlashSnapshot snapshot = new(
@@ -1921,10 +1837,11 @@ static void CheckFirmwareUpdateApiLoopback()
         return true;
     }
 
-    using FirmwareUpdateApiServer server = new(0, () => snapshot, TryStart);
-    Require(server.ListenAddress.Equals(System.Net.IPAddress.Loopback), "固件刷写 API 必须固定绑定 IPv4 Loopback");
+    string selectedPort = string.Empty;
+    using FirmwareUpdateApiServer server = new(0, () => snapshot, TryStart, () => selectedPort);
+    Require(server.ListenAddress.Equals(System.Net.IPAddress.Any), "固件刷写 API 必须绑定全部 IPv4 接口");
     server.SetEnabled(true);
-    Require(server.Enabled && server.Port > 0, "固件刷写 API 未在临时 Loopback 端口启动");
+    Require(server.Enabled && server.Port > 0, "固件刷写 API 未在临时局域网端口启动");
     using HttpClient client = new() { BaseAddress = new Uri($"http://127.0.0.1:{server.Port}") };
 
     HttpResponseMessage statusResponse = client.GetAsync("/api/v1/firmware/status").GetAwaiter().GetResult();
@@ -1954,20 +1871,21 @@ static void CheckFirmwareUpdateApiLoopback()
         Encoding.UTF8,
         "application/json");
     HttpResponseMessage missingPortResponse = client.Send(missingPort);
-    Require(missingPortResponse.StatusCode == System.Net.HttpStatusCode.BadRequest, "远程刷写未指定串口时必须返回 400");
-    Require(started == 0, "缺少串口时不得调用刷写任务");
+    Require(missingPortResponse.StatusCode == System.Net.HttpStatusCode.BadRequest, "设置页未选择串口时远程刷写必须返回 400");
+    Require(started == 0, "设置页未选择串口时不得调用刷写任务");
 
+    selectedPort = "COM7";
     using HttpRequestMessage request = new(HttpMethod.Post, "/api/v1/firmware/flash");
     request.Headers.Add(FirmwareUpdateApiServer.ConfirmationHeaderName, FirmwareUpdateApiServer.ConfirmationHeaderValue);
     request.Content = new StringContent(
-        JsonSerializer.Serialize(new { manifestPath, portName = "COM7" }),
+        JsonSerializer.Serialize(new { manifestPath }),
         Encoding.UTF8,
         "application/json");
     HttpResponseMessage accepted = client.Send(request);
     Require(accepted.StatusCode == System.Net.HttpStatusCode.Accepted, "合法刷写请求未返回 202");
     Require(started == 1, "合法刷写请求必须且只能启动一次任务");
     Require(requestedManifestPath == manifestPath, "远程刷写 API 未将请求指定的 JSON 路径传给底层刷写工具");
-    Require(requestedPortName == "COM7", "远程刷写 API 未将请求指定的串口传给底层刷写工具");
+    Require(requestedPortName == "COM7", "远程刷写 API 未使用设置页已选择的串口");
     server.SetEnabled(false);
     Require(!server.Enabled, "设置关闭后固件刷写 API 必须停止监听");
 }
@@ -2756,7 +2674,7 @@ static void CheckWindowLayout()
                 $"right={form.AlwaysOutputUdpCheckBox.Right}/{udpOptionsLayout.ClientSize.Width}," +
                 $"anchor={form.UdpSmoothingCheckBox.Anchor}/{form.AlwaysOutputUdpCheckBox.Anchor}," +
                 $"flow={udpOptionsLayout.FlowDirection}");
-            Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Checked, "本机固件刷写接口默认必须关闭");
+            Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Checked, "局域网固件刷写接口默认必须关闭");
             Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Enabled, "无串口刷写服务时设置页接口开关必须禁用");
             Require(
                 form.SettingsPage.FirmwarePortComboBox.DropDownStyle == ComboBoxStyle.DropDown &&
@@ -2869,7 +2787,7 @@ static void CheckWindowLayout()
             Require(allText.Contains("输出灵敏度", StringComparison.Ordinal), "界面未显示统一输出灵敏度控件");
             Require(allText.Contains("发送到固件前处理最终", StringComparison.Ordinal), "界面未说明输出灵敏度生效位置");
             Require(allText.Contains("始终开启 UDP 输出", StringComparison.Ordinal), "界面未显示始终开启 UDP 输出开关");
-            Require(allText.Contains("本机固件刷写接口", StringComparison.Ordinal), "设置页未显示本机固件刷写接口开关");
+            Require(allText.Contains("局域网固件刷写接口", StringComparison.Ordinal), "设置页未显示局域网固件刷写接口开关");
             Require(allText.Contains("暂停自动跟随", StringComparison.Ordinal), "日志栏未提示滚动到上方后暂停自动跟随");
             CheckDarkSurfaceTextContrast(form);
             string artifactDirectory = Path.Combine(Environment.CurrentDirectory, "artifacts");
@@ -3185,9 +3103,20 @@ internal sealed class RecordingTransport : IBridgeTransport
 
     internal MouseReport[] MouseReports() => _frames
         .Where(frame => frame.Type == MessageType.MouseReport)
-        .Select(frame => MouseReportCodec.TryDecode(frame.Payload, out MouseReport report)
+        .Select(frame => frame.Payload.Length == MouseReportCodec.BridgeLength
+            ? MouseReportCodec.TryDecodeBridge(frame.Payload, out BridgeMouseReport bridgeReport)
+                ? bridgeReport.Report
+                : throw new InvalidDataException("记录到无效桥接鼠标报告")
+            : MouseReportCodec.TryDecode(frame.Payload, out MouseReport report)
+                ? report
+                : throw new InvalidDataException("记录到无效鼠标报告"))
+        .ToArray();
+
+    internal BridgeMouseReport[] BridgeMouseReports() => _frames
+        .Where(frame => frame.Type == MessageType.MouseReport)
+        .Select(frame => MouseReportCodec.TryDecodeBridge(frame.Payload, out BridgeMouseReport report)
             ? report
-            : throw new InvalidDataException("记录到无效鼠标报告"))
+            : throw new InvalidDataException("记录到非 8 字节桥接鼠标报告"))
         .ToArray();
 
     internal long[] MouseTimestamps() => _frames

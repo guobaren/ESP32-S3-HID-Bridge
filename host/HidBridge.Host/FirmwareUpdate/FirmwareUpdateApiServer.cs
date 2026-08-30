@@ -10,7 +10,7 @@ internal delegate bool FirmwareFlashStarter(
     string portName,
     out FirmwareFlashSnapshot snapshot);
 
-internal sealed record FirmwareFlashRequest(string ManifestPath, string PortName);
+internal sealed record FirmwareFlashRequest(string ManifestPath);
 
 internal sealed class FirmwareUpdateApiServer : IDisposable
 {
@@ -21,25 +21,31 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
     private readonly int _port;
     private readonly Func<FirmwareFlashSnapshot> _getSnapshot;
     private readonly FirmwareFlashStarter _tryStart;
+    private readonly Func<string?> _selectedPortProvider;
     private readonly object _sync = new();
     private TcpListener? _listener;
     private CancellationTokenSource? _cancellation;
     private Task? _listenerTask;
     private bool _disposed;
 
-    internal FirmwareUpdateApiServer(int port, FirmwareFlashService service)
-        : this(port, service.GetSnapshot, service.TryStartFromManifest)
+    internal FirmwareUpdateApiServer(
+        int port,
+        FirmwareFlashService service,
+        Func<string?> selectedPortProvider)
+        : this(port, service.GetSnapshot, service.TryStartFromManifest, selectedPortProvider)
     {
     }
 
     internal FirmwareUpdateApiServer(
         int port,
         Func<FirmwareFlashSnapshot> getSnapshot,
-        FirmwareFlashStarter tryStart)
+        FirmwareFlashStarter tryStart,
+        Func<string?> selectedPortProvider)
     {
         _port = port;
         _getSnapshot = getSnapshot;
         _tryStart = tryStart;
+        _selectedPortProvider = selectedPortProvider;
     }
 
     internal bool Enabled
@@ -64,7 +70,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         }
     }
 
-    internal IPAddress ListenAddress => IPAddress.Loopback;
+    internal IPAddress ListenAddress => IPAddress.Any;
     internal bool FlashInProgress => _getSnapshot().State == "running";
 
     internal void SetEnabled(bool enabled)
@@ -97,7 +103,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         _listenerTask = Task.Run(() => AcceptLoopAsync(listener, cancellation.Token));
         int actualPort = ((IPEndPoint)listener.LocalEndpoint).Port;
         Console.WriteLine(
-            $"本机固件刷写接口已启用：http://127.0.0.1:{actualPort}/api/v1/firmware；仅接受 Loopback 请求。");
+            $"局域网固件刷写接口已启用：0.0.0.0:{actualPort}/api/v1/firmware；仅限受信任局域网。");
     }
 
     private void StopLocked()
@@ -123,7 +129,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
             }
         }
         cancellation?.Dispose();
-        Console.WriteLine("本机固件刷写接口已关闭。");
+        Console.WriteLine("局域网固件刷写接口已关闭。");
     }
 
     private async Task AcceptLoopAsync(TcpListener listener, CancellationToken cancellationToken)
@@ -145,7 +151,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine($"本机固件刷写接口接受连接失败：{exception.Message}");
+                Console.Error.WriteLine($"局域网固件刷写接口接受连接失败：{exception.Message}");
             }
         }
     }
@@ -156,10 +162,6 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         {
             try
             {
-                if (client.Client.RemoteEndPoint is not IPEndPoint remote || !IPAddress.IsLoopback(remote.Address))
-                {
-                    return;
-                }
                 using NetworkStream stream = client.GetStream();
                 using CancellationTokenSource requestTimeout =
                     CancellationTokenSource.CreateLinkedTokenSource(serverCancellation);
@@ -229,15 +231,16 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                             .ConfigureAwait(false);
                         return;
                     }
-                    if (string.IsNullOrWhiteSpace(request.PortName))
+                    string selectedPort = _selectedPortProvider()?.Trim() ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(selectedPort))
                     {
-                        await WriteJsonAsync(stream, 400, new { error = "port_name_required" }, requestTimeout.Token)
+                        await WriteJsonAsync(stream, 400, new { error = "firmware_flash_port_not_selected" }, requestTimeout.Token)
                             .ConfigureAwait(false);
                         return;
                     }
                     bool started = _tryStart(
                         request.ManifestPath,
-                        request.PortName,
+                        selectedPort,
                         out FirmwareFlashSnapshot snapshot);
                     int responseCode = started
                         ? 202
@@ -258,7 +261,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
             }
             catch (IOException exception)
             {
-                Console.Error.WriteLine($"本机固件刷写接口连接失败：{exception.Message}");
+                Console.Error.WriteLine($"局域网固件刷写接口连接失败：{exception.Message}");
             }
         }
     }

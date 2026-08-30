@@ -448,7 +448,8 @@ esp_err_t ble_output_submit(const bridge_frame_t *frame)
     if (frame->type == BRIDGE_MESSAGE_KEYBOARD_REPORT && frame->payload_length == 8) {
         return esp_hidd_dev_input_set(s_device, 0, 1, (uint8_t *)frame->payload, 8);
     }
-    if (frame->type == BRIDGE_MESSAGE_MOUSE_REPORT && frame->payload_length == 7) {
+    if (frame->type == BRIDGE_MESSAGE_MOUSE_REPORT &&
+        (frame->payload_length == 7 || frame->payload_length == 8)) {
         if (s_mouse_mutex == NULL || xSemaphoreTake(s_mouse_mutex, portMAX_DELAY) != pdTRUE) {
             return ESP_ERR_INVALID_STATE;
         }

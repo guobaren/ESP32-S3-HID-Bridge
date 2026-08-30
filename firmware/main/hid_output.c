@@ -15,12 +15,14 @@
 #include "tinyusb_default_config.h"
 #include "tusb.h"
 #include "output_router.h"
+#include "mouse_motion_smoother.h"
 #include "usb_cdc_input.h"
 #include "usb_output_liveness.h"
 
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE 2
 #define MOUSE_REPORT_LENGTH 7
+#define BRIDGE_MOUSE_REPORT_LENGTH 8
 #define CONTROL_QUEUE_LENGTH 32
 #define USB_HID_INTERFACE_COUNT 1
 #define USB_CDC_INTERFACE_COUNT 2
@@ -63,6 +65,7 @@ typedef struct {
     int64_t pending_y;
     int64_t pending_wheel;
     int64_t pending_pan;
+    mouse_motion_smoother_t motion_smoother;
     int64_t received_x;
     int64_t received_y;
     int64_t submitted_x;
@@ -506,7 +509,8 @@ static bool submit_mouse_report(uint8_t buttons, bool force)
         s_diagnostics.motion_submitted++;
     }
     if (s_mouse.pending_x == 0 && s_mouse.pending_y == 0 &&
-        s_mouse.pending_wheel == 0 && s_mouse.pending_pan == 0) {
+        s_mouse.pending_wheel == 0 && s_mouse.pending_pan == 0 &&
+        !mouse_motion_smoother_has_pending(&s_mouse.motion_smoother)) {
         s_mouse.pending_motion_reports = 0;
     }
     portEXIT_CRITICAL(&s_mouse_lock);
@@ -684,6 +688,15 @@ static void hid_sender_task(void *argument)
             continue;
         }
 
+        portENTER_CRITICAL(&s_mouse_lock);
+        mouse_motion_delta_t scheduled =
+            mouse_motion_smoother_take_next(&s_mouse.motion_smoother);
+        s_mouse.pending_x += scheduled.x;
+        s_mouse.pending_y += scheduled.y;
+        s_mouse.pending_wheel += scheduled.wheel;
+        s_mouse.pending_pan += scheduled.pan;
+        portEXIT_CRITICAL(&s_mouse_lock);
+
         hid_control_event_t event;
         xSemaphoreTake(s_control_mutex, portMAX_DELAY);
         if (xQueuePeek(s_control_queue, &event, 0) == pdTRUE) {
@@ -824,7 +837,8 @@ esp_err_t hid_output_submit(const bridge_frame_t *frame)
     }
 
     if (frame->type == BRIDGE_MESSAGE_MOUSE_REPORT) {
-        if (frame->payload_length != MOUSE_REPORT_LENGTH) {
+        if (frame->payload_length != MOUSE_REPORT_LENGTH &&
+            frame->payload_length != BRIDGE_MOUSE_REPORT_LENGTH) {
             return ESP_ERR_INVALID_SIZE;
         }
         const uint8_t buttons = frame->payload[0];
@@ -832,6 +846,12 @@ esp_err_t hid_output_submit(const bridge_frame_t *frame)
         const int16_t y = read_i16_le(&frame->payload[3]);
         const int8_t wheel = (int8_t)frame->payload[5];
         const int8_t pan = (int8_t)frame->payload[6];
+        const uint8_t smoothing_slots = frame->payload_length == BRIDGE_MOUSE_REPORT_LENGTH
+            ? frame->payload[7]
+            : 0U;
+        if (!mouse_motion_smoother_valid_slot_count(smoothing_slots)) {
+            return ESP_ERR_INVALID_ARG;
+        }
 
         uint8_t previous_buttons;
         portENTER_CRITICAL(&s_mouse_lock);
@@ -854,10 +874,15 @@ esp_err_t hid_output_submit(const bridge_frame_t *frame)
 
         portENTER_CRITICAL(&s_mouse_lock);
         s_mouse.received_buttons = buttons;
-        s_mouse.pending_x += x;
-        s_mouse.pending_y += y;
-        s_mouse.pending_wheel += wheel;
-        s_mouse.pending_pan += pan;
+        mouse_motion_smoother_enqueue(
+            &s_mouse.motion_smoother,
+            (mouse_motion_delta_t){
+                .x = x,
+                .y = y,
+                .wheel = wheel,
+                .pan = pan,
+            },
+            smoothing_slots);
         s_mouse.received_x += x;
         s_mouse.received_y += y;
         s_mouse.received_reports++;
@@ -868,8 +893,10 @@ esp_err_t hid_output_submit(const bridge_frame_t *frame)
                 s_mouse.max_pending_motion_reports = s_mouse.pending_motion_reports;
             }
         }
-        uint64_t pending_x = absolute_u64(s_mouse.pending_x);
-        uint64_t pending_y = absolute_u64(s_mouse.pending_y);
+        mouse_motion_delta_t scheduled_pending =
+            mouse_motion_smoother_pending(&s_mouse.motion_smoother);
+        uint64_t pending_x = absolute_u64(s_mouse.pending_x + scheduled_pending.x);
+        uint64_t pending_y = absolute_u64(s_mouse.pending_y + scheduled_pending.y);
         if (pending_x > s_mouse.max_pending_x) {
             s_mouse.max_pending_x = pending_x;
         }
@@ -891,8 +918,10 @@ esp_err_t hid_output_submit(const bridge_frame_t *frame)
     } else if (frame->type == BRIDGE_MESSAGE_RELEASE_ALL) {
         event.type = HID_CONTROL_RELEASE_ALL;
         portENTER_CRITICAL(&s_mouse_lock);
-        s_mouse.discarded_x += s_mouse.pending_x;
-        s_mouse.discarded_y += s_mouse.pending_y;
+        mouse_motion_delta_t scheduled_pending =
+            mouse_motion_smoother_drain(&s_mouse.motion_smoother);
+        s_mouse.discarded_x += s_mouse.pending_x + scheduled_pending.x;
+        s_mouse.discarded_y += s_mouse.pending_y + scheduled_pending.y;
         s_mouse.pending_x = 0;
         s_mouse.pending_y = 0;
         s_mouse.pending_wheel = 0;

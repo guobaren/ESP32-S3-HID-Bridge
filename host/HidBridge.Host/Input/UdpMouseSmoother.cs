@@ -13,94 +13,31 @@ internal readonly record struct UdpMouseSmootherStatistics(
 
 internal sealed class UdpMouseSmoother
 {
-    internal const int OutputIntervalMilliseconds = 1;
-    internal const int SmoothingSlots = 20;
-    internal const int MaximumScheduledDelayMilliseconds =
-        OutputIntervalMilliseconds * SmoothingSlots;
+    // UDP 不再在 Host 侧展开为多个发送槽；这里仅保留诊断计数，
+    // 实际 5 槽分摊由 ESP32 USB HID 输出任务完成。
+    internal const int FirmwareSmoothingSlots = 5;
+    internal const int MaximumScheduledDelayMilliseconds = 0;
 
-    private readonly MouseDelta[] _scheduled = new MouseDelta[SmoothingSlots];
-    private int _nextSlot;
-    private int _distributionPhase;
     private long _enqueuedCommands;
-    private long _overlappingCommands;
 
-    internal void Enqueue(MouseDelta delta)
+    internal void Record(MouseDelta delta)
     {
         if (delta.IsZero)
         {
             return;
         }
 
-        bool overlapsExistingPlan = _scheduled.Any(slot => !slot.IsZero);
         _enqueuedCommands++;
-        if (overlapsExistingPlan)
-        {
-            _overlappingCommands++;
-        }
-        else
-        {
-            _distributionPhase = 0;
-        }
-
-        for (int offset = 0; offset < SmoothingSlots; offset++)
-        {
-            int slotIndex = (_nextSlot + offset) % SmoothingSlots;
-            MouseDelta current = _scheduled[slotIndex];
-            _scheduled[slotIndex] = new MouseDelta(
-                current.X + Split(delta.X, offset, SmoothingSlots, _distributionPhase),
-                current.Y + Split(delta.Y, offset, SmoothingSlots, _distributionPhase),
-                current.Wheel + Split(delta.Wheel, offset, SmoothingSlots, _distributionPhase),
-                current.Pan + Split(delta.Pan, offset, SmoothingSlots, _distributionPhase));
-        }
-        _distributionPhase = (_distributionPhase + 1) % SmoothingSlots;
-    }
-
-    internal bool TryDequeue(out MouseDelta delta)
-    {
-        delta = _scheduled[_nextSlot];
-        _scheduled[_nextSlot] = default;
-        _nextSlot = (_nextSlot + 1) % SmoothingSlots;
-        return !delta.IsZero;
-    }
-
-    internal MouseDelta Drain()
-    {
-        MouseDelta total = default;
-        for (int index = 0; index < SmoothingSlots; index++)
-        {
-            if (TryDequeue(out MouseDelta delta))
-            {
-                total = new MouseDelta(
-                    total.X + delta.X,
-                    total.Y + delta.Y,
-                    total.Wheel + delta.Wheel,
-                    total.Pan + delta.Pan);
-            }
-        }
-        return total;
     }
 
     internal UdpMouseSmootherStatistics GetStatistics() => new(
-        SmoothingSlots,
-        _scheduled.Count(slot => !slot.IsZero),
+        FirmwareSmoothingSlots,
+        0,
         _enqueuedCommands,
-        _overlappingCommands);
+        0);
 
     internal void Reset()
     {
-        Array.Clear(_scheduled);
-        _nextSlot = 0;
-        _distributionPhase = 0;
         _enqueuedCommands = 0;
-        _overlappingCommands = 0;
-    }
-
-    private static long Split(long total, int index, int parts, int phase)
-    {
-        long quotient = total / parts;
-        long remainder = total % parts;
-        int phasedIndex = (index - phase + parts) % parts;
-        long remainderPart = phasedIndex < Math.Abs(remainder) ? Math.Sign(remainder) : 0;
-        return quotient + remainderPart;
     }
 }

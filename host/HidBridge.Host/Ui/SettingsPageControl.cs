@@ -72,10 +72,10 @@ internal sealed class SettingsPageControl : UserControl
             "生成按键情况分析图片",
             "默认关闭。左右键同时按下开始记录，全部松开 3 秒后完成；启用后弹出 X/Y 实际固件报告分析窗口，并将 PNG 保存到程序目录 log。仅用于观察输出，不改变转发逻辑。");
         _firmwareUpdateApiCheckBox = CreateOption(
-            "启用本机固件刷写接口",
+            "启用局域网固件刷写接口",
             firmwareUpdateApi is null
                 ? "当前不是串口模式，固件刷写接口不可用。"
-                : $"仅监听 127.0.0.1:{firmwareUpdateApi.Port}；默认关闭，可由远程控制在本机发起请求。");
+                : $"监听局域网 TCP {firmwareUpdateApi.Port}；默认关闭，刷写时自动使用下方已选择的串口。仅限受信任局域网。");
         _firmwareUpdateApiCheckBox.Enabled = firmwareUpdateApi is not null;
 
         _simulatedUdpCheckBox = new CheckBox
@@ -292,7 +292,7 @@ internal sealed class SettingsPageControl : UserControl
         Label sectionTitle = CreateSectionTitle("本地固件刷写");
         Label sectionDescription = new()
         {
-            Text = "在本模块选择刷写串口和本机 JSON 清单；刷写直接使用所选 COM，不要求应用层握手。远程 API 使用请求中单独指定的串口和 JSON。",
+            Text = "在本模块选择刷写串口和本机 JSON 清单；刷写直接使用所选 COM，不要求应用层握手。远程 API 自动使用这里保存的串口。",
             Dock = DockStyle.Top,
             Height = 44,
             ForeColor = MutedTextColor,

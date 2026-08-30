@@ -67,7 +67,10 @@ internal static class Program
             if (serialBridge is not null)
             {
                 firmwareFlash = new FirmwareFlashService(options, serialBridge, input);
-                firmwareUpdateApi = new FirmwareUpdateApiServer(options.FirmwareUpdateApiPort, firmwareFlash);
+                firmwareUpdateApi = new FirmwareUpdateApiServer(
+                    options.FirmwareUpdateApiPort,
+                    firmwareFlash,
+                    () => automation.Settings.FirmwareFlashPortName);
                 if (automation.Settings.FirmwareUpdateApiEnabled)
                 {
                     try
@@ -78,7 +81,7 @@ internal static class Program
                     {
                         automation.Settings.FirmwareUpdateApiEnabled = false;
                         automation.SaveSettings();
-                        Console.Error.WriteLine($"本机固件刷写接口启动失败，已恢复为关闭：{exception.Message}");
+                        Console.Error.WriteLine($"局域网固件刷写接口启动失败，已恢复为关闭：{exception.Message}");
                     }
                 }
             }
