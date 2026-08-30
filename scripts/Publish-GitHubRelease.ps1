@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^v\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$')]
@@ -76,12 +76,12 @@ function Invoke-PrepareRelease {
         throw "找不到现有发布件生成脚本：$prepareScript"
     }
 
-    $prepareArguments = @()
+    $prepareArguments = @{}
     if ($SkipHostBuild) {
-        $prepareArguments += '-SkipHostBuild'
+        $prepareArguments['SkipHostBuild'] = $true
     }
     if ($BuildFirmware) {
-        $prepareArguments += '-BuildFirmware'
+        $prepareArguments['BuildFirmware'] = $true
     }
 
     if ($SkipHostBuild) {
@@ -212,7 +212,7 @@ function Assert-ReleaseChecksumManifest {
     }
 
     $entries = @{}
-    foreach ($line in @(Get-Content -LiteralPath $sumPath)) {
+    foreach ($line in @(Get-Content -LiteralPath $sumPath -Encoding UTF8)) {
         $trimmed = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($trimmed)) {
             continue
