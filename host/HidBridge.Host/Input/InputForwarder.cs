@@ -24,6 +24,7 @@ internal sealed class InputForwarder : IDisposable
         uint VirtualKey,
         bool Extended,
         bool IsDown,
+        IntPtr MouseDevice,
         NativeMethods.RawMouse RawMouse);
 
     private readonly record struct CapturedKeyboardKey(uint VirtualKey, bool Extended);
@@ -50,6 +51,7 @@ internal sealed class InputForwarder : IDisposable
     private readonly HashSet<uint> _triggerHeldKeys = [];
     private readonly HashSet<uint> _controlHotkeysDown = [];
     private readonly HashSet<CapturedKeyboardKey> _capturedKeyboardKeysDown = [];
+    private readonly Dictionary<IntPtr, byte> _mouseButtonsByDevice = [];
     private IntPtr _keyboardHook;
     private IntPtr _mouseHook;
     private RawMouseInputWindow? _rawMouseInput;
@@ -255,13 +257,19 @@ internal sealed class InputForwarder : IDisposable
     }
 
     internal void ProcessRawMouseInputForChecks(NativeMethods.RawMouse input) =>
-        HandleRawMouseInputSafely(input);
+        ProcessRawMouseInputForChecks(IntPtr.Zero, input);
+
+    internal void ProcessRawMouseInputForChecks(IntPtr device, NativeMethods.RawMouse input) =>
+        HandleRawMouseInputSafely(device, input);
 
     internal bool EnqueueKeyboardInputForChecks(uint virtualKey, bool extended, bool isDown) =>
         TryEnqueueKeyboardTransition(virtualKey, extended, isDown);
 
     internal bool EnqueueRawMouseInputForChecks(NativeMethods.RawMouse input) =>
-        EnqueueRawMouseInputCore(input);
+        EnqueueRawMouseInputForChecks(IntPtr.Zero, input);
+
+    internal bool EnqueueRawMouseInputForChecks(IntPtr device, NativeMethods.RawMouse input) =>
+        EnqueueRawMouseInputCore(device, input);
 
     internal void SendAutomationMouseMove(int deltaX, int deltaY)
     {
@@ -453,7 +461,7 @@ internal sealed class InputForwarder : IDisposable
         }
         try
         {
-            _rawMouseInput = new RawMouseInputWindow((_, input) => EnqueueRawMouseInput(input));
+            _rawMouseInput = new RawMouseInputWindow(EnqueueRawMouseInput);
             IntPtr module = NativeMethods.GetModuleHandle(null);
             _keyboardHook = NativeMethods.SetWindowsHookEx(
                 NativeMethods.WhKeyboardLl,
@@ -553,7 +561,7 @@ internal sealed class InputForwarder : IDisposable
                 }
                 else
                 {
-                    HandleRawMouseInputSafely(input.RawMouse);
+                    HandleRawMouseInputSafely(input.MouseDevice, input.RawMouse);
                 }
             }
         }
@@ -656,6 +664,7 @@ internal sealed class InputForwarder : IDisposable
                     virtualKey,
                     extended,
                     isDown,
+                    IntPtr.Zero,
                     default)))
             {
                 return true;
@@ -757,6 +766,7 @@ internal sealed class InputForwarder : IDisposable
                     0,
                     false,
                     false,
+                    IntPtr.Zero,
                     default)))
             {
                 return true;
@@ -786,7 +796,9 @@ internal sealed class InputForwarder : IDisposable
         {
             int chunkX = unchecked((int)Math.Clamp(deltaX, int.MinValue, int.MaxValue));
             int chunkY = unchecked((int)Math.Clamp(deltaY, int.MinValue, int.MaxValue));
-            HandleRawMouseInputSafely(new NativeMethods.RawMouse { LastX = chunkX, LastY = chunkY });
+            HandleRawMouseInputSafely(
+                IntPtr.Zero,
+                new NativeMethods.RawMouse { LastX = chunkX, LastY = chunkY });
             deltaX -= chunkX;
             deltaY -= chunkY;
         }
@@ -808,10 +820,10 @@ internal sealed class InputForwarder : IDisposable
         (input.Flags & NativeMethods.MouseMoveAbsolute) == 0 &&
         (input.LastX != 0 || input.LastY != 0);
 
-    private void EnqueueRawMouseInput(NativeMethods.RawMouse input) =>
-        EnqueueRawMouseInputForChecks(input);
+    private void EnqueueRawMouseInput(IntPtr device, NativeMethods.RawMouse input) =>
+        EnqueueRawMouseInputForChecks(device, input);
 
-    private bool EnqueueRawMouseInputCore(NativeMethods.RawMouse input)
+    private bool EnqueueRawMouseInputCore(IntPtr device, NativeMethods.RawMouse input)
     {
         if (IsCoalescibleRawMouseMovement(input))
         {
@@ -824,6 +836,7 @@ internal sealed class InputForwarder : IDisposable
                 0,
                 false,
                 false,
+                device,
                 input));
     }
 
@@ -953,12 +966,13 @@ internal sealed class InputForwarder : IDisposable
             _mouseButtons = 0;
             _automationMouseButtons = 0;
             _remoteMouseButtons = 0;
+            _mouseButtonsByDevice.Clear();
             _verticalWheelRemainder = 0;
             _horizontalWheelRemainder = 0;
         }
     }
 
-    private void HandleRawMouseInput(NativeMethods.RawMouse input)
+    private void HandleRawMouseInput(IntPtr device, NativeMethods.RawMouse input)
     {
         // 自动化触发监听与 HID 转发是两条独立链路。本机模式虽然不向对端
         // 累计报告，仍必须把实体鼠标按键送给宏和 Lua 的 OnEvent/IsPressed。
@@ -967,6 +981,8 @@ internal sealed class InputForwarder : IDisposable
         bool forwarding = ForwardingEnabled;
         byte combinedButtons;
         bool hasButtonChange;
+        byte previousPhysicalButtons;
+        byte currentPhysicalButtons;
         int wheel = 0;
         int pan = 0;
         byte mouseMask;
@@ -974,11 +990,9 @@ internal sealed class InputForwarder : IDisposable
         lock (_inputStateLock)
         {
             byte previousButtons = GetCombinedMouseButtonsLocked(forwarding);
-            UpdateMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, LeftButton);
-            UpdateMouseButton(flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, RightButton);
-            UpdateMouseButton(flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, MiddleButton);
-            UpdateMouseButton(flags, NativeMethods.RawMouseButton4Down, NativeMethods.RawMouseButton4Up, BackButton);
-            UpdateMouseButton(flags, NativeMethods.RawMouseButton5Down, NativeMethods.RawMouseButton5Up, ForwardButton);
+            previousPhysicalButtons = _mouseButtons;
+            UpdateMouseButtonsForDeviceLocked(device, flags);
+            currentPhysicalButtons = _mouseButtons;
 
             if ((flags & NativeMethods.RawMouseWheel) != 0)
             {
@@ -1011,14 +1025,14 @@ internal sealed class InputForwarder : IDisposable
                 forwardedPan);
         }
         // 与键盘相同，先把实体按钮的新状态交给 500 Hz 报告泵，再执行 Lua/宏回调。
-        NotifyMouseButtonTransitions(flags);
+        NotifyMouseButtonTransitions(previousPhysicalButtons, currentPhysicalButtons);
     }
 
-    private void HandleRawMouseInputSafely(NativeMethods.RawMouse input)
+    private void HandleRawMouseInputSafely(IntPtr device, NativeMethods.RawMouse input)
     {
         try
         {
-            HandleRawMouseInput(input);
+            HandleRawMouseInput(device, input);
         }
         catch (Exception exception)
         {
@@ -1027,15 +1041,46 @@ internal sealed class InputForwarder : IDisposable
         }
     }
 
-    private void UpdateMouseButton(ushort flags, ushort downFlag, ushort upFlag, byte button)
+    private void UpdateMouseButtonsForDeviceLocked(IntPtr device, ushort flags)
+    {
+        _mouseButtonsByDevice.TryGetValue(device, out byte deviceButtons);
+        UpdateMouseButton(ref deviceButtons, flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, LeftButton);
+        UpdateMouseButton(ref deviceButtons, flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, RightButton);
+        UpdateMouseButton(ref deviceButtons, flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, MiddleButton);
+        UpdateMouseButton(ref deviceButtons, flags, NativeMethods.RawMouseButton4Down, NativeMethods.RawMouseButton4Up, BackButton);
+        UpdateMouseButton(ref deviceButtons, flags, NativeMethods.RawMouseButton5Down, NativeMethods.RawMouseButton5Up, ForwardButton);
+
+        if (deviceButtons == 0)
+        {
+            _mouseButtonsByDevice.Remove(device);
+        }
+        else
+        {
+            _mouseButtonsByDevice[device] = deviceButtons;
+        }
+
+        byte combined = 0;
+        foreach (byte buttons in _mouseButtonsByDevice.Values)
+        {
+            combined |= buttons;
+        }
+        _mouseButtons = combined;
+    }
+
+    private static void UpdateMouseButton(
+        ref byte buttons,
+        ushort flags,
+        ushort downFlag,
+        ushort upFlag,
+        byte button)
     {
         if ((flags & downFlag) != 0)
         {
-            _mouseButtons |= button;
+            buttons |= button;
         }
         if ((flags & upFlag) != 0)
         {
-            _mouseButtons &= unchecked((byte)~button);
+            buttons &= unchecked((byte)~button);
         }
     }
 
@@ -1121,22 +1166,26 @@ internal sealed class InputForwarder : IDisposable
         _modifiers,
         _pressedKeys.Take(10).ToArray());
 
-    private void NotifyMouseButtonTransitions(ushort flags)
+    private void NotifyMouseButtonTransitions(byte previousButtons, byte currentButtons)
     {
-        NotifyMouseButton(flags, NativeMethods.RawMouseLeftButtonDown, NativeMethods.RawMouseLeftButtonUp, 0x01);
-        NotifyMouseButton(flags, NativeMethods.RawMouseRightButtonDown, NativeMethods.RawMouseRightButtonUp, 0x02);
-        NotifyMouseButton(flags, NativeMethods.RawMouseMiddleButtonDown, NativeMethods.RawMouseMiddleButtonUp, 0x04);
-        NotifyMouseButton(flags, NativeMethods.RawMouseButton4Down, NativeMethods.RawMouseButton4Up, 0x05);
-        NotifyMouseButton(flags, NativeMethods.RawMouseButton5Down, NativeMethods.RawMouseButton5Up, 0x06);
+        NotifyMouseButton(previousButtons, currentButtons, LeftButton, 0x01);
+        NotifyMouseButton(previousButtons, currentButtons, RightButton, 0x02);
+        NotifyMouseButton(previousButtons, currentButtons, MiddleButton, 0x04);
+        NotifyMouseButton(previousButtons, currentButtons, BackButton, 0x05);
+        NotifyMouseButton(previousButtons, currentButtons, ForwardButton, 0x06);
     }
 
-    private void NotifyMouseButton(ushort flags, ushort downFlag, ushort upFlag, uint virtualKey)
+    private void NotifyMouseButton(
+        byte previousButtons,
+        byte currentButtons,
+        byte button,
+        uint virtualKey)
     {
-        if ((flags & downFlag) != 0)
+        if ((previousButtons & button) == 0 && (currentButtons & button) != 0)
         {
             NotifyPhysicalInput(virtualKey, true);
         }
-        if ((flags & upFlag) != 0)
+        if ((previousButtons & button) != 0 && (currentButtons & button) == 0)
         {
             NotifyPhysicalInput(virtualKey, false);
         }

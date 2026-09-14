@@ -83,6 +83,7 @@ CheckDeviceLogPolicy();
 CheckDeviceTraceRealtimePersistence();
 CheckInputSuppressionPolicy();
 CheckKeyboardAutoRepeatEdgeFiltering();
+CheckMouseButtonsAreTrackedPerDevice();
 CheckInputCaptureThreadIsolation();
 CheckUnexpectedInputCaptureExitReleasesAll();
 CheckForwardingNotificationFailureStillReleasesAll();
@@ -952,6 +953,59 @@ static void CheckInputCallbackFailureStillReleasesAll()
         transport.FrameCount(MessageType.ReleaseAll) > releaseCountBeforeInput,
         "Lua/宏输入回调异常后未强制发送 ReleaseAll");
     Console.WriteLine("输入回调故障检查：Lua/宏回调异常后已禁用转发并发送 ReleaseAll。");
+}
+
+static void CheckMouseButtonsAreTrackedPerDevice()
+{
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    IntPtr firstMouse = new(1);
+    IntPtr secondMouse = new(2);
+    input.SetForwardingEnabled(true);
+
+    input.ProcessRawMouseInputForChecks(firstMouse, new NativeMethods.RawMouse
+    {
+        Buttons = NativeMethods.RawMouseRightButtonDown,
+    });
+    Require(
+        SpinWait.SpinUntil(
+            () => transport.MouseReports().Any(report => (report.Buttons & 0x02) != 0),
+            1000),
+        "第一只鼠标右键按下未送达报告泵");
+    int reportsAfterPress = transport.MouseReports().Length;
+
+    input.ProcessRawMouseInputForChecks(secondMouse, new NativeMethods.RawMouse
+    {
+        Buttons = NativeMethods.RawMouseRightButtonUp,
+    });
+    Thread.Sleep(20);
+    MouseReport[] afterUnpairedRelease = transport.MouseReports();
+    Require(
+        afterUnpairedRelease.Length == reportsAfterPress &&
+        (afterUnpairedRelease[^1].Buttons & 0x02) != 0,
+        "另一只鼠标的未配对右键松开不应释放第一只鼠标仍按住的右键");
+
+    input.ProcessRawMouseInputForChecks(secondMouse, new NativeMethods.RawMouse
+    {
+        Buttons = NativeMethods.RawMouseRightButtonDown,
+    });
+    input.ProcessRawMouseInputForChecks(firstMouse, new NativeMethods.RawMouse
+    {
+        Buttons = NativeMethods.RawMouseRightButtonUp,
+    });
+    Thread.Sleep(20);
+    Require(
+        (transport.MouseReports()[^1].Buttons & 0x02) != 0,
+        "第一只鼠标松开时第二只鼠标仍按住右键，不应发送右键松开");
+
+    input.ProcessRawMouseInputForChecks(secondMouse, new NativeMethods.RawMouse
+    {
+        Buttons = NativeMethods.RawMouseRightButtonUp,
+    });
+    Require(
+        SpinWait.SpinUntil(() => transport.MouseReports().Last().Buttons == 0, 1000),
+        "最后一只鼠标松开右键后应发送右键松开报告");
+    Console.WriteLine("多鼠标按钮检查：按设备维护状态，非来源设备的松开不会清除仍按住的右键。");
 }
 
 static void CheckLuaReleaseCannotBlockInputCapture()
