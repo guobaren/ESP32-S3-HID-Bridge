@@ -41,8 +41,23 @@ PC 侧原生 USB 是一个复合设备（同一 USB 父设备、同一根线）�
 | `0x21` | PHYSICAL_MOUSE：接口、Report ID、按钮、X/Y、wheel/pan |
 | `0x22` | PHYSICAL_RELEASE：实体源释放 |
 | `0x23` | LINK_PING：链路保活 |
+| `0x24` | PROFILE_BEGIN：动态设备 Profile 的 transfer ID、总长度与 CRC32 |
+| `0x25` | PROFILE_CHUNK：按严格连续 offset 传输最多 56 字节 Profile 数据 |
+| `0x26` | PROFILE_COMMIT：再次核对 transfer ID、总长度与 CRC32 后发布 Profile |
 
 UART1 会拒绝相同 node ID 或相同角色的对端；3 个 250 ms 周期无有效帧后清除实体按钮和积累位移。队列溢出、USB HID 断开、角色切换和退出路径都发送安全释放。
+
+## 多型号动态 Profile（运行时观察阶段）
+
+`hid_device_profile` 提供与具体鼠标无关的有界二进制模型，保存原始 Device/Configuration 描述符、UTF-8 字符串以及按物理 interface number 索引的 HID Report 描述符。Profile 最大 4096 字节；接口数、字符串和单份描述符都有独立上限。UART1 分片接收器只接受严格连续 offset，并且只有在 BEGIN/COMMIT 字段一致、总 CRC32 正确、反序列化恰好消费全部数据后才发布新 Profile。错误或中断的替换传输不会清除上一份已发布 Profile。
+
+当前已增加运行时观察路径：鼠标侧在每个 HID 接口成功打开并取得报告描述符后，收集动态 interface number、subclass、protocol、报告描述符和 `hid_host_get_device_info()` 提供的 VID/PID/字符串；最后一个接口后约 200 ms 防抖，Profile 序列化后通过 UART1 的 `0x24..0x26` 有界分片发送。电脑侧只接收、校验并记录完整 Profile 摘要，保留上一份有效 Profile，不会改变当前 USB 枚举或调用 TinyUSB 卸载/重枚举。
+
+ESP-IDF 当前公开 HID Host API 没有把 raw device/config descriptor 暴露给本工程的 `hid_host_device_handle_t`。因此运行时观察 Profile 的 `flags` 会明确标记 `PARTIAL`、`SYNTHETIC_DEVICE_DESCRIPTOR` 和 `SYNTHETIC_CONFIG_DESCRIPTOR`；设备描述符只用 VID/PID 构造规范化占位，Configuration descriptor 为空，不能据此宣称已取得完整原始描述符或完成驱动克隆。Profile v2 的每个报告项额外保存原始 `interface_number/subclass/protocol`。
+
+Profile 串流在 UART1 链路在线时发送；实体鼠标安全释放队列优先，普通鼠标报告每累计 8 个最多让出一个 Profile 帧，离线不发送，peer generation 改变从 BEGIN 重新开始。统计输出包含 Profile begin/chunk/commit/restart/fail。这个阶段仍尚未动态重枚举，也未实现 Logitech 驱动/G Hub 识别；无法安全解析相对 X/Y、wheel、pan 或 buttons 的型号只能原样透传，不能擅自叠加软件移动。
+
+C092 的 VID/PID、字符串、67/151 字节报告描述符仅是首个测试向量，不是默认运行配置。后续动态克隆仍必须检查接口和端点预算。
 
 本阶段只实现通用 HID 鼠标，不实现 Logitech C092 的原始 VID/PID、第二个 vendor/HID++ 接口、Feature 报告和控制事务。因此不能宣称 Logitech 驱动/G Hub 完整兼容；interface 1 `protocol=0` 仅隔离并计数。
 

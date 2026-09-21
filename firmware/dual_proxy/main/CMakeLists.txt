@@ -8,6 +8,8 @@ idf_component_register(
         "usb_cdc_control.c"
         "usb_cdc_control_logic.c"
         "uart1_link.c"
+        "hid_device_profile.c"
+        "hid_clone_descriptor.c"
         "hid_host_mouse.c"
         "pc_hid_output.c"
     INCLUDE_DIRS "."

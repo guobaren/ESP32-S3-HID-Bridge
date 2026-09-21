@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "bridge_protocol.h"
@@ -34,3 +35,33 @@ esp_err_t dual_uart1_send_mouse(
     int8_t wheel,
     int8_t pan);
 esp_err_t dual_uart1_send_release(uint8_t reason);
+esp_err_t dual_uart1_send_raw_hid_input(
+    uint8_t interface_number,
+    uint8_t report_id,
+    const uint8_t *data,
+    size_t data_length);
+esp_err_t dual_uart1_send_hid_set_report(
+    uint16_t transaction_id,
+    uint8_t interface_number,
+    uint8_t report_id,
+    uint8_t report_type,
+    const uint8_t *data,
+    size_t data_length);
+esp_err_t dual_uart1_send_hid_get_request(
+    uint16_t transaction_id,
+    uint8_t interface_number,
+    uint8_t report_id,
+    uint8_t report_type,
+    uint8_t requested_length);
+esp_err_t dual_uart1_send_hid_get_response(
+    uint16_t transaction_id,
+    uint8_t status,
+    uint8_t interface_number,
+    uint8_t report_id,
+    const uint8_t *data,
+    size_t data_length);
+/* Copy a complete serialized HID profile for bounded, fair UART1 streaming. */
+esp_err_t dual_uart1_queue_profile(
+    const uint8_t *blob,
+    size_t length,
+    uint32_t crc32);

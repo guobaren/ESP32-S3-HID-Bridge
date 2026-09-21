@@ -13,6 +13,7 @@
 #include "bridge_protocol.h"
 #include "dual_status_led.h"
 #include "hid_host_mouse.h"
+#include "hid_device_profile.h"
 #include "pc_hid_output.h"
 #include "usb_cdc_control.h"
 #include "uart1_link.h"
@@ -22,6 +23,7 @@
 static const char *TAG = "dual_proxy";
 static uint8_t s_node_id[6];
 static uint8_t s_role;
+static hid_profile_receiver_t s_profile_receiver;
 
 static int16_t read_i16_le(const uint8_t *value)
 {
@@ -51,28 +53,72 @@ static void on_link_fault(void)
 {
     if (s_role == DUAL_ROLE_PC_DEVICE) {
         dual_pc_hid_physical_release();
+        dual_pc_hid_vendor_link_fault();
+    } else if (s_role == DUAL_ROLE_MOUSE_HOST) {
+        dual_hid_host_clear_control_queue();
     }
 }
 
 static void on_link_frame(const dual_frame_t *frame)
 {
-    if (s_role != DUAL_ROLE_PC_DEVICE || frame == NULL) {
+    if (frame == NULL) {
         return;
     }
-    if (frame->type == DUAL_MESSAGE_PHYSICAL_RELEASE) {
-        dual_pc_hid_physical_release();
-        return;
+    if (s_role == DUAL_ROLE_PC_DEVICE) {
+        if (frame->type == DUAL_MESSAGE_PROFILE_BEGIN ||
+            frame->type == DUAL_MESSAGE_PROFILE_CHUNK ||
+            frame->type == DUAL_MESSAGE_PROFILE_COMMIT) {
+            (void)hid_profile_receiver_accept_frame(&s_profile_receiver, frame);
+            return;
+        }
+        if (frame->type == DUAL_MESSAGE_PHYSICAL_RELEASE) {
+            dual_pc_hid_physical_release();
+            return;
+        }
+        if (frame->type == DUAL_MESSAGE_RAW_HID_INPUT ||
+            frame->type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE) {
+            dual_pc_hid_handle_vendor_frame(frame);
+            return;
+        }
+        if (frame->type != DUAL_MESSAGE_PHYSICAL_MOUSE || frame->payload_length != 9) {
+            return;
+        }
+        /* UART1 reports are already normalized by the mouse-side boot parser. */
+        dual_pc_hid_physical_report(
+            frame->payload[2],
+            read_i16_le(&frame->payload[3]),
+            read_i16_le(&frame->payload[5]),
+            (int8_t)frame->payload[7],
+            (int8_t)frame->payload[8]);
+    } else if (s_role == DUAL_ROLE_MOUSE_HOST &&
+               (frame->type == DUAL_MESSAGE_HID_SET_REPORT ||
+                frame->type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST)) {
+        dual_hid_host_handle_control_frame(frame);
     }
-    if (frame->type != DUAL_MESSAGE_PHYSICAL_MOUSE || frame->payload_length != 9) {
-        return;
+}
+
+static void on_profile_published(const hid_device_profile_t *profile, void *context)
+{
+    (void)context;
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    if (profile != NULL && profile->device_descriptor.length >= 12U) {
+        const uint8_t *descriptor = profile->device_descriptor.data;
+        vid = (uint16_t)descriptor[8] | ((uint16_t)descriptor[9] << 8);
+        pid = (uint16_t)descriptor[10] | ((uint16_t)descriptor[11] << 8);
     }
-    /* UART1 reports are already normalized by the mouse-side boot parser. */
-    dual_pc_hid_physical_report(
-        frame->payload[2],
-        read_i16_le(&frame->payload[3]),
-        read_i16_le(&frame->payload[5]),
-        (int8_t)frame->payload[7],
-        (int8_t)frame->payload[8]);
+    ESP_LOGI(TAG,
+             "收到物理HID Profile观察快照：VID:PID=%04X:%04X manufacturer_len=%u "
+             "product_len=%u serial_present=%s interfaces=%u length_flags=%02X",
+             vid, pid, profile != NULL ? profile->manufacturer.length : 0,
+             profile != NULL ? profile->product.length : 0,
+             profile != NULL && profile->serial.length != 0 ? "yes" : "no",
+             profile != NULL ? profile->report_descriptor_count : 0,
+             profile != NULL ? profile->flags : 0);
+    const esp_err_t result = dual_pc_hid_schedule_reconfigure(profile);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "动态USB克隆排队失败：%s", esp_err_to_name(result));
+    }
 }
 
 static void on_mouse_report(
@@ -104,6 +150,7 @@ static void on_mouse_release(void)
 static esp_err_t start_pc_role(void)
 {
     s_role = DUAL_ROLE_PC_DEVICE;
+    hid_profile_receiver_init(&s_profile_receiver, on_profile_published, NULL);
     esp_err_t result = dual_uart1_start(s_role, s_node_id, on_link_frame, on_link_fault);
     if (result != ESP_OK) {
         return result;
@@ -117,6 +164,7 @@ static esp_err_t start_pc_role(void)
     if (result != ESP_OK) {
         return result;
     }
+    dual_pc_hid_enable_reconfigure();
     dual_status_led_set_role(DUAL_STATUS_LED_ROLE_PC_DEVICE);
     dual_status_led_set_pc_mounted(tud_mounted());
     ESP_LOGI(TAG, "角色锁定：PC_DEVICE；原生USB=HID+CDC控制，UART0=日志，UART1=实体鼠标链路");
@@ -126,7 +174,12 @@ static esp_err_t start_pc_role(void)
 static esp_err_t start_mouse_role(void)
 {
     s_role = DUAL_ROLE_MOUSE_HOST;
-    esp_err_t result = dual_uart1_start(s_role, s_node_id, NULL, on_mouse_release);
+    /*
+     * 鼠标侧同样必须接收来自电脑侧的 HID++ SET/GET_REPORT。
+     * 这里只注册断开回调会导致描述符虽然克隆成功，但 G HUB 的控制请求
+     * 在 UART 解析后被静默丢弃。
+     */
+    esp_err_t result = dual_uart1_start(s_role, s_node_id, on_link_frame, on_link_fault);
     if (result != ESP_OK) {
         return result;
     }

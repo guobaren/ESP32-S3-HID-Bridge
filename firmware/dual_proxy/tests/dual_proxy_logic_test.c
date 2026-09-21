@@ -5,6 +5,8 @@
 
 #include "bridge_protocol.h"
 #include "dual_input_aggregator.h"
+#include "hid_device_profile.h"
+#include "hid_clone_descriptor.h"
 #include "dual_proxy_runtime_config.h"
 #include "dual_status_led_logic.h"
 #include "usb_cdc_control_logic.h"
@@ -12,6 +14,11 @@
 _Static_assert(DUAL_PROXY_REQUIRED_FREERTOS_HZ == 1000U, "FreeRTOS tick必须保持1000Hz");
 _Static_assert(DUAL_PROXY_LINK_TX_BATCH_LIMIT > 0U, "UART1批量上限回归保护失败");
 _Static_assert(DUAL_PROXY_HID_PERIOD_US == 1000U, "HID周期必须保持1000us");
+_Static_assert(DUAL_MESSAGE_PROFILE_BEGIN == 0x24, "ProfileBegin消息类型回归保护失败");
+_Static_assert(DUAL_MESSAGE_PROFILE_CHUNK == 0x25, "ProfileChunk消息类型回归保护失败");
+_Static_assert(DUAL_MESSAGE_PROFILE_COMMIT == 0x26, "ProfileCommit消息类型回归保护失败");
+_Static_assert(HID_PROFILE_MAX_CHUNK_DATA + HID_PROFILE_FRAME_CHUNK_HEADER ==
+               DUAL_PROXY_MAX_PAYLOAD, "Profile分片必须适配64字节UART帧");
 
 static void test_merge_and_independent_release(void)
 {
@@ -186,6 +193,373 @@ static void test_cdc_parser_and_lease_release(void)
     assert(input.software_buttons == 0 && input.software_x == 0);
 }
 
+static const uint8_t c092_mouse_report_descriptor[] = {
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01,
+    0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x10,
+    0x15, 0x00, 0x25, 0x01, 0x95, 0x10, 0x75, 0x01,
+    0x81, 0x02, 0x05, 0x01, 0x16, 0x01, 0x80, 0x26,
+    0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x09, 0x30,
+    0x09, 0x31, 0x81, 0x06, 0x15, 0x81, 0x25, 0x7F,
+    0x75, 0x08, 0x95, 0x01, 0x09, 0x38, 0x81, 0x06,
+    0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81,
+    0x06, 0xC0, 0xC0,
+};
+
+static const uint8_t c092_vendor_report_descriptor[] = {
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
+    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x81, 0x03, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00,
+    0x26, 0xFF, 0x00, 0x19, 0x00, 0x2A, 0xFF, 0x00,
+    0x81, 0x00, 0xC0, 0x05, 0x0C, 0x09, 0x01, 0xA1,
+    0x01, 0x85, 0x03, 0x75, 0x10, 0x95, 0x02, 0x15,
+    0x01, 0x26, 0x8C, 0x02, 0x19, 0x01, 0x2A, 0x8C,
+    0x02, 0x81, 0x00, 0xC0, 0x05, 0x01, 0x09, 0x80,
+    0xA1, 0x01, 0x85, 0x04, 0x75, 0x02, 0x95, 0x01,
+    0x15, 0x01, 0x25, 0x03, 0x09, 0x82, 0x09, 0x81,
+    0x09, 0x83, 0x81, 0x60, 0x75, 0x06, 0x81, 0x03,
+    0xC0, 0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01,
+    0x85, 0x10, 0x75, 0x08, 0x95, 0x06, 0x15, 0x00,
+    0x26, 0xFF, 0x00, 0x09, 0x01, 0x81, 0x00, 0x09,
+    0x01, 0x91, 0x00, 0xC0, 0x06, 0x00, 0xFF, 0x09,
+    0x02, 0xA1, 0x01, 0x85, 0x11, 0x75, 0x08, 0x95,
+    0x13, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x09, 0x02,
+    0x81, 0x00, 0x09, 0x02, 0x91, 0x00, 0xC0,
+};
+
+typedef struct {
+    unsigned count;
+    hid_device_profile_t profile;
+} profile_capture_t;
+
+static void capture_profile(const hid_device_profile_t *profile, void *context)
+{
+    profile_capture_t *capture = (profile_capture_t *)context;
+    assert(capture != NULL);
+    assert(profile != NULL);
+    capture->profile = *profile;
+    ++capture->count;
+}
+
+static void write_u32_le_test(uint8_t *destination, uint32_t value)
+{
+    destination[0] = (uint8_t)value;
+    destination[1] = (uint8_t)(value >> 8);
+    destination[2] = (uint8_t)(value >> 16);
+    destination[3] = (uint8_t)(value >> 24);
+}
+
+static void make_c092_profile(hid_device_profile_t *profile)
+{
+    static const uint8_t device_descriptor[18] = {
+        18, 1, 0x00, 0x02, 0, 0, 0, 64, 0x6D, 0x04, 0x92, 0xC0,
+        0, 1, 1, 2, 3, 1,
+    };
+    static const uint8_t config_descriptor[9] = {
+        9, 2, 0, 0, 2, 1, 0, 0xA0, 50,
+    };
+    hid_device_profile_init(profile);
+    assert(hid_device_profile_set_device_descriptor(
+        profile, device_descriptor, sizeof(device_descriptor)));
+    assert(hid_device_profile_set_config_descriptor(
+        profile, config_descriptor, sizeof(config_descriptor)));
+    assert(hid_device_profile_set_string(
+        &profile->manufacturer, "Logitech", strlen("Logitech")));
+    assert(hid_device_profile_set_string(
+        &profile->product, "G102 LIGHTSYNC Gaming Mouse", strlen("G102 LIGHTSYNC Gaming Mouse")));
+    assert(hid_device_profile_set_string(&profile->serial, "", 0));
+    assert(hid_device_profile_add_report_descriptor(
+        profile, 0, 1, 2, c092_mouse_report_descriptor, sizeof(c092_mouse_report_descriptor)));
+    assert(hid_device_profile_add_report_descriptor(
+        profile, 1, 0, 0, c092_vendor_report_descriptor, sizeof(c092_vendor_report_descriptor)));
+}
+
+static void test_profile_model_and_roundtrip(void)
+{
+    static const uint8_t crc_input[] = "123456789";
+    assert(hid_profile_crc32(crc_input, sizeof(crc_input) - 1) == 0xCBF43926U);
+    assert(sizeof(c092_mouse_report_descriptor) == 67U);
+    assert(sizeof(c092_vendor_report_descriptor) == 151U);
+
+    hid_device_profile_t empty;
+    hid_device_profile_init(&empty);
+    uint8_t empty_blob[HID_PROFILE_MAX_BLOB] = {0};
+    size_t empty_length = 0;
+    assert(hid_device_profile_serialize(
+        &empty, empty_blob, sizeof(empty_blob), &empty_length));
+    assert(empty_length == HID_PROFILE_SERIAL_HEADER_SIZE);
+    hid_device_profile_t empty_roundtrip;
+    assert(hid_device_profile_deserialize(&empty_roundtrip, empty_blob, empty_length));
+    assert(empty_roundtrip.report_descriptor_count == 0);
+
+    hid_device_profile_t source;
+    make_c092_profile(&source);
+    uint8_t blob[HID_PROFILE_MAX_BLOB] = {0};
+    size_t blob_length = 0;
+    assert(hid_device_profile_serialize(&source, blob, sizeof(blob), &blob_length));
+    hid_device_profile_t decoded;
+    assert(hid_device_profile_deserialize(&decoded, blob, blob_length));
+    assert(decoded.device_descriptor.length == source.device_descriptor.length);
+    assert(decoded.config_descriptor.length == source.config_descriptor.length);
+    assert(decoded.manufacturer.length == source.manufacturer.length);
+    assert(strcmp(decoded.manufacturer.data, "Logitech") == 0);
+    assert(strcmp(decoded.product.data, "G102 LIGHTSYNC Gaming Mouse") == 0);
+    assert(decoded.report_descriptor_count == 2);
+    assert(decoded.report_descriptors[0].interface_number == 0);
+    assert(decoded.report_descriptors[0].subclass == 1);
+    assert(decoded.report_descriptors[0].protocol == 2);
+    assert(decoded.report_descriptors[0].length == 67);
+    assert(decoded.report_descriptors[1].interface_number == 1);
+    assert(decoded.report_descriptors[1].subclass == 0);
+    assert(decoded.report_descriptors[1].protocol == 0);
+    assert(decoded.report_descriptors[1].length == 151);
+    assert(memcmp(decoded.report_descriptors[0].data,
+                  c092_mouse_report_descriptor, sizeof(c092_mouse_report_descriptor)) == 0);
+    assert(memcmp(decoded.report_descriptors[1].data,
+                  c092_vendor_report_descriptor, sizeof(c092_vendor_report_descriptor)) == 0);
+
+    uint8_t truncated[HID_PROFILE_MAX_BLOB] = {0};
+    memcpy(truncated, blob, blob_length);
+    assert(!hid_device_profile_deserialize(&decoded, truncated, blob_length - 1U));
+    truncated[6] = (uint8_t)(HID_PROFILE_SERIAL_HEADER_SIZE - 1U);
+    assert(!hid_device_profile_deserialize(&decoded, truncated, blob_length));
+
+    assert(!hid_device_profile_set_string(
+        &source.manufacturer, "\xC0\x80", 2));
+    assert(!hid_device_profile_add_report_descriptor(
+        &source, 0, 1, 2, c092_mouse_report_descriptor, sizeof(c092_mouse_report_descriptor)));
+    assert(!hid_device_profile_add_report_descriptor(
+        &source, 2, 0, 0, c092_vendor_report_descriptor,
+        HID_PROFILE_MAX_REPORT_DESCRIPTOR + 1U));
+}
+
+static void fill_bytes(uint8_t *data, size_t length, uint8_t seed)
+{
+    for (size_t index = 0; index < length; ++index) {
+        data[index] = (uint8_t)(seed + index);
+    }
+}
+
+static void test_profile_size_boundaries(void)
+{
+    hid_device_profile_t maximum;
+    hid_device_profile_init(&maximum);
+    uint8_t device[HID_PROFILE_MAX_DEVICE_DESCRIPTOR];
+    uint8_t config[1038];
+    uint8_t report[HID_PROFILE_MAX_REPORT_DESCRIPTOR];
+    char string[HID_PROFILE_MAX_STRING_BYTES + 1U];
+    fill_bytes(device, sizeof(device), 0x10);
+    fill_bytes(config, sizeof(config), 0x20);
+    fill_bytes(report, sizeof(report), 0x30);
+    memset(string, 'x', HID_PROFILE_MAX_STRING_BYTES);
+    string[HID_PROFILE_MAX_STRING_BYTES] = '\0';
+    assert(hid_device_profile_set_device_descriptor(&maximum, device, sizeof(device)));
+    assert(hid_device_profile_set_config_descriptor(&maximum, config, sizeof(config)));
+    assert(hid_device_profile_set_string(&maximum.manufacturer, string, HID_PROFILE_MAX_STRING_BYTES));
+    assert(hid_device_profile_set_string(&maximum.product, string, HID_PROFILE_MAX_STRING_BYTES));
+    assert(hid_device_profile_set_string(&maximum.serial, string, HID_PROFILE_MAX_STRING_BYTES));
+    for (uint8_t interface_number = 0; interface_number < 5; ++interface_number) {
+        assert(hid_device_profile_add_report_descriptor(
+            &maximum, interface_number, 1, 2, report, sizeof(report)));
+    }
+    uint8_t blob[HID_PROFILE_MAX_BLOB] = {0};
+    size_t length = 0;
+    assert(hid_device_profile_serialize(&maximum, blob, sizeof(blob), &length));
+    assert(length == HID_PROFILE_MAX_BLOB);
+    assert(!hid_device_profile_serialize(&maximum, blob, length - 1U, &length));
+
+    hid_device_profile_t oversized;
+    hid_device_profile_init(&oversized);
+    assert(hid_device_profile_set_config_descriptor(&oversized, config, sizeof(config)));
+    for (uint8_t interface_number = 0; interface_number < 6; ++interface_number) {
+        assert(hid_device_profile_add_report_descriptor(
+            &oversized, interface_number, 0, 0, report, sizeof(report)));
+    }
+    assert(!hid_device_profile_serialize(&oversized, blob, sizeof(blob), &length));
+}
+
+static void test_profile_stream_fairness(void)
+{
+    assert(!hid_profile_stream_can_send(false, false, false, 0, 8));
+    assert(!hid_profile_stream_can_send(true, true, false, 8, 8));
+    assert(hid_profile_stream_can_send(true, false, false, 0, 8));
+    assert(!hid_profile_stream_can_send(true, false, true, 7, 8));
+    assert(hid_profile_stream_can_send(true, false, true, 8, 8));
+    assert(hid_profile_stream_can_send(true, false, true, 0, 0));
+    assert(hid_profile_stream_needs_restart(false, 10, 10));
+    assert(!hid_profile_stream_needs_restart(true, 10, 10));
+    assert(hid_profile_stream_needs_restart(true, 10, 11));
+}
+
+static void test_dynamic_clone_descriptor_builder(void)
+{
+    static const uint8_t c092_device[] = {
+        18, 1, 0x00, 0x02, 0, 0, 0, 64, 0x6D, 0x04, 0x92, 0xC0,
+        0, 1, 1, 2, 3, 1,
+    };
+    static const uint8_t c092_config[] = {
+        9, 2, 59, 0, 2, 1, 0, 0xA0, 50,
+        9, 4, 0, 0, 1, 3, 1, 2, 0,
+        9, 0x21, 0x11, 0x01, 0, 1, 0x22, 67, 0,
+        7, 5, 0x81, 3, 8, 0, 1,
+        9, 4, 1, 0, 1, 3, 0, 0, 0,
+        9, 0x21, 0x11, 0x01, 0, 1, 0x22, 151, 0,
+        7, 5, 0x82, 3, 20, 0, 1,
+    };
+    hid_device_profile_t profile;
+    make_c092_profile(&profile);
+    assert(hid_device_profile_set_device_descriptor(
+        &profile, c092_device, sizeof(c092_device)));
+    assert(hid_device_profile_set_config_descriptor(
+        &profile, c092_config, sizeof(c092_config)));
+    hid_clone_descriptor_set_t clone;
+    assert(hid_clone_descriptor_build(&profile, &clone));
+    assert(clone.configuration_length == 125U);
+    assert(clone.configuration_descriptor[2] == 125U);
+    assert(clone.configuration_descriptor[4] == 4U);
+    assert(clone.hid_count == 2U);
+    assert(clone.hid_interface_numbers[0] == 0U);
+    assert(clone.hid_interface_numbers[1] == 1U);
+    assert(clone.cdc_control_interface == 2U);
+    assert(clone.cdc_data_interface == 3U);
+    assert(clone.cdc_notification_endpoint == 0x83U);
+    assert(clone.cdc_data_in_endpoint == 0x84U);
+    assert(clone.cdc_data_out_endpoint == 0x01U);
+
+    hid_clone_descriptor_set_t exact_clone;
+    assert(hid_clone_descriptor_build_exact(&profile, &exact_clone));
+    assert(exact_clone.configuration_length == 59U);
+    assert(exact_clone.configuration_descriptor[2] == 59U);
+    assert(exact_clone.configuration_descriptor[4] == 2U);
+    assert(exact_clone.hid_count == 2U);
+    assert(exact_clone.cdc_control_interface == 0U);
+    assert(exact_clone.cdc_data_interface == 0U);
+
+    profile.config_descriptor.data[2] = 58;
+    assert(!hid_clone_descriptor_build(&profile, &clone));
+    profile.config_descriptor.data[2] = 59;
+    profile.report_descriptor_count = 1;
+    assert(!hid_clone_descriptor_build(&profile, &clone));
+}
+
+static void feed_profile_frames(
+    hid_profile_receiver_t *receiver,
+    const uint8_t *blob,
+    size_t length,
+    uint32_t transfer_id,
+    uint32_t crc32)
+{
+    dual_frame_t frame = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = DUAL_MESSAGE_PROFILE_BEGIN,
+        .sequence = 1,
+        .payload_length = 12,
+    };
+    write_u32_le_test(&frame.payload[0], transfer_id);
+    write_u32_le_test(&frame.payload[4], (uint32_t)length);
+    write_u32_le_test(&frame.payload[8], crc32);
+    assert(hid_profile_receiver_accept_frame(receiver, &frame));
+
+    size_t offset = 0;
+    uint16_t sequence = 2;
+    while (offset < length) {
+        const size_t chunk_length = (length - offset) < HID_PROFILE_MAX_CHUNK_DATA
+            ? length - offset : HID_PROFILE_MAX_CHUNK_DATA;
+        memset(&frame, 0, sizeof(frame));
+        frame.version = DUAL_PROXY_PROTOCOL_VERSION;
+        frame.type = DUAL_MESSAGE_PROFILE_CHUNK;
+        frame.sequence = sequence++;
+        frame.payload_length = (uint8_t)(HID_PROFILE_FRAME_CHUNK_HEADER + chunk_length);
+        write_u32_le_test(&frame.payload[0], transfer_id);
+        write_u32_le_test(&frame.payload[4], (uint32_t)offset);
+        memcpy(&frame.payload[HID_PROFILE_FRAME_CHUNK_HEADER], &blob[offset], chunk_length);
+        assert(hid_profile_receiver_accept_frame(receiver, &frame));
+        offset += chunk_length;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.version = DUAL_PROXY_PROTOCOL_VERSION;
+    frame.type = DUAL_MESSAGE_PROFILE_COMMIT;
+    frame.sequence = sequence;
+    frame.payload_length = 12;
+    write_u32_le_test(&frame.payload[0], transfer_id);
+    write_u32_le_test(&frame.payload[4], (uint32_t)length);
+    write_u32_le_test(&frame.payload[8], crc32);
+    assert(hid_profile_receiver_accept_frame(receiver, &frame));
+}
+
+static void test_profile_receiver_state_machine(void)
+{
+    hid_device_profile_t source;
+    make_c092_profile(&source);
+    uint8_t blob[HID_PROFILE_MAX_BLOB] = {0};
+    size_t length = 0;
+    assert(hid_device_profile_serialize(&source, blob, sizeof(blob), &length));
+    const uint32_t crc32 = hid_profile_crc32(blob, length);
+
+    profile_capture_t capture = {0};
+    hid_profile_receiver_t receiver;
+    hid_profile_receiver_init(&receiver, capture_profile, &capture);
+    dual_frame_t begin = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = DUAL_MESSAGE_PROFILE_BEGIN,
+        .payload_length = 12,
+    };
+    write_u32_le_test(&begin.payload[0], 7);
+    write_u32_le_test(&begin.payload[4], (uint32_t)length);
+    write_u32_le_test(&begin.payload[8], crc32);
+    assert(hid_profile_receiver_accept_frame(&receiver, &begin));
+    assert(hid_profile_receiver_is_active(&receiver));
+    assert(!hid_profile_receiver_has_profile(&receiver));
+
+    dual_frame_t out_of_order = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = DUAL_MESSAGE_PROFILE_CHUNK,
+        .payload_length = HID_PROFILE_FRAME_CHUNK_HEADER + 1,
+    };
+    write_u32_le_test(&out_of_order.payload[0], 7);
+    write_u32_le_test(&out_of_order.payload[4], 1);
+    out_of_order.payload[HID_PROFILE_FRAME_CHUNK_HEADER] = blob[0];
+    assert(!hid_profile_receiver_accept_frame(&receiver, &out_of_order));
+    assert(!hid_profile_receiver_is_active(&receiver));
+    assert(!hid_profile_receiver_has_profile(&receiver));
+
+    feed_profile_frames(&receiver, blob, length, 8, crc32);
+    assert(capture.count == 1);
+    assert(hid_profile_receiver_has_profile(&receiver));
+    assert(hid_profile_receiver_get_profile(&receiver)->report_descriptor_count == 2);
+
+    /* A duplicate chunk, wrong transfer id, or bad commit discards the transfer. */
+    assert(hid_profile_receiver_begin(&receiver, 9, (uint32_t)length, crc32));
+    assert(hid_profile_receiver_chunk(&receiver, 9, 0, blob, 3));
+    assert(!hid_profile_receiver_chunk(&receiver, 9, 0, blob, 1));
+    assert(hid_profile_receiver_has_profile(&receiver));
+    assert(hid_profile_receiver_begin(&receiver, 10, (uint32_t)length, crc32));
+    assert(!hid_profile_receiver_chunk(&receiver, 11, 0, blob, 1));
+    assert(hid_profile_receiver_has_profile(&receiver));
+
+    assert(hid_profile_receiver_begin(&receiver, 12, (uint32_t)length, crc32 ^ 1U));
+    size_t offset = 0;
+    while (offset < length) {
+        const size_t chunk_length = (length - offset) < HID_PROFILE_MAX_CHUNK_DATA
+            ? length - offset : HID_PROFILE_MAX_CHUNK_DATA;
+        assert(hid_profile_receiver_chunk(&receiver, 12, (uint32_t)offset,
+                                           &blob[offset], chunk_length));
+        offset += chunk_length;
+    }
+    assert(!hid_profile_receiver_commit(&receiver, 12, (uint32_t)length, crc32 ^ 1U));
+    assert(hid_profile_receiver_has_profile(&receiver));
+
+    /* A new begin replaces an incomplete transfer rather than publishing it. */
+    assert(hid_profile_receiver_begin(&receiver, 13, (uint32_t)length, crc32));
+    assert(hid_profile_receiver_chunk(&receiver, 13, 0, blob, 2));
+    assert(hid_profile_receiver_begin(&receiver, 14, (uint32_t)length, crc32));
+    assert(!hid_profile_receiver_commit(&receiver, 13, (uint32_t)length, crc32));
+    assert(hid_profile_receiver_has_profile(&receiver));
+    feed_profile_frames(&receiver, blob, length, 14, crc32);
+    assert(capture.count == 2);
+}
+
 static void test_runtime_scheduling_guards(void)
 {
     assert(DUAL_PROXY_REQUIRED_FREERTOS_HZ == 1000U);
@@ -239,6 +613,11 @@ int main(void)
     test_peek_commit_preserves_pending_on_retry();
     test_bridge_protocol();
     test_cdc_parser_and_lease_release();
+    test_profile_model_and_roundtrip();
+    test_profile_size_boundaries();
+    test_profile_stream_fairness();
+    test_dynamic_clone_descriptor_builder();
+    test_profile_receiver_state_machine();
     test_runtime_scheduling_guards();
     test_status_led_logic();
     puts("dual_proxy_logic_test: PASS");

@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "tinyusb_cdc_acm.h"
 #include "tusb.h"
@@ -20,6 +21,8 @@
 
 static const char *TAG = "dual_usb_cdc";
 static TaskHandle_t s_control_task;
+static SemaphoreHandle_t s_control_stopped;
+static volatile bool s_stop_requested;
 static dual_cdc_report_callback_t s_report_callback;
 static dual_cdc_release_callback_t s_release_callback;
 static dual_cdc_session_state_t s_session;
@@ -162,8 +165,11 @@ static void control_task(void *argument)
     dual_parser_t parser;
     dual_parser_init(&parser, on_control_frame, NULL);
     TickType_t last_statistics = xTaskGetTickCount();
-    while (true) {
+    while (!s_stop_requested) {
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        if (s_stop_requested) {
+            break;
+        }
         process_disconnect_events();
 
         while (tud_cdc_n_available(CDC_CONTROL_PORT) > 0) {
@@ -188,6 +194,10 @@ static void control_task(void *argument)
             last_statistics = xTaskGetTickCount();
         }
     }
+    release_software_input();
+    s_control_task = NULL;
+    xSemaphoreGive(s_control_stopped);
+    vTaskDelete(NULL);
 }
 
 esp_err_t dual_usb_cdc_control_start(
@@ -197,8 +207,13 @@ esp_err_t dual_usb_cdc_control_start(
     if (s_control_task != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    s_report_callback = report_callback;
-    s_release_callback = release_callback;
+    /* 重枚举后重新初始化 CDC 时允许传 NULL，继续沿用原角色回调。 */
+    if (report_callback != NULL) {
+        s_report_callback = report_callback;
+    }
+    if (release_callback != NULL) {
+        s_release_callback = release_callback;
+    }
     s_detached = false;
     s_line_event_pending = false;
     s_line_dtr = false;
@@ -208,6 +223,13 @@ esp_err_t dual_usb_cdc_control_start(
     s_rejected = 0;
     s_mouse_reports = 0;
     s_discontinuities = 0;
+    s_stop_requested = false;
+    if (s_control_stopped == NULL) {
+        s_control_stopped = xSemaphoreCreateBinary();
+        if (s_control_stopped == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     dual_cdc_session_init(&s_session);
 
     const tinyusb_config_cdcacm_t config = {
@@ -229,6 +251,19 @@ esp_err_t dual_usb_cdc_control_start(
     }
     ESP_LOGI(TAG, "原生USB CDC控制已启动；仅CDC承载协议v2，UART0仅保留日志");
     return ESP_OK;
+}
+
+esp_err_t dual_usb_cdc_control_stop(void)
+{
+    if (s_control_task == NULL) {
+        return ESP_OK;
+    }
+    s_stop_requested = true;
+    xTaskNotifyGive(s_control_task);
+    if (xSemaphoreTake(s_control_stopped, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return tinyusb_cdcacm_deinit(CDC_CONTROL_PORT);
 }
 
 void dual_usb_cdc_control_on_detached(void)

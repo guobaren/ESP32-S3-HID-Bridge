@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "tinyusb.h"
@@ -17,6 +18,9 @@
 #include "dual_input_aggregator.h"
 #include "dual_proxy_runtime_config.h"
 #include "dual_status_led.h"
+#include "hid_clone_descriptor.h"
+#include "hid_device_profile.h"
+#include "uart1_link.h"
 #include "usb_cdc_control.h"
 
 #define REPORT_ID_MOUSE 1
@@ -30,11 +34,25 @@
 #define USB_CDC_DATA_IN_ENDPOINT 0x83
 #define USB_CONFIG_TOTAL_LENGTH (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
 #define USB_PID_HID_CDC 0x4005
+#define CLONE_STRING_COUNT 16U
+#define CLONE_STRING_CAPACITY (HID_PROFILE_MAX_STRING_BYTES + 1U)
+#define RECONFIGURE_TASK_STACK 8192
+#define RECONFIGURE_TASK_PRIORITY 4
+#define VENDOR_INPUT_QUEUE_LENGTH 32
+#define VENDOR_CONTROL_QUEUE_LENGTH 8
+#define VENDOR_INPUT_TASK_STACK 3072
+#define VENDOR_CONTROL_TASK_STACK 3072
+#define VENDOR_GET_REPORT_TIMEOUT_MS 20
 
 static const char *TAG = "dual_pc_hid";
 static SemaphoreHandle_t s_state_mutex;
+static SemaphoreHandle_t s_sender_stopped;
+static SemaphoreHandle_t s_reconfigure_mutex;
 static TaskHandle_t s_sender_task;
+static TaskHandle_t s_reconfigure_task;
 static esp_timer_handle_t s_sender_timer;
+static volatile bool s_sender_stop_requested;
+static volatile bool s_reconfigure_enabled;
 static dual_input_state_t s_state;
 static volatile bool s_force_release;
 static volatile bool s_installed;
@@ -61,11 +79,349 @@ static int64_t s_output_y;
 static int64_t s_output_wheel;
 static int64_t s_output_pan;
 static int64_t s_last_stats_us;
+static hid_device_profile_t s_reconfigure_profile;
+static hid_device_profile_t s_reconfigure_work_profile;
+static hid_device_profile_t s_active_profile;
+static hid_clone_descriptor_set_t s_clone_descriptors;
+static tusb_desc_device_t s_clone_device_descriptor;
+static volatile bool s_clone_active;
+static uint8_t s_clone_mouse_instance;
+static char s_clone_manufacturer[CLONE_STRING_CAPACITY];
+static char s_clone_product[CLONE_STRING_CAPACITY];
+static char s_clone_serial[CLONE_STRING_CAPACITY];
+static char s_clone_language[] = {0x09, 0x04};
+static const char *s_clone_string_descriptors[CLONE_STRING_COUNT];
+static uint8_t s_clone_string_count;
+static const char s_empty_string[] = "";
+static volatile uint32_t s_clone_input_suppressed;
+
+typedef struct {
+    uint8_t interface_number;
+    uint8_t report_id;
+    uint8_t length;
+    uint8_t data[DUAL_HID_RAW_INPUT_MAX_DATA];
+} vendor_input_item_t;
+
+typedef struct {
+    bool get_report;
+    uint16_t transaction_id;
+    uint8_t interface_number;
+    uint8_t report_id;
+    uint8_t report_type;
+    uint8_t requested_length;
+    uint8_t length;
+    uint8_t data[DUAL_HID_CONTROL_MAX_DATA];
+} vendor_control_item_t;
+
+static QueueHandle_t s_vendor_input_queue;
+static QueueHandle_t s_vendor_control_queue;
+static TaskHandle_t s_vendor_input_task;
+static TaskHandle_t s_vendor_control_task;
+static SemaphoreHandle_t s_get_gate;
+static SemaphoreHandle_t s_get_response_sem;
+static SemaphoreHandle_t s_get_state_mutex;
+static volatile bool s_get_inflight;
+static volatile bool s_get_response_ready;
+static uint16_t s_get_transaction_id;
+static uint8_t s_get_interface_number;
+static uint8_t s_get_report_id;
+static uint8_t s_get_status;
+static uint8_t s_get_response_length;
+static uint8_t s_get_response_data[DUAL_HID_CONTROL_MAX_DATA];
+static uint16_t s_next_vendor_transaction_id = 1;
+static volatile uint32_t s_vendor_input_received;
+static volatile uint32_t s_vendor_input_submitted;
+static volatile uint32_t s_vendor_input_dropped;
+static volatile uint32_t s_vendor_set_queued;
+static volatile uint32_t s_vendor_set_dropped;
+static volatile uint32_t s_vendor_get_requests;
+static volatile uint32_t s_vendor_get_timeouts;
+static volatile uint32_t s_vendor_get_mismatches;
 
 _Static_assert(CONFIG_FREERTOS_HZ == DUAL_PROXY_REQUIRED_FREERTOS_HZ,
                "dual_proxy要求CONFIG_FREERTOS_HZ=1000");
 _Static_assert(pdMS_TO_TICKS(1) == 1, "1ms必须正好折算为1 tick");
 _Static_assert(DUAL_PROXY_HID_PERIOD_US == 1000U, "HID周期必须保持1000us");
+
+static bool clone_copy_ascii(
+    char *destination,
+    size_t capacity,
+    const hid_profile_string_t *source)
+{
+    if (destination == NULL || capacity == 0 || source == NULL ||
+        source->length >= capacity) {
+        return false;
+    }
+    for (uint16_t index = 0; index < source->length; ++index) {
+        const uint8_t value = (uint8_t)source->data[index];
+        if (value == 0 || value > 0x7FU) {
+            return false;
+        }
+        destination[index] = (char)value;
+    }
+    destination[source->length] = '\0';
+    return true;
+}
+
+static bool clone_sanitize_interface_strings(
+    uint8_t *configuration,
+    size_t length)
+{
+    if (configuration == NULL || length < 9U) {
+        return false;
+    }
+    size_t offset = 0;
+    while (offset < length) {
+        if (length - offset < 2U || configuration[offset] < 2U ||
+            configuration[offset] > length - offset) {
+            return false;
+        }
+        const uint8_t descriptor_length = configuration[offset];
+        if (configuration[offset + 1U] == TUSB_DESC_INTERFACE &&
+            descriptor_length >= 9U) {
+            /* The profile currently carries only the three device strings.
+             * Do not leave an interface string index pointing at an unknown
+             * table entry; an empty iInterface is valid and deterministic. */
+            configuration[offset + 8U] = 0;
+        }
+        offset += descriptor_length;
+    }
+    return offset == length;
+}
+
+static bool prepare_clone_descriptor_set(const hid_device_profile_t *profile)
+{
+    if (profile == NULL ||
+        (profile->flags & (HID_PROFILE_FLAG_SYNTHETIC_DEVICE_DESCRIPTOR |
+                           HID_PROFILE_FLAG_SYNTHETIC_CONFIG_DESCRIPTOR)) != 0 ||
+        profile->device_descriptor.length != sizeof(tusb_desc_device_t) ||
+        profile->device_descriptor.data[1] != TUSB_DESC_DEVICE ||
+        profile->device_descriptor.data[17] != 1U ||
+        profile->report_descriptor_count == 0U ||
+        profile->report_descriptor_count > CONFIG_TINYUSB_HID_COUNT) {
+        return false;
+    }
+    hid_clone_descriptor_set_t built;
+    if (!hid_clone_descriptor_build_exact(profile, &built) ||
+        built.hid_count == 0U || built.hid_count > CONFIG_TINYUSB_HID_COUNT ||
+        !clone_sanitize_interface_strings(
+            built.configuration_descriptor, built.configuration_length) ||
+        !clone_copy_ascii(s_clone_manufacturer, sizeof(s_clone_manufacturer),
+                          &profile->manufacturer) ||
+        !clone_copy_ascii(s_clone_product, sizeof(s_clone_product),
+                          &profile->product) ||
+        !clone_copy_ascii(s_clone_serial, sizeof(s_clone_serial),
+                          &profile->serial)) {
+        return false;
+    }
+
+    uint8_t mouse_instance = UINT8_MAX;
+    for (uint8_t instance = 0; instance < built.hid_count; ++instance) {
+        const uint8_t report_index = built.profile_report_indices[instance];
+        if (report_index >= profile->report_descriptor_count) {
+            return false;
+        }
+        const hid_profile_report_descriptor_t *report =
+            &profile->report_descriptors[report_index];
+        if (report->subclass == 1U && report->protocol == HID_ITF_PROTOCOL_MOUSE) {
+            if (mouse_instance != UINT8_MAX) {
+                return false;
+            }
+            mouse_instance = instance;
+        }
+    }
+    if (mouse_instance == UINT8_MAX) {
+        return false;
+    }
+
+    const uint8_t manufacturer_index = profile->device_descriptor.data[14];
+    const uint8_t product_index = profile->device_descriptor.data[15];
+    const uint8_t serial_index = profile->device_descriptor.data[16];
+    uint8_t maximum_string_index = manufacturer_index;
+    if (product_index > maximum_string_index) {
+        maximum_string_index = product_index;
+    }
+    if (serial_index > maximum_string_index) {
+        maximum_string_index = serial_index;
+    }
+    if (maximum_string_index >= CLONE_STRING_COUNT) {
+        return false;
+    }
+
+    memcpy(&s_clone_descriptors, &built, sizeof(s_clone_descriptors));
+    memcpy(&s_clone_device_descriptor, built.device_descriptor,
+           sizeof(s_clone_device_descriptor));
+    /* 严格克隆不附加 CDC/IAD，必须保留物理设备原始 class tuple。 */
+    s_clone_device_descriptor.bNumConfigurations = 1;
+    for (uint8_t index = 0; index < CLONE_STRING_COUNT; ++index) {
+        s_clone_string_descriptors[index] = s_empty_string;
+    }
+    s_clone_string_descriptors[0] = s_clone_language;
+    if (manufacturer_index != 0U) {
+        s_clone_string_descriptors[manufacturer_index] = s_clone_manufacturer;
+    }
+    if (product_index != 0U) {
+        s_clone_string_descriptors[product_index] = s_clone_product;
+    }
+    if (serial_index != 0U) {
+        s_clone_string_descriptors[serial_index] = s_clone_serial;
+    }
+    s_clone_string_count = (uint8_t)(maximum_string_index + 1U);
+    s_clone_mouse_instance = mouse_instance;
+    return true;
+}
+
+static bool clone_instance_for_interface(uint8_t interface_number, uint8_t *instance)
+{
+    if (!s_clone_active || instance == NULL) {
+        return false;
+    }
+    for (uint8_t index = 0; index < s_clone_descriptors.hid_count; ++index) {
+        if (s_clone_descriptors.hid_interface_numbers[index] == interface_number) {
+            *instance = index;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool clone_interface_for_instance(uint8_t instance, uint8_t *interface_number)
+{
+    if (!s_clone_active || interface_number == NULL ||
+        instance >= s_clone_descriptors.hid_count) {
+        return false;
+    }
+    *interface_number = s_clone_descriptors.hid_interface_numbers[instance];
+    return true;
+}
+
+static uint16_t next_vendor_transaction_id(void)
+{
+    uint16_t transaction_id = s_next_vendor_transaction_id++;
+    if (transaction_id == 0U) {
+        transaction_id = s_next_vendor_transaction_id++;
+    }
+    return transaction_id;
+}
+
+static void clear_pending_get(bool wake_waiter, uint8_t status)
+{
+    if (s_get_state_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+    if (s_get_inflight) {
+        s_get_status = status;
+        s_get_response_length = 0;
+        s_get_response_ready = wake_waiter;
+        if (wake_waiter && s_get_response_sem != NULL) {
+            xSemaphoreGive(s_get_response_sem);
+        }
+        s_get_inflight = false;
+    }
+    xSemaphoreGive(s_get_state_mutex);
+}
+
+static void vendor_input_task(void *argument)
+{
+    (void)argument;
+    vendor_input_item_t item;
+    while (true) {
+        if (xQueueReceive(s_vendor_input_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        uint8_t instance = 0;
+        if (!s_clone_active || !s_installed || !tud_mounted() ||
+            !clone_instance_for_interface(item.interface_number, &instance) ||
+            item.length == 0U || !tud_hid_n_ready(instance)) {
+            ++s_vendor_input_dropped;
+            ESP_LOGW(TAG,
+                     "PC vendor IN丢弃: interface=%u id=%02X length=%u mounted=%u ready=%u",
+                     item.interface_number, item.report_id, item.length,
+                     tud_mounted() ? 1U : 0U,
+                     instance < CONFIG_TINYUSB_HID_COUNT && tud_hid_n_ready(instance) ? 1U : 0U);
+            continue;
+        }
+        ESP_LOGI(TAG, "PC vendor IN提交: instance=%u interface=%u id=%02X length=%u",
+                 instance, item.interface_number, item.report_id, item.length);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, item.data, item.length, ESP_LOG_INFO);
+        if (tud_hid_n_report(instance, item.report_id, item.data, item.length)) {
+            ++s_vendor_input_submitted;
+        } else {
+            ++s_vendor_input_dropped;
+        }
+    }
+}
+
+static void vendor_control_task(void *argument)
+{
+    (void)argument;
+    vendor_control_item_t item;
+    while (true) {
+        if (xQueueReceive(s_vendor_control_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        uint8_t instance = 0;
+        if (!s_clone_active || !s_installed || !tud_mounted() ||
+            !clone_instance_for_interface(item.interface_number, &instance)) {
+            if (item.get_report) {
+                clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+            }
+            ++s_vendor_set_dropped;
+            continue;
+        }
+        if (item.get_report) {
+            if (dual_uart1_send_hid_get_request(
+                    item.transaction_id, item.interface_number, item.report_id,
+                    item.report_type, item.requested_length) != ESP_OK) {
+                ++s_vendor_get_timeouts;
+                clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+            }
+        } else if (dual_uart1_send_hid_set_report(
+                       item.transaction_id, item.interface_number, item.report_id,
+                       item.report_type, item.data, item.length) != ESP_OK) {
+            ++s_vendor_set_dropped;
+        }
+    }
+}
+
+static esp_err_t ensure_vendor_runtime(void)
+{
+    if (s_vendor_input_queue != NULL && s_vendor_control_queue != NULL &&
+        s_get_gate != NULL && s_get_response_sem != NULL &&
+        s_get_state_mutex != NULL && s_vendor_input_task != NULL &&
+        s_vendor_control_task != NULL) {
+        return ESP_OK;
+    }
+
+    s_vendor_input_queue = xQueueCreate(
+        VENDOR_INPUT_QUEUE_LENGTH, sizeof(vendor_input_item_t));
+    s_vendor_control_queue = xQueueCreate(
+        VENDOR_CONTROL_QUEUE_LENGTH, sizeof(vendor_control_item_t));
+    s_get_gate = xSemaphoreCreateBinary();
+    s_get_response_sem = xSemaphoreCreateBinary();
+    s_get_state_mutex = xSemaphoreCreateMutex();
+    if (s_vendor_input_queue == NULL || s_vendor_control_queue == NULL ||
+        s_get_gate == NULL || s_get_response_sem == NULL ||
+        s_get_state_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreGive(s_get_gate);
+
+    if (xTaskCreate(vendor_input_task, "hid_vendor_input",
+                    VENDOR_INPUT_TASK_STACK, NULL, 7,
+                    &s_vendor_input_task) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(vendor_control_task, "hid_vendor_control",
+                    VENDOR_CONTROL_TASK_STACK, NULL, 6,
+                    &s_vendor_control_task) != pdPASS) {
+        vTaskDelete(s_vendor_input_task);
+        s_vendor_input_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
 static const tusb_desc_device_t s_device_descriptor = {
     .bLength = sizeof(tusb_desc_device_t),
@@ -168,8 +524,35 @@ _Static_assert(sizeof(s_configuration_descriptor) == USB_CONFIG_TOTAL_LENGTH,
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
-    (void)instance;
+    if (s_clone_active && instance < s_clone_descriptors.hid_count) {
+        const uint8_t report_index =
+            s_clone_descriptors.profile_report_indices[instance];
+        if (report_index < s_active_profile.report_descriptor_count) {
+            return s_active_profile.report_descriptors[report_index].data;
+        }
+        return NULL;
+    }
     return s_report_descriptor;
+}
+
+/*
+ * G HUB 将 C092 标记为 DEVIO。先记录所有落到设备级 vendor request
+ * 的 SETUP 包，以确认其是否还依赖 HID++ 之外的 EP0 控制事务。
+ * 尚未实现跨板转发时返回 false，让 TinyUSB 明确 STALL，禁止伪造成功。
+ */
+bool tud_vendor_control_xfer_cb(
+    uint8_t rhport,
+    uint8_t stage,
+    tusb_control_request_t const *request)
+{
+    (void)rhport;
+    if (stage == CONTROL_STAGE_SETUP && request != NULL) {
+        ESP_LOGI(TAG,
+                 "PC VENDOR_CONTROL: bm=%02X request=%02X value=%04X index=%04X length=%u",
+                 request->bmRequestType, request->bRequest, request->wValue,
+                 request->wIndex, request->wLength);
+    }
+    return false;
 }
 
 uint16_t tud_hid_get_report_cb(
@@ -179,12 +562,81 @@ uint16_t tud_hid_get_report_cb(
     uint8_t *buffer,
     uint16_t requested_length)
 {
-    (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)requested_length;
-    return 0;
+    uint8_t interface_number = 0;
+    if (buffer == NULL || requested_length == 0U ||
+        requested_length > DUAL_HID_CONTROL_MAX_DATA ||
+        (uint8_t)report_type < DUAL_HID_REPORT_TYPE_INPUT ||
+        (uint8_t)report_type > DUAL_HID_REPORT_TYPE_FEATURE ||
+        s_vendor_control_queue == NULL || s_get_gate == NULL ||
+        s_get_state_mutex == NULL ||
+        !clone_interface_for_instance(instance, &interface_number)) {
+        return 0;
+    }
+    ESP_LOGI(TAG,
+             "PC GET_REPORT: instance=%u interface=%u id=%02X type=%u requested=%u",
+             instance, interface_number, report_id, (unsigned)report_type,
+             requested_length);
+    if (xSemaphoreTake(s_get_gate, 0) != pdTRUE) {
+        ++s_vendor_get_timeouts;
+        return 0;
+    }
+    while (s_get_response_sem != NULL &&
+           xSemaphoreTake(s_get_response_sem, 0) == pdTRUE) {
+        /* Consume a stale completion before starting a new transaction. */
+    }
+    const uint16_t transaction_id = next_vendor_transaction_id();
+    xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+    s_get_inflight = true;
+    s_get_response_ready = false;
+    s_get_transaction_id = transaction_id;
+    s_get_interface_number = interface_number;
+    s_get_report_id = report_id;
+    s_get_status = DUAL_HID_REPORT_STATUS_TIMEOUT;
+    s_get_response_length = 0;
+    xSemaphoreGive(s_get_state_mutex);
+
+    const vendor_control_item_t item = {
+        .get_report = true,
+        .transaction_id = transaction_id,
+        .interface_number = interface_number,
+        .report_id = report_id,
+        .report_type = (uint8_t)report_type,
+        .requested_length = (uint8_t)requested_length,
+    };
+    if (xQueueSend(s_vendor_control_queue, &item, 0) != pdTRUE) {
+        ++s_vendor_get_timeouts;
+        clear_pending_get(false, DUAL_HID_REPORT_STATUS_TIMEOUT);
+        xSemaphoreGive(s_get_gate);
+        return 0;
+    }
+    ++s_vendor_get_requests;
+    const bool signaled = s_get_response_sem != NULL &&
+        xSemaphoreTake(s_get_response_sem, pdMS_TO_TICKS(VENDOR_GET_REPORT_TIMEOUT_MS)) == pdTRUE;
+    uint16_t result_length = 0;
+    xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+    if (signaled && s_get_response_ready &&
+        s_get_transaction_id == transaction_id &&
+        s_get_interface_number == interface_number &&
+        s_get_report_id == report_id &&
+        s_get_status == DUAL_HID_REPORT_STATUS_OK &&
+        s_get_response_length <= requested_length) {
+        result_length = s_get_response_length;
+        memcpy(buffer, s_get_response_data, result_length);
+        if (result_length != 0U) {
+            ESP_LOG_BUFFER_HEX_LEVEL(
+                TAG, buffer, result_length, ESP_LOG_INFO);
+        }
+    } else if (!signaled) {
+        ++s_vendor_get_timeouts;
+    }
+    s_get_inflight = false;
+    s_get_response_ready = false;
+    xSemaphoreGive(s_get_state_mutex);
+    xSemaphoreGive(s_get_gate);
+    ESP_LOGI(TAG,
+             "PC GET_REPORT完成: interface=%u id=%02X returned=%u status=%u",
+             interface_number, report_id, result_length, s_get_status);
+    return result_length;
 }
 
 void tud_hid_set_report_cb(
@@ -194,11 +646,118 @@ void tud_hid_set_report_cb(
     uint8_t const *buffer,
     uint16_t buffer_size)
 {
-    (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)buffer_size;
+    uint8_t interface_number = 0;
+    if (s_vendor_control_queue == NULL ||
+        !clone_interface_for_instance(instance, &interface_number) ||
+        buffer_size > DUAL_HID_CONTROL_MAX_DATA ||
+        (buffer == NULL && buffer_size != 0U) ||
+        (uint8_t)report_type < DUAL_HID_REPORT_TYPE_INPUT ||
+        (uint8_t)report_type > DUAL_HID_REPORT_TYPE_FEATURE) {
+        ++s_vendor_set_dropped;
+        return;
+    }
+    vendor_control_item_t item = {
+        .get_report = false,
+        .transaction_id = next_vendor_transaction_id(),
+        .interface_number = interface_number,
+        .report_id = report_id,
+        .report_type = (uint8_t)report_type,
+        .length = (uint8_t)buffer_size,
+    };
+    if (buffer_size != 0U) {
+        memcpy(item.data, buffer, buffer_size);
+    }
+    ESP_LOGI(TAG,
+             "PC SET_REPORT: instance=%u interface=%u id=%02X type=%u length=%u",
+             instance, interface_number, report_id, (unsigned)report_type,
+             buffer_size);
+    if (buffer_size != 0U) {
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, buffer, buffer_size, ESP_LOG_INFO);
+    }
+    if (xQueueSend(s_vendor_control_queue, &item, 0) != pdTRUE) {
+        ++s_vendor_set_dropped;
+    } else {
+        ++s_vendor_set_queued;
+    }
+}
+
+void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame)
+{
+    if (frame == NULL) {
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_RAW_HID_INPUT) {
+        const uint8_t *data = NULL;
+        size_t data_length = 0;
+        vendor_input_item_t item = {0};
+        if (!dual_hid_raw_input_decode(
+                frame->payload, frame->payload_length, &item.interface_number,
+                &item.report_id, &data, &data_length) ||
+            data_length > sizeof(item.data)) {
+            ++s_vendor_input_dropped;
+            return;
+        }
+        item.length = (uint8_t)data_length;
+        if (data_length != 0U) {
+            memcpy(item.data, data, data_length);
+        }
+        ++s_vendor_input_received;
+        if (s_vendor_input_queue == NULL ||
+            xQueueSend(s_vendor_input_queue, &item, 0) != pdTRUE) {
+            ++s_vendor_input_dropped;
+        }
+        return;
+    }
+    if (frame->type != DUAL_MESSAGE_HID_GET_REPORT_RESPONSE) {
+        return;
+    }
+    const uint8_t *data = NULL;
+    size_t data_length = 0;
+    uint16_t transaction_id = 0;
+    uint8_t status = DUAL_HID_REPORT_STATUS_INVALID;
+    uint8_t interface_number = 0;
+    uint8_t report_id = 0;
+    if (!dual_hid_get_response_decode(
+            frame->payload, frame->payload_length, &transaction_id, &status,
+            &interface_number, &report_id, &data, &data_length) ||
+        data_length > sizeof(s_get_response_data) || s_get_state_mutex == NULL) {
+        ++s_vendor_get_mismatches;
+        return;
+    }
+    xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+    const bool matches = s_get_inflight &&
+        s_get_transaction_id == transaction_id &&
+        s_get_interface_number == interface_number &&
+        s_get_report_id == report_id;
+    if (!matches) {
+        ++s_vendor_get_mismatches;
+        xSemaphoreGive(s_get_state_mutex);
+        return;
+    }
+    s_get_status = status;
+    s_get_response_length = (uint8_t)data_length;
+    if (data_length != 0U) {
+        memcpy(s_get_response_data, data, data_length);
+    }
+    s_get_response_ready = true;
+    if (s_get_response_sem != NULL) {
+        xSemaphoreGive(s_get_response_sem);
+    }
+    xSemaphoreGive(s_get_state_mutex);
+}
+
+void dual_pc_hid_vendor_link_fault(void)
+{
+    if (s_vendor_input_queue != NULL) {
+        xQueueReset(s_vendor_input_queue);
+    }
+    if (s_vendor_control_queue != NULL) {
+        xQueueReset(s_vendor_control_queue);
+    }
+    clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+    if (s_get_gate != NULL) {
+        (void)xSemaphoreGive(s_get_gate);
+    }
 }
 
 static void usb_event_callback(tinyusb_event_t *event, void *argument)
@@ -214,6 +773,7 @@ static void usb_event_callback(tinyusb_event_t *event, void *argument)
         ESP_LOGW(TAG, "PC侧USB HID已断开，清理所有输入");
         dual_status_led_set_pc_mounted(false);
         dual_usb_cdc_control_on_detached();
+        dual_pc_hid_vendor_link_fault();
         dual_pc_hid_release_all();
     }
 }
@@ -231,7 +791,7 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_
 {
     (void)report;
     (void)len;
-    if (instance != 0) {
+    if (instance != (s_clone_active ? s_clone_mouse_instance : 0U)) {
         return;
     }
     ++s_hid_completions;
@@ -249,7 +809,7 @@ void tud_hid_report_failed_cb(
     (void)report_type;
     (void)report;
     (void)xferred_bytes;
-    if (instance != 0) {
+    if (instance != (s_clone_active ? s_clone_mouse_instance : 0U)) {
         return;
     }
     ++s_hid_transfer_failures;
@@ -286,15 +846,20 @@ static void log_hid_statistics_if_due(void)
         ESP_LOGI(TAG,
                  "HID统计：timer=%" PRIu32 " not_mounted=%" PRIu32 " not_ready=%" PRIu32
                  " attempt=%" PRIu32 " submitted=%" PRIu32 " failed=%" PRIu32
-                 " complete=%" PRIu32 " transfer_fail=%" PRIu32 " physical_rx=%" PRIu32
-                 " input_phys=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
+                     " complete=%" PRIu32 " transfer_fail=%" PRIu32 " physical_rx=%" PRIu32
+                     " clone_suppressed=%" PRIu32
+                     " vendor_rx=%" PRIu32 " vendor_submitted=%" PRIu32
+                     " vendor_dropped=%" PRIu32
+                     " input_phys=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
                  " input_soft=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
                  " output=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
                  " pending=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
                  " balance=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")",
                  s_hid_timer_ticks, s_hid_not_mounted, s_hid_not_ready,
-                 s_hid_attempts, s_hid_submitted, s_hid_submit_failures,
-                 s_hid_completions, s_hid_transfer_failures, s_physical_received,
+                  s_hid_attempts, s_hid_submitted, s_hid_submit_failures,
+                  s_hid_completions, s_hid_transfer_failures, s_physical_received,
+                  s_clone_input_suppressed, s_vendor_input_received,
+                  s_vendor_input_submitted, s_vendor_input_dropped,
                  s_physical_input_x, s_physical_input_y, s_physical_input_wheel, s_physical_input_pan,
                  s_software_input_x, s_software_input_y, s_software_input_wheel, s_software_input_pan,
                  s_output_x, s_output_y, s_output_wheel, s_output_pan,
@@ -310,12 +875,21 @@ static void log_hid_statistics_if_due(void)
 static void sender_task(void *argument)
 {
     (void)argument;
-    s_sender_task = xTaskGetCurrentTaskHandle();
-    while (true) {
+    while (!s_sender_stop_requested) {
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_sender_stop_requested) {
+            break;
+        }
         log_hid_statistics_if_due();
         if (!tud_mounted()) {
             ++s_hid_not_mounted;
+            continue;
+        }
+        if (s_clone_active) {
+            /* The normalized 7-byte report is not valid for an arbitrary
+             * cloned profile.  Until a report-field encoder exists, never
+             * submit it under the cloned descriptor. */
+            ++s_clone_input_suppressed;
             continue;
         }
         if (!tud_hid_ready()) {
@@ -366,6 +940,138 @@ static void sender_task(void *argument)
             }
         }
     }
+    s_sender_task = NULL;
+    if (s_sender_stopped != NULL) {
+        xSemaphoreGive(s_sender_stopped);
+    }
+    vTaskDelete(NULL);
+}
+
+static esp_err_t install_tinyusb(bool clone)
+{
+    tinyusb_config_t config = TINYUSB_DEFAULT_CONFIG(usb_event_callback);
+    if (clone) {
+        config.descriptor.device = &s_clone_device_descriptor;
+        config.descriptor.string = s_clone_string_descriptors;
+        config.descriptor.string_count = s_clone_string_count;
+        config.descriptor.full_speed_config = s_clone_descriptors.configuration_descriptor;
+    } else {
+        config.descriptor.device = &s_device_descriptor;
+        config.descriptor.string = s_string_descriptors;
+        config.descriptor.string_count =
+            sizeof(s_string_descriptors) / sizeof(s_string_descriptors[0]);
+        config.descriptor.full_speed_config = s_configuration_descriptor;
+    }
+    const esp_err_t result = tinyusb_driver_install(&config);
+    if (result == ESP_OK) {
+        s_installed = true;
+    }
+    return result;
+}
+
+esp_err_t dual_pc_hid_stop_sender(void)
+{
+    if (s_sender_timer != NULL) {
+        (void)esp_timer_stop(s_sender_timer);
+        (void)esp_timer_delete(s_sender_timer);
+        s_sender_timer = NULL;
+    }
+    if (s_sender_task == NULL) {
+        return ESP_OK;
+    }
+    s_sender_stop_requested = true;
+    xTaskNotifyGive(s_sender_task);
+    if (xSemaphoreTake(s_sender_stopped, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t restart_runtime_after_install(void)
+{
+    esp_err_t result = dual_pc_hid_start_sender();
+    if (result != ESP_OK) {
+        return result;
+    }
+    /* 严格克隆模式不暴露 CDC，避免改变 Logitech 设备的接口拓扑。 */
+    if (s_clone_active) {
+        return ESP_OK;
+    }
+    result = dual_usb_cdc_control_start(NULL, NULL);
+    if (result != ESP_OK) {
+        (void)dual_pc_hid_stop_sender();
+    }
+    return result;
+}
+
+static void reconfigure_task(void *argument)
+{
+    (void)argument;
+    while (true) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+        memcpy(&s_reconfigure_work_profile, &s_reconfigure_profile,
+               sizeof(s_reconfigure_work_profile));
+        xSemaphoreGive(s_reconfigure_mutex);
+
+        if (!prepare_clone_descriptor_set(&s_reconfigure_work_profile)) {
+            ESP_LOGE(TAG, "物理HID Profile不满足安全克隆条件，保留通用USB设备");
+            continue;
+        }
+
+        dual_pc_hid_release_all();
+        vTaskDelay(pdMS_TO_TICKS(3));
+        esp_err_t result = dual_usb_cdc_control_stop();
+        if (result == ESP_OK) {
+            result = dual_pc_hid_stop_sender();
+        }
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "动态USB切换前停止任务失败：%s", esp_err_to_name(result));
+            continue;
+        }
+        result = tinyusb_driver_uninstall();
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "卸载通用USB设备失败：%s", esp_err_to_name(result));
+            (void)restart_runtime_after_install();
+            continue;
+        }
+        s_installed = false;
+        vTaskDelay(pdMS_TO_TICKS(300));
+
+        memcpy(&s_active_profile, &s_reconfigure_work_profile,
+               sizeof(s_active_profile));
+        s_clone_active = true;
+        result = install_tinyusb(true);
+        if (result == ESP_OK) {
+            result = restart_runtime_after_install();
+        }
+        if (result == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "动态USB严格克隆已启用：VID:PID=%04X:%04X HID=%u mouse_instance=%u CDC=disabled",
+                     s_clone_device_descriptor.idVendor,
+                     s_clone_device_descriptor.idProduct,
+                     s_clone_descriptors.hid_count,
+                     s_clone_mouse_instance);
+            continue;
+        }
+
+        ESP_LOGE(TAG, "动态USB克隆启动失败：%s；回退通用USB设备", esp_err_to_name(result));
+        if (s_installed) {
+            (void)dual_usb_cdc_control_stop();
+            (void)dual_pc_hid_stop_sender();
+            (void)tinyusb_driver_uninstall();
+            s_installed = false;
+        }
+        s_clone_active = false;
+        vTaskDelay(pdMS_TO_TICKS(300));
+        result = install_tinyusb(false);
+        if (result == ESP_OK) {
+            result = restart_runtime_after_install();
+        }
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "通用USB设备回退失败：%s", esp_err_to_name(result));
+        }
+    }
 }
 
 esp_err_t dual_pc_hid_install_device(void)
@@ -402,18 +1108,14 @@ esp_err_t dual_pc_hid_install_device(void)
     s_output_wheel = 0;
     s_output_pan = 0;
     s_last_stats_us = 0;
-    tinyusb_config_t config = TINYUSB_DEFAULT_CONFIG(usb_event_callback);
-    config.descriptor.device = &s_device_descriptor;
-    config.descriptor.string = s_string_descriptors;
-    config.descriptor.string_count = sizeof(s_string_descriptors) / sizeof(s_string_descriptors[0]);
-    config.descriptor.full_speed_config = s_configuration_descriptor;
-    const esp_err_t result = tinyusb_driver_install(&config);
+    s_clone_active = false;
+    s_clone_input_suppressed = 0;
+    const esp_err_t result = install_tinyusb(false);
     if (result != ESP_OK) {
         vSemaphoreDelete(s_state_mutex);
         s_state_mutex = NULL;
         return result;
     }
-    s_installed = true;
     return ESP_OK;
 }
 
@@ -422,7 +1124,19 @@ esp_err_t dual_pc_hid_start_sender(void)
     if (!s_installed || s_sender_task != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (xTaskCreate(sender_task, "dual_hid_sender", 4096, NULL, 8, NULL) != pdPASS) {
+    const esp_err_t vendor_result = ensure_vendor_runtime();
+    if (vendor_result != ESP_OK) {
+        return vendor_result;
+    }
+    if (s_sender_stopped == NULL) {
+        s_sender_stopped = xSemaphoreCreateBinary();
+        if (s_sender_stopped == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_sender_stop_requested = false;
+    if (xTaskCreate(sender_task, "dual_hid_sender", 4096, NULL, 8,
+                    &s_sender_task) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     const esp_timer_create_args_t timer_args = {
@@ -446,6 +1160,37 @@ esp_err_t dual_pc_hid_start_sender(void)
         s_sender_task = NULL;
         return result;
     }
+    return ESP_OK;
+}
+
+void dual_pc_hid_enable_reconfigure(void)
+{
+    if (s_reconfigure_mutex == NULL) {
+        s_reconfigure_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_reconfigure_mutex == NULL) {
+        ESP_LOGE(TAG, "创建动态USB Profile互斥锁失败");
+        return;
+    }
+    if (s_reconfigure_task == NULL &&
+        xTaskCreate(reconfigure_task, "dual_usb_reconfig", RECONFIGURE_TASK_STACK,
+                    NULL, RECONFIGURE_TASK_PRIORITY, &s_reconfigure_task) != pdPASS) {
+        ESP_LOGE(TAG, "创建动态USB重枚举任务失败");
+        return;
+    }
+    s_reconfigure_enabled = true;
+}
+
+esp_err_t dual_pc_hid_schedule_reconfigure(const hid_device_profile_t *profile)
+{
+    if (!s_reconfigure_enabled || s_reconfigure_mutex == NULL ||
+        s_reconfigure_task == NULL || profile == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    memcpy(&s_reconfigure_profile, profile, sizeof(s_reconfigure_profile));
+    xSemaphoreGive(s_reconfigure_mutex);
+    xTaskNotifyGive(s_reconfigure_task);
     return ESP_OK;
 }
 

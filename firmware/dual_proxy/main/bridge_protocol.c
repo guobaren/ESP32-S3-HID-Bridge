@@ -135,3 +135,247 @@ esp_err_t dual_frame_serialize(const dual_frame_t *frame, uint8_t *output, size_
     *length = frame_length;
     return ESP_OK;
 }
+
+static void write_u16_le(uint8_t *output, uint16_t value)
+{
+    output[0] = (uint8_t)value;
+    output[1] = (uint8_t)(value >> 8);
+}
+
+static uint16_t read_u16_le(const uint8_t *input)
+{
+    return (uint16_t)input[0] | ((uint16_t)input[1] << 8);
+}
+
+static bool valid_report_type(uint8_t report_type)
+{
+    return report_type >= DUAL_HID_REPORT_TYPE_INPUT &&
+        report_type <= DUAL_HID_REPORT_TYPE_FEATURE;
+}
+
+static bool encode_report_payload(
+    uint8_t header_length,
+    uint8_t *payload,
+    size_t capacity,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || payload_length == NULL ||
+        capacity < (size_t)header_length + data_length ||
+        data_length > DUAL_HID_CONTROL_MAX_DATA ||
+        (data == NULL && data_length != 0) ||
+        header_length + data_length > DUAL_PROXY_MAX_PAYLOAD) {
+        return false;
+    }
+    if (data_length != 0) {
+        memcpy(&payload[header_length], data, data_length);
+    }
+    *payload_length = (uint8_t)(header_length + data_length);
+    return true;
+}
+
+bool dual_hid_raw_input_encode(
+    uint8_t interface_number,
+    uint8_t report_id,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || payload_length == NULL ||
+        data_length > DUAL_HID_RAW_INPUT_MAX_DATA ||
+        capacity < DUAL_HID_RAW_INPUT_HEADER_LENGTH + data_length ||
+        (data == NULL && data_length != 0)) {
+        return false;
+    }
+    payload[0] = interface_number;
+    payload[1] = report_id;
+    payload[2] = (uint8_t)data_length;
+    if (data_length != 0) {
+        memcpy(&payload[DUAL_HID_RAW_INPUT_HEADER_LENGTH], data, data_length);
+    }
+    *payload_length = (uint8_t)(DUAL_HID_RAW_INPUT_HEADER_LENGTH + data_length);
+    return true;
+}
+
+bool dual_hid_raw_input_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint8_t *interface_number,
+    uint8_t *report_id,
+    const uint8_t **data,
+    size_t *data_length)
+{
+    if (payload == NULL || payload_length < DUAL_HID_RAW_INPUT_HEADER_LENGTH ||
+        payload[2] > DUAL_HID_RAW_INPUT_MAX_DATA ||
+        payload_length != DUAL_HID_RAW_INPUT_HEADER_LENGTH + payload[2] ||
+        interface_number == NULL || report_id == NULL || data == NULL ||
+        data_length == NULL) {
+        return false;
+    }
+    *interface_number = payload[0];
+    *report_id = payload[1];
+    *data = &payload[DUAL_HID_RAW_INPUT_HEADER_LENGTH];
+    *data_length = payload[2];
+    return true;
+}
+
+bool dual_hid_set_report_encode(
+    uint16_t transaction_id,
+    uint8_t interface_number,
+    uint8_t report_id,
+    uint8_t report_type,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || !valid_report_type(report_type) ||
+        capacity < DUAL_HID_SET_REPORT_HEADER_LENGTH + data_length ||
+        !encode_report_payload(DUAL_HID_SET_REPORT_HEADER_LENGTH, payload, capacity,
+                               data, data_length, payload_length)) {
+        return false;
+    }
+    write_u16_le(payload, transaction_id);
+    payload[2] = interface_number;
+    payload[3] = report_id;
+    payload[4] = report_type;
+    payload[5] = (uint8_t)data_length;
+    return true;
+}
+
+bool dual_hid_set_report_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint16_t *transaction_id,
+    uint8_t *interface_number,
+    uint8_t *report_id,
+    uint8_t *report_type,
+    const uint8_t **data,
+    size_t *data_length)
+{
+    if (payload == NULL || payload_length < DUAL_HID_SET_REPORT_HEADER_LENGTH ||
+        payload[5] > DUAL_HID_CONTROL_MAX_DATA ||
+        payload_length != DUAL_HID_SET_REPORT_HEADER_LENGTH + payload[5] ||
+        !valid_report_type(payload[4]) || transaction_id == NULL ||
+        interface_number == NULL || report_id == NULL || report_type == NULL ||
+        data == NULL || data_length == NULL) {
+        return false;
+    }
+    *transaction_id = read_u16_le(payload);
+    *interface_number = payload[2];
+    *report_id = payload[3];
+    *report_type = payload[4];
+    *data = &payload[DUAL_HID_SET_REPORT_HEADER_LENGTH];
+    *data_length = payload[5];
+    return true;
+}
+
+bool dual_hid_get_request_encode(
+    uint16_t transaction_id,
+    uint8_t interface_number,
+    uint8_t report_id,
+    uint8_t report_type,
+    uint8_t requested_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || payload_length == NULL ||
+        capacity < DUAL_HID_GET_REPORT_REQUEST_LENGTH ||
+        !valid_report_type(report_type) || requested_length == 0U ||
+        requested_length > DUAL_HID_CONTROL_MAX_DATA) {
+        return false;
+    }
+    write_u16_le(payload, transaction_id);
+    payload[2] = interface_number;
+    payload[3] = report_id;
+    payload[4] = report_type;
+    payload[5] = requested_length;
+    *payload_length = DUAL_HID_GET_REPORT_REQUEST_LENGTH;
+    return true;
+}
+
+bool dual_hid_get_request_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint16_t *transaction_id,
+    uint8_t *interface_number,
+    uint8_t *report_id,
+    uint8_t *report_type,
+    uint8_t *requested_length)
+{
+    if (payload == NULL || payload_length != DUAL_HID_GET_REPORT_REQUEST_LENGTH ||
+        !valid_report_type(payload[4]) || payload[5] == 0U ||
+        payload[5] > DUAL_HID_CONTROL_MAX_DATA || transaction_id == NULL ||
+        interface_number == NULL || report_id == NULL || report_type == NULL ||
+        requested_length == NULL) {
+        return false;
+    }
+    *transaction_id = read_u16_le(payload);
+    *interface_number = payload[2];
+    *report_id = payload[3];
+    *report_type = payload[4];
+    *requested_length = payload[5];
+    return true;
+}
+
+bool dual_hid_get_response_encode(
+    uint16_t transaction_id,
+    uint8_t status,
+    uint8_t interface_number,
+    uint8_t report_id,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || payload_length == NULL ||
+        status > DUAL_HID_REPORT_STATUS_UNSUPPORTED ||
+        capacity < DUAL_HID_GET_REPORT_RESPONSE_HEADER_LENGTH + data_length ||
+        !encode_report_payload(DUAL_HID_GET_REPORT_RESPONSE_HEADER_LENGTH, payload,
+                               capacity, data, data_length, payload_length)) {
+        return false;
+    }
+    if (status != DUAL_HID_REPORT_STATUS_OK && data_length != 0U) {
+        return false;
+    }
+    write_u16_le(payload, transaction_id);
+    payload[2] = status;
+    payload[3] = interface_number;
+    payload[4] = report_id;
+    payload[5] = (uint8_t)data_length;
+    return true;
+}
+
+bool dual_hid_get_response_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint16_t *transaction_id,
+    uint8_t *status,
+    uint8_t *interface_number,
+    uint8_t *report_id,
+    const uint8_t **data,
+    size_t *data_length)
+{
+    if (payload == NULL || payload_length < DUAL_HID_GET_REPORT_RESPONSE_HEADER_LENGTH ||
+        payload[2] > DUAL_HID_REPORT_STATUS_UNSUPPORTED ||
+        payload[5] > DUAL_HID_CONTROL_MAX_DATA ||
+        payload_length != DUAL_HID_GET_REPORT_RESPONSE_HEADER_LENGTH + payload[5] ||
+        (payload[2] != DUAL_HID_REPORT_STATUS_OK && payload[5] != 0U) ||
+        transaction_id == NULL || status == NULL || interface_number == NULL ||
+        report_id == NULL || data == NULL || data_length == NULL) {
+        return false;
+    }
+    *transaction_id = read_u16_le(payload);
+    *status = payload[2];
+    *interface_number = payload[3];
+    *report_id = payload[4];
+    *data = &payload[DUAL_HID_GET_REPORT_RESPONSE_HEADER_LENGTH];
+    *data_length = payload[5];
+    return true;
+}
