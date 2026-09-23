@@ -11,8 +11,15 @@ esp_err_t dual_pc_hid_install_device(void);
 esp_err_t dual_pc_hid_start_sender(void);
 esp_err_t dual_pc_hid_stop_sender(void);
 esp_err_t dual_pc_hid_schedule_reconfigure(const hid_device_profile_t *profile);
+esp_err_t dual_pc_hid_schedule_disconnect(void);
 void dual_pc_hid_enable_reconfigure(void);
-void dual_pc_hid_software_report(uint8_t buttons, int16_t x, int16_t y, int8_t wheel, int8_t pan);
+void dual_pc_hid_software_report(
+    uint8_t buttons,
+    int16_t x,
+    int16_t y,
+    int8_t wheel,
+    int8_t pan,
+    uint8_t smoothing_slots);
 void dual_pc_hid_software_release(void);
 void dual_pc_hid_physical_report(uint8_t buttons, int16_t x, int16_t y, int8_t wheel, int8_t pan);
 void dual_pc_hid_physical_release(void);

@@ -26,13 +26,13 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | `0x04` | Ping | 空；维持当前输入租约 |
 | `0x05` | SessionStart | 空；申请新的输入租约，并先释放旧会话的全部输入 |
 | `0x06` | DeviceProbe | 8 字节随机数；仅用于 COM 输入通道自动发现，不申请输入租约 |
-| `0x07` | DeviceHello | `HIDBRDG2` ASCII 标识加原样返回的 8 字节随机数；序号与 DeviceProbe 相同 |
+| `0x07` | DeviceHello | `HIDBRDG2` ASCII 标识、原样返回的 8 字节随机数，以及可选的角色字节（`1=PC_DEVICE`、`2=MOUSE_HOST`）；序号与 DeviceProbe 相同 |
 
 主机在每次 UART、原生 USB CDC 或 Wi-Fi 连接建立后先发送 `SessionStart`，之后至少每 500 ms 发送一次 `Ping`。固件默认在 1500 ms 内未收到当前会话的有效帧时执行 `ReleaseAll`，避免断线卡键。
 
-`portName` 为 `auto` 时，主机依次打开当前可用 COM 口并发送 `DeviceProbe`。只有收到 CRC、序号、固定标识和随机数均匹配的 `DeviceHello` 后，才把该 COM 口认定为 HID Bridge。启动日志等非协议字节会被跳过。
+`portName` 为 `auto` 时，主机依次打开当前可用 COM 口并发送 `DeviceProbe`。`dual_proxy` 正式拓扑只接受角色字节为 `MOUSE_HOST` 的响应，避免误连电脑侧板的开发串口；旧固件没有角色字节时只用于兼容诊断脚本。启动日志等非协议字节会被跳过。
 
-### 双板内部动态 HID Profile（运行时观察阶段；尚未重枚举）
+### 双板透明代理内部协议
 
 双板 `dual_proxy` 的 UART1 复用同一帧封装，并预留以下内部消息；它们不属于主机 CDC 控制 API：
 
@@ -41,12 +41,19 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | `0x24` | PROFILE_BEGIN | `transfer_id:u32`、`total_length:u32`、`crc32:u32` |
 | `0x25` | PROFILE_CHUNK | `transfer_id:u32`、`offset:u32`、`data:1..56 bytes` |
 | `0x26` | PROFILE_COMMIT | `transfer_id:u32`、`total_length:u32`、`crc32:u32` |
+| `0x27` | RAW_HID_INPUT | 原始 interface、Report ID 和 Input Report 正文 |
+| `0x28` | HID_SET_REPORT | 事务 ID、interface、Report ID/type 和原始正文 |
+| `0x29` | HID_GET_REPORT_REQUEST | 事务 ID、interface、Report ID/type 和请求长度 |
+| `0x2A` | HID_GET_REPORT_RESPONSE | 事务 ID、状态、interface、Report ID 和响应正文 |
+| `0x2B` | SOFTWARE_MOUSE | 来自电脑 A 的 7/8 字节标准化软件鼠标报告 |
+| `0x2C` | SOFTWARE_RELEASE | 软件输入租约结束、断线或队列故障时释放软件按键 |
+| `0x2D` | DEVICE_GONE | 鼠标侧物理 USB 设备已拔出；1 字节原因码 |
 
 Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`version:u16`、`header_length:u16`、Device descriptor 长度、Configuration descriptor 长度、manufacturer/product/serial UTF-8 长度、报告项数量和 `flags:u8`；随后按长度排列各段数据。每个报告项为 `interface_number:u8`、`subclass:u8`、`protocol:u8`、保留字节、`report_length:u16` 和原始 HID Report descriptor。所有整数均为小端，完整 blob 上限 4096 字节，最多 8 个接口、单份报告描述符 512 字节、每个字符串 128 字节。
 
-接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布；乱序、重复、越界、错误 CRC 或新 BEGIN 会丢弃当前未完成传输，但保留上一份有效 Profile。运行时鼠标侧只通过公开 Host API 提供 VID/PID、字符串和每接口报告描述符；raw Device/Configuration descriptor 不可得时，`flags` 明确标记 partial/synthetic，不能把规范化占位称为原始描述符。
+接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。当前 `dual_proxy` 已通过独立 USB Host client 采集 raw Device/Configuration descriptor；无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许用通用设备冒充物理鼠标。
 
-当前阶段已经接入 Host 采集、UART1 有界公平串流和 PC 侧观察接收，但尚未把 Profile 连接到 USB Device 动态重枚举、VID/PID 克隆或 Logitech 驱动识别；这些结果不能宣称驱动识别已经完成。
+实体 raw Input 优先于软件输入；软件 move/release 使用独立有界队列；HID 厂商控制使用独立队列；Profile 只在安全/输入队列允许时分片发送。鼠标拔出、UART1 超时、鼠标侧掉电或 Profile 超时都先释放输入，再由电脑侧卸载 USB Device；重新插入后只有完整新 Profile 校验通过才重新枚举。
 主机同步程序打开 UART 或原生 USB CDC 对应的 COM 口后，会由同一个 `SerialPort` 实例读取设备日志并缓冲写入 `deviceLogPath` 指定的文件（默认是 EXE 同目录 `log/device/host-serial-{timestamp}.log`），并按 `deviceLogRetentionCount` 清理最旧文件，因此不需要、也不能再同时运行 `idf.py monitor` 独占同一个 COM 口。为避免高频 BLE notify 日志重复触发主机日志落盘和 WinForms 重绘，`showDeviceLogInUi` 默认关闭；该选项只影响窗口镜像，不影响独立设备日志文件。
 
 UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流解析、设备发现和输入租约。Wi-Fi TCP 通道先用预共享密钥进行双向挑战认证，再使用 AES-256-GCM、单调包计数器和会话随机数保护每个完整帧；计数器不连续或认证标签错误时立即断开连接。
@@ -72,7 +79,7 @@ UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流
 - `wheel`、`pan`：有符号 8 位滚轮增量。
 - 四个增量不能全为零；未知字段会被忽略，超范围或无效 JSON 的数据报直接拒绝。
 - 命令在主机 `HOME` 同步开启，或“始终开启 UDP 输出”开关开启时进入 `MouseReportPump`。Host 以最高 500 Hz / 2 ms 聚合完整位移，不再在 Windows 用户态展开平滑槽。
-- 默认开启“UDP 平滑”时，桥接报告第 8 字节为 `5`。原生 USB 固件将 X/Y/Wheel/Pan 分别按整数商和余数分摊到滚动的 5 个 1 ms 槽；新命令叠加到现有未来槽，不串行追加，因此停止输入后的计划尾部不超过 5 ms且每条命令代数和严格守恒。
+- 默认开启“UDP 平滑”时，桥接报告第 8 字节为 `5`。Host 以最高 500 Hz 合并后，该字节会经鼠标侧 UART0 和板间 `SOFTWARE_MOUSE` 原样传到 PC 侧板。PC 侧板将 X/Y/Wheel/Pan 分别按整数商和余数分摊到滚动的 5 个 1 ms 槽，由 1000 Hz USB HID 发送任务消费；新命令叠加到现有未来槽，不串行追加，因此停止输入后的计划尾部不超过 5 ms，且每条命令代数和严格守恒。实体鼠标 report 不进入此平滑器。
 - 关闭“UDP 平滑”后，第 8 字节为 `0`；固件先把已有 5 槽余量合并到当前槽，再加入新位移，下一次 USB 1 ms 周期直接输出。主界面开关只能在 `HOME` 同步关闭时切换；kmboxNet `trace` 可在线切换。同步关闭路径仍发送 `ReleaseAll` 并清空固件槽。
 - BLE 固件接受 7/8 字节桥接报告但忽略第 8 字节，仍以 10 ms 节拍合并位移；只有原生 USB 路径执行 5 槽、1000 Hz 消费。
 - 监听停止、程序退出或关闭“始终开启 UDP 输出”时不保留远端待发送状态，并继续走现有 `ReleaseAll` 清理路径；仅按 HOME 关闭同步不会阻断该开关允许的后续 UDP 输入。

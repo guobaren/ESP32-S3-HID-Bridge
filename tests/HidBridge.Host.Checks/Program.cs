@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Drawing;
@@ -15,6 +16,12 @@ using HidBridge.Host.RemoteInput;
 using HidBridge.Host.Transport;
 using HidBridge.Host.Ui;
 using HidBridge.Protocol;
+
+if (args.Any(argument => argument.Equals("--raw-capture-hardware", StringComparison.OrdinalIgnoreCase)))
+{
+    RunRawCaptureHardwareCheck(args);
+    return;
+}
 
 if (args.Any(argument => argument.Equals("--layout-only", StringComparison.OrdinalIgnoreCase)))
 {
@@ -107,6 +114,57 @@ CheckToggleMacroStopsOnSecondPress();
 CheckHotkeyChooserControl();
 CheckWindowLayout();
 Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、固件 5 槽平滑标记和始终输出开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、局域网固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
+
+static void RunRawCaptureHardwareCheck(string[] arguments)
+{
+    int seconds = 12;
+    for (int index = 0; index + 1 < arguments.Length; index++)
+    {
+        if (arguments[index].Equals("--seconds", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(arguments[index + 1], out int parsed))
+        {
+            seconds = Math.Clamp(parsed, 2, 60);
+        }
+    }
+
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport);
+    input.Start();
+    try
+    {
+        input.SetForwardingEnabled(true);
+        Console.WriteLine($"RAW_CAPTURE_READY seconds={seconds}");
+        Thread.Sleep(TimeSpan.FromSeconds(seconds));
+    }
+    finally
+    {
+        input.Stop();
+    }
+
+    MouseReport[] reports = transport.MouseReports();
+    long[] timestamps = transport.MouseTimestamps();
+    long sumX = reports.Sum(report => (long)report.X);
+    long sumY = reports.Sum(report => (long)report.Y);
+    double activeSeconds = timestamps.Length >= 2
+        ? (double)(timestamps[^1] - timestamps[0]) / Stopwatch.Frequency
+        : 0;
+    double activeRateHz = timestamps.Length >= 2 && activeSeconds > 0
+        ? (timestamps.Length - 1) / activeSeconds
+        : 0;
+    long[] intervalsUs = timestamps
+        .Zip(timestamps.Skip(1), (left, right) =>
+            (right - left) * 1_000_000 / Stopwatch.Frequency)
+        .Order()
+        .ToArray();
+    long medianUs = intervalsUs.Length == 0 ? 0 : intervalsUs[(intervalsUs.Length - 1) / 2];
+    long p95Us = intervalsUs.Length == 0 ? 0 : intervalsUs[(int)((intervalsUs.Length - 1) * 0.95)];
+
+    Console.WriteLine(
+        $"RAW_CAPTURE_RESULT reports={reports.Length} active_seconds={activeSeconds:F3} " +
+        $"rate_hz={activeRateHz:F2} median_us={medianUs} p95_us={p95Us} " +
+        $"sum=({sumX},{sumY})");
+    Require(reports.Length > 0, "真实 Raw Input 窗口未捕获到鼠标移动报告");
+}
 
 static void CheckMouseReportCodec()
 {
@@ -694,6 +752,15 @@ static void CheckSerialDiscoveryProtocol()
     Require(
         !SerialDeviceProbe.TryMatchHello(noisyInput.AsSpan(0, noisyInput.Length - 1), probeSequence, nonce),
         "不完整设备响应不得被接受");
+
+    byte[] rolePayload = "HIDBRDG2"u8.ToArray().Concat(nonce).Concat(new byte[] { 2 }).ToArray();
+    byte[] roleHello = new FrameCodec().Encode(MessageType.DeviceHello, rolePayload);
+    Require(
+        SerialDeviceProbe.TryMatchHello(roleHello, probeSequence, nonce, SerialDeviceProbe.MouseHostRole),
+        "双板鼠标侧角色响应应被接受");
+    Require(
+        !SerialDeviceProbe.TryMatchHello(roleHello, probeSequence, nonce, 1),
+        "电脑侧角色响应不得被当作鼠标侧串口接受");
 
     byte[] wrongNonce = nonce.ToArray();
     wrongNonce[0] ^= 0xFF;
@@ -1770,6 +1837,7 @@ static uint KmboxMix(uint sum, uint y, uint z, int position, uint e, ReadOnlySpa
 static void CheckFirmwareUpdateApiPolicy()
 {
     Require(!new AutomationSettings().FirmwareUpdateApiEnabled, "局域网固件刷写接口必须默认关闭");
+    Require(!new AutomationSettings().LegacySingleBoardFirmwareCompatibility, "旧版单板固件兼容必须默认关闭");
     Require(string.IsNullOrEmpty(new AutomationSettings().FirmwareManifestPath), "本地固件 JSON 默认不得指向隐式镜像");
     Require(string.IsNullOrEmpty(new AutomationSettings().FirmwareFlashPortName), "本地刷写串口默认不得写死");
     Require(SerialBridge.NormalizeFirmwarePortName(" com03 ") == "COM3", "刷写串口名称未规范化");
@@ -2684,6 +2752,7 @@ static void CheckWindowLayout()
             Require(form.SettingsPage.MinimizeToTrayCheckBox.Checked == automation.Settings.MinimizeToTray, "设置页最小化到托盘状态未从配置加载");
             Require(form.SettingsPage.CloseToTrayCheckBox.Checked == automation.Settings.CloseToTray, "设置页关闭到托盘状态未从配置加载");
             Require(form.SettingsPage.GenerateMovementAnalysisImageCheckBox.Checked == automation.Settings.GenerateMovementAnalysisImage, "设置页分析图片开关状态未从配置加载");
+            Require(form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked == automation.Settings.LegacySingleBoardFirmwareCompatibility, "旧版单板固件兼容开关未从配置加载");
             Require(!automation.Settings.GenerateMovementAnalysisImage, "新配置的分析图片开关默认必须关闭");
             Require(form.OutputSensitivityTrackBar.Minimum == 30 && form.OutputSensitivityTrackBar.Maximum == 300 && form.OutputSensitivityTrackBar.Value == 100, "输出灵敏度滑块范围或默认值不正确");
             Require(form.OutputSensitivityTextBox.Text == "1", "输出灵敏度输入框默认值必须为 1");

@@ -68,6 +68,7 @@ internal sealed class AutomationSettings
     public bool GenerateMovementAnalysisImage { get; set; }
     public double OutputSensitivity { get; set; } = MouseOutputSensitivity.Default;
     public bool AlwaysOutputUdpEnabled { get; set; } = true;
+    public bool LegacySingleBoardFirmwareCompatibility { get; set; }
     public bool SimulatedUdpInputEnabled { get; set; }
     public int SimulatedUdpInputFrequencyHz { get; set; } = 100;
     public bool FirmwareUpdateApiEnabled { get; set; }

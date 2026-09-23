@@ -12,6 +12,7 @@ internal static class SerialDeviceProbe
     internal const int ProbeTimeoutMilliseconds = 1500;
     private const int MaximumResponseBytes = 4096;
     private const int ProbeRetryMilliseconds = 250;
+    internal const byte MouseHostRole = 2;
 
     private static ReadOnlySpan<byte> HelloSignature => "HIDBRDG2"u8;
 
@@ -31,7 +32,7 @@ internal static class SerialDeviceProbe
         return frame;
     }
 
-    internal static bool Probe(SerialPort port, FrameCodec codec)
+    internal static bool Probe(SerialPort port, FrameCodec codec, byte? expectedRole = null)
     {
         ArgumentNullException.ThrowIfNull(port);
         ArgumentNullException.ThrowIfNull(codec);
@@ -75,7 +76,8 @@ internal static class SerialDeviceProbe
                 continue;
             }
             responseLength += read;
-            if (TryMatchHello(response.AsSpan(0, responseLength), sequence, nonce))
+            if (TryMatchHello(
+                    response.AsSpan(0, responseLength), sequence, nonce, expectedRole))
             {
                 port.DiscardInBuffer();
                 return true;
@@ -88,7 +90,8 @@ internal static class SerialDeviceProbe
     internal static bool TryMatchHello(
         ReadOnlySpan<byte> data,
         ushort expectedSequence,
-        ReadOnlySpan<byte> expectedNonce)
+        ReadOnlySpan<byte> expectedNonce,
+        byte? expectedRole = null)
     {
         if (expectedNonce.Length != NonceLength)
         {
@@ -108,17 +111,23 @@ internal static class SerialDeviceProbe
                 continue;
             }
 
+            int legacyPayloadLength = HelloSignature.Length + NonceLength;
             if (!FrameCodec.TryDecode(data.Slice(offset, frameLength), out BridgeFrame frame) ||
                 frame.Type != MessageType.DeviceHello ||
                 frame.Sequence != expectedSequence ||
-                frame.Payload.Length != HelloSignature.Length + NonceLength)
+                (frame.Payload.Length != legacyPayloadLength &&
+                 frame.Payload.Length != legacyPayloadLength + 1))
             {
                 continue;
             }
 
             ReadOnlySpan<byte> payload = frame.Payload;
+            ReadOnlySpan<byte> nonce = payload.Slice(HelloSignature.Length, NonceLength);
+            bool roleMatches = expectedRole is null ||
+                (payload.Length == HelloSignature.Length + NonceLength + 1 &&
+                 payload[^1] == expectedRole.Value);
             if (payload[..HelloSignature.Length].SequenceEqual(HelloSignature) &&
-                payload[HelloSignature.Length..].SequenceEqual(expectedNonce))
+                nonce.SequenceEqual(expectedNonce) && roleMatches)
             {
                 return true;
             }

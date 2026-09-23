@@ -76,11 +76,11 @@ internal sealed class InputForwarder : IDisposable
     private int _horizontalWheelRemainder;
     private bool _started;
 
-    internal InputForwarder(IBridgeTransport transport)
+    internal InputForwarder(IBridgeTransport transport, Func<bool>? legacyFirmwareCompatibility = null)
     {
         _keyboardProc = KeyboardCallback;
         _mouseProc = MouseCallback;
-        _mouseReportPump = new MouseReportPump(transport);
+        _mouseReportPump = new MouseReportPump(transport, legacyFirmwareCompatibility: legacyFirmwareCompatibility);
     }
 
     internal bool ForwardingEnabled => _mouseReportPump.Enabled;

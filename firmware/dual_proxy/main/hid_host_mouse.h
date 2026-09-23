@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "bridge_protocol.h"
@@ -13,7 +14,7 @@ typedef void (*dual_physical_mouse_callback_t)(
     int16_t y,
     int8_t wheel,
     int8_t pan);
-typedef void (*dual_physical_release_callback_t)(void);
+typedef void (*dual_physical_release_callback_t)(bool device_gone);
 
 esp_err_t dual_hid_host_start(
     dual_physical_mouse_callback_t report_callback,

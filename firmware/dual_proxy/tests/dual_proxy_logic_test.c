@@ -7,6 +7,8 @@
 #include "dual_input_aggregator.h"
 #include "hid_device_profile.h"
 #include "hid_clone_descriptor.h"
+#include "hid_report_layout.h"
+#include "mouse_motion_smoother.h"
 #include "dual_proxy_runtime_config.h"
 #include "dual_status_led_logic.h"
 #include "usb_cdc_control_logic.h"
@@ -14,9 +16,13 @@
 _Static_assert(DUAL_PROXY_REQUIRED_FREERTOS_HZ == 1000U, "FreeRTOS tick必须保持1000Hz");
 _Static_assert(DUAL_PROXY_LINK_TX_BATCH_LIMIT > 0U, "UART1批量上限回归保护失败");
 _Static_assert(DUAL_PROXY_HID_PERIOD_US == 1000U, "HID周期必须保持1000us");
+_Static_assert(MOUSE_MOTION_SMOOTHING_SLOTS == 5U, "软件移动必须保持5个1ms槽");
 _Static_assert(DUAL_MESSAGE_PROFILE_BEGIN == 0x24, "ProfileBegin消息类型回归保护失败");
 _Static_assert(DUAL_MESSAGE_PROFILE_CHUNK == 0x25, "ProfileChunk消息类型回归保护失败");
 _Static_assert(DUAL_MESSAGE_PROFILE_COMMIT == 0x26, "ProfileCommit消息类型回归保护失败");
+_Static_assert(DUAL_MESSAGE_SOFTWARE_MOUSE == 0x2B, "SoftwareMouse消息类型回归保护失败");
+_Static_assert(DUAL_MESSAGE_SOFTWARE_RELEASE == 0x2C, "SoftwareRelease消息类型回归保护失败");
+_Static_assert(DUAL_MESSAGE_DEVICE_GONE == 0x2D, "DeviceGone消息类型回归保护失败");
 _Static_assert(HID_PROFILE_MAX_CHUNK_DATA + HID_PROFILE_FRAME_CHUNK_HEADER ==
                DUAL_PROXY_MAX_PAYLOAD, "Profile分片必须适配64字节UART帧");
 
@@ -40,6 +46,37 @@ static void test_merge_and_independent_release(void)
     dual_input_physical_release(&state);
     assert(dual_input_take_report(&state, &report, false));
     assert(report.buttons == 0);
+}
+
+static void test_rolling_smoother_preserves_overlapping_500hz_motion(void)
+{
+    mouse_motion_smoother_t smoother;
+    mouse_motion_smoother_reset(&smoother);
+
+    mouse_motion_smoother_enqueue(
+        &smoother, (mouse_motion_delta_t){.x = 20, .y = -10}, 5);
+    mouse_motion_delta_t first = mouse_motion_smoother_take_next(&smoother);
+    mouse_motion_delta_t second = mouse_motion_smoother_take_next(&smoother);
+    assert(first.x == 4 && first.y == -2);
+    assert(second.x == 4 && second.y == -2);
+
+    /* 2 ms 后新命令叠加到未来滚动槽，而不排在旧命令之后。 */
+    mouse_motion_smoother_enqueue(
+        &smoother, (mouse_motion_delta_t){.x = -5, .y = 5}, 5);
+    int64_t total_x = first.x + second.x;
+    int64_t total_y = first.y + second.y;
+    for (int index = 0; index < 5; ++index) {
+        const mouse_motion_delta_t next = mouse_motion_smoother_take_next(&smoother);
+        total_x += next.x;
+        total_y += next.y;
+    }
+    assert(total_x == 15 && total_y == -5);
+    assert(!mouse_motion_smoother_has_pending(&smoother));
+
+    mouse_motion_smoother_enqueue(
+        &smoother, (mouse_motion_delta_t){.x = 9, .y = 1}, 5);
+    mouse_motion_smoother_reset(&smoother);
+    assert(!mouse_motion_smoother_has_pending(&smoother));
 }
 
 static void test_saturation_is_split_without_loss(void)
@@ -577,6 +614,91 @@ static void test_runtime_scheduling_guards(void)
     assert(!dual_proxy_link_should_wait_for_notification(backlog > 0U));
 }
 
+static void assert_logitech_mouse_layout(
+    const uint8_t *descriptor,
+    size_t length,
+    uint8_t expected_report_id)
+{
+    hid_mouse_report_layout_t layout;
+    memset(&layout, 0, sizeof(layout));
+    assert(hid_report_find_mouse_layout(descriptor, length, &layout));
+    assert(layout.valid);
+    assert(layout.report_id == expected_report_id);
+    assert(layout.report_bytes == 8U);
+    assert(layout.buttons_bit_offset == 0U);
+    assert(layout.button_count == 16U);
+    assert(layout.x.bit_offset == 16U && layout.x.bit_size == 16U);
+    assert(layout.y.bit_offset == 32U && layout.y.bit_size == 16U);
+    assert(layout.wheel.bit_offset == 48U && layout.wheel.bit_size == 8U);
+    assert(layout.pan.bit_offset == 56U && layout.pan.bit_size == 8U);
+}
+
+static void test_dynamic_mouse_report_layout(void)
+{
+    static const uint8_t c092_mouse[] = {
+        0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01,
+        0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x10,
+        0x15, 0x00, 0x25, 0x01, 0x95, 0x10, 0x75, 0x01,
+        0x81, 0x02, 0x05, 0x01, 0x16, 0x01, 0x80, 0x26,
+        0xff, 0x7f, 0x75, 0x10, 0x95, 0x02, 0x09, 0x30,
+        0x09, 0x31, 0x81, 0x06, 0x15, 0x81, 0x25, 0x7f,
+        0x75, 0x08, 0x95, 0x01, 0x09, 0x38, 0x81, 0x06,
+        0x05, 0x0c, 0x0a, 0x38, 0x02, 0x95, 0x01, 0x81,
+        0x06, 0xc0, 0xc0,
+    };
+    static const uint8_t c539_mouse[] = {
+        0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x02,
+        0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01,
+        0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x95, 0x10,
+        0x75, 0x01, 0x81, 0x02, 0x05, 0x01, 0x16, 0x01,
+        0x80, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02,
+        0x09, 0x30, 0x09, 0x31, 0x81, 0x06, 0x15, 0x81,
+        0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x09, 0x38,
+        0x81, 0x06, 0x05, 0x0c, 0x0a, 0x38, 0x02, 0x95,
+        0x01, 0x81, 0x06, 0xc0, 0xc0, 0x05, 0x0c, 0x09,
+        0x01, 0xa1, 0x01, 0x85, 0x03, 0x75, 0x10, 0x95,
+        0x02, 0x15, 0x01, 0x26, 0xff, 0x02, 0x19, 0x01,
+        0x2a, 0xff, 0x02, 0x81, 0x00, 0xc0, 0x05, 0x01,
+        0x09, 0x80, 0xa1, 0x01, 0x85, 0x04, 0x75, 0x02,
+        0x95, 0x01, 0x15, 0x01, 0x25, 0x03, 0x09, 0x82,
+        0x09, 0x81, 0x09, 0x83, 0x81, 0x60, 0x75, 0x06,
+        0x81, 0x03, 0xc0, 0x06, 0xbc, 0xff, 0x09, 0x88,
+        0xa1, 0x01, 0x85, 0x08, 0x19, 0x01, 0x29, 0xff,
+        0x15, 0x01, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95,
+        0x01, 0x81, 0x00, 0xc0,
+    };
+    static const uint8_t vendor_only[] = {
+        0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x85,
+        0x10, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00, 0xc0,
+    };
+    static const uint8_t malformed[] = {0x05};
+
+    assert_logitech_mouse_layout(c092_mouse, sizeof(c092_mouse), 0U);
+    assert_logitech_mouse_layout(c539_mouse, sizeof(c539_mouse), 2U);
+    hid_mouse_report_layout_t layout;
+    assert(!hid_report_find_mouse_layout(
+        vendor_only, sizeof(vendor_only), &layout));
+    assert(!hid_report_find_mouse_layout(
+        malformed, sizeof(malformed), &layout));
+
+    assert(hid_report_find_mouse_layout(
+        c539_mouse, sizeof(c539_mouse), &layout));
+    uint8_t report[8] = {
+        0x01, 0x80, /* physical button 1 and physical button 16 */
+        0x7b, 0x00, /* stale physical X, must not repeat */
+        0x38, 0xff, /* stale physical Y, must not repeat */
+        0x04, 0xfb, /* stale wheel/pan, must not repeat */
+    };
+    assert(hid_mouse_report_apply_overlay(
+        &layout, report, sizeof(report), 0x02U, 20, -5, 1, -1));
+    static const uint8_t expected[] = {
+        0x03, 0x80, 0x14, 0x00, 0xfb, 0xff, 0x01, 0xff,
+    };
+    assert(memcmp(report, expected, sizeof(expected)) == 0);
+    assert(!hid_mouse_report_apply_overlay(
+        &layout, report, sizeof(report) - 1U, 0, 0, 0, 0, 0));
+}
+
 static void test_status_led_logic(void)
 {
     dual_status_led_state_t state;
@@ -609,6 +731,7 @@ static void test_status_led_logic(void)
 int main(void)
 {
     test_merge_and_independent_release();
+    test_rolling_smoother_preserves_overlapping_500hz_motion();
     test_saturation_is_split_without_loss();
     test_peek_commit_preserves_pending_on_retry();
     test_bridge_protocol();
@@ -619,6 +742,7 @@ int main(void)
     test_dynamic_clone_descriptor_builder();
     test_profile_receiver_state_machine();
     test_runtime_scheduling_guards();
+    test_dynamic_mouse_report_layout();
     test_status_led_logic();
     puts("dual_proxy_logic_test: PASS");
     return 0;

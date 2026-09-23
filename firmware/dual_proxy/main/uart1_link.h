@@ -35,6 +35,9 @@ esp_err_t dual_uart1_send_mouse(
     int8_t wheel,
     int8_t pan);
 esp_err_t dual_uart1_send_release(uint8_t reason);
+esp_err_t dual_uart1_send_software_mouse(const uint8_t *payload, size_t length);
+esp_err_t dual_uart1_send_software_release(void);
+esp_err_t dual_uart1_send_device_gone(uint8_t reason);
 esp_err_t dual_uart1_send_raw_hid_input(
     uint8_t interface_number,
     uint8_t report_id,

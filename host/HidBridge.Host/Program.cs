@@ -56,10 +56,15 @@ internal static class Program
             }
             else
             {
-                serialBridge = new SerialBridge(options, logSettings);
+                serialBridge = new SerialBridge(
+                    options,
+                    logSettings,
+                    () => automation?.Settings.LegacySingleBoardFirmwareCompatibility ?? false);
                 transport = serialBridge;
             }
-            input = new InputForwarder(transport);
+            input = new InputForwarder(
+                transport,
+                () => automation?.Settings.LegacySingleBoardFirmwareCompatibility ?? false);
             AutomationProfileStore profileStore = new();
             automation = new AutomationController(profileStore, input);
             automation.Log += automationLogWriter.WriteLine;

@@ -15,6 +15,7 @@
 
 #include "dual_status_led.h"
 #include "hid_device_profile.h"
+#include "hid_report_layout.h"
 #include "uart1_link.h"
 
 #define HID_EVENT_QUEUE_LENGTH 16
@@ -42,14 +43,15 @@ typedef struct {
     uint8_t interface_number;
     uint8_t report_id;
     uint8_t length;
-    bool boot_mouse;
+    bool mouse_report;
     uint8_t data[HID_RAW_REPORT_MAX];
 } raw_report_event_t;
 
 typedef struct {
     bool active;
-    bool boot_mouse;
+    bool mouse_interface;
     bool has_report_id;
+    uint8_t mouse_report_id;
     uint8_t interface_number;
     hid_host_device_handle_t handle;
 } hid_interface_slot_t;
@@ -87,13 +89,9 @@ static volatile uint32_t s_vendor_reports;
 static volatile uint32_t s_vendor_input_failures;
 static volatile uint32_t s_vendor_control_requests;
 static volatile uint32_t s_vendor_control_failures;
+static bool s_device_present;
 
 #define HID_STATS_PERIOD_MS 5000
-
-static int8_t read_i8(const uint8_t *value)
-{
-    return (int8_t)*value;
-}
 
 static void wide_ascii_copy(char output[HID_STR_DESC_MAX_LENGTH], const wchar_t *input)
 {
@@ -189,6 +187,16 @@ static void clear_interface_slot(uint8_t interface_number)
     if (slot != NULL) {
         memset(slot, 0, sizeof(*slot));
     }
+}
+
+static bool any_interface_active(void)
+{
+    for (size_t index = 0; index < HID_INTERFACE_SLOT_COUNT; ++index) {
+        if (s_interface_slots[index].active) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool report_descriptor_has_report_id(const uint8_t *descriptor, size_t length)
@@ -467,37 +475,16 @@ static void raw_report_task(void *argument)
         if (xQueueReceive(s_report_queue, &event, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (!event.boot_mouse) {
-            ESP_LOGI(TAG, "物理 vendor IN: interface=%u id=%02X length=%u",
-                     event.interface_number, event.report_id, event.length);
-            if (event.length != 0U) {
-                ESP_LOG_BUFFER_HEX_LEVEL(
-                    TAG, event.data, event.length, ESP_LOG_INFO);
-            }
-            if (event.length == 0U ||
-                dual_uart1_send_raw_hid_input(
-                    event.interface_number, event.report_id, event.data,
-                    event.length) != ESP_OK) {
-                ++s_errors;
-                ++s_vendor_input_failures;
-            } else {
-                ++s_vendor_reports;
-            }
-            continue;
-        }
-        /* Boot mouse: buttons, signed X/Y, optional wheel and pan. */
-        if (event.length < 3) {
+        if (event.length == 0U ||
+            dual_uart1_send_raw_hid_input(
+                event.interface_number, event.report_id, event.data,
+                event.length) != ESP_OK) {
             ++s_errors;
-            continue;
-        }
-        const uint8_t buttons = event.data[0] & 0x1FU;
-        const int16_t x = read_i8(&event.data[1]);
-        const int16_t y = read_i8(&event.data[2]);
-        const int8_t wheel = event.length >= 4 ? read_i8(&event.data[3]) : 0;
-        const int8_t pan = event.length >= 5 ? read_i8(&event.data[4]) : 0;
-        ++s_reports;
-        if (s_report_callback != NULL) {
-            s_report_callback(event.interface_number, 0, buttons, x, y, wheel, pan);
+            ++s_vendor_input_failures;
+        } else if (event.mouse_report) {
+            ++s_reports;
+        } else {
+            ++s_vendor_reports;
         }
     }
 }
@@ -636,16 +623,13 @@ static void hid_interface_callback(
             return;
         }
         hid_interface_slot_t *slot = find_interface_slot(params.iface_num);
-        const bool boot_mouse = params.proto == HID_PROTOCOL_MOUSE &&
-            params.sub_class == HID_SUBCLASS_BOOT_INTERFACE;
-        if (slot == NULL || !slot->active ||
-            (!boot_mouse && length > 0U && slot->has_report_id && length < 1U)) {
+        if (slot == NULL || !slot->active) {
             ++s_errors;
             return;
         }
         uint8_t report_id = 0;
         size_t data_offset = 0;
-        if (!boot_mouse && slot->has_report_id) {
+        if (slot->has_report_id) {
             if (length < 1U) {
                 ++s_errors;
                 return;
@@ -654,7 +638,7 @@ static void hid_interface_callback(
             data_offset = 1U;
         }
         const size_t forwarded_length = length - data_offset;
-        if (!boot_mouse && forwarded_length > DUAL_HID_RAW_INPUT_MAX_DATA) {
+        if (forwarded_length > DUAL_HID_RAW_INPUT_MAX_DATA) {
             ++s_errors;
             ++s_vendor_input_failures;
             return;
@@ -663,31 +647,36 @@ static void hid_interface_callback(
             .interface_number = params.iface_num,
             .report_id = report_id,
             .length = (uint8_t)forwarded_length,
-            .boot_mouse = boot_mouse,
+            .mouse_report = slot->mouse_interface &&
+                report_id == slot->mouse_report_id,
         };
         memcpy(queued.data, &data[data_offset], forwarded_length);
         if (xQueueSend(s_report_queue, &queued, 0) != pdTRUE) {
             ++s_errors;
             if (s_release_callback != NULL) {
-                s_release_callback();
+                s_release_callback(false);
             }
         }
         return;
     }
     if (event == HID_HOST_INTERFACE_EVENT_DISCONNECTED) {
-        const bool boot_mouse = params.proto == HID_PROTOCOL_MOUSE &&
-            params.sub_class == HID_SUBCLASS_BOOT_INTERFACE;
+        hid_interface_slot_t *slot = find_interface_slot(params.iface_num);
+        const bool mouse_interface = slot != NULL && slot->mouse_interface;
         clear_interface_slot(params.iface_num);
-        if (boot_mouse) {
-            ESP_LOGW(TAG, "标准鼠标接口断开：interface=%u", params.iface_num);
+        if (mouse_interface) {
+            ESP_LOGW(TAG, "鼠标 HID 接口断开：interface=%u", params.iface_num);
             dual_status_led_set_host_mouse_ready(false);
-            if (s_release_callback != NULL) {
-                s_release_callback();
-            }
         } else {
             ESP_LOGI(TAG, "vendor HID接口断开：interface=%u", params.iface_num);
             if (s_control_queue != NULL) {
                 xQueueReset(s_control_queue);
+            }
+        }
+        if (s_device_present && !any_interface_active()) {
+            s_device_present = false;
+            ESP_LOGW(TAG, "物理USB HID设备已完全拔出");
+            if (s_release_callback != NULL) {
+                s_release_callback(true);
             }
         }
         profile_reset_collector();
@@ -698,7 +687,7 @@ static void hid_interface_callback(
         ++s_errors;
         ESP_LOGW(TAG, "标准鼠标接口传输错误：interface=%u", params.iface_num);
         if (s_release_callback != NULL) {
-            s_release_callback();
+            s_release_callback(false);
         }
     }
 }
@@ -716,7 +705,7 @@ static void hid_driver_callback(
     if (xQueueSend(s_hid_event_queue, &queued, 0) != pdTRUE) {
         ++s_errors;
         if (s_release_callback != NULL) {
-            s_release_callback();
+            s_release_callback(false);
         }
     }
 }
@@ -767,13 +756,17 @@ static void hid_event_task(void *argument)
             continue;
         }
         slot->handle = event.handle;
-        slot->boot_mouse = params.proto == HID_PROTOCOL_MOUSE &&
-            params.sub_class == HID_SUBCLASS_BOOT_INTERFACE;
+        hid_mouse_report_layout_t mouse_layout;
+        memset(&mouse_layout, 0, sizeof(mouse_layout));
+        slot->mouse_interface = hid_report_find_mouse_layout(
+            descriptor, descriptor_length, &mouse_layout);
+        slot->mouse_report_id = slot->mouse_interface
+            ? mouse_layout.report_id : 0U;
         slot->has_report_id = report_descriptor_has_report_id(
             descriptor, descriptor_length);
-        if (!slot->boot_mouse) {
+        if (!slot->mouse_interface) {
             ESP_LOGI(TAG,
-                     "已打开并启动vendor HID接口：interface=%u subclass=%u protocol=%u report_id=%s",
+                      "已打开并启动vendor HID接口：interface=%u subclass=%u protocol=%u report_id=%s",
                      params.iface_num, params.sub_class, params.proto,
                      slot->has_report_id ? "yes" : "no");
         }
@@ -795,12 +788,16 @@ static void hid_event_task(void *argument)
             clear_interface_slot(params.iface_num);
             (void)hid_host_device_close(event.handle);
             if (s_release_callback != NULL) {
-                s_release_callback();
+                s_release_callback(false);
             }
         } else {
-            if (slot->boot_mouse) {
+            s_device_present = true;
+            if (slot->mouse_interface) {
                 dual_status_led_set_host_mouse_ready(true);
-                ESP_LOGI(TAG, "标准鼠标输入已启动");
+                ESP_LOGI(TAG,
+                         "动态鼠标输入已启动：interface=%u report_id=%u bytes=%u",
+                         params.iface_num, mouse_layout.report_id,
+                         mouse_layout.report_bytes);
             }
         }
     }
@@ -865,6 +862,7 @@ esp_err_t dual_hid_host_start(
     s_vendor_input_failures = 0;
     s_vendor_control_requests = 0;
     s_vendor_control_failures = 0;
+    s_device_present = false;
     memset(s_interface_slots, 0, sizeof(s_interface_slots));
     profile_reset_collector();
     s_hid_event_queue = xQueueCreate(HID_EVENT_QUEUE_LENGTH, sizeof(hid_event_t));

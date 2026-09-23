@@ -8,6 +8,7 @@ namespace HidBridge.Host.Transport;
 internal sealed class SerialBridge : IBridgeTransport
 {
     private const int TraceFlushIntervalMilliseconds = 500;
+    private const int MaxOutboundFrames = 32;
     private static readonly string[] ReducedLogMarkers =
     [
         "BLE connection parameters",
@@ -21,30 +22,61 @@ internal sealed class SerialBridge : IBridgeTransport
         "鼠标统计",
         "USB诊断",
         "输入统计",
+        "UART0协议统计",
+        "UART1统计",
+        "HID统计",
         "advertising restarted",
     ];
 
     private readonly BridgeOptions _options;
     private readonly RuntimeLogSettings _logSettings;
+    private readonly Func<bool> _legacyFirmwareCompatibility;
     private readonly FrameCodec _codec = new();
     private readonly object _sync = new();
+    private readonly object _writeSync = new();
+    private readonly Queue<byte[]> _outboundFrames = [];
+    private readonly AutoResetEvent _outboundSignal = new(false);
+    private readonly Thread _writerThread;
     private readonly System.Threading.Timer _heartbeatTimer;
     private SerialPort? _port;
     private string? _connectedPortName;
+    private bool _connectedLegacyCompatibility;
     private int _heartbeatActive;
     private DateTime _nextConnectAttemptUtc;
     private bool _sessionStarted;
     private bool _firmwareUpdateLeaseActive;
+    private bool _writerStopping;
     private bool _disposed;
     private CancellationTokenSource? _traceCancellation;
     private Task? _traceTask;
     private StreamWriter? _traceWriter;
     private long _nextTraceFlushTimestamp;
+    private long _nextBatchStatisticsTimestamp;
+    private long _batchStatisticsStartTimestamp;
+    private long _batchWriteCount;
+    private long _batchedFrameCount;
+    private long _mouseFramesQueued;
+    private int _maxFramesPerBatch;
+    private int _outboundQueuePeak;
+    private long _backpressureCount;
 
-    public SerialBridge(BridgeOptions options, RuntimeLogSettings logSettings)
+    public SerialBridge(
+        BridgeOptions options,
+        RuntimeLogSettings logSettings,
+        Func<bool>? legacyFirmwareCompatibility = null)
     {
         _options = options;
         _logSettings = logSettings;
+        _legacyFirmwareCompatibility = legacyFirmwareCompatibility ?? (() => false);
+        _batchStatisticsStartTimestamp = Stopwatch.GetTimestamp();
+        _nextBatchStatisticsTimestamp = _batchStatisticsStartTimestamp + Stopwatch.Frequency;
+        _writerThread = new Thread(WriterLoop)
+        {
+            IsBackground = true,
+            Name = "HidBridge.SerialBatchWriter",
+            Priority = ThreadPriority.AboveNormal,
+        };
+        _writerThread.Start();
         _heartbeatTimer = new System.Threading.Timer(
             _ => HeartbeatTick(),
             null,
@@ -82,25 +114,170 @@ internal sealed class SerialBridge : IBridgeTransport
                 return;
             }
 
-            try
+            if (!_sessionStarted)
             {
-                if (!_sessionStarted)
+                if (!EnqueueFrameLocked(
+                        _codec.Encode(MessageType.SessionStart, ReadOnlySpan<byte>.Empty)))
                 {
-                    WriteFrame(_codec.Encode(MessageType.SessionStart, ReadOnlySpan<byte>.Empty));
-                    _sessionStarted = true;
+                    return;
                 }
-                WriteFrame(_codec.Encode(type, payload));
+                _sessionStarted = true;
             }
-            catch (Exception exception) when (
-                exception is IOException or InvalidOperationException or UnauthorizedAccessException)
+            if (EnqueueFrameLocked(_codec.Encode(type, payload)) &&
+                type == MessageType.MouseReport)
             {
-                Console.Error.WriteLine($"串口写入失败：{exception.Message}");
-                ClosePort();
+                _mouseFramesQueued++;
             }
         }
     }
 
-    private void WriteFrame(byte[] frame) => _port!.Write(frame, 0, frame.Length);
+    private bool EnqueueFrameLocked(byte[] frame)
+    {
+        bool backpressured = false;
+        while (_outboundFrames.Count >= MaxOutboundFrames &&
+               !_disposed && !_writerStopping && !_firmwareUpdateLeaseActive)
+        {
+            backpressured = true;
+            Monitor.Wait(_sync, 10);
+        }
+        if (_disposed || _writerStopping || _firmwareUpdateLeaseActive ||
+            _port?.IsOpen != true)
+        {
+            return false;
+        }
+
+        _outboundFrames.Enqueue(frame);
+        if (backpressured)
+        {
+            _backpressureCount++;
+        }
+        _outboundQueuePeak = Math.Max(_outboundQueuePeak, _outboundFrames.Count);
+        _outboundSignal.Set();
+        return true;
+    }
+
+    private void WriterLoop()
+    {
+        while (true)
+        {
+            _outboundSignal.WaitOne();
+            lock (_sync)
+            {
+                if (_writerStopping)
+                {
+                    return;
+                }
+            }
+
+            // 不主动等待：只合并上一次 CH340 写入阻塞期间自然积累的帧。
+            // 这样既不阻塞 500 Hz 采集线程，也不会人为造成多帧突发。
+            while (true)
+            {
+                SerialPort? port;
+                byte[] batch;
+                int frameCount;
+                lock (_sync)
+                {
+                    if (_writerStopping)
+                    {
+                        return;
+                    }
+                    if (_outboundFrames.Count == 0)
+                    {
+                        break;
+                    }
+                    if (_port?.IsOpen != true || _firmwareUpdateLeaseActive)
+                    {
+                        _outboundFrames.Clear();
+                        Monitor.PulseAll(_sync);
+                        break;
+                    }
+
+                    port = _port;
+                    (batch, frameCount) = DrainOutboundBatchLocked();
+                    Monitor.PulseAll(_sync);
+                }
+
+                try
+                {
+                    lock (_writeSync)
+                    {
+                        if (!ReferenceEquals(_port, port) || !port.IsOpen)
+                        {
+                            continue;
+                        }
+                        port.Write(batch, 0, batch.Length);
+                    }
+                    lock (_sync)
+                    {
+                        _batchWriteCount++;
+                        _batchedFrameCount += frameCount;
+                        _maxFramesPerBatch = Math.Max(_maxFramesPerBatch, frameCount);
+                        LogBatchStatisticsIfDueLocked();
+                    }
+                    break;
+                }
+                catch (Exception exception) when (
+                    exception is IOException or InvalidOperationException or UnauthorizedAccessException)
+                {
+                    Console.Error.WriteLine($"串口批量写入失败：{exception.Message}");
+                    lock (_sync)
+                    {
+                        ClosePort();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    private (byte[] Batch, int FrameCount) DrainOutboundBatchLocked()
+    {
+        int frameCount = _outboundFrames.Count;
+        int length = 0;
+        foreach (byte[] frame in _outboundFrames)
+        {
+            length += frame.Length;
+        }
+        byte[] batch = new byte[length];
+        int offset = 0;
+        while (_outboundFrames.Count > 0)
+        {
+            byte[] frame = _outboundFrames.Dequeue();
+            Buffer.BlockCopy(frame, 0, batch, offset, frame.Length);
+            offset += frame.Length;
+        }
+        return (batch, frameCount);
+    }
+
+    private void LogBatchStatisticsIfDueLocked()
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (now < _nextBatchStatisticsTimestamp)
+        {
+            return;
+        }
+        double average = _batchWriteCount == 0
+            ? 0
+            : (double)_batchedFrameCount / _batchWriteCount;
+        double elapsedSeconds = Math.Max(
+            0.001,
+            (double)(now - _batchStatisticsStartTimestamp) / Stopwatch.Frequency);
+        Console.WriteLine(
+            $"EXE输出统计：MouseReport={_mouseFramesQueued} " +
+            $"({_mouseFramesQueued / elapsedSeconds:F1} Hz)，串口写入={_batchWriteCount}，" +
+            $"总帧={_batchedFrameCount}，" +
+            $"平均帧/次={average:F2}，最大帧/次={_maxFramesPerBatch}，" +
+            $"队列峰值={_outboundQueuePeak}/{MaxOutboundFrames}，反压={_backpressureCount}。");
+        _batchWriteCount = 0;
+        _batchedFrameCount = 0;
+        _mouseFramesQueued = 0;
+        _maxFramesPerBatch = 0;
+        _outboundQueuePeak = _outboundFrames.Count;
+        _backpressureCount = 0;
+        _batchStatisticsStartTimestamp = now;
+        _nextBatchStatisticsTimestamp = now + Stopwatch.Frequency;
+    }
 
     private bool EnsureConnected()
     {
@@ -108,9 +285,21 @@ internal sealed class SerialBridge : IBridgeTransport
         {
             return false;
         }
+
+        bool requestedLegacyCompatibility = _legacyFirmwareCompatibility();
         if (_port?.IsOpen == true)
         {
-            return true;
+            if (_connectedLegacyCompatibility == requestedLegacyCompatibility)
+            {
+                return true;
+            }
+
+            // 设置页模式变化后，不能继续复用旧握手和旧 payload 语义的连接。
+            // 关闭并立即重新探测，避免用户必须拔插串口或等待断线。
+            Console.WriteLine(
+                $"旧版单板兼容模式已{(requestedLegacyCompatibility ? "启用" : "停用")}，正在重新连接串口。");
+            ClosePort();
+            _nextConnectAttemptUtc = DateTime.MinValue;
         }
 
         if (DateTime.UtcNow < _nextConnectAttemptUtc)
@@ -140,14 +329,25 @@ internal sealed class SerialBridge : IBridgeTransport
             {
                 candidate = CreatePort(portName);
                 candidate.Open();
-                if (automatic && !SerialDeviceProbe.Probe(candidate, _codec))
+                bool legacyCompatibility = requestedLegacyCompatibility;
+                byte? expectedRole = legacyCompatibility ? null : SerialDeviceProbe.MouseHostRole;
+                bool probeMatched = legacyCompatibility ||
+                    !automatic || SerialDeviceProbe.Probe(candidate, _codec, expectedRole);
+                if (!probeMatched)
                 {
                     Console.WriteLine($"{portName} 未返回 HID Bridge 握手，已忽略。");
                     candidate.Dispose();
                     continue;
                 }
 
+                if (legacyCompatibility)
+                {
+                    Console.WriteLine(
+                        $"{portName} 已按旧版单板通路直接连接；跳过新角色握手，后续使用旧版传输。");
+                }
+
                 _port = candidate;
+                _connectedLegacyCompatibility = legacyCompatibility;
                 Volatile.Write(ref _connectedPortName, portName);
                 StartDeviceTrace(candidate, portName);
                 Console.WriteLine($"已连接 {portName}。");
@@ -454,20 +654,26 @@ internal sealed class SerialBridge : IBridgeTransport
 
     private void ClosePort()
     {
+        _outboundFrames.Clear();
+        Monitor.PulseAll(_sync);
         StopDeviceTrace();
-        try
+        lock (_writeSync)
         {
-            _port?.Dispose();
-        }
-        catch
-        {
-            // 端口已失效时，释放失败不应阻止后续重连。
-        }
-        finally
-        {
-            Volatile.Write(ref _connectedPortName, null);
-            _port = null;
-            _sessionStarted = false;
+            try
+            {
+                _port?.Dispose();
+            }
+            catch
+            {
+                // 端口已失效时，释放失败不应阻止后续重连。
+            }
+            finally
+            {
+                Volatile.Write(ref _connectedPortName, null);
+                _port = null;
+                _connectedLegacyCompatibility = false;
+                _sessionStarted = false;
+            }
         }
     }
 
@@ -552,8 +758,17 @@ internal sealed class SerialBridge : IBridgeTransport
         lock (_sync)
         {
             _disposed = true;
+            _writerStopping = true;
+            _outboundFrames.Clear();
+            Monitor.PulseAll(_sync);
+        }
+        _outboundSignal.Set();
+        _writerThread.Join(500);
+        lock (_sync)
+        {
             ClosePort();
         }
+        _outboundSignal.Dispose();
     }
 
     internal sealed class FirmwareUpdatePortLease : IDisposable

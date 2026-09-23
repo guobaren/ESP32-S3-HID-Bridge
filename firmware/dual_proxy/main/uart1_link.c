@@ -24,6 +24,7 @@
 #define LINK_EVENT_QUEUE_LENGTH 32
 #define LINK_TX_QUEUE_LENGTH 64
 #define LINK_SAFETY_QUEUE_LENGTH 8
+#define LINK_SOFTWARE_QUEUE_LENGTH 32
 #define LINK_VENDOR_QUEUE_LENGTH 32
 #define LINK_RX_CHUNK_SIZE 128
 #define LINK_TASK_PRIORITY 6
@@ -63,6 +64,10 @@ static volatile bool s_peer_online;
 static int64_t s_last_peer_rx_us;
 static uint32_t s_tx_count;
 static uint32_t s_rx_count;
+static uint32_t s_tx_physical_count;
+static uint32_t s_rx_physical_count;
+static uint32_t s_tx_software_count;
+static uint32_t s_rx_software_count;
 static uint32_t s_crc_or_frame_errors;
 static uint32_t s_rejected_peers;
 static volatile uint32_t s_tx_queue_current;
@@ -73,6 +78,7 @@ static volatile uint32_t s_tx_write_failures;
 static QueueHandle_t s_uart_event_queue;
 static QueueHandle_t s_tx_queue;
 static QueueHandle_t s_safety_tx_queue;
+static QueueHandle_t s_software_tx_queue;
 static QueueHandle_t s_vendor_tx_queue;
 static TaskHandle_t s_rx_task;
 static TaskHandle_t s_tx_task;
@@ -128,6 +134,9 @@ static void update_tx_queue_metrics(void)
     if (s_safety_tx_queue != NULL) {
         current += uxQueueMessagesWaiting(s_safety_tx_queue);
     }
+    if (s_software_tx_queue != NULL) {
+        current += uxQueueMessagesWaiting(s_software_tx_queue);
+    }
     if (s_vendor_tx_queue != NULL) {
         current += uxQueueMessagesWaiting(s_vendor_tx_queue);
     }
@@ -144,6 +153,9 @@ static void reset_tx_queues(void)
     }
     if (s_safety_tx_queue != NULL) {
         xQueueReset(s_safety_tx_queue);
+    }
+    if (s_software_tx_queue != NULL) {
+        xQueueReset(s_software_tx_queue);
     }
     if (s_vendor_tx_queue != NULL) {
         xQueueReset(s_vendor_tx_queue);
@@ -245,6 +257,11 @@ static void on_link_frame(const dual_frame_t *frame, void *context)
         return;
     }
     ++s_rx_count;
+    if (frame->type == DUAL_MESSAGE_PHYSICAL_MOUSE) {
+        ++s_rx_physical_count;
+    } else if (frame->type == DUAL_MESSAGE_SOFTWARE_MOUSE) {
+        ++s_rx_software_count;
+    }
     if (s_frame_callback != NULL) {
         s_frame_callback(frame);
     }
@@ -252,7 +269,8 @@ static void on_link_frame(const dual_frame_t *frame, void *context)
 
 static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t length)
 {
-    if (s_tx_queue == NULL || s_safety_tx_queue == NULL || s_vendor_tx_queue == NULL ||
+    if (s_tx_queue == NULL || s_safety_tx_queue == NULL ||
+        s_software_tx_queue == NULL || s_vendor_tx_queue == NULL ||
         length > DUAL_PROXY_MAX_PAYLOAD) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -261,12 +279,16 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
         memcpy(item.payload, payload, length);
     }
 
-    const bool safety = type == DUAL_MESSAGE_PHYSICAL_RELEASE;
+    const bool safety = type == DUAL_MESSAGE_PHYSICAL_RELEASE ||
+        type == DUAL_MESSAGE_SOFTWARE_RELEASE ||
+        type == DUAL_MESSAGE_DEVICE_GONE;
+    const bool software = type == DUAL_MESSAGE_SOFTWARE_MOUSE;
     const bool vendor = type == DUAL_MESSAGE_RAW_HID_INPUT ||
         type == DUAL_MESSAGE_HID_SET_REPORT ||
         type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST ||
         type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE;
     QueueHandle_t target = safety ? s_safety_tx_queue :
+        software ? s_software_tx_queue :
         vendor ? s_vendor_tx_queue : s_tx_queue;
     if (xQueueSend(target, &item, 0) != pdTRUE) {
         ++s_tx_queue_overflows;
@@ -278,6 +300,18 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
             s_tx_queue_drops += (uint32_t)discarded;
             if (xQueueSend(s_safety_tx_queue, &item, 0) != pdTRUE) {
                 ++s_tx_queue_drops;
+            }
+        } else if (software) {
+            const UBaseType_t discarded = uxQueueMessagesWaiting(s_software_tx_queue);
+            xQueueReset(s_software_tx_queue);
+            s_tx_queue_drops += (uint32_t)discarded + 1U;
+            const tx_item_t release = {
+                .type = DUAL_MESSAGE_SOFTWARE_RELEASE,
+                .length = 0,
+            };
+            if (xQueueSend(s_safety_tx_queue, &release, 0) != pdTRUE) {
+                ++s_tx_queue_drops;
+                queue_fault();
             }
         } else if (vendor) {
             ++s_vendor_queue_overflows;
@@ -313,6 +347,11 @@ static bool send_status_frame(uint8_t type, const uint8_t *payload, uint8_t leng
     }
     if (uart_write_bytes(LINK_UART, serialized, serialized_length) == (int)serialized_length) {
         ++s_tx_count;
+        if (type == DUAL_MESSAGE_PHYSICAL_MOUSE) {
+            ++s_tx_physical_count;
+        } else if (type == DUAL_MESSAGE_SOFTWARE_MOUSE) {
+            ++s_tx_software_count;
+        }
         return true;
     } else {
         ++s_tx_write_failures;
@@ -442,6 +481,7 @@ static bool tx_queues_have_items(void)
 {
     return (s_safety_tx_queue != NULL && uxQueueMessagesWaiting(s_safety_tx_queue) > 0) ||
         (s_tx_queue != NULL && uxQueueMessagesWaiting(s_tx_queue) > 0) ||
+        (s_software_tx_queue != NULL && uxQueueMessagesWaiting(s_software_tx_queue) > 0) ||
         (s_vendor_tx_queue != NULL && uxQueueMessagesWaiting(s_vendor_tx_queue) > 0);
 }
 
@@ -450,6 +490,10 @@ static void link_tx_task(void *argument)
     (void)argument;
     int64_t last_status_us = 0;
     int64_t last_summary_us = 0;
+    uint32_t last_tx_physical = 0;
+    uint32_t last_rx_physical = 0;
+    uint32_t last_tx_software = 0;
+    uint32_t last_rx_software = 0;
     uint8_t vendor_turn = 0;
     while (true) {
         /*
@@ -467,6 +511,21 @@ static void link_tx_task(void *argument)
         unsigned motion_processed = 0;
         while (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
                xQueueReceive(s_safety_tx_queue, &item, 0) == pdTRUE) {
+            (void)send_status_frame(item.type, item.payload, item.length);
+            ++processed;
+        }
+
+        /* 实体输入先于软件输入；每批至少给两者各一个机会。 */
+        if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
+            xQueueReceive(s_tx_queue, &item, 0) == pdTRUE) {
+            (void)send_status_frame(item.type, item.payload, item.length);
+            if (item.type == DUAL_MESSAGE_PHYSICAL_MOUSE) {
+                ++motion_processed;
+            }
+            ++processed;
+        }
+        if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
+            xQueueReceive(s_software_tx_queue, &item, 0) == pdTRUE) {
             (void)send_status_frame(item.type, item.payload, item.length);
             ++processed;
         }
@@ -493,6 +552,17 @@ static void link_tx_task(void *argument)
                 ++motion_processed;
             }
             ++processed;
+            if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
+                xQueueReceive(s_software_tx_queue, &item, 0) == pdTRUE) {
+                (void)send_status_frame(item.type, item.payload, item.length);
+                ++processed;
+            }
+        }
+
+        while (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
+               xQueueReceive(s_software_tx_queue, &item, 0) == pdTRUE) {
+            (void)send_status_frame(item.type, item.payload, item.length);
+            ++processed;
         }
 
         if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
@@ -508,7 +578,8 @@ static void link_tx_task(void *argument)
         const bool safety_pending = s_safety_tx_queue != NULL &&
             uxQueueMessagesWaiting(s_safety_tx_queue) > 0;
         const bool motion_pending = s_tx_queue != NULL &&
-            uxQueueMessagesWaiting(s_tx_queue) > 0;
+            (uxQueueMessagesWaiting(s_tx_queue) > 0 ||
+             uxQueueMessagesWaiting(s_software_tx_queue) > 0);
         if (hid_profile_stream_can_send(
                 s_peer_online, safety_pending, motion_pending,
                 s_profile_motion_since_send, LINK_PROFILE_FAIRNESS_LIMIT)) {
@@ -526,19 +597,32 @@ static void link_tx_task(void *argument)
         }
 
         update_tx_queue_metrics();
-        if (last_summary_us == 0 || now_us - last_summary_us >= LINK_STATS_PERIOD_US) {
+        if (last_summary_us == 0 || now_us - last_summary_us >= 1000000LL) {
+            const uint32_t tx_physical_hz = s_tx_physical_count - last_tx_physical;
+            const uint32_t rx_physical_hz = s_rx_physical_count - last_rx_physical;
+            const uint32_t tx_software_hz = s_tx_software_count - last_tx_software;
+            const uint32_t rx_software_hz = s_rx_software_count - last_rx_software;
             ESP_LOGI(TAG, "UART1统计 tx=%" PRIu32 " rx=%" PRIu32
+                     " phys_tx/rx_hz=%" PRIu32 "/%" PRIu32
+                     " soft_tx/rx_hz=%" PRIu32 "/%" PRIu32
                      " reject=%" PRIu32 " q=%" PRIu32 " peak=%" PRIu32
                      " overflow=%" PRIu32 " drop=%" PRIu32 " write_fail=%" PRIu32
                      " vendor_overflow=%" PRIu32 " vendor_drop=%" PRIu32
                      " peer=%s profile=%" PRIu32 "/%" PRIu32 "/%" PRIu32
                      " restart=%" PRIu32 " fail=%" PRIu32,
-                     s_tx_count, s_rx_count, s_rejected_peers, s_tx_queue_current,
+                     s_tx_count, s_rx_count,
+                     tx_physical_hz, rx_physical_hz,
+                     tx_software_hz, rx_software_hz,
+                     s_rejected_peers, s_tx_queue_current,
                       s_tx_queue_peak, s_tx_queue_overflows, s_tx_queue_drops,
                       s_tx_write_failures, s_vendor_queue_overflows, s_vendor_queue_drops,
                       s_peer_online ? "online" : "offline",
-                     s_profile_starts, s_profile_chunks, s_profile_commits,
-                     s_profile_restarts, s_profile_failures);
+                      s_profile_starts, s_profile_chunks, s_profile_commits,
+                      s_profile_restarts, s_profile_failures);
+            last_tx_physical = s_tx_physical_count;
+            last_rx_physical = s_rx_physical_count;
+            last_tx_software = s_tx_software_count;
+            last_rx_software = s_rx_software_count;
             last_summary_us = now_us;
         }
 
@@ -610,6 +694,10 @@ esp_err_t dual_uart1_start(
     s_last_peer_rx_us = 0;
     s_tx_count = 0;
     s_rx_count = 0;
+    s_tx_physical_count = 0;
+    s_rx_physical_count = 0;
+    s_tx_software_count = 0;
+    s_rx_software_count = 0;
     s_crc_or_frame_errors = 0;
     s_rejected_peers = 0;
     s_tx_queue_current = 0;
@@ -664,8 +752,10 @@ esp_err_t dual_uart1_start(
     }
     s_tx_queue = xQueueCreate(LINK_TX_QUEUE_LENGTH, sizeof(tx_item_t));
     s_safety_tx_queue = xQueueCreate(LINK_SAFETY_QUEUE_LENGTH, sizeof(tx_item_t));
+    s_software_tx_queue = xQueueCreate(LINK_SOFTWARE_QUEUE_LENGTH, sizeof(tx_item_t));
     s_vendor_tx_queue = xQueueCreate(LINK_VENDOR_QUEUE_LENGTH, sizeof(tx_item_t));
-    if (s_tx_queue == NULL || s_safety_tx_queue == NULL || s_vendor_tx_queue == NULL) {
+    if (s_tx_queue == NULL || s_safety_tx_queue == NULL ||
+        s_software_tx_queue == NULL || s_vendor_tx_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
     if (xTaskCreate(link_rx_task, "dual_uart1_rx", 4096, NULL, LINK_TASK_PRIORITY, &s_rx_task) != pdPASS ||
@@ -680,9 +770,11 @@ esp_err_t dual_uart1_start(
         }
         vQueueDelete(s_tx_queue);
         vQueueDelete(s_safety_tx_queue);
+        vQueueDelete(s_software_tx_queue);
         vQueueDelete(s_vendor_tx_queue);
         s_tx_queue = NULL;
         s_safety_tx_queue = NULL;
+        s_software_tx_queue = NULL;
         s_vendor_tx_queue = NULL;
         return ESP_ERR_NO_MEM;
     }
@@ -731,6 +823,25 @@ esp_err_t dual_uart1_send_mouse(
 esp_err_t dual_uart1_send_release(uint8_t reason)
 {
     return enqueue_item(DUAL_MESSAGE_PHYSICAL_RELEASE, &reason, 1);
+}
+
+esp_err_t dual_uart1_send_software_mouse(const uint8_t *payload, size_t length)
+{
+    if (payload == NULL || (length != 7U && length != 8U) ||
+        (length == 8U && payload[7] != 0U && payload[7] != 5U)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return enqueue_item(DUAL_MESSAGE_SOFTWARE_MOUSE, payload, (uint8_t)length);
+}
+
+esp_err_t dual_uart1_send_software_release(void)
+{
+    return enqueue_item(DUAL_MESSAGE_SOFTWARE_RELEASE, NULL, 0);
+}
+
+esp_err_t dual_uart1_send_device_gone(uint8_t reason)
+{
+    return enqueue_item(DUAL_MESSAGE_DEVICE_GONE, &reason, 1);
 }
 
 esp_err_t dual_uart1_send_raw_hid_input(

@@ -11,6 +11,7 @@ internal sealed class MouseReportPump : IDisposable
 {
     private const int OutputFrequencyHz = 500;
     private const int OutputIntervalMilliseconds = 1000 / OutputFrequencyHz;
+    private const int CoarseWakeIntervalMilliseconds = 1;
     private const uint CreateWaitableTimerHighResolution = 0x00000002;
     private const uint TimerAllAccess = 0x001F0003;
     private const uint WaitObject0 = 0;
@@ -26,6 +27,7 @@ internal sealed class MouseReportPump : IDisposable
     private readonly Queue<byte> _buttonStates = [];
     private readonly TimeSpan _statisticsInterval;
     private readonly Action<string> _statisticsSink;
+    private readonly Func<bool> _legacyFirmwareCompatibility;
     private readonly BlockingCollection<MouseStatisticsSnapshot> _statisticsQueue =
         new(new ConcurrentQueue<MouseStatisticsSnapshot>());
     private readonly Thread _statisticsThread;
@@ -42,6 +44,7 @@ internal sealed class MouseReportPump : IDisposable
     private long _submittedX;
     private long _submittedY;
     private long _rawEventCount;
+    private long _senderTickCount;
     private long _submittedReportCount;
     private long _buttonTransitionCount;
     private long _maxPendingX;
@@ -64,9 +67,11 @@ internal sealed class MouseReportPump : IDisposable
         IBridgeTransport transport,
         MouseMovementRecorder? movementRecorder = null,
         TimeSpan? statisticsInterval = null,
-        Action<string>? statisticsSink = null)
+        Action<string>? statisticsSink = null,
+        Func<bool>? legacyFirmwareCompatibility = null)
     {
         _transport = transport;
+        _legacyFirmwareCompatibility = legacyFirmwareCompatibility ?? (() => false);
         _movementRecorder = movementRecorder ?? new MouseMovementRecorder();
         _statisticsInterval = statisticsInterval ?? DefaultStatisticsInterval;
         if (_statisticsInterval <= TimeSpan.Zero)
@@ -88,11 +93,14 @@ internal sealed class MouseReportPump : IDisposable
             throw new Win32Exception(Marshal.GetLastWin32Error(), "无法创建鼠标高精度定时器。");
         }
 
-        long dueTime = -OutputIntervalMilliseconds * 10_000L;
+        // 当前部分 Windows 主机即便成功创建 HIGH_RESOLUTION timer，2 ms 周期仍会
+        // 被实际调度为约 2.9 ms。用 1 ms timer 只负责低开销粗唤醒，再按绝对
+        // Stopwatch 截止时间等待，可避免周期漂移，同时不影响固件中的实体鼠标队列。
+        long dueTime = -CoarseWakeIntervalMilliseconds * 10_000L;
         if (!SetWaitableTimer(
                 _waitableTimer,
                 ref dueTime,
-                OutputIntervalMilliseconds,
+                CoarseWakeIntervalMilliseconds,
                 IntPtr.Zero,
                 IntPtr.Zero,
                 false))
@@ -306,14 +314,32 @@ internal sealed class MouseReportPump : IDisposable
 
     private void SenderLoop()
     {
+        long outputIntervalTicks = Math.Max(1, Stopwatch.Frequency / OutputFrequencyHz);
+        long nextOutputTimestamp = Stopwatch.GetTimestamp() + outputIntervalTicks;
         while (WaitForSingleObject(_waitableTimer, Infinite) == WaitObject0)
         {
+            long nowTimestamp;
+            while ((nowTimestamp = Stopwatch.GetTimestamp()) < nextOutputTimestamp)
+            {
+                Thread.SpinWait(20);
+            }
+
+            if (nowTimestamp - nextOutputTimestamp >= outputIntervalTicks)
+            {
+                nextOutputTimestamp = nowTimestamp + outputIntervalTicks;
+            }
+            else
+            {
+                nextOutputTimestamp += outputIntervalTicks;
+            }
+
             lock (_stateLock)
             {
                 if (_disposed)
                 {
                     return;
                 }
+                _senderTickCount++;
             }
             MouseMovementRecording? completed = _movementRecorder.TryComplete(DateTime.UtcNow);
             if (completed is not null)
@@ -484,15 +510,17 @@ internal sealed class MouseReportPump : IDisposable
                         _submittedX += x;
                         _submittedY += y;
                         _submittedReportCount++;
-                        payload = MouseReportCodec.EncodeBridge(
-                            buttons,
-                            x,
-                            y,
-                            wheel,
-                            pan,
-                            _udpSmoothingEnabled
-                                ? MouseReportCodec.FirmwareSmoothingSlots
-                                : MouseReportCodec.FirmwareSmoothingDisabled);
+                        payload = _legacyFirmwareCompatibility()
+                            ? MouseReportCodec.Encode(buttons, x, y, wheel, pan)
+                            : MouseReportCodec.EncodeBridge(
+                                buttons,
+                                x,
+                                y,
+                                wheel,
+                                pan,
+                                _udpSmoothingEnabled
+                                    ? MouseReportCodec.FirmwareSmoothingSlots
+                                    : MouseReportCodec.FirmwareSmoothingDisabled);
                         submittedReport = new MouseReport(buttons, x, y, wheel, pan);
                         RecordSubmittedIntervalLocked(Stopwatch.GetTimestamp());
                     }
@@ -598,6 +626,7 @@ internal sealed class MouseReportPump : IDisposable
             _rawEventCount,
             _capturedX,
             _capturedY,
+            _senderTickCount,
             _submittedReportCount,
             _submittedX,
             _submittedY,
@@ -616,6 +645,7 @@ internal sealed class MouseReportPump : IDisposable
 
     private static string FormatStatistics(MouseStatisticsSnapshot statistics) =>
         $"鼠标统计（500 Hz）：原始事件={statistics.RawEventCount}，采集位移=({statistics.CapturedX},{statistics.CapturedY})，" +
+        $"定时tick={statistics.SenderTickCount}，" +
         $"已提交报告={statistics.SubmittedReportCount}，已提交位移=({statistics.SubmittedX},{statistics.SubmittedY})，" +
         $"待发送=({statistics.PendingX},{statistics.PendingY})，按钮转换={statistics.ButtonTransitionCount}，" +
         $"按钮待发送={statistics.PendingButtonTransitions}，最大积压=({statistics.MaxPendingX},{statistics.MaxPendingY})，" +
@@ -732,6 +762,7 @@ internal sealed class MouseReportPump : IDisposable
         _submittedX = 0;
         _submittedY = 0;
         _rawEventCount = 0;
+        _senderTickCount = 0;
         _submittedReportCount = 0;
         _buttonTransitionCount = 0;
         _maxPendingX = 0;
@@ -769,6 +800,7 @@ internal sealed class MouseReportPump : IDisposable
         long RawEventCount,
         long CapturedX,
         long CapturedY,
+        long SenderTickCount,
         long SubmittedReportCount,
         long SubmittedX,
         long SubmittedY,

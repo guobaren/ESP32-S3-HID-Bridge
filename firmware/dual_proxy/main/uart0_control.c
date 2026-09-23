@@ -9,6 +9,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "uart1_link.h"
+
 #define CONTROL_UART UART_NUM_0
 #define CONTROL_BAUD 921600
 #define CONTROL_RX_BUFFER_SIZE 4096
@@ -18,6 +20,7 @@
 static const char *TAG = "dual_uart0";
 static dual_software_report_callback_t s_report_callback;
 static dual_software_release_callback_t s_release_callback;
+static uint8_t s_role;
 
 typedef struct {
     bool active;
@@ -29,6 +32,7 @@ typedef struct {
     uint64_t rejected;
     uint64_t discontinuities;
     uint64_t mouse_reports;
+    uint64_t last_mouse_reports;
 } control_state_t;
 
 static control_state_t s_state;
@@ -43,10 +47,11 @@ static void send_device_hello(const dual_frame_t *probe)
         .version = DUAL_PROXY_PROTOCOL_VERSION,
         .type = DUAL_MESSAGE_DEVICE_HELLO,
         .sequence = probe->sequence,
-        .payload_length = sizeof(signature) + 8,
+        .payload_length = sizeof(signature) + 8 + 1,
     };
     memcpy(hello.payload, signature, sizeof(signature));
     memcpy(&hello.payload[sizeof(signature)], probe->payload, 8);
+    hello.payload[sizeof(signature) + 8] = s_role;
     uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
     size_t serialized_length = 0;
     if (dual_frame_serialize(&hello, serialized, sizeof(serialized), &serialized_length) != ESP_OK) {
@@ -140,8 +145,26 @@ static void control_task(void *argument)
     TickType_t last_statistics = xTaskGetTickCount();
     while (true) {
         uint8_t buffer[128];
-        const int received = uart_read_bytes(CONTROL_UART, buffer, sizeof(buffer), pdMS_TO_TICKS(20));
+        /*
+         * 先阻塞等待 1 字节，再一次性排空已经到达的字节。不要用“大块读取 + 20 ms
+         * 超时”：UART0 上的软件移动帧通常只有 17 字节，那种读法会把每条命令稳定
+         * 留在接收路径约 20 ms，连续命令还会在进入 5 槽平滑前合并。
+         */
+        int received = uart_read_bytes(CONTROL_UART, buffer, 1, portMAX_DELAY);
         if (received > 0) {
+            size_t buffered = 0;
+            if (uart_get_buffered_data_len(CONTROL_UART, &buffered) == ESP_OK && buffered > 0) {
+                const size_t remaining = sizeof(buffer) - (size_t)received;
+                const size_t drain_length = buffered < remaining ? buffered : remaining;
+                const int drained = uart_read_bytes(
+                    CONTROL_UART,
+                    buffer + received,
+                    drain_length,
+                    0);
+                if (drained > 0) {
+                    received += drained;
+                }
+            }
             dual_parser_feed(&parser, buffer, (size_t)received);
         }
         if (s_state.active && xTaskGetTickCount() - s_state.last_activity > pdMS_TO_TICKS(CONTROL_LEASE_MS)) {
@@ -152,20 +175,29 @@ static void control_task(void *argument)
                 s_release_callback();
             }
         }
-        if (xTaskGetTickCount() - last_statistics >= pdMS_TO_TICKS(5000)) {
+        if (xTaskGetTickCount() - last_statistics >= pdMS_TO_TICKS(1000)) {
+            const uint64_t mouse_reports_window =
+                s_state.mouse_reports - s_state.last_mouse_reports;
             ESP_LOGI(TAG, "UART0协议统计：接收=%" PRIu64 " MouseReport=%" PRIu64
+                     " MouseReportHz=%" PRIu64
                      " 接受=%" PRIu64 " 拒绝=%" PRIu64 " 序号不连续=%" PRIu64,
-                     s_state.received, s_state.mouse_reports, s_state.accepted,
-                     s_state.rejected, s_state.discontinuities);
+                     s_state.received, s_state.mouse_reports, mouse_reports_window,
+                     s_state.accepted, s_state.rejected, s_state.discontinuities);
+            s_state.last_mouse_reports = s_state.mouse_reports;
             last_statistics = xTaskGetTickCount();
         }
     }
 }
 
 esp_err_t dual_uart0_control_start(
+    uint8_t role,
     dual_software_report_callback_t report_callback,
     dual_software_release_callback_t release_callback)
 {
+    if (role != DUAL_ROLE_PC_DEVICE && role != DUAL_ROLE_MOUSE_HOST) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_role = role;
     s_report_callback = report_callback;
     s_release_callback = release_callback;
     const uart_config_t config = {

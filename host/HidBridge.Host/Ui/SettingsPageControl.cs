@@ -20,6 +20,7 @@ internal sealed class SettingsPageControl : UserControl
     private readonly CheckBox _startOnBootCheckBox;
     private readonly CheckBox _minimizeToTrayCheckBox;
     private readonly CheckBox _closeToTrayCheckBox;
+    private readonly CheckBox _legacySingleBoardFirmwareCheckBox;
     private readonly CheckBox _generateMovementAnalysisImageCheckBox;
     private readonly CheckBox _firmwareUpdateApiCheckBox;
     private readonly CheckBox _simulatedUdpCheckBox;
@@ -68,6 +69,9 @@ internal sealed class SettingsPageControl : UserControl
         _startOnBootCheckBox = CreateOption("开机启动", "登录当前 Windows 用户后自动启动本程序。");
         _minimizeToTrayCheckBox = CreateOption("最小化到托盘", "点击最小化后隐藏主窗口，双击托盘图标可恢复。");
         _closeToTrayCheckBox = CreateOption("关闭到托盘", "点击窗口关闭按钮时隐藏主窗口，不结束键鼠捕获和脚本运行。");
+        _legacySingleBoardFirmwareCheckBox = CreateOption(
+            "使用旧版单板通路",
+            "开启后完全使用旧版单板串口通路：跳过新双板角色握手，发送旧版 7 字节鼠标报告。仅在连接旧版单板转发固件时开启。默认关闭。\n开启后无法确认串口设备身份。 ");
         _generateMovementAnalysisImageCheckBox = CreateOption(
             "生成按键情况分析图片",
             "默认关闭。左右键同时按下开始记录，全部松开 3 秒后完成；启用后弹出 X/Y 实际固件报告分析窗口，并将 PNG 保存到程序目录 log。仅用于观察输出，不改变转发逻辑。");
@@ -109,7 +113,7 @@ internal sealed class SettingsPageControl : UserControl
         FlowLayoutPanel startupOptions = new()
         {
             Dock = DockStyle.Fill,
-            Height = 174,
+            Height = 212,
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
             Padding = new Padding(0, 8, 0, 0),
@@ -118,9 +122,10 @@ internal sealed class SettingsPageControl : UserControl
             WrapOption(_startOnBootCheckBox),
             WrapOption(_minimizeToTrayCheckBox),
             WrapOption(_closeToTrayCheckBox),
+            WrapOption(_legacySingleBoardFirmwareCheckBox),
         ]);
 
-        Panel startupPanel = CreateCardPanel(238);
+        Panel startupPanel = CreateCardPanel(276);
         Label startupTitle = CreateSectionTitle("启动与托盘");
         startupTitle.Dock = DockStyle.None;
         startupTitle.Location = new Point(16, 10);
@@ -128,7 +133,7 @@ internal sealed class SettingsPageControl : UserControl
         startupTitle.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         startupOptions.Dock = DockStyle.None;
         startupOptions.Location = new Point(16, 44);
-        startupOptions.Size = new Size(900, 178);
+        startupOptions.Size = new Size(900, 216);
         startupOptions.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         startupPanel.Controls.Add(startupOptions);
         startupPanel.Controls.Add(startupTitle);
@@ -200,6 +205,7 @@ internal sealed class SettingsPageControl : UserControl
         _startOnBootCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _minimizeToTrayCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _closeToTrayCheckBox.CheckedChanged += (_, _) => SaveSettings();
+        _legacySingleBoardFirmwareCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _generateMovementAnalysisImageCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _firmwareUpdateApiCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _simulatedUdpCheckBox.CheckedChanged += (_, _) => SaveSettings();
@@ -210,6 +216,7 @@ internal sealed class SettingsPageControl : UserControl
     internal CheckBox StartOnBootCheckBox => _startOnBootCheckBox;
     internal CheckBox MinimizeToTrayCheckBox => _minimizeToTrayCheckBox;
     internal CheckBox CloseToTrayCheckBox => _closeToTrayCheckBox;
+    internal CheckBox LegacySingleBoardFirmwareCheckBox => _legacySingleBoardFirmwareCheckBox;
     internal CheckBox GenerateMovementAnalysisImageCheckBox => _generateMovementAnalysisImageCheckBox;
     internal CheckBox FirmwareUpdateApiCheckBox => _firmwareUpdateApiCheckBox;
     internal CheckBox SimulatedUdpCheckBox => _simulatedUdpCheckBox;
@@ -691,6 +698,8 @@ internal sealed class SettingsPageControl : UserControl
         _controller.Settings.StartOnBoot = _startOnBootCheckBox.Checked;
         _minimizeToTrayCheckBox.Checked = _controller.Settings.MinimizeToTray;
         _closeToTrayCheckBox.Checked = _controller.Settings.CloseToTray;
+        _legacySingleBoardFirmwareCheckBox.Checked =
+            _controller.Settings.LegacySingleBoardFirmwareCompatibility;
         _generateMovementAnalysisImageCheckBox.Checked = _controller.Settings.GenerateMovementAnalysisImage;
         int simulatedFrequency = SimulatedUdpMouseInput.SupportedFrequencies.Contains(
             _controller.Settings.SimulatedUdpInputFrequencyHz)
@@ -717,6 +726,8 @@ internal sealed class SettingsPageControl : UserControl
         _controller.Settings.StartOnBoot = _startOnBootCheckBox.Checked;
         _controller.Settings.MinimizeToTray = _minimizeToTrayCheckBox.Checked;
         _controller.Settings.CloseToTray = _closeToTrayCheckBox.Checked;
+        _controller.Settings.LegacySingleBoardFirmwareCompatibility =
+            _legacySingleBoardFirmwareCheckBox.Checked;
         _controller.Settings.GenerateMovementAnalysisImage = _generateMovementAnalysisImageCheckBox.Checked;
         _controller.Settings.FirmwareUpdateApiEnabled =
             _firmwareUpdateApi is not null && _firmwareUpdateApiCheckBox.Checked;

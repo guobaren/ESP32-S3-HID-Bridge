@@ -51,6 +51,7 @@ class SerialTap:
         self.invalid_count = 0
         self.text_line_count = 0
         self.device_hello = False
+        self.device_role: Optional[int] = None
         self.expected_probe_nonce = expected_probe_nonce
         self.log_file = log_path.open("ab") if log_path else None
 
@@ -112,10 +113,14 @@ class SerialTap:
                 message_type == TYPE_DEVICE_HELLO
                 and payload[:8] == DEVICE_SIGNATURE
                 and self.expected_probe_nonce is not None
-                and payload[8:] == self.expected_probe_nonce
+                and payload[8:16] == self.expected_probe_nonce
+                and len(payload) in (16, 17)
             ):
                 self.device_hello = True
-                print("[device] DeviceHello HIDBRDG2 nonce matched")
+                self.device_role = payload[16] if len(payload) == 17 else None
+                role_name = {1: "PC_DEVICE", 2: "MOUSE_HOST"}.get(
+                    self.device_role, "legacy/unknown")
+                print(f"[device] DeviceHello HIDBRDG2 nonce matched role={role_name}")
             print(f"[frame] type=0x{message_type:02X} seq={sequence} payload={payload_length}")
 
 
@@ -140,8 +145,8 @@ def read_for(port, tap: SerialTap, seconds: float) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="双板 HID Proxy 原生 USB CDC 协议 v2 小幅往返测试")
-    parser.add_argument("--port", required=True, help="PC 侧原生 USB CDC COM 端口，例如 COM7")
+    parser = argparse.ArgumentParser(description="双板 HID Proxy 鼠标侧 UART0 协议 v2 小幅往返测试")
+    parser.add_argument("--port", required=True, help="鼠标侧板 CH340/UART0 COM 端口，例如 COM7")
     parser.add_argument("--baud", type=int, default=921600, help="CDC兼容参数；协议不依赖UART波特率")
     parser.add_argument("--step", type=int, default=4, help="X 方向测试步长，默认 4")
     parser.add_argument("--pause", type=float, default=0.25, help="+X 与 -X 之间的等待秒数")
@@ -149,6 +154,7 @@ def main() -> int:
     parser.add_argument("--cursor", action="store_true", help="只读取 Windows 光标位置，不发送本机输入")
     parser.add_argument("--log", type=Path, help="保存 UART 原始字节的文件路径")
     parser.add_argument("--no-probe", action="store_true", help="跳过 DeviceProbe（不推荐，可能选错 COM）")
+    parser.add_argument("--probe-only", action="store_true", help="只确认设备角色，不发送会话或移动命令")
     args = parser.parse_args()
 
     if args.step == 0 or not -32768 <= args.step <= 32767:
@@ -208,6 +214,12 @@ def main() -> int:
             if not tap.device_hello:
                 print("未收到匹配的 DeviceHello/HIDBRDG2，停止发送移动命令。", file=sys.stderr)
                 return 1
+            if tap.device_role not in (None, 2):
+                print("目标串口不是MOUSE_HOST，停止发送移动命令。", file=sys.stderr)
+                return 1
+        if args.probe_only:
+            print("[summary] probe_only=true role=MOUSE_HOST；未发送会话或移动命令。")
+            return 0
         send(TYPE_SESSION_START)
         send(TYPE_MOUSE, bytes((0, args.step & 0xFF, (args.step >> 8) & 0xFF, 0, 0, 0, 0, 0)))
         time.sleep(args.pause)

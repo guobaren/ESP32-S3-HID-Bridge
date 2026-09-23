@@ -20,6 +20,8 @@
 #include "dual_status_led.h"
 #include "hid_clone_descriptor.h"
 #include "hid_device_profile.h"
+#include "hid_report_layout.h"
+#include "mouse_motion_smoother.h"
 #include "uart1_link.h"
 #include "usb_cdc_control.h"
 
@@ -38,8 +40,9 @@
 #define CLONE_STRING_CAPACITY (HID_PROFILE_MAX_STRING_BYTES + 1U)
 #define RECONFIGURE_TASK_STACK 8192
 #define RECONFIGURE_TASK_PRIORITY 4
-#define VENDOR_INPUT_QUEUE_LENGTH 32
+#define VENDOR_INPUT_QUEUE_LENGTH 128
 #define VENDOR_CONTROL_QUEUE_LENGTH 8
+#define VENDOR_CLONE_READY_TIMEOUT_MS 5000U
 #define VENDOR_INPUT_TASK_STACK 3072
 #define VENDOR_CONTROL_TASK_STACK 3072
 #define VENDOR_GET_REPORT_TIMEOUT_MS 20
@@ -53,6 +56,7 @@ static TaskHandle_t s_reconfigure_task;
 static esp_timer_handle_t s_sender_timer;
 static volatile bool s_sender_stop_requested;
 static volatile bool s_reconfigure_enabled;
+static volatile bool s_reconfigure_disconnect_requested;
 static dual_input_state_t s_state;
 static volatile bool s_force_release;
 static volatile bool s_installed;
@@ -79,6 +83,10 @@ static int64_t s_output_y;
 static int64_t s_output_wheel;
 static int64_t s_output_pan;
 static int64_t s_last_stats_us;
+static uint32_t s_last_stats_timer_ticks;
+static uint32_t s_last_stats_physical_received;
+static uint32_t s_last_stats_submitted;
+static uint32_t s_last_stats_completions;
 static hid_device_profile_t s_reconfigure_profile;
 static hid_device_profile_t s_reconfigure_work_profile;
 static hid_device_profile_t s_active_profile;
@@ -86,6 +94,10 @@ static hid_clone_descriptor_set_t s_clone_descriptors;
 static tusb_desc_device_t s_clone_device_descriptor;
 static volatile bool s_clone_active;
 static uint8_t s_clone_mouse_instance;
+static hid_mouse_report_layout_t s_clone_mouse_layout;
+static uint8_t s_clone_mouse_template[DUAL_HID_RAW_INPUT_MAX_DATA];
+static uint8_t s_clone_mouse_template_length;
+static bool s_clone_mouse_template_valid;
 static char s_clone_manufacturer[CLONE_STRING_CAPACITY];
 static char s_clone_product[CLONE_STRING_CAPACITY];
 static char s_clone_serial[CLONE_STRING_CAPACITY];
@@ -94,6 +106,8 @@ static const char *s_clone_string_descriptors[CLONE_STRING_COUNT];
 static uint8_t s_clone_string_count;
 static const char s_empty_string[] = "";
 static volatile uint32_t s_clone_input_suppressed;
+static mouse_motion_smoother_t s_software_smoother;
+static uint8_t s_software_buttons;
 
 typedef struct {
     uint8_t interface_number;
@@ -137,11 +151,25 @@ static volatile uint32_t s_vendor_set_dropped;
 static volatile uint32_t s_vendor_get_requests;
 static volatile uint32_t s_vendor_get_timeouts;
 static volatile uint32_t s_vendor_get_mismatches;
+static volatile bool s_usb_reconfigure_in_progress;
 
 _Static_assert(CONFIG_FREERTOS_HZ == DUAL_PROXY_REQUIRED_FREERTOS_HZ,
                "dual_proxy要求CONFIG_FREERTOS_HZ=1000");
 _Static_assert(pdMS_TO_TICKS(1) == 1, "1ms必须正好折算为1 tick");
 _Static_assert(DUAL_PROXY_HID_PERIOD_US == 1000U, "HID周期必须保持1000us");
+
+static void apply_next_scheduled_software_locked(void)
+{
+    const mouse_motion_delta_t scheduled =
+        mouse_motion_smoother_take_next(&s_software_smoother);
+    dual_input_software_report(
+        &s_state,
+        s_software_buttons,
+        (int16_t)scheduled.x,
+        (int16_t)scheduled.y,
+        (int8_t)scheduled.wheel,
+        (int8_t)scheduled.pan);
+}
 
 static bool clone_copy_ascii(
     char *destination,
@@ -216,6 +244,8 @@ static bool prepare_clone_descriptor_set(const hid_device_profile_t *profile)
     }
 
     uint8_t mouse_instance = UINT8_MAX;
+    hid_mouse_report_layout_t mouse_layout;
+    memset(&mouse_layout, 0, sizeof(mouse_layout));
     for (uint8_t instance = 0; instance < built.hid_count; ++instance) {
         const uint8_t report_index = built.profile_report_indices[instance];
         if (report_index >= profile->report_descriptor_count) {
@@ -223,11 +253,19 @@ static bool prepare_clone_descriptor_set(const hid_device_profile_t *profile)
         }
         const hid_profile_report_descriptor_t *report =
             &profile->report_descriptors[report_index];
-        if (report->subclass == 1U && report->protocol == HID_ITF_PROTOCOL_MOUSE) {
+        hid_mouse_report_layout_t candidate;
+        memset(&candidate, 0, sizeof(candidate));
+        if (hid_report_find_mouse_layout(
+                report->data, report->length, &candidate)) {
             if (mouse_instance != UINT8_MAX) {
                 return false;
             }
+            if (candidate.report_bytes == 0U ||
+                candidate.report_bytes > DUAL_HID_RAW_INPUT_MAX_DATA) {
+                return false;
+            }
             mouse_instance = instance;
+            mouse_layout = candidate;
         }
     }
     if (mouse_instance == UINT8_MAX) {
@@ -252,6 +290,14 @@ static bool prepare_clone_descriptor_set(const hid_device_profile_t *profile)
     memcpy(&s_clone_device_descriptor, built.device_descriptor,
            sizeof(s_clone_device_descriptor));
     /* 严格克隆不附加 CDC/IAD，必须保留物理设备原始 class tuple。 */
+    /*
+     * bMaxPacketSize0 是设备控制器的硬件/编译期属性，不能像
+     * VID/PID 和 HID 拓扑一样在运行时克隆。例如 C539 接收器声明
+     * 32 bytes，而 ESP32-S3 TinyUSB 设备端按 CFG_TUD_ENDPOINT0_SIZE
+     * 配置。描述符必须反映实际控制端点，否则主机可能在取配置
+     * 描述符前就中止枚举。
+     */
+    s_clone_device_descriptor.bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE;
     s_clone_device_descriptor.bNumConfigurations = 1;
     for (uint8_t index = 0; index < CLONE_STRING_COUNT; ++index) {
         s_clone_string_descriptors[index] = s_empty_string;
@@ -268,6 +314,10 @@ static bool prepare_clone_descriptor_set(const hid_device_profile_t *profile)
     }
     s_clone_string_count = (uint8_t)(maximum_string_index + 1U);
     s_clone_mouse_instance = mouse_instance;
+    s_clone_mouse_layout = mouse_layout;
+    s_clone_mouse_template_length = (uint8_t)mouse_layout.report_bytes;
+    s_clone_mouse_template_valid = false;
+    memset(s_clone_mouse_template, 0, sizeof(s_clone_mouse_template));
     return true;
 }
 
@@ -330,22 +380,56 @@ static void vendor_input_task(void *argument)
         if (xQueueReceive(s_vendor_input_queue, &item, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        uint8_t instance = 0;
-        if (!s_clone_active || !s_installed || !tud_mounted() ||
-            !clone_instance_for_interface(item.interface_number, &instance) ||
-            item.length == 0U || !tud_hid_n_ready(instance)) {
+        if (item.length == 0U) {
             ++s_vendor_input_dropped;
-            ESP_LOGW(TAG,
-                     "PC vendor IN丢弃: interface=%u id=%02X length=%u mounted=%u ready=%u",
-                     item.interface_number, item.report_id, item.length,
-                     tud_mounted() ? 1U : 0U,
-                     instance < CONFIG_TINYUSB_HID_COUNT && tud_hid_n_ready(instance) ? 1U : 0U);
             continue;
         }
-        ESP_LOGI(TAG, "PC vendor IN提交: instance=%u interface=%u id=%02X length=%u",
-                 instance, item.interface_number, item.report_id, item.length);
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, item.data, item.length, ESP_LOG_INFO);
-        if (tud_hid_n_report(instance, item.report_id, item.data, item.length)) {
+        uint8_t instance = 0;
+        bool clone_ready = false;
+        for (uint32_t waited_ms = 0; waited_ms < VENDOR_CLONE_READY_TIMEOUT_MS;
+             ++waited_ms) {
+            if (s_clone_active && s_installed && tud_mounted() &&
+                clone_instance_for_interface(item.interface_number, &instance)) {
+                clone_ready = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (!clone_ready) {
+            ++s_vendor_input_dropped;
+            continue;
+        }
+        if (instance == s_clone_mouse_instance &&
+            item.report_id == s_clone_mouse_layout.report_id &&
+            item.length == s_clone_mouse_layout.report_bytes &&
+            s_state_mutex != NULL) {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            memcpy(s_clone_mouse_template, item.data, item.length);
+            s_clone_mouse_template_length = item.length;
+            s_clone_mouse_template_valid = true;
+            xSemaphoreGive(s_state_mutex);
+        }
+        /*
+         * UART 到包时刻与 USB IN 轮询不同步，不能因为端点正好
+         * busy 就丢掉实体鼠标/键盘报告。由 complete callback 唤醒后
+         * 立即重试，最多等待 4 ms；断线或长时间不 ready 仍有明确丢弃
+         * 边界，避免单个故障接口堵死整条链路。
+         */
+        (void)ulTaskNotifyTake(pdTRUE, 0);
+        bool submitted = false;
+        for (uint8_t attempt = 0; attempt < 4U; ++attempt) {
+            if (!s_clone_active || !s_installed || !tud_mounted()) {
+                break;
+            }
+            if (tud_hid_n_ready(instance) &&
+                tud_hid_n_report(instance, item.report_id,
+                                 item.data, item.length)) {
+                submitted = true;
+                break;
+            }
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
+        }
+        if (submitted) {
             ++s_vendor_input_submitted;
         } else {
             ++s_vendor_input_dropped;
@@ -773,7 +857,9 @@ static void usb_event_callback(tinyusb_event_t *event, void *argument)
         ESP_LOGW(TAG, "PC侧USB HID已断开，清理所有输入");
         dual_status_led_set_pc_mounted(false);
         dual_usb_cdc_control_on_detached();
-        dual_pc_hid_vendor_link_fault();
+        if (!s_usb_reconfigure_in_progress) {
+            dual_pc_hid_vendor_link_fault();
+        }
         dual_pc_hid_release_all();
     }
 }
@@ -791,12 +877,14 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_
 {
     (void)report;
     (void)len;
-    if (instance != (s_clone_active ? s_clone_mouse_instance : 0U)) {
-        return;
+    if (s_vendor_input_task != NULL) {
+        xTaskNotifyGive(s_vendor_input_task);
     }
-    ++s_hid_completions;
-    if (s_sender_task != NULL) {
-        xTaskNotifyGive(s_sender_task);
+    if (instance == (s_clone_active ? s_clone_mouse_instance : 0U)) {
+        ++s_hid_completions;
+        if (s_sender_task != NULL) {
+            xTaskNotifyGive(s_sender_task);
+        }
     }
 }
 
@@ -826,48 +914,72 @@ static int64_t add_stat_axis(int64_t first, int64_t second)
 static void log_hid_statistics_if_due(void)
 {
     const int64_t now_us = esp_timer_get_time();
-    if (s_last_stats_us == 0 || now_us - s_last_stats_us >= 5000000LL) {
+    if (s_last_stats_us == 0 || now_us - s_last_stats_us >= 1000000LL) {
         int64_t pending_x = 0;
         int64_t pending_y = 0;
         int64_t pending_wheel = 0;
         int64_t pending_pan = 0;
         if (s_state_mutex != NULL) {
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-            pending_x = add_stat_axis(s_state.physical_x, s_state.software_x);
-            pending_y = add_stat_axis(s_state.physical_y, s_state.software_y);
-            pending_wheel = add_stat_axis(s_state.physical_wheel, s_state.software_wheel);
-            pending_pan = add_stat_axis(s_state.physical_pan, s_state.software_pan);
+            const mouse_motion_delta_t scheduled =
+                mouse_motion_smoother_pending(&s_software_smoother);
+            pending_x = add_stat_axis(
+                add_stat_axis(s_state.physical_x, s_state.software_x), scheduled.x);
+            pending_y = add_stat_axis(
+                add_stat_axis(s_state.physical_y, s_state.software_y), scheduled.y);
+            pending_wheel = add_stat_axis(
+                add_stat_axis(s_state.physical_wheel, s_state.software_wheel),
+                scheduled.wheel);
+            pending_pan = add_stat_axis(
+                add_stat_axis(s_state.physical_pan, s_state.software_pan), scheduled.pan);
             xSemaphoreGive(s_state_mutex);
         }
         const int64_t input_x = add_stat_axis(s_physical_input_x, s_software_input_x);
         const int64_t input_y = add_stat_axis(s_physical_input_y, s_software_input_y);
         const int64_t input_wheel = add_stat_axis(s_physical_input_wheel, s_software_input_wheel);
         const int64_t input_pan = add_stat_axis(s_physical_input_pan, s_software_input_pan);
+        const uint32_t timer_hz = s_hid_timer_ticks - s_last_stats_timer_ticks;
+        const uint32_t physical_rx_hz =
+            s_physical_received - s_last_stats_physical_received;
+        const uint32_t submitted_hz = s_hid_submitted - s_last_stats_submitted;
+        const uint32_t completion_hz = s_hid_completions - s_last_stats_completions;
         ESP_LOGI(TAG,
-                 "HID统计：timer=%" PRIu32 " not_mounted=%" PRIu32 " not_ready=%" PRIu32
+                 "HID统计：rate timer/phys_rx/submit/complete=%" PRIu32 "/%" PRIu32
+                     "/%" PRIu32 "/%" PRIu32
+                     " total timer=%" PRIu32 " not_mounted=%" PRIu32 " not_ready=%" PRIu32
                  " attempt=%" PRIu32 " submitted=%" PRIu32 " failed=%" PRIu32
                      " complete=%" PRIu32 " transfer_fail=%" PRIu32 " physical_rx=%" PRIu32
                      " clone_suppressed=%" PRIu32
-                     " vendor_rx=%" PRIu32 " vendor_submitted=%" PRIu32
-                     " vendor_dropped=%" PRIu32
+                  " vendor_rx=%" PRIu32 " vendor_submitted=%" PRIu32
+                      " vendor_dropped=%" PRIu32
+                      " set_queued/dropped=%" PRIu32 "/%" PRIu32
+                      " get_requests/timeouts/mismatches=%" PRIu32 "/%" PRIu32 "/%" PRIu32
                      " input_phys=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
                  " input_soft=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
                  " output=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
                  " pending=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")"
-                 " balance=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")",
+                  " balance=(%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ")",
+                 timer_hz, physical_rx_hz, submitted_hz, completion_hz,
                  s_hid_timer_ticks, s_hid_not_mounted, s_hid_not_ready,
                   s_hid_attempts, s_hid_submitted, s_hid_submit_failures,
                   s_hid_completions, s_hid_transfer_failures, s_physical_received,
-                  s_clone_input_suppressed, s_vendor_input_received,
-                  s_vendor_input_submitted, s_vendor_input_dropped,
+                   s_clone_input_suppressed, s_vendor_input_received,
+                   s_vendor_input_submitted, s_vendor_input_dropped,
+                   s_vendor_set_queued, s_vendor_set_dropped,
+                   s_vendor_get_requests, s_vendor_get_timeouts,
+                   s_vendor_get_mismatches,
                  s_physical_input_x, s_physical_input_y, s_physical_input_wheel, s_physical_input_pan,
                  s_software_input_x, s_software_input_y, s_software_input_wheel, s_software_input_pan,
                  s_output_x, s_output_y, s_output_wheel, s_output_pan,
                  pending_x, pending_y, pending_wheel, pending_pan,
                  input_x - s_output_x - pending_x,
                  input_y - s_output_y - pending_y,
-                 input_wheel - s_output_wheel - pending_wheel,
-                 input_pan - s_output_pan - pending_pan);
+                  input_wheel - s_output_wheel - pending_wheel,
+                  input_pan - s_output_pan - pending_pan);
+        s_last_stats_timer_ticks = s_hid_timer_ticks;
+        s_last_stats_physical_received = s_physical_received;
+        s_last_stats_submitted = s_hid_submitted;
+        s_last_stats_completions = s_hid_completions;
         s_last_stats_us = now_us;
     }
 }
@@ -886,10 +998,65 @@ static void sender_task(void *argument)
             continue;
         }
         if (s_clone_active) {
-            /* The normalized 7-byte report is not valid for an arbitrary
-             * cloned profile.  Until a report-field encoder exists, never
-             * submit it under the cloned descriptor. */
-            ++s_clone_input_suppressed;
+            if (!tud_hid_n_ready(s_clone_mouse_instance)) {
+                ++s_hid_not_ready;
+                continue;
+            }
+            dual_mouse_report_t report;
+            uint8_t payload[DUAL_HID_RAW_INPUT_MAX_DATA] = {0};
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            const bool force = s_force_release;
+            apply_next_scheduled_software_locked();
+            const bool software_flash_pending = s_software_flash_pending;
+            const bool available = dual_input_peek_report(
+                &s_state, &report, force);
+            if (!available) {
+                xSemaphoreGive(s_state_mutex);
+                continue;
+            }
+            const uint8_t payload_length = s_clone_mouse_template_length;
+            if (payload_length == 0U ||
+                payload_length != s_clone_mouse_layout.report_bytes) {
+                ++s_hid_submit_failures;
+                xSemaphoreGive(s_state_mutex);
+                continue;
+            }
+            if (s_clone_mouse_template_valid) {
+                memcpy(payload, s_clone_mouse_template, payload_length);
+            }
+            if (!hid_mouse_report_apply_overlay(
+                    &s_clone_mouse_layout, payload, payload_length,
+                    report.buttons, report.x, report.y,
+                    report.wheel, report.pan)) {
+                ++s_hid_submit_failures;
+                xSemaphoreGive(s_state_mutex);
+                continue;
+            }
+            ++s_hid_attempts;
+            if (!tud_hid_n_report(
+                    s_clone_mouse_instance, s_clone_mouse_layout.report_id,
+                    payload, payload_length)) {
+                ++s_hid_submit_failures;
+                xSemaphoreGive(s_state_mutex);
+                continue;
+            }
+            dual_input_commit_report(&s_state, &report);
+            if (force) {
+                s_force_release = false;
+            }
+            if (software_flash_pending) {
+                s_software_flash_pending = false;
+            }
+            ++s_hid_submitted;
+            s_output_x += report.x;
+            s_output_y += report.y;
+            s_output_wheel += report.wheel;
+            s_output_pan += report.pan;
+            xSemaphoreGive(s_state_mutex);
+            if (software_flash_pending) {
+                dual_status_led_notify_software_success(
+                    (uint32_t)(esp_timer_get_time() / 1000LL));
+            }
             continue;
         }
         if (!tud_hid_ready()) {
@@ -900,6 +1067,7 @@ static void sender_task(void *argument)
         dual_mouse_report_t report;
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         const bool force = s_force_release;
+        apply_next_scheduled_software_locked();
         const bool software_flash_pending = s_software_flash_pending;
         const bool available = dual_input_peek_report(&s_state, &report, force);
         if (!available) {
@@ -1004,38 +1172,66 @@ static esp_err_t restart_runtime_after_install(void)
     return result;
 }
 
+static esp_err_t stop_installed_usb(void)
+{
+    if (!s_installed) {
+        return ESP_OK;
+    }
+    dual_pc_hid_release_all();
+    vTaskDelay(pdMS_TO_TICKS(3));
+    esp_err_t result = dual_usb_cdc_control_stop();
+    if (result == ESP_OK) {
+        result = dual_pc_hid_stop_sender();
+    }
+    if (result == ESP_OK) {
+        result = tinyusb_driver_uninstall();
+    }
+    if (result == ESP_OK) {
+        s_installed = false;
+        dual_status_led_set_pc_mounted(false);
+    }
+    return result;
+}
+
 static void reconfigure_task(void *argument)
 {
     (void)argument;
     while (true) {
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+        const bool disconnect_requested = s_reconfigure_disconnect_requested;
         memcpy(&s_reconfigure_work_profile, &s_reconfigure_profile,
                sizeof(s_reconfigure_work_profile));
         xSemaphoreGive(s_reconfigure_mutex);
 
-        if (!prepare_clone_descriptor_set(&s_reconfigure_work_profile)) {
-            ESP_LOGE(TAG, "物理HID Profile不满足安全克隆条件，保留通用USB设备");
+        if (disconnect_requested) {
+            s_usb_reconfigure_in_progress = false;
+            const esp_err_t result = stop_installed_usb();
+            if (result != ESP_OK) {
+                ESP_LOGE(TAG, "物理鼠标消失后断开USB失败：%s", esp_err_to_name(result));
+                continue;
+            }
+            s_clone_active = false;
+            s_clone_mouse_template_valid = false;
+            s_clone_mouse_template_length = 0;
+            memset(s_clone_mouse_template, 0, sizeof(s_clone_mouse_template));
+            memset(&s_active_profile, 0, sizeof(s_active_profile));
+            ESP_LOGW(TAG, "接收端USB已断开，等待新的完整物理HID Profile");
             continue;
         }
 
-        dual_pc_hid_release_all();
-        vTaskDelay(pdMS_TO_TICKS(3));
-        esp_err_t result = dual_usb_cdc_control_stop();
-        if (result == ESP_OK) {
-            result = dual_pc_hid_stop_sender();
+        if (!prepare_clone_descriptor_set(&s_reconfigure_work_profile)) {
+            ESP_LOGE(TAG, "物理HID Profile不满足安全克隆条件，保持USB断开");
+            continue;
         }
+
+        s_usb_reconfigure_in_progress = true;
+        esp_err_t result = stop_installed_usb();
         if (result != ESP_OK) {
+            s_usb_reconfigure_in_progress = false;
             ESP_LOGE(TAG, "动态USB切换前停止任务失败：%s", esp_err_to_name(result));
             continue;
         }
-        result = tinyusb_driver_uninstall();
-        if (result != ESP_OK) {
-            ESP_LOGE(TAG, "卸载通用USB设备失败：%s", esp_err_to_name(result));
-            (void)restart_runtime_after_install();
-            continue;
-        }
-        s_installed = false;
         vTaskDelay(pdMS_TO_TICKS(300));
 
         memcpy(&s_active_profile, &s_reconfigure_work_profile,
@@ -1045,6 +1241,7 @@ static void reconfigure_task(void *argument)
         if (result == ESP_OK) {
             result = restart_runtime_after_install();
         }
+        s_usb_reconfigure_in_progress = false;
         if (result == ESP_OK) {
             ESP_LOGI(TAG,
                      "动态USB严格克隆已启用：VID:PID=%04X:%04X HID=%u mouse_instance=%u CDC=disabled",
@@ -1055,7 +1252,7 @@ static void reconfigure_task(void *argument)
             continue;
         }
 
-        ESP_LOGE(TAG, "动态USB克隆启动失败：%s；回退通用USB设备", esp_err_to_name(result));
+        ESP_LOGE(TAG, "动态USB克隆启动失败：%s；保持USB断开", esp_err_to_name(result));
         if (s_installed) {
             (void)dual_usb_cdc_control_stop();
             (void)dual_pc_hid_stop_sender();
@@ -1063,14 +1260,6 @@ static void reconfigure_task(void *argument)
             s_installed = false;
         }
         s_clone_active = false;
-        vTaskDelay(pdMS_TO_TICKS(300));
-        result = install_tinyusb(false);
-        if (result == ESP_OK) {
-            result = restart_runtime_after_install();
-        }
-        if (result != ESP_OK) {
-            ESP_LOGE(TAG, "通用USB设备回退失败：%s", esp_err_to_name(result));
-        }
     }
 }
 
@@ -1084,6 +1273,8 @@ esp_err_t dual_pc_hid_install_device(void)
         return ESP_ERR_NO_MEM;
     }
     dual_input_init(&s_state);
+    mouse_motion_smoother_reset(&s_software_smoother);
+    s_software_buttons = 0;
     s_force_release = false;
     s_hid_timer_ticks = 0;
     s_hid_not_mounted = 0;
@@ -1108,8 +1299,15 @@ esp_err_t dual_pc_hid_install_device(void)
     s_output_wheel = 0;
     s_output_pan = 0;
     s_last_stats_us = 0;
+    s_last_stats_timer_ticks = 0;
+    s_last_stats_physical_received = 0;
+    s_last_stats_submitted = 0;
+    s_last_stats_completions = 0;
     s_clone_active = false;
     s_clone_input_suppressed = 0;
+    s_clone_mouse_template_length = 0;
+    s_clone_mouse_template_valid = false;
+    memset(s_clone_mouse_template, 0, sizeof(s_clone_mouse_template));
     const esp_err_t result = install_tinyusb(false);
     if (result != ESP_OK) {
         vSemaphoreDelete(s_state_mutex);
@@ -1179,6 +1377,7 @@ void dual_pc_hid_enable_reconfigure(void)
         return;
     }
     s_reconfigure_enabled = true;
+    s_reconfigure_disconnect_requested = false;
 }
 
 esp_err_t dual_pc_hid_schedule_reconfigure(const hid_device_profile_t *profile)
@@ -1188,25 +1387,56 @@ esp_err_t dual_pc_hid_schedule_reconfigure(const hid_device_profile_t *profile)
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    s_reconfigure_disconnect_requested = false;
     memcpy(&s_reconfigure_profile, profile, sizeof(s_reconfigure_profile));
     xSemaphoreGive(s_reconfigure_mutex);
     xTaskNotifyGive(s_reconfigure_task);
     return ESP_OK;
 }
 
-void dual_pc_hid_software_report(uint8_t buttons, int16_t x, int16_t y, int8_t wheel, int8_t pan)
+esp_err_t dual_pc_hid_schedule_disconnect(void)
 {
-    if (s_state_mutex == NULL) {
+    if (!s_reconfigure_enabled || s_reconfigure_mutex == NULL ||
+        s_reconfigure_task == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    s_reconfigure_disconnect_requested = true;
+    xSemaphoreGive(s_reconfigure_mutex);
+    xTaskNotifyGive(s_reconfigure_task);
+    return ESP_OK;
+}
+
+void dual_pc_hid_software_report(
+    uint8_t buttons,
+    int16_t x,
+    int16_t y,
+    int8_t wheel,
+    int8_t pan,
+    uint8_t smoothing_slots)
+{
+    if (s_state_mutex == NULL ||
+        !mouse_motion_smoother_valid_slot_count(smoothing_slots)) {
         return;
     }
+    const mouse_motion_delta_t delta = {
+        .x = x,
+        .y = y,
+        .wheel = wheel,
+        .pan = pan,
+    };
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    dual_input_software_report(&s_state, buttons, x, y, wheel, pan);
+    s_software_buttons = buttons & 0x1FU;
+    dual_input_software_report(&s_state, s_software_buttons, 0, 0, 0, 0);
+    mouse_motion_smoother_enqueue(&s_software_smoother, delta, smoothing_slots);
     s_software_flash_pending = true;
     s_software_input_x += x;
     s_software_input_y += y;
     s_software_input_wheel += wheel;
     s_software_input_pan += pan;
     xSemaphoreGive(s_state_mutex);
+    /* 即使 sender 任务异常未运行，也从输入侧留下每秒一次的闭环诊断。 */
+    log_hid_statistics_if_due();
 }
 
 void dual_pc_hid_software_release(void)
@@ -1215,6 +1445,8 @@ void dual_pc_hid_software_release(void)
         return;
     }
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    mouse_motion_smoother_reset(&s_software_smoother);
+    s_software_buttons = 0;
     dual_input_software_release(&s_state);
     s_software_flash_pending = false;
     xSemaphoreGive(s_state_mutex);
@@ -1251,6 +1483,8 @@ void dual_pc_hid_release_all(void)
         return;
     }
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    mouse_motion_smoother_reset(&s_software_smoother);
+    s_software_buttons = 0;
     dual_input_release_all(&s_state);
     s_software_flash_pending = false;
     s_force_release = true;
