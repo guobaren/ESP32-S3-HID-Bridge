@@ -6,7 +6,7 @@
 - USB Host 成功启动至少一个物理 HID 接口：本机锁定为 `MOUSE_HOST`，以 USB Host 接真实鼠标/接收器，同时从 UART0/CH340 接收电脑 A 的软件输入。此角色确认不要求先解析出标准鼠标布局，避免复合设备枚举期间按周期切断重试；实体移动只由已识别的鼠标 Report layout 转换和转发；
 - 任一板锁定后通过周期性 `LINK_HELLO` 告知对端，未定身份的一侧锁定为相反角色。锁定后 USB 或 UART 暂时断开不会重新选角色；角色仅保存在 RAM，单板复位由仍在线的对端告知互补角色，两板都断电后双方重新从 `UNRESOLVED` 开始。
 
-板载 ESP32-S3-DevKitC-1 WS2812B 使用 GPIO48：身份未定时熄灭；锁定身份但板间对端未在线时红色常亮；对端在线时 `MOUSE_HOST` 为绿色、`PC_DEVICE` 为蓝色。本地 Profile 采集、诊断版 5 秒接收确认或 USB 克隆失败时红色闪烁。电脑侧 USB 已挂载且软件移动报告提交成功时蓝灯短暂熄灭。LED 刷新由独立任务执行，1 kHz 输入路径只更新状态。
+板载 ESP32-S3-DevKitC-1 WS2812B 使用 GPIO48：身份未定时熄灭；锁定身份但板间对端未在线时红色常亮；对端在线时 `MOUSE_HOST` 为绿色、`PC_DEVICE` 为蓝色。本地 Profile 采集、`FLOW_ACK` 阶段确认超时（当前正式值 5 秒）或 USB 克隆失败时红色闪烁。电脑侧 USB 已挂载且软件移动报告提交成功时蓝灯短暂熄灭。LED 刷新由独立任务执行，1 kHz 输入路径只更新状态。
 
 ## 运行连接
 
@@ -47,7 +47,7 @@ PC 侧正式运行时不追加 CDC、自定义 HID 或隐藏控制 Report；它�
 | `0x31` | PROFILE_OFFER：M 发起新 Profile 克隆提议 |
 | `0x32` | FLOW_ACK：REQUEST、OFFER、COMMIT 或 DEVICE_GONE 的接收确认 |
 
-UART1 会拒绝相同 node ID 或相同角色的对端；3 个 250 ms 周期无有效帧、鼠标侧掉电、物理鼠标拔出或 Profile 超时均按设备拔出处理：先释放所有输入，再让 PC 侧卸载 USB Device。新 Profile 完整校验前不会重新连接电脑 B。
+UART1 会拒绝相同 node ID 或相同角色的对端；**超过 `LINK_TIMEOUT_MS`＝3000 ms（约 12 个 250 ms 心跳周期）无有效帧**、鼠标侧掉电、物理鼠标拔出（先经 800 ms 瞬断防抖）或 Profile 超时均按设备拔出处理：先释放所有输入，再让 PC 侧卸载 USB Device。新 Profile 完整校验前不会重新连接电脑 B。（该阈值原为 750 ms，与实测心跳间隔峰值 737 ms 只差 13 ms，会造成克隆反复拆卸重建，已放宽。）
 
 每次启动生成新的非零 32 位 UART1 generation。对端 generation 变化会清除旧序号窗口与本会话申请状态；P 再发一次 `PROFILE_REQUEST`，M 重新获取当前 USB 信息并发 OFFER。旧会话缓存的未确认 Profile 不会在新会话自行提议，以免与 P 请求形成双克隆。该字段位于 12-byte `LINK_HELLO` 和 4-byte `LINK_PING` 中，因此两板必须刷入同一版本。
 
@@ -81,6 +81,21 @@ C092 的 VID/PID、字符串、67/151 字节报告描述符仅是首个测试向
 
 软件键盘注入只在物理 Profile 本来就包含可安全解析的键盘 collection 时允许；为保持厂商驱动兼容，不给纯鼠标 Profile 追加键盘接口。
 
+## 控制通道加固与自愈（2026-09-25）
+
+针对"设备偶发不完成一笔控制传输"导致整条厂商通道瘫痪（第三方组件整设备共用**一个** `usb_transfer_t`，超时后不取消、后续提交被 `ESP_ERR_NOT_FINISHED` 拒绝）：
+
+- **独立 URB 直连通道**：`vendor_urb.{c,h}`，SET 路径经 `VENDOR_USE_DIRECT_URB`（`hid_host_mouse.c:27`，默认 1）切换，每个请求独立分配 URB、完成即释放；本版本无 `usb_host_transfer_abort` 且 EP0 不支持 flush，超时 URB 标记 `orphan` 由回调回收。
+- **参数**：单次等待 `VENDOR_URB_TIMEOUT_MS=800`、每请求最多 `VENDOR_URB_ATTEMPTS=2` 次尝试、连续 `VENDOR_URB_RECOVER_STREAK=3` 次请求失败升级。
+- **两级恢复**：① 重挂各活动 HID 接口（`recover`）；② 一级被在飞传输挡住时根端口断电 300 ms 重枚举（`port_cycle`）。第三级（重启 USB 主机栈）未实现。
+- **预热期豁免**：枚举后 `VENDOR_URB_WARMUP_US=10 s` 内用 2500 ms 等待且**只重试、不升级**，避免"端口断电 → 重新枚举 → 再进慢阶段"的恢复风暴。
+- **其它已生效机制**：上电/复位后克隆 USB 操作无条件延迟 1000 ms（`CLONE_USB_START_DELAY_MS`）；鼠标瞬断 800 ms 防抖（`MOUSE_GONE_DEBOUNCE_US`）；UART1 接收缓冲 16 KB 且**溢出不再判链路故障**（只 flush + 重同步 + `rx_ovf`）；三条发送队列各 128 槽；P 侧握手保护窗 2.5 s / 厂商在途 400 ms 内纯移动让路、移动配额 96/128 槽。
+- **已知缺口**：GET_REPORT 仍走组件单例 URB（`hid_host_mouse.c:852`）；P 侧任务优先级仍是 `sender > vendor_input > vendor_control`；`s_mouse_motion_yielded` 未接入日志行。
+
+## 板载滚动日志
+
+每板把控制台日志写入 SPIFFS（`partitions.csv` 的 `storage` 4 MB；4×512 KB 文件轮转＝上限 2 MB；跨复位续写；每行前缀 `[b<boot> mm:ss.mmm]`）。协议命令 `0x08/0x0A/0x0B` 走 UART0 或原生 CDC，取用入口为 `tools/fetch_onboard_log.py` 与主机 EXE 的「转存板载日志」按钮。注意 `LOG_LINE_MAX=512`：统计行加了字段后会在板载副本里被截断，读计数请走控制台。
+
 ## 构建和刷写
 
 在 ESP-IDF 6.0.2 环境中：
@@ -92,7 +107,11 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
-刷写仍使用项目现有工具选择本工程 `build/flasher_args.json`。本任务只构建，不自动刷写硬件。
+刷写使用本工程 `build/flasher_args.json`（**不是**早期单板 `firmware/build/flasher_args.json`）。注意事项：
+
+- **两板必须刷同一版本固件**：`PROFILE_ACK` 长度（17 bytes）本身就是新旧判别条件，混刷会出现长度不匹配并判失败。
+- 分区表含 `storage`（SPIFFS 4 MB）：改动分区表必须**整片重刷**（bootloader + partition + app 三段）。
+- 刷写**不会清除 SPIFFS**，板载日志跨刷写保留；需要清空请用 `0x0A` 或 `tools/fetch_onboard_log.py --clear-*`。
 
 ## 纯逻辑回归
 

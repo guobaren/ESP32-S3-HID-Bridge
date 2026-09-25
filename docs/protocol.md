@@ -1,5 +1,9 @@
 # 主机输入协议（UART / USB CDC）
 
+> **适用范围**：本文的「帧格式 / 消息类型 / 双板透明代理内部协议 / 有界重试与去重规则 / 板载日志下载命令」适用于当前双板主线 `firmware/dual_proxy`（板载日志容量见下）。
+> 「主机局域网模拟鼠标 UDP 接口」整章属于**主机 EXE + 早期单板固件**形态（UDP/kmboxNet 远程输入），双板主线不涉及，保留供该产品线参考。
+> 标注为"早期单板"的段落（原生 USB CDC 探测窗口、BLE 节拍、Wi-Fi TCP）只适用于 `firmware/` 单板工程；双板克隆不开 CDC、无 Wi-Fi/BLE。
+
 ## 帧格式
 
 所有多字节整数采用小端序。
@@ -80,26 +84,27 @@ FLOW_ACK 的字段偏移为：`acknowledged_type@0`、`flow_id@1`、`status@5`�
 - 重复 `PROFILE_REQUEST`/`PROFILE_OFFER` 按 generation + flow ID 去重；物理鼠标尚未枚举时 M 受理并等待，设备到达后继续当前流程。
 - 接收端对重复到达的前缀分片幂等（内容一致才忽略，冲突则失败）；同一 `transfer_id` 的重复 BEGIN/CHUNK/COMMIT 返回既有结果，不重新发布，因此不会第二次重枚举 USB。最终 `PROFILE_ACK` 丢失时 M 只重放同一 transfer 的 COMMIT，P 只补发确认。
 - 恢复总预算 10 秒，各阶段共用剩余预算，不串联多个完整等待窗口；预算耗尽后明确终止本轮，新物理事件或新会话可重新发起。
+- 当前 `FLOW_ACK` 的**阶段超时为 5 秒**（`LINK_PROFILE_STAGE_TIMEOUT_US`，即 `LINK_FLOW_ACK_TIMEOUT_US`），占 10 秒共享预算的一半；原计划恢复为 1 秒尚未执行。控制传输（EP0）另有一套独立参数：单次等待 800 ms、每请求最多 2 次尝试、连续 3 次失败升级恢复，枚举后 10 秒预热期内只重试不升级（见 `docs/连接流程.md` §12）。
 
 Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`version:u16`、`header_length:u16`、Device descriptor 长度、Configuration descriptor 长度、manufacturer/product/serial UTF-8 长度、报告项数量和 `flags:u8`；随后按长度排列各段数据。每个报告项为 `interface_number:u8`、`subclass:u8`、`protocol:u8`、保留字节、`report_length:u16` 和原始 HID Report descriptor。所有整数均为小端，完整 blob 上限 4096 字节，最多 8 个接口、单份报告描述符 512 字节、每个字符串 128 字节。
 
 接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。电脑侧每收到完整 Profile 都必须覆盖旧 Profile 并重新插拔电脑 USB：先使旧 vendor HID 会话代号失效、清空输入/控制队列和待处理 GET_REPORT，卸载旧 TinyUSB 设备并清空活动 Profile/报告模板；USB 断开后才构建并安装新描述符，避免枚举期间新旧描述符混用。无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许回退呈现旧 Profile 或通用设备冒充物理鼠标。
 
 实体 raw Input 优先于软件输入；软件 move/release 使用独立有界队列；HID 厂商控制使用独立队列；Profile 只在安全/输入队列允许时分片发送。鼠标拔出、UART1 超时、鼠标侧掉电或 Profile 超时都先释放输入，再由电脑侧卸载 USB Device；重新插入后只有完整新 Profile 校验通过才重新枚举。
-主机同步程序打开 UART 或原生 USB CDC 对应的 COM 口后，会由同一个 `SerialPort` 实例读取设备日志并缓冲写入 `deviceLogPath` 指定的文件（默认是 EXE 同目录 `log/device/host-serial-{timestamp}.log`），并按 `deviceLogRetentionCount` 清理最旧文件，因此不需要、也不能再同时运行 `idf.py monitor` 独占同一个 COM 口。为避免高频 BLE notify 日志重复触发主机日志落盘和 WinForms 重绘，`showDeviceLogInUi` 默认关闭；该选项只影响窗口镜像，不影响独立设备日志文件。
+**（主机 EXE / 早期单板）** 主机同步程序打开 UART 或原生 USB CDC 对应的 COM 口后，会由同一个 `SerialPort` 实例读取设备日志并缓冲写入 `deviceLogPath` 指定的文件（默认是 EXE 同目录 `log/device/host-serial-{timestamp}.log`），并按 `deviceLogRetentionCount` 清理最旧文件，因此不需要、也不能再同时运行 `idf.py monitor` 独占同一个 COM 口。为避免高频 BLE notify 日志重复触发主机日志落盘和 WinForms 重绘，`showDeviceLogInUi` 默认关闭；该选项只影响窗口镜像，不影响独立设备日志文件。
 
-UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流解析、设备发现和输入租约。Wi-Fi TCP 通道先用预共享密钥进行双向挑战认证，再使用 AES-256-GCM、单调包计数器和会话随机数保护每个完整帧；计数器不连续或认证标签错误时立即断开连接。
+**（早期单板）** UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流解析、设备发现和输入租约。Wi-Fi TCP 通道先用预共享密钥进行双向挑战认证，再使用 AES-256-GCM、单调包计数器和会话随机数保护每个完整帧；计数器不连续或认证标签错误时立即断开连接。双板 `dual_proxy` 不使用 Wi-Fi/BLE，也不开原生 USB CDC 控制口。
 
-固件启动后的 1500 ms 为原生 USB profile 检测窗口：收到任何 CRC 正确的 UART 协议帧时选择键盘与相对触摸板 HID-only；未收到时先选择 CDC-only。若 CDC-only 启动后 UART 才收到首个有效协议帧，固件会执行 `ReleaseAll` 并自动重启一次；控制端持续探测会在新的启动窗口内命中，使原生 USB 重新枚举为 HID-only。已经处于 HID-only 时不会重复重启。选择只影响原生 USB 描述符，不改变本协议帧格式。
+**（早期单板）** 固件启动后的 1500 ms 为原生 USB profile 检测窗口：收到任何 CRC 正确的 UART 协议帧时选择键盘与相对触摸板 HID-only；未收到时先选择 CDC-only。若 CDC-only 启动后 UART 才收到首个有效协议帧，固件会执行 `ReleaseAll` 并自动重启一次；控制端持续探测会在新的启动窗口内命中，使原生 USB 重新枚举为 HID-only。已经处于 HID-only 时不会重复重启。选择只影响原生 USB 描述符，不改变本协议帧格式。
 
 解析器遇到错误 Magic、过长 Payload 或 CRC 错误时丢弃当前候选帧，并继续寻找下一个 `A5 5A`。
 
-协议 v2 不兼容旧的 5 字节鼠标报告。主机、固件与 Target Agent 必须使用同一版本。
+**（主机 / 早期单板）** 协议 v2 不兼容旧的 5 字节鼠标报告。主机、固件与 Target Agent 必须使用同一版本。
 
 
 ## 板载日志下载命令
 
-每块板把控制台日志写入自己的 SPIFFS 分区（4×128 KB 轮转，跨复位续写）。这些命令走
+每块板把控制台日志写入自己的 SPIFFS 分区（**4×512 KB 轮转 = 上限 2 MB**，`partitions.csv` 的 `storage` 为 4 MB；跨复位续写）。这些命令走
 **板子自己的 UART0**（鼠标侧板＝主机控制口；电脑侧板＝调试口，只跑日志服务），
 不占用输入租约，没建会话也能用：
 
@@ -111,7 +116,7 @@ UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流
 | `0x0B` | LOG_DUMP_REQUEST | `offset:u32`、`max_bytes:u32`；设备**连续**回多条 `LOG_READ_RESPONSE` 后以空 `data` 帧收尾 |
 
 逻辑字节流按「最旧 → 最新」排列，`offset` 从 0 开始；`total_bytes` 是板端当前可读的
-总字节数（上限 512 KB）。客户端的推荐做法是发一条 `LOG_DUMP_REQUEST`，然后流式解析
+总字节数（**上限 2 MB**）。客户端的推荐做法是发一条 `LOG_DUMP_REQUEST`，然后流式解析
 响应帧直到遇到空 `data` 帧。
 
 解析注意：日志文本与协议帧共用同一个串口，客户端必须**在混杂文本中扫描帧**（找
@@ -124,7 +129,7 @@ UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流
 串口被独占借出、键鼠同步先释放全部按键并暂停，结束后自动恢复控制连接；`host/HidBridge.Host/Transport/OnboardLogDownloader.cs`
 是该实现，打开串口时显式保持 DTR/RTS 为低，不会复位被测板。命令行/脚本路径见 `tools/fetch_onboard_log.py`。
 
-## 主机局域网模拟鼠标 UDP 接口
+## 主机局域网模拟鼠标 UDP 接口（主机 EXE / 早期单板，非双板主线）
 
 该接口是 Windows 主机 EXE 的输入适配层，不改变电脑到 ESP32 的串口/Wi-Fi 帧格式。默认监听 `0.0.0.0:24814`；可用 `bridge.local.json` 的 `remoteInputBindAddress` 和 `remoteInputPort` 覆盖。主界面左上角显示当前可用的局域网监听 IP 和端口。该 UDP 接口不做身份认证。
 
