@@ -379,3 +379,79 @@ bool hid_mouse_report_apply_overlay(
            write_axis(report, report_length, &layout->wheel, wheel) &&
            write_axis(report, report_length, &layout->pan, pan);
 }
+
+static bool read_axis(
+    const uint8_t *report,
+    size_t report_length,
+    const hid_mouse_axis_field_t *field,
+    int32_t *value)
+{
+    if (value == NULL) {
+        return false;
+    }
+    if (field->bit_offset == HID_MOUSE_FIELD_INVALID_OFFSET) {
+        *value = 0;
+        return true;
+    }
+    if (field->bit_size == 0U || field->bit_size > 32U ||
+        (uint32_t)field->bit_offset + field->bit_size > report_length * 8U) {
+        return false;
+    }
+    uint32_t raw = 0U;
+    for (uint8_t bit = 0; bit < field->bit_size; ++bit) {
+        const uint32_t source_bit = (uint32_t)field->bit_offset + bit;
+        if ((report[source_bit >> 3U] & (uint8_t)(1U << (source_bit & 7U))) != 0U) {
+            raw |= (1UL << bit);
+        }
+    }
+    /* 有符号字段按位宽做符号扩展（相对轴通常是有符号的）。 */
+    if (field->bit_size < 32U && (raw & (1UL << (field->bit_size - 1U))) != 0U) {
+        raw |= ~((1UL << field->bit_size) - 1U);
+    }
+    *value = (int32_t)raw;
+    return true;
+}
+
+bool hid_mouse_report_read_axes(
+    const uint8_t *report,
+    size_t report_length,
+    const hid_mouse_report_layout_t *layout,
+    int32_t *x,
+    int32_t *y,
+    int32_t *wheel,
+    int32_t *pan)
+{
+    if (report == NULL || layout == NULL || !layout->valid) {
+        return false;
+    }
+    return read_axis(report, report_length, &layout->x, x) &&
+        read_axis(report, report_length, &layout->y, y) &&
+        read_axis(report, report_length, &layout->wheel, wheel) &&
+        read_axis(report, report_length, &layout->pan, pan);
+}
+
+bool hid_mouse_report_add_axes(
+    uint8_t *report,
+    size_t report_length,
+    const hid_mouse_report_layout_t *layout,
+    int32_t delta_x,
+    int32_t delta_y,
+    int32_t delta_wheel,
+    int32_t delta_pan)
+{
+    if (report == NULL || layout == NULL || !layout->valid) {
+        return false;
+    }
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t wheel = 0;
+    int32_t pan = 0;
+    if (!hid_mouse_report_read_axes(report, report_length, layout,
+                                    &x, &y, &wheel, &pan)) {
+        return false;
+    }
+    return write_axis(report, report_length, &layout->x, x + delta_x) &&
+        write_axis(report, report_length, &layout->y, y + delta_y) &&
+        write_axis(report, report_length, &layout->wheel, wheel + delta_wheel) &&
+        write_axis(report, report_length, &layout->pan, pan + delta_pan);
+}

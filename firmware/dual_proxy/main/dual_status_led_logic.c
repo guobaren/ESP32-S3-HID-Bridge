@@ -55,6 +55,24 @@ void dual_status_led_logic_set_host_mouse_ready(
     }
 }
 
+void dual_status_led_logic_set_peer_connected(
+    dual_status_led_state_t *state,
+    bool connected)
+{
+    if (state != NULL) {
+        state->peer_connected = connected;
+    }
+}
+
+void dual_status_led_logic_set_flow_error(
+    dual_status_led_state_t *state,
+    bool failed)
+{
+    if (state != NULL) {
+        state->flow_error = failed;
+    }
+}
+
 void dual_status_led_logic_notify_software_success(
     dual_status_led_state_t *state,
     uint32_t now_ms)
@@ -78,15 +96,24 @@ dual_status_led_color_t dual_status_led_logic_color(
     if (state == NULL) {
         return DUAL_STATUS_LED_COLOR_OFF;
     }
-    if (state->role == DUAL_STATUS_LED_ROLE_MOUSE_HOST) {
-        return state->host_mouse_ready
-            ? DUAL_STATUS_LED_COLOR_GREEN
-            : DUAL_STATUS_LED_COLOR_RED;
+    if (state->role == DUAL_STATUS_LED_ROLE_NONE) {
+        return DUAL_STATUS_LED_COLOR_OFF;
     }
-    if (state->role == DUAL_STATUS_LED_ROLE_PC_DEVICE && state->pc_mounted) {
-        return deadline_is_after(now_ms, state->flash_until_ms)
+    if (!state->peer_connected) {
+        return DUAL_STATUS_LED_COLOR_RED;
+    }
+    if (state->flow_error) {
+        return ((now_ms / DUAL_STATUS_LED_ERROR_BLINK_MS) & 1U) == 0U
+            ? DUAL_STATUS_LED_COLOR_RED
+            : DUAL_STATUS_LED_COLOR_OFF;
+    }
+    if (state->role == DUAL_STATUS_LED_ROLE_MOUSE_HOST) {
+        return DUAL_STATUS_LED_COLOR_GREEN;
+    }
+    if (state->role == DUAL_STATUS_LED_ROLE_PC_DEVICE) {
+        return state->pc_mounted && deadline_is_after(now_ms, state->flash_until_ms)
             ? DUAL_STATUS_LED_COLOR_FLASH_OFF
             : DUAL_STATUS_LED_COLOR_BLUE;
     }
-    return DUAL_STATUS_LED_COLOR_RED;
+    return DUAL_STATUS_LED_COLOR_OFF;
 }

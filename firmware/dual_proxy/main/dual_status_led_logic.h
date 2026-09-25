@@ -5,6 +5,7 @@
 
 #define DUAL_STATUS_LED_FLASH_MS 40U
 #define DUAL_STATUS_LED_FLASH_COOLDOWN_MS 60U
+#define DUAL_STATUS_LED_ERROR_BLINK_MS 250U
 
 typedef enum {
     DUAL_STATUS_LED_ROLE_NONE = 0,
@@ -24,6 +25,8 @@ typedef struct {
     dual_status_led_role_t role;
     bool pc_mounted;
     bool host_mouse_ready;
+    bool peer_connected;
+    bool flow_error;
     uint32_t flash_until_ms;
     uint32_t next_flash_allowed_ms;
 } dual_status_led_state_t;
@@ -38,6 +41,12 @@ void dual_status_led_logic_set_pc_mounted(
 void dual_status_led_logic_set_host_mouse_ready(
     dual_status_led_state_t *state,
     bool ready);
+void dual_status_led_logic_set_peer_connected(
+    dual_status_led_state_t *state,
+    bool connected);
+void dual_status_led_logic_set_flow_error(
+    dual_status_led_state_t *state,
+    bool failed);
 void dual_status_led_logic_notify_software_success(
     dual_status_led_state_t *state,
     uint32_t now_ms);

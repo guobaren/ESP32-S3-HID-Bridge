@@ -78,8 +78,17 @@ typedef struct {
     uint32_t total_length;
     uint32_t expected_crc32;
     uint32_t received_length;
+    uint32_t published_transfer_id;
+    uint32_t published_crc32;
     bool active;
     bool profile_valid;
+    /*
+     * 同一 transfer 的重放：M 丢失最终确认后会重放 BEGIN/CHUNK/COMMIT。
+     * 该标志让接收端幂等跳过已发布的同一份 Profile，不重新触发发布回调，
+     * 因此电脑侧不会因为一次丢包再执行一次 USB 重枚举。
+     */
+    bool published_transfer_replay;
+    bool last_commit_was_duplicate;
     /* Decode staging lives in static receiver storage, not the 4 KB UART task stack. */
     hid_device_profile_t staging_profile;
     hid_device_profile_t profile;
@@ -122,8 +131,15 @@ bool hid_profile_stream_can_send(
     uint8_t fairness_limit);
 bool hid_profile_stream_needs_restart(
     bool generation_valid,
-    uint16_t streamed_generation,
-    uint16_t peer_generation);
+    uint32_t streamed_generation,
+    uint32_t peer_generation);
+bool hid_profile_stream_retry_due(
+    bool profile_available,
+    bool stream_pending,
+    bool peer_ready,
+    int64_t now_us,
+    int64_t last_commit_us,
+    int64_t retry_interval_us);
 
 bool hid_device_profile_serialize(
     const hid_device_profile_t *profile,

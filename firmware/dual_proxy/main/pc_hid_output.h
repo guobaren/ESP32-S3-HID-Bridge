@@ -10,8 +10,22 @@
 esp_err_t dual_pc_hid_install_device(void);
 esp_err_t dual_pc_hid_start_sender(void);
 esp_err_t dual_pc_hid_stop_sender(void);
-esp_err_t dual_pc_hid_schedule_reconfigure(const hid_device_profile_t *profile);
-esp_err_t dual_pc_hid_schedule_disconnect(void);
+esp_err_t dual_pc_hid_prepare_for_profile(void);
+
+/*
+ * 同一条 Profile（同 transfer + 同 crc）已挂载时，OFFER 阶段就不再排清理屏障：
+ * 卸载 + 重装会让 USB 设备在总线上真实消失再出现一次，而鼠标侧板重启正是
+ * “立刻移动鼠标就识别异常”的高发窗口。返回 true 表示可沿用现有克隆。
+ */
+esp_err_t dual_pc_hid_schedule_reconfigure(
+    const hid_device_profile_t *profile, uint32_t transfer_id, uint32_t crc32);
+/* ack_type is zero for local cleanup, PROFILE_OFFER, or DEVICE_GONE otherwise.
+ * The matching flow ACK is sent only after USB teardown and session clearing. */
+esp_err_t dual_pc_hid_schedule_disconnect(
+    uint32_t sender_generation,
+    uint32_t event_id,
+    uint8_t ack_type,
+    uint32_t ack_flow_id);
 void dual_pc_hid_enable_reconfigure(void);
 void dual_pc_hid_software_report(
     uint8_t buttons,
@@ -25,5 +39,6 @@ void dual_pc_hid_physical_report(uint8_t buttons, int16_t x, int16_t y, int8_t w
 void dual_pc_hid_physical_release(void);
 void dual_pc_hid_release_all(void);
 bool dual_pc_hid_ready(void);
+bool dual_pc_hid_usb_attached(void);
 void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame);
 void dual_pc_hid_vendor_link_fault(void);

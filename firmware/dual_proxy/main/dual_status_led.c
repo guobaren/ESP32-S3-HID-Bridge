@@ -141,6 +141,22 @@ void dual_status_led_set_host_mouse_ready(bool ready)
     notify_task();
 }
 
+void dual_status_led_set_peer_connected(bool connected)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    dual_status_led_logic_set_peer_connected(&s_state, connected);
+    portEXIT_CRITICAL(&s_state_lock);
+    notify_task();
+}
+
+void dual_status_led_set_flow_error(bool failed)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    dual_status_led_logic_set_flow_error(&s_state, failed);
+    portEXIT_CRITICAL(&s_state_lock);
+    notify_task();
+}
+
 void dual_status_led_notify_software_success(uint32_t timestamp_ms)
 {
     portENTER_CRITICAL(&s_state_lock);

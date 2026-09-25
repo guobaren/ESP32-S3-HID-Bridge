@@ -9,6 +9,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "bridge_protocol.h"
+#include "onboard_log.h"
 #include "uart1_link.h"
 
 #define CONTROL_UART UART_NUM_0
@@ -21,6 +23,8 @@ static const char *TAG = "dual_uart0";
 static dual_software_report_callback_t s_report_callback;
 static dual_software_release_callback_t s_release_callback;
 static uint8_t s_role;
+/* 只服务日志命令（电脑侧板的调试口）：不接受输入会话。 */
+static bool s_log_only;
 
 typedef struct {
     bool active;
@@ -33,6 +37,7 @@ typedef struct {
     uint64_t discontinuities;
     uint64_t mouse_reports;
     uint64_t last_mouse_reports;
+    uint64_t log_chunks;
 } control_state_t;
 
 static control_state_t s_state;
@@ -100,11 +105,199 @@ static bool accept_input_frame(const dual_frame_t *frame)
     return true;
 }
 
+static void send_log_chunk(const dual_frame_t *request, uint32_t offset, const uint8_t *data,
+                           size_t length)
+{
+    dual_frame_t response = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = DUAL_MESSAGE_LOG_READ_RESPONSE,
+        .sequence = request->sequence,
+    };
+    if (!dual_log_read_response_encode(offset, dual_onboard_log_total_bytes(), data, length,
+                                       response.payload, sizeof(response.payload),
+                                       &response.payload_length)) {
+        return;
+    }
+    uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+    size_t serialized_length = 0;
+    if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                             &serialized_length) != ESP_OK) {
+        return;
+    }
+    if (uart_write_bytes(CONTROL_UART, serialized, serialized_length) ==
+        (int)serialized_length) {
+        ++s_state.log_chunks;
+    }
+}
+
+/*
+ * 流式下载：一条请求连续回多个分片，避免 56 字节/次的逐块往返。
+ * uart_write_bytes 在发送缓冲满时会阻塞，天然形成节流，不需要额外延时。
+ */
+static void send_log_dump(const dual_frame_t *request)
+{
+    if (request->payload_length != DUAL_LOG_DUMP_REQUEST_LENGTH) {
+        return;
+    }
+    uint32_t offset = 0U;
+    uint32_t budget = 0U;
+    memcpy(&offset, &request->payload[0], sizeof(offset));
+    memcpy(&budget, &request->payload[4], sizeof(budget));
+    dual_onboard_log_request_flush();
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    uint8_t data[DUAL_LOG_CHUNK_MAX];
+    uint8_t block[1024];
+    size_t block_length = 0U;
+    size_t block_offset = 0U;
+    uint32_t sent = 0U;
+    while (sent < budget) {
+        if (block_offset >= block_length) {
+            /* 一次 VFS 读放 1 KB，再切成 56 字节帧：否则每帧都要 fopen/fread。 */
+            size_t want = budget - sent;
+            if (want > sizeof(block)) {
+                want = sizeof(block);
+            }
+            block_length = dual_onboard_log_read(offset + sent, block, want);
+            block_offset = 0U;
+            if (block_length == 0U) {
+                break;
+            }
+        }
+        size_t chunk = block_length - block_offset;
+        if (chunk > DUAL_LOG_CHUNK_MAX) {
+            chunk = DUAL_LOG_CHUNK_MAX;
+        }
+        memcpy(data, &block[block_offset], chunk);
+        send_log_chunk(request, offset + sent, data, chunk);
+        block_offset += chunk;
+        sent += (uint32_t)chunk;
+    }
+    (void)uart_wait_tx_done(CONTROL_UART, pdMS_TO_TICKS(500));
+    /* 以空分片收尾，客户端据此确认流结束。 */
+    send_log_chunk(request, offset + sent, NULL, 0U);
+    (void)uart_wait_tx_done(CONTROL_UART, pdMS_TO_TICKS(500));
+}
+
+static void send_log_response(const dual_frame_t *request)
+{
+    uint32_t offset = 0U;
+    uint8_t max_bytes = 0U;
+    if (!dual_log_read_request_decode(request->payload, request->payload_length,
+                                      &offset, &max_bytes)) {
+        return;
+    }
+    if (offset == 0U) {
+        /* 首次请求时让写盘任务先落盘，客户端就能一次拿到包括尾部在内的内容。 */
+        dual_onboard_log_request_flush();
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    if (max_bytes > DUAL_LOG_CHUNK_MAX) {
+        max_bytes = DUAL_LOG_CHUNK_MAX;
+    }
+    uint8_t data[DUAL_LOG_CHUNK_MAX];
+    const size_t read = dual_onboard_log_read(offset, data, max_bytes);
+    dual_frame_t response = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = DUAL_MESSAGE_LOG_READ_RESPONSE,
+        .sequence = request->sequence,
+    };
+    if (!dual_log_read_response_encode(offset, dual_onboard_log_total_bytes(), data, read,
+                                       response.payload, sizeof(response.payload),
+                                       &response.payload_length)) {
+        return;
+    }
+    uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+    size_t serialized_length = 0;
+    if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                             &serialized_length) != ESP_OK) {
+        return;
+    }
+    if (uart_write_bytes(CONTROL_UART, serialized, serialized_length) ==
+        (int)serialized_length) {
+        (void)uart_wait_tx_done(CONTROL_UART, pdMS_TO_TICKS(200));
+        ++s_state.log_chunks;
+    }
+}
+
+static void send_log_cleared(const dual_frame_t *request)
+{
+    dual_frame_t response = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = DUAL_MESSAGE_LOG_READ_RESPONSE,
+        .sequence = request->sequence,
+        .payload_length = DUAL_LOG_READ_RESPONSE_HEADER_LENGTH,
+    };
+    const esp_err_t cleared = dual_onboard_log_clear();
+    const uint32_t total = cleared == ESP_OK ? 0U : dual_onboard_log_total_bytes();
+    if (!dual_log_read_response_encode(0U, total, NULL, 0U, response.payload,
+                                       sizeof(response.payload),
+                                       &response.payload_length)) {
+        return;
+    }
+    uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+    size_t serialized_length = 0;
+    if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                             &serialized_length) != ESP_OK) {
+        return;
+    }
+    (void)uart_write_bytes(CONTROL_UART, serialized, serialized_length);
+    ESP_LOGW(TAG, "板载日志已清空：%s", esp_err_to_name(cleared));
+}
+
 static void on_control_frame(const dual_frame_t *frame, void *context)
 {
     (void)context;
     if (frame->type == DUAL_MESSAGE_DEVICE_PROBE) {
         send_device_hello(frame);
+        return;
+    }
+    /*
+     * 日志命令不受输入会话约束：没插鼠标、没建会话时也要能把板载日志取走，
+     * 否则恰恰在最需要日志的故障现场取不到。
+     */
+    if (frame->type == DUAL_MESSAGE_LOG_READ_REQUEST) {
+        ++s_state.accepted;
+        send_log_response(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_LOG_CONTROL_REQUEST) {
+        ++s_state.accepted;
+        if (frame->payload_length == 1U) {
+            dual_onboard_log_set_paused(frame->payload[0] != 0U);
+            ESP_LOGW(TAG, "板载写盘%s", frame->payload[0] != 0U ? "已暂停（A/B 对照）" : "已恢复");
+        }
+        /* 用一条 READ_RESPONSE 回报状态：data[0]=是否暂停，total=当前字节数。 */
+        const uint8_t paused_state = dual_onboard_log_paused() ? 1U : 0U;
+        dual_frame_t response = {
+            .version = DUAL_PROXY_PROTOCOL_VERSION,
+            .type = DUAL_MESSAGE_LOG_READ_RESPONSE,
+            .sequence = frame->sequence,
+        };
+        if (dual_log_read_response_encode(0U, dual_onboard_log_total_bytes(), &paused_state,
+                                          1U, response.payload, sizeof(response.payload),
+                                          &response.payload_length)) {
+            uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+            size_t serialized_length = 0;
+            if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                                     &serialized_length) == ESP_OK) {
+                (void)uart_write_bytes(CONTROL_UART, serialized, serialized_length);
+            }
+        }
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_LOG_DUMP_REQUEST) {
+        ++s_state.accepted;
+        send_log_dump(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_LOG_CLEAR_REQUEST) {
+        ++s_state.accepted;
+        send_log_cleared(frame);
+        return;
+    }
+    if (s_log_only) {
+        ++s_state.rejected;
         return;
     }
     if (frame->type == DUAL_MESSAGE_SESSION_START ||
@@ -189,7 +382,8 @@ static void control_task(void *argument)
     }
 }
 
-esp_err_t dual_uart0_control_start(
+/* 内部实现：由双角色入口和日志服务入口共用。 */
+static esp_err_t uart0_control_start(
     uint8_t role,
     dual_software_report_callback_t report_callback,
     dual_software_release_callback_t release_callback)
@@ -198,6 +392,8 @@ esp_err_t dual_uart0_control_start(
         return ESP_ERR_INVALID_ARG;
     }
     s_role = role;
+    s_report_callback = report_callback;
+    s_release_callback = release_callback;
     s_report_callback = report_callback;
     s_release_callback = release_callback;
     const uart_config_t config = {
@@ -225,4 +421,20 @@ esp_err_t dual_uart0_control_start(
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+esp_err_t dual_uart0_control_start(
+    uint8_t role,
+    dual_software_report_callback_t report_callback,
+    dual_software_release_callback_t release_callback)
+{
+    s_log_only = false;
+    return uart0_control_start(role, report_callback, release_callback);
+}
+
+esp_err_t dual_uart0_log_service_start(uint8_t role)
+{
+    /* 电脑侧板的调试口只跑日志服务：不接受软件输入会话，也不转发鼠标报告。 */
+    s_log_only = true;
+    return uart0_control_start(role, NULL, NULL);
 }

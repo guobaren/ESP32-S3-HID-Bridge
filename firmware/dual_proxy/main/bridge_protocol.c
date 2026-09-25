@@ -147,6 +147,22 @@ static uint16_t read_u16_le(const uint8_t *input)
     return (uint16_t)input[0] | ((uint16_t)input[1] << 8);
 }
 
+static void write_u32_le(uint8_t *output, uint32_t value)
+{
+    output[0] = (uint8_t)value;
+    output[1] = (uint8_t)(value >> 8);
+    output[2] = (uint8_t)(value >> 16);
+    output[3] = (uint8_t)(value >> 24);
+}
+
+static uint32_t read_u32_le(const uint8_t *input)
+{
+    return (uint32_t)input[0] |
+        ((uint32_t)input[1] << 8) |
+        ((uint32_t)input[2] << 16) |
+        ((uint32_t)input[3] << 24);
+}
+
 static bool valid_report_type(uint8_t report_type)
 {
     return report_type >= DUAL_HID_REPORT_TYPE_INPUT &&
@@ -377,5 +393,63 @@ bool dual_hid_get_response_decode(
     *report_id = payload[4];
     *data = &payload[DUAL_HID_GET_REPORT_RESPONSE_HEADER_LENGTH];
     *data_length = payload[5];
+    return true;
+}
+
+bool dual_log_read_request_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint32_t *offset,
+    uint8_t *max_bytes)
+{
+    if (payload == NULL || offset == NULL || max_bytes == NULL ||
+        payload_length != DUAL_LOG_READ_REQUEST_LENGTH || payload[4] == 0U) {
+        return false;
+    }
+    *offset = read_u32_le(payload);
+    *max_bytes = payload[4];
+    return true;
+}
+
+bool dual_log_read_response_encode(
+    uint32_t offset,
+    uint32_t total_bytes,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || payload_length == NULL ||
+        data_length > DUAL_PROXY_MAX_PAYLOAD - DUAL_LOG_READ_RESPONSE_HEADER_LENGTH ||
+        (data == NULL && data_length != 0U) ||
+        capacity < DUAL_LOG_READ_RESPONSE_HEADER_LENGTH + data_length) {
+        return false;
+    }
+    write_u32_le(&payload[0], offset);
+    write_u32_le(&payload[4], total_bytes);
+    if (data_length > 0U) {
+        memcpy(&payload[DUAL_LOG_READ_RESPONSE_HEADER_LENGTH], data, data_length);
+    }
+    *payload_length = (uint8_t)(DUAL_LOG_READ_RESPONSE_HEADER_LENGTH + data_length);
+    return true;
+}
+
+bool dual_log_read_response_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint32_t *offset,
+    uint32_t *total_bytes,
+    const uint8_t **data,
+    size_t *data_length)
+{
+    if (payload == NULL || offset == NULL || total_bytes == NULL || data == NULL ||
+        data_length == NULL || payload_length < DUAL_LOG_READ_RESPONSE_HEADER_LENGTH) {
+        return false;
+    }
+    *offset = read_u32_le(&payload[0]);
+    *total_bytes = read_u32_le(&payload[4]);
+    *data = &payload[DUAL_LOG_READ_RESPONSE_HEADER_LENGTH];
+    *data_length = payload_length - DUAL_LOG_READ_RESPONSE_HEADER_LENGTH;
     return true;
 }

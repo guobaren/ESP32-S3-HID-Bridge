@@ -414,10 +414,23 @@ bool hid_profile_stream_can_send(
 
 bool hid_profile_stream_needs_restart(
     bool generation_valid,
-    uint16_t streamed_generation,
-    uint16_t peer_generation)
+    uint32_t streamed_generation,
+    uint32_t peer_generation)
 {
     return !generation_valid || streamed_generation != peer_generation;
+}
+
+bool hid_profile_stream_retry_due(
+    bool profile_available,
+    bool stream_pending,
+    bool peer_ready,
+    int64_t now_us,
+    int64_t last_commit_us,
+    int64_t retry_interval_us)
+{
+    return profile_available && !stream_pending && !peer_ready &&
+        last_commit_us > 0 && retry_interval_us > 0 && now_us >= last_commit_us &&
+        now_us - last_commit_us >= retry_interval_us;
 }
 
 uint32_t hid_profile_crc32(const uint8_t *data, size_t length)
@@ -442,6 +455,7 @@ static void receiver_reset_transfer(hid_profile_receiver_t *receiver, bool clear
     receiver->total_length = 0;
     receiver->expected_crc32 = 0;
     receiver->received_length = 0;
+    receiver->published_transfer_replay = false;
     if (clear_profile) {
         receiver->profile_valid = false;
         memset(&receiver->profile, 0, sizeof(receiver->profile));
@@ -470,6 +484,18 @@ bool hid_profile_receiver_begin(
     if (receiver == NULL) {
         return false;
     }
+    receiver->last_commit_was_duplicate = false;
+    /*
+     * 已经发布过的同一 transfer 再次 BEGIN：这是丢失最终确认后的等价重放。
+     * 保留已发布的 Profile，只标记重放，避免重复解码与重复发布。
+     */
+    if (receiver->profile_valid && transfer_id != 0U &&
+        transfer_id == receiver->published_transfer_id &&
+        crc32 == receiver->published_crc32) {
+        receiver->published_transfer_replay = true;
+        return true;
+    }
+    receiver->published_transfer_replay = false;
     /* Keep the last published profile until a complete replacement commits. */
     receiver_reset_transfer(receiver, false);
     if (total_length == 0 || total_length > HID_PROFILE_MAX_BLOB) {
@@ -489,13 +515,33 @@ bool hid_profile_receiver_chunk(
     const uint8_t *data,
     size_t length)
 {
-    if (receiver == NULL || !receiver->active || transfer_id != receiver->transfer_id ||
+    if (receiver == NULL) {
+        return false;
+    }
+    if (receiver->published_transfer_replay &&
+        transfer_id == receiver->published_transfer_id) {
+        /* 已发布 transfer 的重放分片：幂等忽略，不重复计入。 */
+        return true;
+    }
+    if (!receiver->active || transfer_id != receiver->transfer_id ||
         length == 0 || length > HID_PROFILE_MAX_CHUNK_DATA ||
-        offset != receiver->received_length || offset > receiver->total_length ||
-        length > receiver->total_length - offset || (data == NULL && length != 0)) {
-        if (receiver != NULL) {
-            receiver_reset_transfer(receiver, false);
+        offset > receiver->total_length ||
+        length > receiver->total_length - offset ||
+        (data == NULL && length != 0)) {
+        receiver_reset_transfer(receiver, false);
+        return false;
+    }
+    if ((uint64_t)offset + length <= receiver->received_length) {
+        /* 重复到达的前缀分片：内容一致才算幂等，不计入两次。 */
+        if (memcmp(&receiver->blob[offset], data, length) == 0) {
+            return true;
         }
+        receiver_reset_transfer(receiver, false);
+        return false;
+    }
+    if (offset != receiver->received_length) {
+        /* 缺口或乱序：整份重传（同一 transfer 重新 BEGIN）才能恢复。 */
+        receiver_reset_transfer(receiver, false);
         return false;
     }
     memcpy(&receiver->blob[offset], data, length);
@@ -509,13 +555,27 @@ bool hid_profile_receiver_commit(
     uint32_t total_length,
     uint32_t crc32)
 {
-    if (receiver == NULL || !receiver->active || transfer_id != receiver->transfer_id ||
+    if (receiver == NULL) {
+        return false;
+    }
+    if (receiver->profile_valid && transfer_id != 0U &&
+        transfer_id == receiver->published_transfer_id &&
+        crc32 == receiver->published_crc32) {
+        /*
+         * 同一 transfer 的重复 COMMIT：返回已有处理结果，不重新发布。
+         * 这条路径不要求当前有活动传输——M 丢失最终确认后可能只重放
+         * COMMIT，而成功发布后接收端已经不在传输中。
+         */
+        receiver->last_commit_was_duplicate = true;
+        receiver->published_transfer_replay = true;
+        return true;
+    }
+    receiver->last_commit_was_duplicate = false;
+    if (!receiver->active || transfer_id != receiver->transfer_id ||
         total_length != receiver->total_length || crc32 != receiver->expected_crc32 ||
         receiver->received_length != receiver->total_length ||
         hid_profile_crc32(receiver->blob, receiver->total_length) != receiver->expected_crc32) {
-        if (receiver != NULL) {
-            receiver_reset_transfer(receiver, false);
-        }
+        receiver_reset_transfer(receiver, false);
         return false;
     }
     if (!hid_device_profile_deserialize(
@@ -526,6 +586,9 @@ bool hid_profile_receiver_commit(
     receiver->profile = receiver->staging_profile;
     receiver->profile_valid = true;
     receiver->active = false;
+    receiver->published_transfer_replay = false;
+    receiver->published_transfer_id = transfer_id;
+    receiver->published_crc32 = crc32;
     if (receiver->publish_callback != NULL) {
         receiver->publish_callback(&receiver->profile, receiver->publish_context);
     }

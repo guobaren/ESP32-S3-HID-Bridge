@@ -44,7 +44,8 @@ internal sealed class SerialBridge : IBridgeTransport
     private int _heartbeatActive;
     private DateTime _nextConnectAttemptUtc;
     private bool _sessionStarted;
-    private bool _firmwareUpdateLeaseActive;
+    private bool _exclusivePortLeaseActive;
+    private string? _exclusivePortPurpose;
     private bool _writerStopping;
     private bool _disposed;
     private CancellationTokenSource? _traceCancellation;
@@ -109,7 +110,7 @@ internal sealed class SerialBridge : IBridgeTransport
     {
         lock (_sync)
         {
-            if (_disposed || _firmwareUpdateLeaseActive || !EnsureConnected())
+            if (_disposed || _exclusivePortLeaseActive || !EnsureConnected())
             {
                 return;
             }
@@ -135,12 +136,12 @@ internal sealed class SerialBridge : IBridgeTransport
     {
         bool backpressured = false;
         while (_outboundFrames.Count >= MaxOutboundFrames &&
-               !_disposed && !_writerStopping && !_firmwareUpdateLeaseActive)
+               !_disposed && !_writerStopping && !_exclusivePortLeaseActive)
         {
             backpressured = true;
             Monitor.Wait(_sync, 10);
         }
-        if (_disposed || _writerStopping || _firmwareUpdateLeaseActive ||
+        if (_disposed || _writerStopping || _exclusivePortLeaseActive ||
             _port?.IsOpen != true)
         {
             return false;
@@ -186,7 +187,7 @@ internal sealed class SerialBridge : IBridgeTransport
                     {
                         break;
                     }
-                    if (_port?.IsOpen != true || _firmwareUpdateLeaseActive)
+                    if (_port?.IsOpen != true || _exclusivePortLeaseActive)
                     {
                         _outboundFrames.Clear();
                         Monitor.PulseAll(_sync);
@@ -281,7 +282,7 @@ internal sealed class SerialBridge : IBridgeTransport
 
     private bool EnsureConnected()
     {
-        if (_firmwareUpdateLeaseActive)
+        if (_exclusivePortLeaseActive)
         {
             return false;
         }
@@ -685,25 +686,30 @@ internal sealed class SerialBridge : IBridgeTransport
             .ThenBy(name => name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-    internal FirmwareUpdatePortLease AcquireFirmwareUpdatePort(string portName)
+    /// <summary>
+    /// 暂停控制串口连接，把该串口独占交给外围串口任务（固件刷写、板载日志转存等）。
+    /// 调用方必须释放返回的租约，控制软件才会重新接管串口。
+    /// </summary>
+    internal ExclusivePortLease AcquireExclusivePort(string portName, string purpose)
     {
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_firmwareUpdateLeaseActive)
+            if (_exclusivePortLeaseActive)
             {
-                throw new InvalidOperationException("固件刷写已经占用串口。");
+                throw new InvalidOperationException($"串口正被{_exclusivePortPurpose ?? "其它串口任务"}占用。");
             }
             string selectedPort = NormalizeFirmwarePortName(portName);
             if (!GetAvailablePortNames().Contains(selectedPort, StringComparer.OrdinalIgnoreCase))
             {
-                throw new IOException($"所选刷写串口 {selectedPort} 当前不存在。");
+                throw new IOException($"所选串口 {selectedPort} 当前不存在。");
             }
 
-            _firmwareUpdateLeaseActive = true;
+            _exclusivePortLeaseActive = true;
+            _exclusivePortPurpose = purpose;
             ClosePort();
-            Console.WriteLine($"已暂停控制串口连接，将 {selectedPort} 交给固件刷写任务独占使用。");
-            return new FirmwareUpdatePortLease(this, selectedPort);
+            Console.WriteLine($"已暂停控制串口连接，将 {selectedPort} 交给{purpose}独占使用。");
+            return new ExclusivePortLease(this, selectedPort, purpose);
         }
     }
 
@@ -728,7 +734,7 @@ internal sealed class SerialBridge : IBridgeTransport
             cancellationToken.ThrowIfCancellationRequested();
             lock (_sync)
             {
-                if (!_disposed && !_firmwareUpdateLeaseActive && EnsureConnected())
+                if (!_disposed && !_exclusivePortLeaseActive && EnsureConnected())
                 {
                     return true;
                 }
@@ -738,17 +744,18 @@ internal sealed class SerialBridge : IBridgeTransport
         return false;
     }
 
-    private void ReleaseFirmwareUpdatePort(string portName)
+    private void ReleaseExclusivePort(string portName, string purpose)
     {
         lock (_sync)
         {
-            if (!_firmwareUpdateLeaseActive)
+            if (!_exclusivePortLeaseActive)
             {
                 return;
             }
-            _firmwareUpdateLeaseActive = false;
+            _exclusivePortLeaseActive = false;
+            _exclusivePortPurpose = null;
             _nextConnectAttemptUtc = DateTime.MinValue;
-            Console.WriteLine($"固件刷写已释放 {portName}，控制软件开始恢复连接。");
+            Console.WriteLine($"{purpose}已释放 {portName}，控制软件开始恢复连接。");
         }
     }
 
@@ -771,19 +778,23 @@ internal sealed class SerialBridge : IBridgeTransport
         _outboundSignal.Dispose();
     }
 
-    internal sealed class FirmwareUpdatePortLease : IDisposable
+    /// <summary>串口独占租约：释放后控制软件立刻开始恢复连接。</summary>
+    internal sealed class ExclusivePortLease : IDisposable
     {
         private SerialBridge? _owner;
 
-        internal FirmwareUpdatePortLease(SerialBridge owner, string portName)
+        internal ExclusivePortLease(SerialBridge owner, string portName, string purpose)
         {
             _owner = owner;
             PortName = portName;
+            Purpose = purpose;
         }
 
         internal string PortName { get; }
 
+        internal string Purpose { get; }
+
         public void Dispose() =>
-            Interlocked.Exchange(ref _owner, null)?.ReleaseFirmwareUpdatePort(PortName);
+            Interlocked.Exchange(ref _owner, null)?.ReleaseExclusivePort(PortName, Purpose);
     }
 }

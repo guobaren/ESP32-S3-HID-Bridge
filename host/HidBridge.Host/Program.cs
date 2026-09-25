@@ -114,7 +114,8 @@ internal static class Program
                 logSettings,
                 firmwareUpdateApi,
                 firmwareFlash,
-                lanEndpointDescription: remoteInput?.DisplayEndpoint);
+                lanEndpointDescription: remoteInput?.DisplayEndpoint,
+                serialBridge: serialBridge);
             logWriter.Attach(form.AppendLog);
             Console.WriteLine($"目标端点：{endpoint}");
             Console.WriteLine($"本地实时日志：{logWriter.FilePath}");

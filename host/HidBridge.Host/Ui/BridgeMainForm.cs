@@ -2,6 +2,7 @@ using System.Drawing;
 using HidBridge.Host.Automation;
 using HidBridge.Host.FirmwareUpdate;
 using HidBridge.Host.Input;
+using HidBridge.Host.Transport;
 
 namespace HidBridge.Host.Ui;
 
@@ -16,12 +17,16 @@ internal sealed class BridgeMainForm : Form
     private static readonly Color SecondaryTextOnDeepSurface = Color.FromArgb(82, 106, 139);
     private static readonly Color SuccessTextOnDeepSurface = Color.FromArgb(19, 128, 88);
     private static readonly Color DangerTextOnDeepSurface = Color.FromArgb(157, 91, 35);
+    private static readonly Color SecondaryButtonColor = Color.FromArgb(237, 243, 250);
+    private const int OnboardLogReconnectTimeoutSeconds = 10;
+    private const int OnboardLogReleaseDelayMilliseconds = 100;
 
     private readonly InputForwarder _input;
     private readonly AutomationController _automation;
     private readonly RuntimeLogSettings _logSettings;
     private readonly FirmwareUpdateApiServer? _firmwareUpdateApi;
     private readonly FirmwareFlashService? _firmwareFlash;
+    private readonly SerialBridge? _serialBridge;
     private readonly MouseCursorLock _cursorLock = new();
     private readonly bool _enableCursorLock;
     private readonly MouseCaptureSurface _captureSurface;
@@ -29,6 +34,7 @@ internal sealed class BridgeMainForm : Form
     private readonly Label _lanEndpointLabel;
     private readonly TextBox _logTextBox;
     private readonly ComboBox _logModeComboBox;
+    private readonly Button _onboardLogButton;
     private readonly CheckBox _udpSmoothingCheckBox;
     private readonly CheckBox _alwaysOutputUdpCheckBox;
     private readonly TrackBar _outputSensitivityTrackBar;
@@ -43,6 +49,8 @@ internal sealed class BridgeMainForm : Form
     private readonly NotifyIcon _notifyIcon;
     private readonly List<string> _pendingLogs = [];
     private bool _updatingOutputSensitivity;
+    private CancellationTokenSource? _onboardLogCancellation;
+    private bool _onboardLogDownloadActive;
     private const int MaxVisibleLogCharacters = 500_000;
 
     private bool _closing;
@@ -56,11 +64,13 @@ internal sealed class BridgeMainForm : Form
         FirmwareUpdateApiServer? firmwareUpdateApi = null,
         FirmwareFlashService? firmwareFlash = null,
         bool enableCursorLock = true,
-        string? lanEndpointDescription = null)
+        string? lanEndpointDescription = null,
+        SerialBridge? serialBridge = null)
     {
         _input = input;
         _automation = automation;
         _enableCursorLock = enableCursorLock;
+        _serialBridge = serialBridge;
         double configuredOutputSensitivity = MouseOutputSensitivity.Clamp(automation.Settings.OutputSensitivity);
         _automation.Settings.OutputSensitivity = configuredOutputSensitivity;
         _input.ConfigureOutputSensitivity(configuredOutputSensitivity);
@@ -372,22 +382,39 @@ internal sealed class BridgeMainForm : Form
                     : "日志模式已切换为精简高性能；仅保留连接参数、统计、警告和错误等关键设备日志。");
             }
         };
+        _onboardLogButton = new Button
+        {
+            Dock = DockStyle.Fill,
+            Text = "转存板载日志",
+            Enabled = serialBridge is not null,
+            BackColor = SecondaryButtonColor,
+            ForeColor = PrimaryTextOnDeepSurface,
+            UseVisualStyleBackColor = false,
+            AccessibleName = "转存板载日志",
+            AccessibleDescription = serialBridge is null
+                ? "当前不是串口传输模式，无法读取板载日志。"
+                : "按协议从当前已连接的串口下载板载滚动日志；转存期间会暂停串口连接和键鼠同步。",
+            Margin = new Padding(8, 0, 0, 0),
+        };
+        _onboardLogButton.Click += OnOnboardLogDownloadClicked;
         TableLayoutPanel logPanel = new()
         {
             Dock = DockStyle.Fill,
             RowCount = 2,
-            ColumnCount = 2,
+            ColumnCount = 3,
             Padding = new Padding(14, 10, 14, 14),
             BackColor = PageBackgroundColor,
         };
-        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
-        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
+        logPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 152));
         logPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         logPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         logPanel.Controls.Add(logLabel, 0, 0);
         logPanel.Controls.Add(_logModeComboBox, 1, 0);
+        logPanel.Controls.Add(_onboardLogButton, 2, 0);
         logPanel.Controls.Add(_logTextBox, 0, 1);
-        logPanel.SetColumnSpan(_logTextBox, 2);
+        logPanel.SetColumnSpan(_logTextBox, 3);
         logPanel.Paint += (_, eventArgs) =>
         {
             using Pen border = new(CardBorderColor);
@@ -521,6 +548,7 @@ internal sealed class BridgeMainForm : Form
 
     internal TextBox LogTextBox => _logTextBox;
     internal ComboBox LogModeComboBox => _logModeComboBox;
+    internal Button OnboardLogButton => _onboardLogButton;
     internal CheckBox SimulatedUdpCheckBox => _settingsPage.SimulatedUdpCheckBox;
     internal ComboBox SimulatedUdpFrequencyComboBox => _settingsPage.SimulatedUdpFrequencyComboBox;
     internal CheckBox UdpSmoothingCheckBox => _udpSmoothingCheckBox;
@@ -646,6 +674,176 @@ internal sealed class BridgeMainForm : Form
         }
     }
 
+    /// <summary>
+    /// 转存板载日志：借走当前已连接的串口，按协议下载板载滚动日志并写入 UTF-8 文件。
+    /// 串口以独占租约方式借出，转存期间控制软件暂停连接与键鼠同步，结束后自动恢复。
+    /// </summary>
+    private async void OnOnboardLogDownloadClicked(object? sender, EventArgs e)
+    {
+        SerialBridge? serialBridge = _serialBridge;
+        if (serialBridge is null || _onboardLogDownloadActive)
+        {
+            return;
+        }
+
+        string? portName = serialBridge.GetConnectedPortName();
+        if (string.IsNullOrWhiteSpace(portName))
+        {
+            string[] availablePorts = SerialBridge.GetAvailablePortNames();
+            string hint = availablePorts.Length == 0
+                ? "当前系统没有可用串口。"
+                : $"当前可选串口：{string.Join("、", availablePorts)}；请等控制软件连上目标板后重试。";
+            AppendLog($"转存板载日志已取消：当前未连接串口。{hint}");
+            ShowOnboardLogMessage($"当前未连接串口，无法转存板载日志。{hint}", MessageBoxIcon.Information);
+            return;
+        }
+
+        string? outputPath = ChooseOnboardLogOutputPath();
+        if (string.IsNullOrWhiteSpace(outputPath))
+        {
+            AppendLog("转存板载日志已取消：未选择保存路径。");
+            return;
+        }
+
+        bool restoreForwarding = _input.ForwardingEnabled;
+        CancellationTokenSource cancellation = new();
+        _onboardLogCancellation = cancellation;
+        _onboardLogDownloadActive = true;
+        _onboardLogButton.Enabled = false;
+        SerialBridge.ExclusivePortLease? lease = null;
+        try
+        {
+            AppendLog(
+                $"开始转存板载日志：端口={portName}，输出={outputPath}；" +
+                "转存期间暂停串口连接与键鼠同步（先释放所有按键），结束或失败后自动恢复。");
+            // 先发 ReleaseAll 再交出串口：转存期间释放事件无法送达，不能让目标端留下按住不放的键。
+            _input.DisableForwarding();
+            await Task.Delay(OnboardLogReleaseDelayMilliseconds).ConfigureAwait(true);
+            lease = serialBridge.AcquireExclusivePort(portName, "板载日志转存任务");
+            OnboardLogDownloadResult result = await OnboardLogDownloader.DownloadAsync(
+                portName,
+                outputPath,
+                new Progress<OnboardLogDownloadProgress>(ReportOnboardLogProgress),
+                cancellationToken: cancellation.Token).ConfigureAwait(true);
+            string summary = DescribeOnboardLogResult(result, portName, outputPath);
+            AppendLog(summary);
+            ShowOnboardLogMessage(
+                summary,
+                result.Completed ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        catch (OperationCanceledException)
+        {
+            AppendLog($"转存板载日志已取消：{outputPath}");
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or InvalidOperationException or
+                TimeoutException or ArgumentException or ObjectDisposedException)
+        {
+            string message = $"转存板载日志失败：{exception.Message}";
+            AppendLog(message);
+            ShowOnboardLogMessage(message, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            if (lease is not null)
+            {
+                lease.Dispose();
+                // 恢复连接会在 UI 线程上做串口握手探测，放到后台线程避免窗口假死。
+                bool reconnected = await Task.Run(() => serialBridge.WaitForConnectionAsync(
+                    TimeSpan.FromSeconds(OnboardLogReconnectTimeoutSeconds),
+                    CancellationToken.None)).ConfigureAwait(true);
+                AppendLog(reconnected
+                    ? $"串口 {portName} 已恢复控制连接。"
+                    : $"串口 {portName} 未在 {OnboardLogReconnectTimeoutSeconds} 秒内恢复控制连接，" +
+                      "控制软件会继续自动重试。");
+            }
+            if (restoreForwarding)
+            {
+                _input.SetForwardingEnabled(true);
+            }
+            cancellation.Dispose();
+            _onboardLogCancellation = null;
+            _onboardLogDownloadActive = false;
+            if (!IsDisposed && !_closing)
+            {
+                _onboardLogButton.Enabled = true;
+            }
+        }
+    }
+
+    /// <summary>选择板载日志保存路径；默认落在 EXE 同目录的 log\device 下。</summary>
+    private string? ChooseOnboardLogOutputPath()
+    {
+        string directory = Path.Combine(AppContext.BaseDirectory, "log", "device");
+        try
+        {
+            Directory.CreateDirectory(directory);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"板载日志默认目录不可用，改用程序目录：{exception.Message}");
+            directory = AppContext.BaseDirectory;
+        }
+
+        using SaveFileDialog dialog = new()
+        {
+            Title = "保存板载日志",
+            Filter = "日志文件 (*.log)|*.log|文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+            DefaultExt = "log",
+            AddExtension = true,
+            OverwritePrompt = true,
+            InitialDirectory = directory,
+            FileName = $"onboard-log-{DateTime.Now:yyyyMMdd-HHmmss}.log",
+        };
+        return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
+    }
+
+    /// <summary>把转存结果拼成可诊断的一行结论：完成 / 截断 / 无响应 / 超时。</summary>
+    internal static string DescribeOnboardLogResult(
+        OnboardLogDownloadResult result,
+        string portName,
+        string outputPath)
+    {
+        string detail =
+            $"端口={portName}，已下载={result.BytesReceived} 字节，板端上报={result.DeviceTotalBytes} 字节，" +
+            $"分片={result.ChunkCount}，耗时={result.Elapsed.TotalSeconds:F1} 秒，文件={outputPath}";
+        if (result.Completed && !result.Truncated)
+        {
+            return $"板载日志转存完成：{detail}。";
+        }
+        if (result.Completed)
+        {
+            return $"板载日志转存结束：未覆盖板端上报总量，尾部仍在板上，可再转存一次；{detail}。";
+        }
+        if (result.NoResponse)
+        {
+            return "板载日志转存失败：板端没有任何 LOG_READ_RESPONSE 响应（端口选错、板子未运行日志服务，" +
+                   $"或该串口只有控制台文本）；{detail}。";
+        }
+        return $"板载日志转存失败：等待窗口内没有收到后续分片，已保存部分内容；{detail}。";
+    }
+
+    private void ReportOnboardLogProgress(OnboardLogDownloadProgress progress)
+    {
+        if (_closing || IsDisposed)
+        {
+            return;
+        }
+        string total = progress.DeviceTotalBytes == 0 ? "未知" : $"{progress.DeviceTotalBytes} 字节";
+        AppendLog(
+            $"板载日志转存进度：已收 {progress.BytesReceived} 字节，" +
+            $"板端上报 {total}，分片 {progress.ChunkCount}。");
+    }
+
+    private void ShowOnboardLogMessage(string message, MessageBoxIcon icon)
+    {
+        if (_closing || IsDisposed)
+        {
+            return;
+        }
+        MessageBox.Show(this, message, "转存板载日志", MessageBoxButtons.OK, icon);
+    }
+
     private void InputOnExitRequested(object? sender, EventArgs e)
     {
         if (_closing || IsDisposed)
@@ -692,6 +890,7 @@ internal sealed class BridgeMainForm : Form
             Console.Error.WriteLine($"退出时保存窗口尺寸失败，将继续关闭：{exception.Message}");
         }
         _closing = true;
+        _onboardLogCancellation?.Cancel();
         _notifyIcon.Visible = false;
         _logFlushTimer.Stop();
         FlushPendingLogs();

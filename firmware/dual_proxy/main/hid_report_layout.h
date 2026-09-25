@@ -51,3 +51,24 @@ bool hid_mouse_report_apply_overlay(
     int32_t y,
     int32_t wheel,
     int32_t pan);
+
+/*
+ * 读取/累加一条鼠标报表的相对轴值。用于把积压的多条移动合并成一条提交：
+ * 逐条提交会变成"停止后还在动"（旧采样延迟到达），逐条丢弃又会丢位移。
+ */
+bool hid_mouse_report_read_axes(
+    const uint8_t *report,
+    size_t report_length,
+    const hid_mouse_report_layout_t *layout,
+    int32_t *x,
+    int32_t *y,
+    int32_t *wheel,
+    int32_t *pan);
+bool hid_mouse_report_add_axes(
+    uint8_t *report,
+    size_t report_length,
+    const hid_mouse_report_layout_t *layout,
+    int32_t delta_x,
+    int32_t delta_y,
+    int32_t delta_wheel,
+    int32_t delta_pan);

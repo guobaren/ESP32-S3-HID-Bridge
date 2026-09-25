@@ -20,56 +20,68 @@ using HidBridge.Protocol;
 if (args.Any(argument => argument.Equals("--raw-capture-hardware", StringComparison.OrdinalIgnoreCase)))
 {
     RunRawCaptureHardwareCheck(args);
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--layout-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckHotkeyChooserControl();
     CheckWindowLayout();
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--mouse-release-plan-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckWin32MouseReleasePlan();
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--statistics-gate-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckStatisticsActivityGate();
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--driver-support-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckCh341DriverSupport();
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--driver-store-probe-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckCh341DriverStoreProbeReadOnly();
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--lua-format-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckLuaSpacingFormatting();
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--lua-runtime-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckLuaRuntimeFeatures();
-    return;
+    return 0;
 }
 
 if (args.Any(argument => argument.Equals("--kmbox-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckKmboxNetCompatibility();
-    return;
+    return 0;
+}
+
+if (args.Any(argument => argument.Equals("--onboard-log-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckOnboardLogDownload();
+    return 0;
+}
+
+// 真机模式：用与「转存板载日志」按钮完全相同的下载器从真实串口取日志。
+if (args.Any(argument => argument.Equals("--onboard-log-live", StringComparison.OrdinalIgnoreCase)))
+{
+    return await RunOnboardLogLiveAsync(args);
 }
 
 CheckMouseReportCodec();
@@ -88,6 +100,7 @@ CheckSerialHeartbeatGate();
 CheckWiFiBoardTransportDisabled();
 CheckDeviceLogPolicy();
 CheckDeviceTraceRealtimePersistence();
+CheckOnboardLogDownload();
 CheckInputSuppressionPolicy();
 CheckKeyboardAutoRepeatEdgeFiltering();
 CheckMouseButtonsAreTrackedPerDevice();
@@ -113,7 +126,8 @@ CheckTriggerForwardingIntegration();
 CheckToggleMacroStopsOnSecondPress();
 CheckHotkeyChooserControl();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、固件 5 槽平滑标记和始终输出开关、左右键移动记录与分析图、串口握手、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、局域网固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、固件 5 槽平滑标记和始终输出开关、左右键移动记录与分析图、串口握手、板载日志转存协议、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、局域网固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
+return 0;
 
 static void RunRawCaptureHardwareCheck(string[] arguments)
 {
@@ -877,6 +891,311 @@ static void CheckDeviceTraceRealtimePersistence()
     {
         Directory.Delete(directory, recursive: true);
     }
+}
+
+// 真机模式：走与「转存板载日志」按钮相同的 OnboardLogDownloader，从真实串口取日志。
+// 用法：HidBridge.Host.Checks.exe --onboard-log-live <COMx> <输出文件>
+static async Task<int> RunOnboardLogLiveAsync(string[] arguments)
+{
+    string[] positional = arguments
+        .Where(argument => !argument.StartsWith("--", StringComparison.Ordinal))
+        .ToArray();
+    if (positional.Length < 2)
+    {
+        Console.Error.WriteLine("用法：--onboard-log-live <COMx> <输出文件>");
+        return 2;
+    }
+    string portName = positional[0];
+    string outputPath = Path.GetFullPath(positional[1]);
+    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+    Stopwatch stopwatch = Stopwatch.StartNew();
+    try
+    {
+        OnboardLogDownloadResult result = await OnboardLogDownloader.DownloadAsync(portName, outputPath);
+        stopwatch.Stop();
+        long fileBytes = new FileInfo(outputPath).Exists ? new FileInfo(outputPath).Length : 0;
+        Console.WriteLine(
+            $"真机转存结果：端口={portName} 已下载={result.BytesReceived} 板端上报={result.DeviceTotalBytes} " +
+            $"分片={result.ChunkCount} 完成={result.Completed} 截断={result.Truncated} 无响应={result.NoResponse} " +
+            $"超时={result.TimedOut} 耗时={result.Elapsed.TotalSeconds:F1}s 文件字节={fileBytes}");
+        Console.WriteLine($"文件：{outputPath}");
+        // 判定标准：完成、未截断、板端上报量与落盘量一致（允许日志仍在增长导致的少量偏差）。
+        bool ok = result.Completed && !result.NoResponse && fileBytes > 0 &&
+            result.BytesReceived == fileBytes;
+        Console.WriteLine(ok ? "真机转存：PASS" : "真机转存：FAIL");
+        return ok ? 0 : 1;
+    }
+    catch (Exception exception)
+    {
+        stopwatch.Stop();
+        Console.Error.WriteLine($"真机转存异常（{stopwatch.Elapsed.TotalSeconds:F1}s）：{exception}");
+        return 1;
+    }
+}
+
+static void CheckOnboardLogDownload()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-onboard-log-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        CheckOnboardLogFrameEncoding();
+        CheckOnboardLogFrameScanner();
+        CheckOnboardLogStreamingDownload(directory);
+        CheckOnboardLogTimeoutAndNoResponse(directory);
+        CheckOnboardLogResultMessages();
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+// ① 转存请求帧必须与共享 FrameCodec 逐字节一致（A5 5A + version + type + sequence + 长度 + CRC16）。
+static void CheckOnboardLogFrameEncoding()
+{
+    byte[] payload = OnboardLogDownloader.BuildDumpPayload(0, OnboardLogDownloader.DefaultMaxBytes);
+    byte[] shared = new FrameCodec().Encode(MessageType.LogDumpRequest, payload);
+    byte[] local = OnboardLogDownloader.EncodeFrame(MessageType.LogDumpRequest, 0, payload);
+    Require(local.SequenceEqual(shared), "转存请求帧与共享 FrameCodec 编码不一致");
+    Require(
+        local[3] == (byte)MessageType.LogDumpRequest && local[6] == 8,
+        $"转存请求帧类型或载荷长度不正确：type=0x{local[3]:X2}，payload_length={local[6]}");
+    Require(
+        BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(0, 4)) == 0 &&
+        BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(4, 4)) == 1u << 20,
+        "LOG_DUMP_REQUEST 载荷必须是 offset=0、max_bytes=1 MB");
+    Console.WriteLine(
+        $"板载日志转存请求帧检查：通过；type=0x{local[3]:X2}，帧长={local.Length}，" +
+        $"CRC=0x{BinaryPrimitives.ReadUInt16LittleEndian(local.AsSpan(local.Length - 2, 2)):X4}（与 FrameCodec 逐字节一致）。");
+}
+
+// ② 混杂控制台文本、假帧头（CRC 错误/长度非法）和跨读取窗口的半帧都必须能正确恢复出真实帧。
+static void CheckOnboardLogFrameScanner()
+{
+    byte[] text = Encoding.UTF8.GetBytes("I (1234) dual_proxy: 控制台文本 A5 5A 后面不是帧\r\n");
+    byte[] firstPayload = Encoding.UTF8.GetBytes("日志第一段");
+    byte[] first = BuildLogResponseFrame(sequence: 7, offset: 0, total: 12, firstPayload);
+    byte[] badCrc = [0xA5, 0x5A, 0x02, 0x09, 0x00, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04, 0xDE, 0xAD];
+    byte[] badLength = [0xA5, 0x5A, 0x02, 0x09, 0x00, 0x00, 0xFF];
+    byte[] terminator = BuildLogResponseFrame(sequence: 7, offset: 12, total: 12, []);
+
+    List<byte> stream = [];
+    stream.AddRange(text);
+    stream.AddRange(first);
+    stream.AddRange(badCrc);
+    stream.AddRange(badLength);
+    stream.AddRange(text);
+    stream.AddRange(terminator);
+    byte[] bytes = [.. stream];
+
+    List<(byte Type, ushort Sequence, byte[] Payload)> frames = [];
+    OnboardLogFrameScanner scanner = new();
+    // 故意切成不等长片段，并让片段边界落在帧头和帧体内部。
+    foreach ((int Start, int Length) slice in new[] { (0, 3), (3, 11), (14, 9), (23, 5), (28, bytes.Length - 28) })
+    {
+        scanner.Feed(bytes.AsSpan(slice.Start, slice.Length), (type, sequence, payload) =>
+            frames.Add((type, sequence, payload.ToArray())));
+    }
+
+    Require(frames.Count == 2, $"帧扫描应只恢复 2 条合法帧，实际={frames.Count}");
+    Require(
+        frames[0].Type == (byte)MessageType.LogReadResponse && frames[0].Sequence == 7 &&
+        BinaryPrimitives.ReadUInt32LittleEndian(frames[0].Payload.AsSpan(0, 4)) == 0 &&
+        frames[0].Payload.AsSpan(8).SequenceEqual(firstPayload),
+        "跨读取窗口的第一条 LOG_READ_RESPONSE 未被正确恢复");
+    Require(
+        frames[1].Sequence == 7 && frames[1].Payload.Length == 8,
+        "空 data 结束帧未被正确恢复");
+    Require(
+        BinaryPrimitives.ReadUInt32LittleEndian(frames[1].Payload.AsSpan(4, 4)) == 12,
+        "结束帧上报的 total_bytes 不正确");
+    Console.WriteLine(
+        $"板载日志帧扫描检查：通过；混杂文本 {text.Length} 字节、假帧头 2 条被跳过，" +
+        $"恢复合法帧={frames.Count}（含空 data 结束帧）。");
+}
+
+// ③ 合成设备：分片流式下载 + 跨分片 UTF-8 中文 + 结束帧 + 进度回调 + 无 BOM 落盘。
+static void CheckOnboardLogStreamingDownload(string directory)
+{
+    string text =
+        "板载日志第一行：鼠标侧启动\r\n" +
+        "中文与 ASCII 混排 second line\r\n" +
+        "第三行结尾没有换行";
+    byte[] logBytes = Encoding.UTF8.GetBytes(text);
+    string path = Path.Combine(directory, "streaming.log");
+    OnboardLogScriptedChannel channel = new(maxReadSize: 7);
+    // 每片 40 字节（板端实际上限 56）：第 2 片的边界落在「动」字的第三个字节内部，
+    // 用来验证下载器用同一个 Decoder 跨分片拼接多字节字符。
+    List<byte[]> pieces = [];
+    for (int offset = 0; offset < logBytes.Length; offset += 40)
+    {
+        pieces.Add(logBytes[offset..Math.Min(offset + 40, logBytes.Length)]);
+    }
+    Require(pieces.Count >= 3, "流式转存检查的合成日志太短，无法覆盖跨分片解码");
+    int written = 0;
+    foreach (byte[] piece in pieces)
+    {
+        channel.WriteResponse(BuildLogResponseFrame(1, (uint)written, (uint)logBytes.Length, piece));
+        written += piece.Length;
+    }
+    channel.WriteResponse(BuildLogResponseFrame(1, (uint)logBytes.Length, (uint)logBytes.Length, []));
+
+    List<OnboardLogDownloadProgress> reports = [];
+    OnboardLogDownloadResult result = OnboardLogDownloader.DownloadFromChannel(
+        channel,
+        path,
+        new Progress<OnboardLogDownloadProgress>(reports.Add),
+        timeout: TimeSpan.FromSeconds(2),
+        firstResponseTimeout: TimeSpan.FromSeconds(2));
+
+    Require(channel.RequestWritten, "转存下载器没有写出 LOG_DUMP_REQUEST");
+    byte[] request = channel.Request;
+    Require(
+        request[0] == 0xA5 && request[1] == 0x5A && request[3] == (byte)MessageType.LogDumpRequest &&
+        BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(4, 2)) == 1 &&
+        FrameCodec.ComputeCrc16(request.AsSpan(2, request.Length - 4)) ==
+        BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(request.Length - 2, 2)),
+        "转存下载器写出的请求帧不符合 A5 5A 帧格式");
+    Require(result.Completed && !result.TimedOut, $"合成流下载未正常结束：{result}");
+    Require(
+        result.BytesReceived == logBytes.Length && result.ChunkCount == pieces.Count + 1 &&
+        result.DeviceTotalBytes == (uint)logBytes.Length,
+        $"合成流下载结果不正确：{result}");
+    Require(!result.Truncated && !result.NoResponse, "完整下载不得被判定为截断或无响应");
+    byte[] saved = File.ReadAllBytes(path);
+    Require(
+        saved.Length >= 3 && !(saved[0] == 0xEF && saved[1] == 0xBB && saved[2] == 0xBF),
+        "板载日志文件不得写入 UTF-8 BOM");
+    Require(Encoding.UTF8.GetString(saved) == text, "板载日志文件内容与设备发送的字节不一致");
+    Require(reports.Count == 0 || reports[^1].BytesReceived <= logBytes.Length, "进度回调超过实际下载量");
+    Console.WriteLine(
+        $"板载日志流式转存检查：通过；设备字节={logBytes.Length}，下载字节={result.BytesReceived}，" +
+        $"分片={result.ChunkCount}，读取窗口=7 字节（帧跨多次读取），中文跨分片解码正确，文件无 BOM。");
+
+    // ④ 大日志：分片上限 56 字节、超过 32 KB 时必须触发进度回调。
+    int largeLength = 40 * 1024;
+    byte[] large = new byte[largeLength];
+    for (int index = 0; index < large.Length; index++)
+    {
+        large[index] = (byte)('a' + index % 26);
+    }
+    string largePath = Path.Combine(directory, "large.log");
+    OnboardLogScriptedChannel largeChannel = new();
+    for (int offset = 0; offset < largeLength; offset += OnboardLogDownloader.MaximumChunkBytes)
+    {
+        int length = Math.Min(OnboardLogDownloader.MaximumChunkBytes, largeLength - offset);
+        largeChannel.WriteResponse(BuildLogResponseFrame(1, (uint)offset, (uint)largeLength,
+            large[offset..(offset + length)]));
+    }
+    largeChannel.WriteResponse(BuildLogResponseFrame(1, (uint)largeLength, (uint)largeLength, []));
+    List<OnboardLogDownloadProgress> largeReports = [];
+    OnboardLogDownloadResult largeResult = OnboardLogDownloader.DownloadFromChannel(
+        largeChannel,
+        largePath,
+        new Progress<OnboardLogDownloadProgress>(largeReports.Add),
+        timeout: TimeSpan.FromSeconds(5),
+        firstResponseTimeout: TimeSpan.FromSeconds(5));
+    int expectedChunks = (largeLength + OnboardLogDownloader.MaximumChunkBytes - 1) /
+                         OnboardLogDownloader.MaximumChunkBytes + 1;
+    Require(
+        largeResult.Completed && largeResult.BytesReceived == largeLength &&
+        largeResult.ChunkCount == expectedChunks,
+        $"40 KB 合成日志下载结果不正确：{largeResult}，期望分片={expectedChunks}");
+    Require(File.ReadAllBytes(largePath).Length == largeLength, "40 KB 合成日志落盘字节数不一致");
+    Require(
+        largeReports.Count >= 1 && largeReports[^1].BytesReceived >= OnboardLogDownloader.ProgressReportIntervalBytes,
+        $"超过 {OnboardLogDownloader.ProgressReportIntervalBytes} 字节后必须回调进度，实际={largeReports.Count} 次");
+    Console.WriteLine(
+        $"板载日志大包检查：通过；设备字节={largeLength}，分片={largeResult.ChunkCount}，" +
+        $"进度回调={largeReports.Count} 次（最后一次 {largeReports[^1].BytesReceived} 字节）。");
+}
+
+// ⑤ 超时与无响应必须可区分，且部分内容仍要落盘供现场判断。
+static void CheckOnboardLogTimeoutAndNoResponse(string directory)
+{
+    byte[] partial = Encoding.UTF8.GetBytes("只有前两片，板子随后没再回数据\r\n");
+    string timeoutPath = Path.Combine(directory, "timeout.log");
+    OnboardLogScriptedChannel timeoutChannel = new();
+    timeoutChannel.WriteResponse(BuildLogResponseFrame(1, 0, 4096, partial));
+    OnboardLogDownloadResult timeoutResult = OnboardLogDownloader.DownloadFromChannel(
+        timeoutChannel,
+        timeoutPath,
+        timeout: TimeSpan.FromMilliseconds(250),
+        firstResponseTimeout: TimeSpan.FromMilliseconds(250));
+    Require(
+        timeoutResult.TimedOut && !timeoutResult.Completed && !timeoutResult.NoResponse,
+        $"分片中断未被判定为超时：{timeoutResult}");
+    Require(
+        timeoutResult.BytesReceived == partial.Length && File.ReadAllBytes(timeoutPath).Length == partial.Length,
+        $"超时前的部分内容没有完整落盘：{timeoutResult}");
+    Require(timeoutResult.Truncated, "板端上报总量大于下载量时必须标记为截断");
+
+    string emptyPath = Path.Combine(directory, "no-response.log");
+    OnboardLogScriptedChannel silentChannel = new();
+    OnboardLogDownloadResult silentResult = OnboardLogDownloader.DownloadFromChannel(
+        silentChannel,
+        emptyPath,
+        timeout: TimeSpan.FromMilliseconds(200),
+        firstResponseTimeout: TimeSpan.FromMilliseconds(200));
+    Require(
+        silentResult.NoResponse && silentResult.TimedOut && silentResult.BytesReceived == 0,
+        $"板端无响应未被区分：{silentResult}");
+    Require(silentChannel.RequestWritten, "无响应场景下也必须先写出请求帧");
+    Console.WriteLine(
+        $"板载日志超时检查：通过；分片中断={timeoutResult.BytesReceived} 字节（已落盘、标记截断），" +
+        $"完全无响应={silentResult.NoResponse}，两者均与正常结束可区分。");
+}
+
+// ⑥ 界面结论文案必须覆盖完成、截断、无响应、超时四种可诊断结果。
+static void CheckOnboardLogResultMessages()
+{
+    string port = "COM9";
+    string path = @"D:\log\device\onboard-log.log";
+    string completed = BridgeMainForm.DescribeOnboardLogResult(
+        new OnboardLogDownloadResult(1024, 20, 1024, Completed: true, TimedOut: false, TimeSpan.FromSeconds(1.5)),
+        port,
+        path);
+    Require(
+        completed.Contains("转存完成", StringComparison.Ordinal) &&
+        completed.Contains("已下载=1024 字节", StringComparison.Ordinal) &&
+        completed.Contains("端口=COM9", StringComparison.Ordinal) &&
+        completed.Contains(path, StringComparison.Ordinal),
+        $"完成结论缺少端口/字节数/文件路径：{completed}");
+    string truncated = BridgeMainForm.DescribeOnboardLogResult(
+        new OnboardLogDownloadResult(1 << 20, 20000, 4 << 20, Completed: true, TimedOut: false, TimeSpan.FromSeconds(9)),
+        port,
+        path);
+    Require(
+        truncated.Contains("尾部仍在板上", StringComparison.Ordinal) &&
+        truncated.Contains("板端上报=4194304 字节", StringComparison.Ordinal),
+        $"截断结论未提示尾部仍在板上：{truncated}");
+    string noResponse = BridgeMainForm.DescribeOnboardLogResult(
+        new OnboardLogDownloadResult(0, 0, 0, Completed: false, TimedOut: true, TimeSpan.FromSeconds(3)),
+        port,
+        path);
+    Require(
+        noResponse.Contains("没有任何 LOG_READ_RESPONSE 响应", StringComparison.Ordinal) &&
+        noResponse.Contains("端口选错", StringComparison.Ordinal),
+        $"无响应结论未给出可诊断原因：{noResponse}");
+    string timeout = BridgeMainForm.DescribeOnboardLogResult(
+        new OnboardLogDownloadResult(512, 40, 4096, Completed: false, TimedOut: true, TimeSpan.FromSeconds(30)),
+        port,
+        path);
+    Require(
+        timeout.Contains("没有收到后续分片", StringComparison.Ordinal) &&
+        timeout.Contains("已保存部分内容", StringComparison.Ordinal),
+        $"超时结论未说明已保存部分内容：{timeout}");
+    Console.WriteLine("板载日志结论文案检查：通过；完成、截断、无响应、超时四种结果均给出端口、字节数、分片、耗时与文件路径。");
+}
+
+static byte[] BuildLogResponseFrame(ushort sequence, uint offset, uint total, byte[] data)
+{
+    byte[] payload = new byte[8 + data.Length];
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), offset);
+    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), total);
+    data.CopyTo(payload.AsSpan(8));
+    return OnboardLogDownloader.EncodeFrame(MessageType.LogReadResponse, sequence, payload);
 }
 
 static void CheckKeyboardAutoRepeatEdgeFiltering()
@@ -2829,6 +3148,14 @@ static void CheckWindowLayout()
             form.LogModeComboBox.SelectedIndex = 1;
             Require(form.LogModeComboBox.SelectedIndex == 1, "日志模式必须能切换到完整诊断");
             form.LogModeComboBox.SelectedIndex = 0;
+            Require(
+                form.OnboardLogButton.Text == "转存板载日志" &&
+                !form.OnboardLogButton.Enabled &&
+                form.OnboardLogButton.Visible,
+                "非串口模式必须显示但禁用「转存板载日志」入口");
+            Require(
+                form.OnboardLogButton.Parent is TableLayoutPanel,
+                "「转存板载日志」入口必须与日志模式下拉框同排在日志栏顶部");
             Require(!form.SimulatedUdpCheckBox.Checked, "模拟 UDP 开关默认必须关闭");
             Require(!input.SimulatedUdpInputEnabled, "界面创建后模拟 UDP 状态应默认关闭");
             Require(!form.SimulatedUdpFrequencyComboBox.Enabled, "模拟 UDP 关闭时频率列表应禁用");
@@ -3257,6 +3584,44 @@ internal sealed class RecordingTransport : IBridgeTransport
     public void Dispose()
     {
     }
+}
+
+/// <summary>
+/// 合成设备通道：按脚本预置响应字节，记录下载器写出的请求帧；读取窗口可设置得很小，
+/// 用来验证帧扫描能处理跨多次读取到达的帧。不涉及真实串口。
+/// </summary>
+internal sealed class OnboardLogScriptedChannel : IOnboardLogChannel
+{
+    private readonly MemoryStream _stream = new();
+    private readonly int _maxReadSize;
+    private byte[]? _request;
+    private int _readOffset;
+
+    internal OnboardLogScriptedChannel(int maxReadSize = 4096) => _maxReadSize = Math.Max(1, maxReadSize);
+
+    internal bool RequestWritten => _request is not null;
+
+    internal byte[] Request => _request ?? throw new InvalidOperationException("转存下载器没有写出请求帧");
+
+    internal void WriteResponse(byte[] bytes) => _stream.Write(bytes, 0, bytes.Length);
+
+    public void Write(ReadOnlySpan<byte> frame) => _request = frame.ToArray();
+
+    public int Read(Span<byte> buffer)
+    {
+        // 写入时 MemoryStream 的位置停在末尾，因此读取必须用独立的读游标。
+        int available = (int)_stream.Length - _readOffset;
+        int count = Math.Min(Math.Min(available, buffer.Length), _maxReadSize);
+        if (count <= 0)
+        {
+            return 0; // 脚本数据已放完：模拟板端不再回数据
+        }
+        _stream.GetBuffer().AsSpan(_readOffset, count).CopyTo(buffer);
+        _readOffset += count;
+        return count;
+    }
+
+    public void Dispose() => _stream.Dispose();
 }
 
 internal sealed class RecordingAutomationOutput : IAutomationOutput

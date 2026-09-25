@@ -34,10 +34,14 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 
 ### 双板透明代理内部协议
 
-双板 `dual_proxy` 的 UART1 复用同一帧封装，并预留以下内部消息；它们不属于主机 CDC 控制 API：
+双板 `dual_proxy` 的 UART1 复用同一帧封装，并使用以下内部消息；它们不属于主机 CDC 控制 API：
 
 | Type | 名称 | Payload |
 |---:|---|---|
+| `0x20` | LINK_HELLO | `role:u8`、`usb_state:u8`、`node_id:6 bytes`、`generation:u32` |
+| `0x21` | PHYSICAL_MOUSE | `interface:u8`、`report_id:u8`、`buttons:u8`、`x/y:i16`、`wheel/pan:i8` |
+| `0x22` | PHYSICAL_RELEASE | `reason:u8` |
+| `0x23` | LINK_PING | `generation:u32` |
 | `0x24` | PROFILE_BEGIN | `transfer_id:u32`、`total_length:u32`、`crc32:u32` |
 | `0x25` | PROFILE_CHUNK | `transfer_id:u32`、`offset:u32`、`data:1..56 bytes` |
 | `0x26` | PROFILE_COMMIT | `transfer_id:u32`、`total_length:u32`、`crc32:u32` |
@@ -47,11 +51,39 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | `0x2A` | HID_GET_REPORT_RESPONSE | 事务 ID、状态、interface、Report ID 和响应正文 |
 | `0x2B` | SOFTWARE_MOUSE | 来自电脑 A 的 7/8 字节标准化软件鼠标报告 |
 | `0x2C` | SOFTWARE_RELEASE | 软件输入租约结束、断线或队列故障时释放软件按键 |
-| `0x2D` | DEVICE_GONE | 鼠标侧物理 USB 设备已拔出；1 字节原因码 |
+| `0x2D` | DEVICE_GONE | `sender_generation:u32`、`target_generation:u32`、非零 `event_id:u32`、`reason:u8`；长度 13 字节 |
+| `0x2E` | PROFILE_ACK | `transfer_id:u32`、`crc32:u32`、`status:u8`、`recipient_generation:u32`、`sender_generation:u32`；长度 17 字节，电脑侧在新 Profile 成功配置并 `tud_mounted()` 后回 ACK，`status=1` 表示不可克隆 |
+| `0x2F` | ROLE_ACK | `role:u8`、`generation:u32`；确认收到并接受对应身份声明 |
+| `0x30` | PROFILE_REQUEST | `generation:u32`、`flow_id:u32`；P 发起一次重新采集申请 |
+| `0x31` | PROFILE_OFFER | `flow_id:u32`、`transfer_id:u32`、`crc32:u32`；M 已采集到新 Profile，提议 P 清空旧会话并重新克隆 |
+| `0x32` | FLOW_ACK | `acknowledged_type:u8`、`flow_id:u32`、`status:u8`、`recipient_generation:u32`、`sender_generation:u32`；长度 14 字节，确认帧绑定双方会话 |
+
+一次性申请和提议都要求对端先通过 `LINK_HELLO` 声明互补角色；仅有 UART 字节活动或 `UNRESOLVED` 声明不足以触发申请。
+
+`LINK_HELLO.role` 使用 `0=UNRESOLVED`、`1=PC_DEVICE`、`2=MOUSE_HOST`；`usb_state` 使用 `0=WAITING`、`1=MOUNTED`、`2=HID_CONNECTED`、`3=DISCONNECTED`、`4=ERROR`。双板启动后先通过 UART1 广播未定身份，并各自在 USB Device/Host 间轮换探测，每个角色探测窗口为 3 秒。Device 检测到 USB 主机 attach 或配置完成后确认 `PC_DEVICE`；Host 成功启动至少一个物理 HID 接口后确认 `MOUSE_HOST`。未确认身份时 LED 熄灭；身份确认但板间对端未在线时红色常亮；对端在线时 M 绿色、P 蓝色；本地 Profile 采集或克隆流程失败时红色闪烁。已确认身份通过周期性 `LINK_HELLO` 告知对端，以 `ROLE_ACK` 回确认；未定身份的一侧锁定互补角色。角色只保存在 RAM，每次复位或重新上电均重新从 `UNRESOLVED` 开始，单板复位可从仍在线的对端重新确定。`generation` 是每次启动生成的非零 32 位会话 ID；对端观察到变化时清空旧序号窗口和单次申请状态，不自动重放已确认的旧 Profile。
+
+P 锁定身份后先完成本地 USB Device 卸载、清空活动 Profile/描述符/报告模板及厂商 HID 会话，成功后才开放并发送本会话唯一一次 `PROFILE_REQUEST`。M generation 变化等同 M 重新上电：P 关闭申请门，重新执行同一套本地清理，完成后再发送新的单次申请。M 收到 REQUEST 后取消尚未完成的旧提议，安排重新读取当前 USB Device/Configuration 描述符并重新发布 HID Profile，同时以 `FLOW_ACK(REQUEST, flow_id, status)` 确认是否接受。
+
+M 每次采集到 Profile 时发起 `PROFILE_OFFER`。该 OFFER 自身也是清理请求：P 先释放输入、卸载 TinyUSB、清空旧 Profile/描述符/报告模板并使旧厂商 HID 会话失效，全部成功后才发送 `FLOW_ACK(OFFER, flow_id, accepted)`；排入异步任务不算成功。M 只有收到双方 generation 与 flow ID 都匹配的 accepted ACK 后，才发送 BEGIN/CHUNK/COMMIT。P 对完整且校验成功的 COMMIT 回 `FLOW_ACK(COMMIT, transfer_id, status)`，随后执行 USB 克隆；`tud_mounted()` 后再发最终 `PROFILE_ACK(transfer_id, crc32, status)`。
+
+鼠标物理拔出时，M 生成非零 event ID 并发送 `DEVICE_GONE(sender_generation, target_generation, event_id, reason)`。P 只接受两个 generation 与当前会话匹配的事件，取消任何旧 pending Profile，并用操作 epoch 使已经开始但尚未完成的重配置快照失效。P 必须实际完成 TinyUSB 卸载与旧会话清空后，才回 `FLOW_ACK(DEVICE_GONE, event_id, accepted)`。M 在收到匹配确认前禁止发送 PROFILE_OFFER 和任何 Profile 分片；即使新鼠标已采集到 Profile，也只缓存等待。鼠标重新插入后，顺序为：GONE 清理 ACK → 新 OFFER 清理 ACK（即便清理是幂等的也要执行并确认）→ BEGIN/CHUNK/COMMIT → P 挂载后的最终 PROFILE_ACK。重复/迟到的 GONE 按 peer generation 与 event ID 去重，不得撤销更新会话中的新克隆。清理失败或确认超时按“有界重试与去重规则”处理：先在同一 generation 内重试同一事务，预算耗尽才闪红灯终止本轮；新 peer generation/板复位开启新的恢复流程。M 侧报告的输入异常（`on_mouse_release(false)`，如报告队列满或传输错误）不属于物理拔出，只释放按钮并记录输入错误，不发送 `DEVICE_GONE`。
+
+FLOW_ACK 的字段偏移为：`acknowledged_type@0`、`flow_id@1`、`status@5`、`recipient_generation@6`、`sender_generation@10`。PROFILE_ACK 的字段偏移为：`transfer_id@0`、`crc32@4`、`status@8`、`recipient_generation@9`、`sender_generation@13`。接收方必须同时验证本地 generation、对端 generation 和 flow/event/transfer ID，旧会话或错配 ACK 不得解锁流程；M 只有收到三者全部匹配的成功 `PROFILE_ACK` 才把自己的 `usb_state` 更新为 `HID_CONNECTED`。`LINK_HELLO` 为 12 bytes，`LINK_PING` 为 4 bytes；PROFILE_ACK 由 9 bytes 变为 17 bytes，两板必须同时刷入本协议版本（帧头版本字节与 Host 协议共用，仍为 `02`，因此长度本身就是新旧固件的判别条件）。上述均为 UART1 双板内部消息，不改变 Host C# 所用 UART/USB CDC 输入协议及其帧格式。
+
+### 有界重试与去重规则
+
+本轮把“一次超时即永久失败”改为有界事务恢复，参数集中在 `firmware/dual_proxy/main/link_recovery_logic.h`（保守初值，待实机标定）：
+
+- 事务身份为 `(双方 generation, 鼠标连接代号, event/flow/transfer ID, 本地 epoch)`；重试只重放同一事务，不创建新 ID；同一时刻只允许一个清理屏障和一个 Profile 传输。
+- `DEVICE_GONE` 按 0.7 秒间隔、最多 8 次重发同一 `event_id`；P 若报告清理失败，M 保留同一事务继续重试。等待窗口 5 秒或次数用尽才判失败，但双方 generation 与 event ID 都匹配的迟到确认仍然有效。快速插回时新 Profile 只缓存，必须等旧屏障完成才能 OFFER。
+- P 清理失败保持克隆门关闭并本地重试同一事务最多 3 次；清理成功后立即登记结果，只有确认帧入队失败时最多补发 3 次，不重复卸载 USB、不清输入、不递增 epoch。
+- 重复 `PROFILE_REQUEST`/`PROFILE_OFFER` 按 generation + flow ID 去重；物理鼠标尚未枚举时 M 受理并等待，设备到达后继续当前流程。
+- 接收端对重复到达的前缀分片幂等（内容一致才忽略，冲突则失败）；同一 `transfer_id` 的重复 BEGIN/CHUNK/COMMIT 返回既有结果，不重新发布，因此不会第二次重枚举 USB。最终 `PROFILE_ACK` 丢失时 M 只重放同一 transfer 的 COMMIT，P 只补发确认。
+- 恢复总预算 10 秒，各阶段共用剩余预算，不串联多个完整等待窗口；预算耗尽后明确终止本轮，新物理事件或新会话可重新发起。
 
 Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`version:u16`、`header_length:u16`、Device descriptor 长度、Configuration descriptor 长度、manufacturer/product/serial UTF-8 长度、报告项数量和 `flags:u8`；随后按长度排列各段数据。每个报告项为 `interface_number:u8`、`subclass:u8`、`protocol:u8`、保留字节、`report_length:u16` 和原始 HID Report descriptor。所有整数均为小端，完整 blob 上限 4096 字节，最多 8 个接口、单份报告描述符 512 字节、每个字符串 128 字节。
 
-接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。当前 `dual_proxy` 已通过独立 USB Host client 采集 raw Device/Configuration descriptor；无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许用通用设备冒充物理鼠标。
+接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。电脑侧每收到完整 Profile 都必须覆盖旧 Profile 并重新插拔电脑 USB：先使旧 vendor HID 会话代号失效、清空输入/控制队列和待处理 GET_REPORT，卸载旧 TinyUSB 设备并清空活动 Profile/报告模板；USB 断开后才构建并安装新描述符，避免枚举期间新旧描述符混用。无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许回退呈现旧 Profile 或通用设备冒充物理鼠标。
 
 实体 raw Input 优先于软件输入；软件 move/release 使用独立有界队列；HID 厂商控制使用独立队列；Profile 只在安全/输入队列允许时分片发送。鼠标拔出、UART1 超时、鼠标侧掉电或 Profile 超时都先释放输入，再由电脑侧卸载 USB Device；重新插入后只有完整新 Profile 校验通过才重新枚举。
 主机同步程序打开 UART 或原生 USB CDC 对应的 COM 口后，会由同一个 `SerialPort` 实例读取设备日志并缓冲写入 `deviceLogPath` 指定的文件（默认是 EXE 同目录 `log/device/host-serial-{timestamp}.log`），并按 `deviceLogRetentionCount` 清理最旧文件，因此不需要、也不能再同时运行 `idf.py monitor` 独占同一个 COM 口。为避免高频 BLE notify 日志重复触发主机日志落盘和 WinForms 重绘，`showDeviceLogInUi` 默认关闭；该选项只影响窗口镜像，不影响独立设备日志文件。
@@ -64,6 +96,33 @@ UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流
 
 协议 v2 不兼容旧的 5 字节鼠标报告。主机、固件与 Target Agent 必须使用同一版本。
 
+
+## 板载日志下载命令
+
+每块板把控制台日志写入自己的 SPIFFS 分区（4×128 KB 轮转，跨复位续写）。这些命令走
+**板子自己的 UART0**（鼠标侧板＝主机控制口；电脑侧板＝调试口，只跑日志服务），
+不占用输入租约，没建会话也能用：
+
+| Type | 名称 | Payload |
+|---:|---|---|
+| `0x08` | LOG_READ_REQUEST | `offset:u32`、`max_bytes:u8`（1..56）；设备回一条 `LOG_READ_RESPONSE` |
+| `0x09` | LOG_READ_RESPONSE | `offset:u32`、`total_bytes:u32`、`data:0..56`；`data` 为空表示流结束 |
+| `0x0A` | LOG_CLEAR_REQUEST | 空；清空全部日志文件后回一条 `total_bytes=0` 的 `LOG_READ_RESPONSE` |
+| `0x0B` | LOG_DUMP_REQUEST | `offset:u32`、`max_bytes:u32`；设备**连续**回多条 `LOG_READ_RESPONSE` 后以空 `data` 帧收尾 |
+
+逻辑字节流按「最旧 → 最新」排列，`offset` 从 0 开始；`total_bytes` 是板端当前可读的
+总字节数（上限 512 KB）。客户端的推荐做法是发一条 `LOG_DUMP_REQUEST`，然后流式解析
+响应帧直到遇到空 `data` 帧。
+
+解析注意：日志文本与协议帧共用同一个串口，客户端必须**在混杂文本中扫描帧**（找
+`A5 5A`、校验长度与 CRC16，失败则后移一字节继续）。命令本身不受会话约束，也不会
+更新帧序号窗口。
+
+主机 EXE 侧的入口是鼠标捕获页日志栏右上角的**「转存板载日志」**按钮：它取当前已连接的
+串口，发一条 `LOG_DUMP_REQUEST{offset=0, max_bytes=1 MB}`，把收到的分片按 UTF-8 追加写入
+`log/device/onboard-log-yyyyMMdd-HHmmss.log`（默认目录，SaveFileDialog 可改）。转存期间
+串口被独占借出、键鼠同步先释放全部按键并暂停，结束后自动恢复控制连接；`host/HidBridge.Host/Transport/OnboardLogDownloader.cs`
+是该实现，打开串口时显式保持 DTR/RTS 为低，不会复位被测板。命令行/脚本路径见 `tools/fetch_onboard_log.py`。
 
 ## 主机局域网模拟鼠标 UDP 接口
 

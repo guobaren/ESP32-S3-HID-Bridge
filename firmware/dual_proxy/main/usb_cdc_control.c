@@ -12,6 +12,7 @@
 #include "tusb.h"
 
 #include "usb_cdc_control_logic.h"
+#include "onboard_log.h"
 
 #define CDC_CONTROL_PORT TINYUSB_CDC_ACM_0
 #define CDC_RX_BUFFER_SIZE 512
@@ -73,6 +74,50 @@ static void send_device_hello(const dual_frame_t *probe)
     }
 }
 
+static void send_log_response(const dual_frame_t *request)
+{
+    dual_onboard_log_request_flush();
+    vTaskDelay(pdMS_TO_TICKS(120));
+    uint32_t offset = 0U;
+    uint8_t max_bytes = 0U;
+    if (!dual_log_read_request_decode(request->payload, request->payload_length,
+                                      &offset, &max_bytes)) {
+        ++s_rejected;
+        return;
+    }
+    if (max_bytes > DUAL_LOG_CHUNK_MAX) {
+        max_bytes = DUAL_LOG_CHUNK_MAX;
+    }
+    uint8_t data[DUAL_LOG_CHUNK_MAX];
+    const size_t read = dual_onboard_log_read(offset, data, max_bytes);
+    dual_frame_t response = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = DUAL_MESSAGE_LOG_READ_RESPONSE,
+        .sequence = request->sequence,
+    };
+    if (!dual_log_read_response_encode(offset, dual_onboard_log_total_bytes(), data, read,
+                                       response.payload, sizeof(response.payload),
+                                       &response.payload_length)) {
+        ++s_rejected;
+        return;
+    }
+    uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+    size_t serialized_length = 0;
+    if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                             &serialized_length) != ESP_OK) {
+        ++s_rejected;
+        return;
+    }
+    const size_t queued = tinyusb_cdcacm_write_queue(CDC_CONTROL_PORT, serialized,
+                                                     serialized_length);
+    if (queued != serialized_length ||
+        tinyusb_cdcacm_write_flush(CDC_CONTROL_PORT, pdMS_TO_TICKS(200)) != ESP_OK) {
+        ++s_rejected;
+        return;
+    }
+    ++s_accepted;
+}
+
 static void on_control_frame(const dual_frame_t *frame, void *context)
 {
     (void)context;
@@ -85,6 +130,81 @@ static void on_control_frame(const dual_frame_t *frame, void *context)
         } else {
             ++s_rejected;
         }
+        return;
+    }
+    /* 日志命令不占用输入会话：没建会话时也能取板载日志。 */
+    if (frame->type == DUAL_MESSAGE_LOG_READ_REQUEST) {
+        send_log_response(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_LOG_DUMP_REQUEST &&
+        frame->payload_length == DUAL_LOG_DUMP_REQUEST_LENGTH) {
+        uint32_t offset = 0U;
+        uint32_t budget = 0U;
+        memcpy(&offset, &frame->payload[0], sizeof(offset));
+        memcpy(&budget, &frame->payload[4], sizeof(budget));
+        dual_onboard_log_request_flush();
+        vTaskDelay(pdMS_TO_TICKS(120));
+        uint8_t data[DUAL_LOG_CHUNK_MAX];
+        uint32_t sent = 0U;
+        while (sent < budget) {
+            size_t want = budget - sent;
+            if (want > DUAL_LOG_CHUNK_MAX) {
+                want = DUAL_LOG_CHUNK_MAX;
+            }
+            const size_t read = dual_onboard_log_read(offset, data, want);
+            if (read == 0U) {
+                break;
+            }
+            dual_frame_t response = {
+                .version = DUAL_PROXY_PROTOCOL_VERSION,
+                .type = DUAL_MESSAGE_LOG_READ_RESPONSE,
+                .sequence = frame->sequence,
+            };
+            if (!dual_log_read_response_encode(offset, dual_onboard_log_total_bytes(),
+                                               data, read, response.payload,
+                                               sizeof(response.payload),
+                                               &response.payload_length)) {
+                break;
+            }
+            uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+            size_t serialized_length = 0;
+            if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                                     &serialized_length) != ESP_OK) {
+                break;
+            }
+            if (tinyusb_cdcacm_write_queue(CDC_CONTROL_PORT, serialized,
+                                           serialized_length) != serialized_length ||
+                tinyusb_cdcacm_write_flush(CDC_CONTROL_PORT, pdMS_TO_TICKS(500)) != ESP_OK) {
+                break;
+            }
+            offset += (uint32_t)read;
+            sent += (uint32_t)read;
+        }
+        ++s_accepted;
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_LOG_CLEAR_REQUEST) {
+        (void)dual_onboard_log_clear();
+        dual_frame_t response = {
+            .version = DUAL_PROXY_PROTOCOL_VERSION,
+            .type = DUAL_MESSAGE_LOG_READ_RESPONSE,
+            .sequence = frame->sequence,
+        };
+        if (dual_log_read_response_encode(0U, 0U, NULL, 0U, response.payload,
+                                          sizeof(response.payload),
+                                          &response.payload_length)) {
+            uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+            size_t serialized_length = 0;
+            if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                                     &serialized_length) == ESP_OK &&
+                tinyusb_cdcacm_write_queue(CDC_CONTROL_PORT, serialized,
+                                           serialized_length) == serialized_length) {
+                (void)tinyusb_cdcacm_write_flush(CDC_CONTROL_PORT, pdMS_TO_TICKS(200));
+                ++s_accepted;
+            }
+        }
+        ESP_LOGW(TAG, "板载日志已清空（CDC）");
         return;
     }
 

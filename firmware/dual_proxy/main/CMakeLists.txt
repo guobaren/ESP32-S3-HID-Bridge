@@ -13,8 +13,10 @@ idf_component_register(
         "hid_clone_descriptor.c"
         "hid_report_layout.c"
         "hid_host_mouse.c"
+        "vendor_urb.c"
         "pc_hid_output.c"
+        "onboard_log.c"
         "../../main/mouse_motion_smoother.c"
     INCLUDE_DIRS "." "../../main"
-    REQUIRES esp_driver_uart esp_system esp_timer esp_tinyusb led_strip usb_host_hid
+    REQUIRES esp_driver_uart esp_system esp_timer esp_tinyusb led_strip usb_host_hid spiffs
 )

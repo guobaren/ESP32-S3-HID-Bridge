@@ -1,7 +1,21 @@
 """测量远程 UDP 鼠标输入的延迟、5 槽平滑和连续命令重叠效果。
 
-脚本在本机每 1 ms 时间桶采样一次鼠标坐标，向远端 HidBridge UDP 端口发送
-相对位移，并生成 CSV、JSON 和两个 SVG 图。测试结束后用反向 UDP 命令恢复起点。
+脚本在运行机本机每 1 ms 时间桶采样一次鼠标坐标，向运行 HidBridge.Host.exe 的
+地址发送相对位移，并生成 CSV、JSON 和两个 SVG 图。测试结束后用反向 UDP 命令
+恢复起点。
+
+使用前提（不满足时退出码 2）::
+
+    * 电脑侧板(P)的 USB 输出接到**运行本脚本的这台机器**，克隆鼠标已枚举；
+    * HidBridge.Host.exe 正在运行，且 UDP 输入端口可访问（默认本机 24814）。
+
+判定标准（不符合时退出码 1）::
+
+    * 每类用例的首次移动延迟 < 10 ms（相对该用例第一条命令的发出时刻）；
+    * 实际位移与预期一致：单次用例 20px、连续用例 60px。
+
+默认执行一次 20px 和三次连续 20px（命令间隔 10ms）。50% 位移耗时、逐命令延迟、
+每步位移等只作为过程信息写入 JSON/CSV/SVG，不参与判定。
 """
 
 from __future__ import annotations
@@ -11,9 +25,17 @@ import ctypes
 import csv
 import json
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+# 判定阈值与前置检查标识。
+FIRST_MOVE_LIMIT_MS = 10.0
+CLONE_INSTANCE_HINT = "VID_046D&PID_C092"
+SINGLE_DISTANCE_PX = 20
+CONTINUOUS_COMMANDS = 3
 
 
 class Point(ctypes.Structure):
@@ -57,6 +79,75 @@ def restore_cursor(x: int, y: int) -> None:
         time.sleep(0.001)
     current = cursor_position()
     raise RuntimeError(f"无法恢复鼠标位置：目标=({x},{y})，当前=({current[0]},{current[1]})")
+
+
+def clone_device_present() -> bool | None:
+    """只读检查本机是否已枚举电脑侧板(P)克隆出来的鼠标设备。
+
+    返回 True/False 表示检查成功，None 表示无法完成检查（例如没有 PowerShell）。
+    """
+    query = (
+        "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
+        f"Where-Object {{ $_.InstanceId -like '*{CLONE_INSTANCE_HINT}*' }} | "
+        "Measure-Object | Select-Object -ExpandProperty Count"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", query],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        return int(lines[-1]) > 0
+    except ValueError:
+        return None
+
+
+def first_move_latency_ms(result: dict) -> float | None:
+    """取该用例首条命令的实际首动延迟（ms）；未观测到位移时返回 None。
+
+    只取首条命令：连续用例中后续命令发出时前一条命令的平滑槽位仍在到达，
+    用它们算首动会把上一命令的残留位移误记为本命令的延迟。
+    """
+    per_command = result.get("per_command") or []
+    if not per_command:
+        return None
+    latency_us = per_command[0].get("start_latency_us")
+    return None if latency_us is None else latency_us / 1000.0
+
+
+def judge_case(label: str, result: dict, expected_dx: int) -> list[str]:
+    """按验收标准判定一次用例，返回失败原因列表（空列表表示通过）。"""
+    failures: list[str] = []
+    latency_ms = first_move_latency_ms(result)
+    if latency_ms is None:
+        failures.append(
+            f"{label}：未观测到首次位移（要求 < {FIRST_MOVE_LIMIT_MS:.1f}ms）；"
+            f"请确认电脑侧板(P)输出到本机、克隆已枚举且 HidBridge.Host.exe 正在运行")
+    elif latency_ms >= FIRST_MOVE_LIMIT_MS:
+        failures.append(
+            f"{label}：首次移动延迟 {latency_ms:.2f}ms 未低于 {FIRST_MOVE_LIMIT_MS:.1f}ms")
+    else:
+        print(f"[判定] {label} 首次移动延迟 {latency_ms:.2f}ms < "
+              f"{FIRST_MOVE_LIMIT_MS:.1f}ms：合格", flush=True)
+
+    observed = result.get("total_observed_dx")
+    if observed != expected_dx:
+        failures.append(f"{label}：实际位移 {observed}px 与预期 {expected_dx}px 不符")
+        if observed is not None and abs(observed - expected_dx) == 1 and \
+                len(result.get("per_command") or []) > 1:
+            print("[提示] 多命令用例偏差 1px 时先检查 Windows 指针加速"
+                  "（设置→鼠标→提高指针精确度）与上一用例残留的平滑槽位；"
+                  "单次用例的位移判定不受影响。", flush=True)
+    else:
+        print(f"[判定] {label} 实际位移 {observed}px 与预期一致：合格", flush=True)
+    return failures
 
 
 class UdpSender:
@@ -231,26 +322,73 @@ def run_case(name: str, sender: UdpSender, settle_us: int, interval_us: int, cou
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="192.168.3.50")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="运行 HidBridge.Host.exe 的地址（默认本机 127.0.0.1；"
+                             "EXE 在另一台机器时改成那台的地址）")
     parser.add_argument("--port", type=int, default=24814)
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/tests/udp-smoothing-measurement"))
+    parser.add_argument("--force", action="store_true",
+                        help="跳过“本机是否已枚举电脑侧板克隆设备”的前置检查")
     args = parser.parse_args()
+
+    if not args.force:
+        present = clone_device_present()
+        if present is False:
+            print(f"前置条件不满足：本机没有 {CLONE_INSTANCE_HINT} 节点。本脚本只在电脑侧板(P)"
+                  f"输出到本机、克隆设备已枚举、且 HidBridge.Host.exe 正在运行时可用。",
+                  file=sys.stderr, flush=True)
+            return 2
+        if present is None:
+            print("[前置] 无法查询 PnP 设备，跳过前置检查（可用 --force 显式跳过）", flush=True)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[连接] UDP 目标 {args.host}:{args.port}，观测源=本机光标；"
+          f"判定：首动 < {FIRST_MOVE_LIMIT_MS:.1f}ms 且位移与预期一致", flush=True)
     sender = UdpSender(args.host, args.port)
     try:
         single, single_samples, single_commands, single_start = run_case("single_20px", sender, 40_000, 0, 1)
-        continuous, continuous_samples, continuous_commands, continuous_start = run_case("three_20px_every_10ms", sender, 40_000, 10_000, 3)
+        continuous, continuous_samples, continuous_commands, continuous_start = run_case(
+            "three_20px_every_10ms", sender, 40_000, 10_000, CONTINUOUS_COMMANDS)
     finally:
         sender.close()
+
+    failures: list[str] = []
+    failures += judge_case(f"单次 {SINGLE_DISTANCE_PX}px", single,
+                           SINGLE_DISTANCE_PX)
+    failures += judge_case(
+        f"连续 {CONTINUOUS_COMMANDS} 次 {SINGLE_DISTANCE_PX}px（间隔 10ms）", continuous,
+        SINGLE_DISTANCE_PX * CONTINUOUS_COMMANDS)
+
     write_csv(args.output_dir / "single_20px.csv", single_samples)
     write_csv(args.output_dir / "three_20px_every_10ms.csv", continuous_samples)
     svg_plot(args.output_dir / "single_20px.svg", "单次 20 px UDP 移动", single_samples, single_commands, single_start, single["analysis_start_us"], single["analysis_end_us"])
     svg_plot(args.output_dir / "three_20px_every_10ms.svg", "每 10 ms 发送一次 20 px，共 3 次", continuous_samples, continuous_commands, continuous_start, continuous["analysis_start_us"], continuous["analysis_end_us"])
-    summary = {"target": f"{args.host}:{args.port}", "single": single, "continuous": continuous}
+    summary = {
+        "target": f"{args.host}:{args.port}",
+        "criteria": {
+            "first_move_limit_ms": FIRST_MOVE_LIMIT_MS,
+            "single_expected_dx": SINGLE_DISTANCE_PX,
+            "continuous_expected_dx": SINGLE_DISTANCE_PX * CONTINUOUS_COMMANDS,
+        },
+        "judged": {
+            "single_first_move_ms": first_move_latency_ms(single),
+            "continuous_first_move_ms": first_move_latency_ms(continuous),
+        },
+        "single": single,
+        "continuous": continuous,
+        "failures": failures,
+    }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"图表和原始采样已写入：{args.output_dir}")
+    if failures:
+        print("[结论] FAIL", flush=True)
+        for reason in failures:
+            print(f"  - {reason}", flush=True)
+        return 1
+    print("[结论] PASS（首次移动延迟达标且位移与预期一致）", flush=True)
     return 0
 
 

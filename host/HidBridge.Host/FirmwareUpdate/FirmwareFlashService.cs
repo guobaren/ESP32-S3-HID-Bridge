@@ -123,14 +123,14 @@ internal sealed class FirmwareFlashService : IDisposable
     private async Task RunAsync(string jobId, FirmwareFlashPlan plan, string selectedPortName)
     {
         bool restoreForwarding = _input.ForwardingEnabled;
-        SerialBridge.FirmwareUpdatePortLease? lease = null;
+        SerialBridge.ExclusivePortLease? lease = null;
         int? exitCode = null;
         string? portName = null;
         try
         {
             _input.DisableForwarding();
             await Task.Delay(100).ConfigureAwait(false);
-            lease = _serialBridge.AcquireFirmwareUpdatePort(selectedPortName);
+            lease = _serialBridge.AcquireExclusivePort(selectedPortName, "固件刷写任务");
             portName = lease.PortName;
             SetRunning(jobId, $"正在通过 {portName} 刷写固件。", portName);
             WriteLog(
