@@ -14,8 +14,11 @@
     * 每类用例的首次移动延迟 < 10 ms（相对该用例第一条命令的发出时刻）；
     * 实际位移与预期一致：单次用例 20px、连续用例 60px。
 
-默认执行一次 20px 和三次连续 20px（命令间隔 10ms）。50% 位移耗时、逐命令延迟、
-每步位移等只作为过程信息写入 JSON/CSV/SVG，不参与判定。
+默认对**每一类用例连续测量 10 轮**（`--repeat` 可改），且**每一轮都必须达标**：
+任何一轮不达标即整体 FAIL，结论里会列出全部未达标轮次。测量结束后额外输出各指标的
+**平均结果**（首动延迟的均值/最小/最大、逐命令延迟均值、50% 位移耗时均值、实际位移均值）。
+50% 位移耗时、逐命令延迟、每步位移等仍只作为过程信息写入 JSON/CSV/SVG 与平均结果，
+不参与逐轮判定。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import argparse
 import ctypes
 import csv
 import json
+import math
 import socket
 import subprocess
 import sys
@@ -33,6 +37,9 @@ from pathlib import Path
 
 # 判定阈值与前置检查标识。
 FIRST_MOVE_LIMIT_MS = 10.0
+# 开始测量前先等这么久，然后把准心移到屏幕中心再测：圆形用例半径 100 px，
+# 从屏幕边缘起步会被边界裁掉位移，终点核对随之失去意义。
+CENTER_SETTLE_S = 3.0
 # 克隆设备型号随被代理的鼠标变化：046D:C092（有线 G102）与 046D:C539（Lightspeed
 # 接收器）都在实机出现过。因此前置检查默认按“当前枚举到的任意 USB 罗技节点”判定，
 # 需要精确型号时用 --expect-vidpid 046D:xxxx。
@@ -41,6 +48,21 @@ CLONE_USB_PREFIX = "USB\\VID_046D&PID_"
 CLONE_INSTANCE_HINT = "VID_046D&PID_C092"  # 历史样本，仅用于文案提示
 SINGLE_DISTANCE_PX = 20
 CONTINUOUS_COMMANDS = 3
+# 长时移动用例（2026-09-27 新增，同日改为 1 像素步进）：每 1 ms 发一次位移、持续 10 s，
+# 沿半径 100 px 的圆**逐像素**行走——每步只走 1 个像素单位（dx/dy ∈ {-1,0,1}）。
+# 10 s × 1000 步 ≈ 10000 步 ≈ 10000 px 路程 ≈ 15.9 圈（周长 2πr ≈ 628 px）。
+# 这样既能压出长时高频负载，又能用「实际终点 vs 预期终点」验证每个 1 px 微步是否被
+# 逐条精确执行（而不是像变长增量那样只看总量）。
+# 采样降到 2 ms：1 ms 桶已经被发送占满，再叠加一次 GetCursorPos 会让调度失真。
+CIRCLE_RADIUS_PX = 100
+CIRCLE_DURATION_S = 10.0
+CIRCLE_STEP_US = 1_000
+CIRCLE_SAMPLE_US = 2_000
+CIRCLE_STEP_PX = 1                   # 每步移动的像素单位（曼哈顿步长）
+CIRCLE_END_TOLERANCE_PX = 2          # 终点允许偏差（指针加速/取整可能带来 1~2 px）
+# 长时移动的检查阈值（超过即计入 failures）
+CIRCLE_MAX_GAP_US = 100_000          # 位移停顿 > 100 ms 视为卡顿
+CIRCLE_MAX_SEND_LAG_US = 5_000       # 单次发送相对计划时刻滞后 > 5 ms 视为节奏失守
 
 
 class Point(ctypes.Structure):
@@ -52,6 +74,10 @@ _USER32.GetCursorPos.argtypes = [ctypes.POINTER(Point)]
 _USER32.GetCursorPos.restype = ctypes.c_bool
 _USER32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 _USER32.SetCursorPos.restype = ctypes.c_bool
+_USER32.GetSystemMetrics.argtypes = [ctypes.c_int]
+_USER32.GetSystemMetrics.restype = ctypes.c_int
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
 
 
 @dataclass(frozen=True)
@@ -84,6 +110,19 @@ def restore_cursor(x: int, y: int) -> None:
         time.sleep(0.001)
     current = cursor_position()
     raise RuntimeError(f"无法恢复鼠标位置：目标=({x},{y})，当前=({current[0]},{current[1]})")
+
+
+def screen_center() -> tuple[int, int]:
+    """主屏中心坐标（多屏环境取主屏即可满足半径 100 px 的圆用例）。"""
+    return (_USER32.GetSystemMetrics(SM_CXSCREEN) // 2,
+            _USER32.GetSystemMetrics(SM_CYSCREEN) // 2)
+
+
+def move_cursor_to_center() -> tuple[int, int]:
+    """把准心移到屏幕中心并确认到位，返回中心坐标。"""
+    center_x, center_y = screen_center()
+    restore_cursor(center_x, center_y)
+    return center_x, center_y
 
 
 def present_logitech_nodes() -> list[str] | None:
@@ -173,6 +212,73 @@ def judge_case(label: str, result: dict, expected_dx: int) -> list[str]:
     else:
         print(f"[判定] {label} 实际位移 {observed}px 与预期一致：合格", flush=True)
     return failures
+
+
+def _mean(values: list[float | int | None]) -> float | None:
+    usable = [float(value) for value in values if value is not None]
+    return None if not usable else sum(usable) / len(usable)
+
+
+def _fmt_ms(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
+def average_runs(results: list[dict]) -> dict:
+    """对同一用例的多轮测量求平均，供结论里的“平均结果”使用。
+
+    只统计可用的数值指标：首动延迟（每轮取首条命令）、逐命令延迟、50% 位移耗时、
+    整段位移耗时、实际总位移。任一轮缺失的指标不参与该项平均（不是按 0 计入）。
+    """
+    if not results:
+        return {"runs": 0}
+    first_moves = [first_move_latency_ms(result) for result in results]
+    command_latencies = [
+        command["start_latency_us"] / 1000.0
+        for result in results
+        for command in (result.get("per_command") or [])
+        if command.get("start_latency_us") is not None
+    ]
+    half_times = [
+        command["half_time_us"] / 1000.0
+        for result in results
+        for command in (result.get("per_command") or [])
+        if command.get("half_time_us") is not None
+    ]
+    durations = [
+        result["motion_duration_us"] / 1000.0
+        for result in results
+        if result.get("motion_duration_us") is not None
+    ]
+    observed = [
+        result["total_observed_dx"]
+        for result in results
+        if result.get("total_observed_dx") is not None
+    ]
+    usable_first = [value for value in first_moves if value is not None]
+    return {
+        "runs": len(results),
+        "runs_with_first_move": len(usable_first),
+        "first_move_ms_avg": _mean(usable_first),
+        "first_move_ms_min": min(usable_first) if usable_first else None,
+        "first_move_ms_max": max(usable_first) if usable_first else None,
+        "per_command_latency_ms_avg": _mean(command_latencies),
+        "half_travel_ms_avg": _mean(half_times),
+        "motion_duration_ms_avg": _mean(durations),
+        "observed_dx_avg": _mean(observed),
+    }
+
+
+def print_average(title: str, average: dict) -> None:
+    observed = average.get("observed_dx_avg")
+    observed_text = "-" if observed is None else f"{observed:.2f}"
+    print(f"[平均] {title}：共 {average.get('runs', 0)} 轮，"
+          f"首动均值 {_fmt_ms(average.get('first_move_ms_avg'))} ms"
+          f"（最小 {_fmt_ms(average.get('first_move_ms_min'))} / "
+          f"最大 {_fmt_ms(average.get('first_move_ms_max'))} ms），"
+          f"逐命令延迟均值 {_fmt_ms(average.get('per_command_latency_ms_avg'))} ms，"
+          f"50% 位移均值 {_fmt_ms(average.get('half_travel_ms_avg'))} ms，"
+          f"位移耗时均值 {_fmt_ms(average.get('motion_duration_ms_avg'))} ms，"
+          f"实际位移均值 {observed_text} px", flush=True)
 
 
 class UdpSender:
@@ -346,6 +452,190 @@ def run_case(name: str, sender: UdpSender, settle_us: int, interval_us: int, cou
     return result, samples, commands, start_x
 
 
+def circle_metrics(
+    samples: list[Sample],
+    commands: list[Command],
+    send_lags_us: list[int],
+    walk_dx: int,
+    walk_dy: int,
+    expected_end: tuple[int, int],
+    actual_end: tuple[int, int],
+    end_delta: tuple[int, int],
+) -> dict:
+    """长时移动的检查指标：发送节奏、位移连续性、路程与**终点核对**。"""
+    changes = changed_samples(samples)
+    # 最长"无位移"间隔：从首条命令（或上一次观测到位移）到下一次位移之间的时长。
+    previous_us = commands[0].sent_us if commands else 0
+    max_gap_us = 0
+    for sample, _, _ in changes:
+        max_gap_us = max(max_gap_us, sample.elapsed_us - previous_us)
+        previous_us = sample.elapsed_us
+    ordered = sorted(send_lags_us)
+
+    def percentile(pct: float) -> int | None:
+        if not ordered:
+            return None
+        index = min(len(ordered) - 1, int(round((pct / 100.0) * (len(ordered) - 1))))
+        return ordered[index]
+
+    return {
+        "commands_sent": len(commands),
+        "sample_count": len(samples),
+        "duration_us": samples[-1].elapsed_us if samples else None,
+        "send_lag_us_avg": (sum(send_lags_us) / len(send_lags_us)) if send_lags_us else None,
+        "send_lag_us_p99": percentile(99.0),
+        "send_lag_us_max": max(send_lags_us) if send_lags_us else None,
+        "send_behind_count": sum(1 for lag in send_lags_us if lag > CIRCLE_MAX_SEND_LAG_US),
+        "motion_change_count": len(changes),
+        "max_no_motion_gap_us": max_gap_us,
+        "total_path_px": sum(abs(dx) + abs(dy) for _, dx, dy in changes),
+        "walk_steps": len(commands),
+        "walk_px": len(commands) * CIRCLE_STEP_PX,
+        "net_walk_dx": walk_dx,
+        "net_walk_dy": walk_dy,
+        "expected_end": [expected_end[0], expected_end[1]],
+        "actual_end": [actual_end[0], actual_end[1]],
+        "end_delta": [end_delta[0], end_delta[1]],
+        "end_delta_px": max(abs(end_delta[0]), abs(end_delta[1])),
+    }
+
+
+def print_circle_report(result: dict) -> None:
+    def ms(value: float | None) -> str:
+        return "-" if value is None else f"{value / 1000.0:.2f}"
+
+    print(f"[长时移动] 发出 {result.get('commands_sent')} 条命令（每 1ms 一条）／"
+          f"采样 {result.get('sample_count')} 点／"
+          f"观测到位移变化 {result.get('motion_change_count')} 次", flush=True)
+    print(f"  发送节奏：平均滞后 {ms(result.get('send_lag_us_avg'))} ms，"
+          f"p99 {ms(result.get('send_lag_us_p99'))} ms，"
+          f"最大 {ms(result.get('send_lag_us_max'))} ms，"
+          f"超 {CIRCLE_MAX_SEND_LAG_US / 1000.0:.0f}ms 的有 "
+          f"{result.get('send_behind_count')} 次", flush=True)
+    print(f"  连续性：最长无位移 {ms(result.get('max_no_motion_gap_us'))} ms"
+          f"（阈值 {CIRCLE_MAX_GAP_US / 1000.0:.0f} ms）；"
+          f"观测路程 {result.get('total_path_px')} px；"
+          f"发出步数 {result.get('walk_steps')}（每步 {CIRCLE_STEP_PX} px）", flush=True)
+    end_delta = result.get("end_delta") or [None, None]
+    print(f"  终点核对：预期 {result.get('expected_end')} → 实际 "
+          f"{result.get('actual_end')}，偏差 dx={end_delta[0]} dy={end_delta[1]}"
+          f"（最大 {result.get('end_delta_px')} px，容差 {CIRCLE_END_TOLERANCE_PX} px）",
+          flush=True)
+
+
+def judge_circle(result: dict) -> list[str]:
+    """判定长时移动用例；返回失败原因列表（空列表表示通过）。"""
+    label = f"长时移动（{CIRCLE_DURATION_S:.0f}s 每 1ms 一次画 r={CIRCLE_RADIUS_PX}px 圆）"
+    failures: list[str] = []
+    expected_commands = int(round(CIRCLE_DURATION_S * 1_000_000 / CIRCLE_STEP_US))
+    if result.get("commands_sent") != expected_commands:
+        failures.append(
+            f"{label}：实际发出 {result.get('commands_sent')} 条命令，预期 {expected_commands} 条")
+    gap = result.get("max_no_motion_gap_us")
+    if gap is None:
+        failures.append(
+            f"{label}：完全没有观测到位移；请确认电脑侧板(P)输出到本机、"
+            f"克隆已枚举且 HidBridge.Host.exe 正在运行")
+    elif gap > CIRCLE_MAX_GAP_US:
+        failures.append(f"{label}：出现 {gap / 1000.0:.1f}ms 的位移停顿，超过阈值 "
+                        f"{CIRCLE_MAX_GAP_US / 1000.0:.0f}ms")
+    lag = result.get("send_lag_us_max")
+    if lag is not None and lag > CIRCLE_MAX_SEND_LAG_US:
+        failures.append(f"{label}：发送节奏最大滞后 {lag / 1000.0:.1f}ms，超过阈值 "
+                        f"{CIRCLE_MAX_SEND_LAG_US / 1000.0:.0f}ms")
+    end_delta_px = result.get("end_delta_px")
+    if end_delta_px is None:
+        failures.append(f"{label}：未取得终点数据，无法核对最终位置")
+    elif end_delta_px > CIRCLE_END_TOLERANCE_PX:
+        failures.append(
+            f"{label}：最终位置与预期相差 {end_delta_px}px（容差 {CIRCLE_END_TOLERANCE_PX}px）"
+            f"——预期 {result.get('expected_end')}、实际 {result.get('actual_end')}，"
+            f"说明存在被吞掉或多发的 {CIRCLE_STEP_PX}px 微步")
+    if not failures:
+        print(f"[判定] {label}：发送节奏、位移连续性与终点位置均达标", flush=True)
+    return failures
+
+
+def run_circle_case(sender: UdpSender) -> tuple[dict, list[Sample], list[Command], int]:
+    """长时移动用例：每 1 ms 发一次、持续 10 s，沿 r=100px 的圆**逐像素**行走。
+
+    每步只走 1 个像素单位：先按"每步弧长 1 px"推进角度得到理想位置，再从 8 邻域
+    （dx/dy ∈ {-1,0,1}）里挑出离理想位置最近的一步发出去。这样每个 UDP 包都是微步，
+    既能验证"1 px 的移动不会被吞掉"，也能用累积出来的预期终点去核对最终落点。
+
+    计时与短用例同源：perf_counter_ns() 忙等到**绝对**时间点（step × 1ms），绝不 sleep。
+    """
+    start_x, start_y = cursor_position()
+    total_steps = int(round(CIRCLE_DURATION_S * 1_000_000 / CIRCLE_STEP_US))
+    arc_step = CIRCLE_STEP_PX / float(CIRCLE_RADIUS_PX)   # 每步对应的圆心角
+    neighbor_steps = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
+    commands: list[Command] = []
+    samples: list[Sample] = []
+    send_lags_us: list[int] = []
+    start_ns = time.perf_counter_ns()
+    walk_x = 0      # 相对起点的累积位移，也就是预期终点的偏移量
+    walk_y = 0
+    step = 0
+    next_plan_us = CIRCLE_STEP_US
+    next_sample_us = 0
+    end_us = total_steps * CIRCLE_STEP_US
+    while step < total_steps or next_sample_us <= end_us:
+        now_us = (time.perf_counter_ns() - start_ns) // 1_000
+        while step < total_steps and now_us >= next_plan_us:
+            angle = arc_step * (step + 1)
+            ideal_x = CIRCLE_RADIUS_PX * math.cos(angle)
+            ideal_y = CIRCLE_RADIUS_PX * math.sin(angle)
+            # 8 邻域里挑离理想位置最近的一步 → 保证每步恰好 1 个像素单位。
+            best_dx, best_dy = neighbor_steps[0]
+            best_distance: float | None = None
+            for dx, dy in neighbor_steps:
+                distance = (walk_x + dx - ideal_x) ** 2 + (walk_y + dy - ideal_y) ** 2
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_dx, best_dy = dx, dy
+            walk_x += best_dx
+            walk_y += best_dy
+            sender.send(best_dx, best_dy)
+            sent_us = (time.perf_counter_ns() - start_ns) // 1_000
+            commands.append(Command(step + 1, sent_us, best_dx, best_dy))
+            send_lags_us.append(max(0, sent_us - next_plan_us))
+            step += 1
+            next_plan_us += CIRCLE_STEP_US
+        if now_us >= next_sample_us:
+            x, y = cursor_position()
+            samples.append(Sample(now_us, x, y))
+            next_sample_us += CIRCLE_SAMPLE_US
+
+    # 终点核对：链路与平滑槽排空都需要时间，等位置**连续两次读数一致**再判定，
+    # 否则会把"还没走完的平滑残留"误算成终点偏差（最多等 1.5 s）。
+    expected_end = (start_x + walk_x, start_y + walk_y)
+    actual_end = cursor_position()
+    for _ in range(30):
+        time.sleep(0.05)
+        current = cursor_position()
+        if current == actual_end:
+            break
+        actual_end = current
+    end_delta = (actual_end[0] - expected_end[0], actual_end[1] - expected_end[1])
+    # 再走回起点（恢复用户原来的光标位置）。
+    if walk_x or walk_y:
+        sender.send(-walk_x, -walk_y)
+        time.sleep(0.15)
+    restore_cursor(start_x, start_y)
+
+    result = circle_metrics(samples, commands, send_lags_us, walk_x, walk_y,
+                            expected_end, actual_end, end_delta)
+    result.update({
+        "name": "circle_r100_10s_1px_step",
+        "start": [start_x, start_y],
+        "end": [actual_end[0], actual_end[1]],
+        "end_restored": cursor_position() == (start_x, start_y),
+        "analysis_start_us": commands[0].sent_us if commands else 0,
+        "analysis_end_us": samples[-1].elapsed_us if samples else None,
+    })
+    return result, samples, commands, start_x
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -359,10 +649,21 @@ def main() -> int:
                              "缺省自动：本机当前枚举到任意 USB 罗技设备即通过")
     parser.add_argument("--force", action="store_true",
                         help="跳过“本机是否已枚举电脑侧板克隆设备”的前置检查")
+    parser.add_argument("--repeat", type=int, default=10,
+                        help="每类用例连续测量的轮数（默认 10；每一轮都必须达标，"
+                             "任何一轮不达标即整体 FAIL）")
+    parser.add_argument("--circle-repeat", type=int, default=1,
+                        help="长时移动用例（10 秒画 r=100px 圆）的轮数，默认 1；"
+                             "每轮会发 1 万条命令，调大前先确认发送端扛得住")
     parser.add_argument("--print-json", action="store_true",
                         help="额外在标准输出打印完整判定 JSON（缺省只写入 summary.json）")
     args = parser.parse_args()
 
+    if args.force:
+        # 明确警告：跳过前置检查时 UDP 可能根本没有接收方，此时测到的位移会来自
+        # 使用者手动移动鼠标——这种数字不能当结论用（2026-09-27 踩过一次）。
+        print("[前置] 已用 --force 跳过克隆设备检查：若 HidBridge.Host.exe 未运行，"
+              "本轮位移可能全部来自手动移动鼠标，结果不可作为结论。", flush=True)
     if not args.force:
         expected = normalize_expected_vidpid(args.expect_vidpid)
         nodes = present_logitech_nodes()
@@ -385,42 +686,122 @@ def main() -> int:
                       file=sys.stderr, flush=True)
             return 2
 
+    print(f"[准备] {CENTER_SETTLE_S:.0f} 秒后把准心移到屏幕中心，然后开始测量"
+          f"（圆形用例半径 {CIRCLE_RADIUS_PX}px，从屏幕边缘起步会被边界裁掉）", flush=True)
+    original_cursor = cursor_position()
+    time.sleep(CENTER_SETTLE_S)
+    center_x, center_y = move_cursor_to_center()
+    print(f"[准备] 准心已在屏幕中心 ({center_x},{center_y})，开始测量", flush=True)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[连接] UDP 目标 {args.host}:{args.port}，观测源=本机光标；"
           f"判定：首动 < {FIRST_MOVE_LIMIT_MS:.1f}ms 且位移与预期一致", flush=True)
+    repeat = max(1, args.repeat)
+    print(f"[测量] 每类用例连续测量 {repeat} 轮，且每一轮都必须达标", flush=True)
+    single_runs: list[dict] = []
+    continuous_runs: list[dict] = []
+    circle_runs: list[dict] = []
+    single_plot: tuple[list[Sample], list[Command], int] | None = None
+    continuous_plot: tuple[list[Sample], list[Command], int] | None = None
+    circle_plot: tuple[list[Sample], list[Command], int] | None = None
+    failures: list[str] = []
     sender = UdpSender(args.host, args.port)
     try:
-        single, single_samples, single_commands, single_start = run_case("single_20px", sender, 40_000, 0, 1)
-        continuous, continuous_samples, continuous_commands, continuous_start = run_case(
-            "three_20px_every_10ms", sender, 40_000, 10_000, CONTINUOUS_COMMANDS)
+        for attempt in range(1, repeat + 1):
+            single, single_samples, single_commands, single_start = run_case(
+                "single_20px", sender, 40_000, 0, 1)
+            single_runs.append(single)
+            if single_plot is None:
+                # 图表与 CSV 取第一轮采样（足够代表波形）；每轮原始结果都进 summary.json。
+                single_plot = (single_samples, single_commands, single_start)
+            failures += judge_case(
+                f"单次 {SINGLE_DISTANCE_PX}px（第 {attempt}/{repeat} 轮）",
+                single, SINGLE_DISTANCE_PX)
+
+            continuous, continuous_samples, continuous_commands, continuous_start = run_case(
+                "three_20px_every_10ms", sender, 40_000, 10_000, CONTINUOUS_COMMANDS)
+            continuous_runs.append(continuous)
+            if continuous_plot is None:
+                continuous_plot = (continuous_samples, continuous_commands, continuous_start)
+            failures += judge_case(
+                f"连续 {CONTINUOUS_COMMANDS} 次 {SINGLE_DISTANCE_PX}px"
+                f"（间隔 10ms，第 {attempt}/{repeat} 轮）",
+                continuous, SINGLE_DISTANCE_PX * CONTINUOUS_COMMANDS)
+
+        # 长时移动用例放在最后：每 1 ms 一条、持续 10 s，画半径 100 px 的圆。
+        circle_repeat = max(1, args.circle_repeat)
+        for circle_attempt in range(1, circle_repeat + 1):
+            print(f"[测量] 长时移动第 {circle_attempt}/{circle_repeat} 轮："
+                  f"{CIRCLE_DURATION_S:.0f}s 每 1ms 一次画 r={CIRCLE_RADIUS_PX}px 圆"
+                  f"（共 {int(round(CIRCLE_DURATION_S * 1_000_000 / CIRCLE_STEP_US))} 条命令）",
+                  flush=True)
+            circle, circle_samples, circle_commands, circle_start = run_circle_case(sender)
+            circle_runs.append(circle)
+            if circle_plot is None:
+                circle_plot = (circle_samples, circle_commands, circle_start)
+            print_circle_report(circle)
+            failures += judge_circle(circle)
     finally:
         sender.close()
 
-    failures: list[str] = []
-    failures += judge_case(f"单次 {SINGLE_DISTANCE_PX}px", single,
-                           SINGLE_DISTANCE_PX)
-    failures += judge_case(
-        f"连续 {CONTINUOUS_COMMANDS} 次 {SINGLE_DISTANCE_PX}px（间隔 10ms）", continuous,
-        SINGLE_DISTANCE_PX * CONTINUOUS_COMMANDS)
+    single = single_runs[0]
+    continuous = continuous_runs[0]
+    circle = circle_runs[0]
+    single_samples, single_commands, single_start = single_plot
+    continuous_samples, continuous_commands, continuous_start = continuous_plot
+    circle_samples, circle_commands, circle_start = circle_plot
+    single_average = average_runs(single_runs)
+    continuous_average = average_runs(continuous_runs)
 
     write_csv(args.output_dir / "single_20px.csv", single_samples)
     write_csv(args.output_dir / "three_20px_every_10ms.csv", continuous_samples)
+    write_csv(args.output_dir / "circle_r100_10s.csv", circle_samples)
     svg_plot(args.output_dir / "single_20px.svg", "单次 20 px UDP 移动", single_samples, single_commands, single_start, single["analysis_start_us"], single["analysis_end_us"])
     svg_plot(args.output_dir / "three_20px_every_10ms.svg", "每 10 ms 发送一次 20 px，共 3 次", continuous_samples, continuous_commands, continuous_start, continuous["analysis_start_us"], continuous["analysis_end_us"])
+    svg_plot(args.output_dir / "circle_r100_10s.svg",
+             f"长时移动：{CIRCLE_DURATION_S:.0f}s 每 1ms 一次画 r={CIRCLE_RADIUS_PX}px 圆",
+             circle_samples, circle_commands, circle_start,
+             circle["analysis_start_us"], circle["analysis_end_us"])
     summary = {
         "target": f"{args.host}:{args.port}",
+        "forced_no_precheck": bool(args.force),
         "criteria": {
             "first_move_limit_ms": FIRST_MOVE_LIMIT_MS,
             "single_expected_dx": SINGLE_DISTANCE_PX,
             "continuous_expected_dx": SINGLE_DISTANCE_PX * CONTINUOUS_COMMANDS,
+            "repeat": repeat,
+            "require_every_run_pass": True,
+            "circle": {
+                "radius_px": CIRCLE_RADIUS_PX,
+                "duration_s": CIRCLE_DURATION_S,
+                "step_us": CIRCLE_STEP_US,
+                "step_px": CIRCLE_STEP_PX,
+                "steps": int(round(CIRCLE_DURATION_S * 1_000_000 / CIRCLE_STEP_US)),
+                "sample_us": CIRCLE_SAMPLE_US,
+                "end_tolerance_px": CIRCLE_END_TOLERANCE_PX,
+                "max_no_motion_gap_us": CIRCLE_MAX_GAP_US,
+                "max_send_lag_us": CIRCLE_MAX_SEND_LAG_US,
+                "repeat": circle_repeat,
+            },
         },
         "judged": {
             "single_first_move_ms": first_move_latency_ms(single),
             "continuous_first_move_ms": first_move_latency_ms(continuous),
         },
+        "average": {
+            "single": single_average,
+            "continuous": continuous_average,
+        },
+        "runs": {
+            "single": single_runs,
+            "continuous": continuous_runs,
+            "circle": circle_runs,
+        },
         "single": single,
         "continuous": continuous,
+        "circle": circle,
         "failures": failures,
+        "failure_count": len(failures),
     }
     (args.output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -428,12 +809,38 @@ def main() -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"图表、原始采样与判定已写入：{args.output_dir}"
           f"（summary.json / *.csv / *.svg；需要贴到终端时用 --print-json）")
+
+    print("")
+    print(f"===== {repeat} 轮平均结果 =====", flush=True)
+    print_average(f"单次 {SINGLE_DISTANCE_PX}px", single_average)
+    print_average(
+        f"连续 {CONTINUOUS_COMMANDS} 次 {SINGLE_DISTANCE_PX}px（间隔 10ms）",
+        continuous_average)
+
+    print("")
+    print(f"===== 长时移动检查（{circle_repeat} 轮，每轮 "
+          f"{CIRCLE_DURATION_S:.0f}s / r={CIRCLE_RADIUS_PX}px / 每 1ms 一次）=====",
+          flush=True)
+    for index, run in enumerate(circle_runs, start=1):
+        if circle_repeat > 1:
+            print(f"  第 {index}/{circle_repeat} 轮：", flush=True)
+        print_circle_report(run)
+
+    # 收尾：把准心还给使用者原来的位置（测量前已挪到屏幕中心）。
+    try:
+        restore_cursor(original_cursor[0], original_cursor[1])
+        print(f"[收尾] 准心已回到测量前的位置 ({original_cursor[0]},{original_cursor[1]})",
+              flush=True)
+    except RuntimeError as error:
+        print(f"[收尾] 恢复准心失败：{error}", flush=True)
+
     if failures:
-        print("[结论] FAIL", flush=True)
+        print(f"[结论] FAIL（{repeat} 轮中累计 {len(failures)} 项未达标）", flush=True)
         for reason in failures:
             print(f"  - {reason}", flush=True)
         return 1
-    print("[结论] PASS（首次移动延迟达标且位移与预期一致）", flush=True)
+    print(f"[结论] PASS（{repeat} 轮全部达标：首次移动延迟 < {FIRST_MOVE_LIMIT_MS:.1f}ms "
+          f"且位移与预期一致）", flush=True)
     return 0
 
 

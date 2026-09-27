@@ -86,6 +86,22 @@ esp_err_t dual_uart1_send_hid_get_response(
     uint8_t report_id,
     const uint8_t *data,
     size_t data_length);
+/* 设备级 Vendor 控制请求/响应（2026-09-27）：P→M 转发任意 EP0 控制传输，
+ * M 用直连 URB 发给物理设备；IN 方向的数据由 response 带回。 */
+esp_err_t dual_uart1_send_vendor_control_request(
+    uint16_t transaction_id,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    uint16_t w_length,
+    const uint8_t *data,
+    size_t data_length);
+esp_err_t dual_uart1_send_vendor_control_response(
+    uint16_t transaction_id,
+    uint8_t status,
+    const uint8_t *data,
+    size_t data_length);
 /* Copy a complete serialized HID profile for bounded, fair UART1 streaming. */
 esp_err_t dual_uart1_queue_profile(
     const uint8_t *blob,

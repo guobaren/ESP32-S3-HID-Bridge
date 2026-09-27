@@ -427,6 +427,18 @@ static uint32_t s_generation;
 static uint16_t s_next_sequence;
 static uint16_t s_peer_last_sequence;
 static bool s_peer_sequence_initialized;
+/*
+ * 帧级收发统计（2026-09-27 新增）：板间每一帧本来就带 16 位全局序号，接收侧也
+ * 一直在用 `distance` 判新旧；这里把"缺口"累计下来，于是"链路上丢了多少帧"
+ * 从推断变成可观测量。逐类型收发计数用于跨板对照：M 的 tx_move 应等于 P 的
+ * rx_move（反之亦然）。两板各自打印同一行 `UART1帧统计`，由工具比对流入/流出。
+ */
+static uint32_t s_tx_type_count[256];
+static uint32_t s_rx_type_count[256];
+static uint32_t s_peer_seq_gap;         /* 累计缺口帧数（所有类型合计） */
+static uint32_t s_peer_seq_gap_events;  /* 发生缺口的次数：区分零星与突发 */
+static uint32_t s_peer_seq_gap_max;     /* 单次最大跳跃 */
+static uint32_t s_peer_seq_back;        /* 重复或序号回退而被丢弃的帧数 */
 static uint32_t s_peer_generation;
 static bool s_peer_generation_initialized;
 static volatile bool s_peer_online;
@@ -599,7 +611,10 @@ static bool is_vendor_hid_message(uint8_t type)
     return type == DUAL_MESSAGE_RAW_HID_INPUT ||
         type == DUAL_MESSAGE_HID_SET_REPORT ||
         type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST ||
-        type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE;
+        type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE ||
+        /* 设备级 Vendor 控制请求/响应同属厂商会话：对端换会话时一并作废。 */
+        type == DUAL_MESSAGE_VENDOR_CONTROL_REQUEST ||
+        type == DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE;
 }
 
 static uint32_t vendor_hid_session_generation(void)
@@ -712,7 +727,17 @@ static bool peer_sequence_is_new(uint16_t sequence)
     }
     const uint16_t distance = (uint16_t)(sequence - s_peer_last_sequence);
     if (distance == 0 || distance >= 0x8000U) {
+        ++s_peer_seq_back;
         return false;
+    }
+    if (distance > 1U) {
+        /* 中间缺号 = 链路上真的少了帧（16 位回绕已由上面的距离判断处理）。 */
+        const uint32_t gap = (uint32_t)distance - 1U;
+        s_peer_seq_gap += gap;
+        ++s_peer_seq_gap_events;
+        if (gap > s_peer_seq_gap_max) {
+            s_peer_seq_gap_max = gap;
+        }
     }
     s_peer_last_sequence = sequence;
     return true;
@@ -830,6 +855,14 @@ static bool accept_peer_frame(const dual_frame_t *frame)
             write_u32_le(&ack[1], peer_generation);
             (void)enqueue_item(DUAL_MESSAGE_ROLE_ACK, ack, sizeof(ack));
         }
+        /*
+         * HELLO 同样来自对端的同一条序号流，必须在这里推进序号基准：它在本函数里
+         * 早于通用序号检查就返回，若不推进，每次心跳（250 ms）消耗的序号都会让紧随
+         * 其后的正常帧被记为"链路缺帧"，使 seq_gap 虚高（实测虚高量约为 beat 帧数的
+         * 一半）。新会话场景是安全的：generation 变化时上面已把
+         * s_peer_sequence_initialized 置 false，这里正好为新会话建立基准。
+         */
+        (void)peer_sequence_is_new(frame->sequence);
         return true;
     }
     if (!s_peer_online || !peer_sequence_is_new(frame->sequence)) {
@@ -1183,6 +1216,7 @@ static void on_link_frame(const dual_frame_t *frame, void *context)
         return;
     }
     ++s_rx_count;
+    ++s_rx_type_count[frame->type];
     dual_diag_stream_record(DUAL_DIAG_SOURCE_UART1_RX, frame->type,
                             frame->payload, frame->payload_length);
     if (frame->type == DUAL_MESSAGE_PHYSICAL_MOUSE) {
@@ -1209,6 +1243,9 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
     const bool vendor = type == DUAL_MESSAGE_HID_SET_REPORT ||
         type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST ||
         type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE ||
+        /* Vendor 控制请求/响应与厂商控制走同一条队列（用户 2026-09-27 指令）。 */
+        type == DUAL_MESSAGE_VENDOR_CONTROL_REQUEST ||
+        type == DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE ||
         type == DUAL_MESSAGE_PROFILE_ACK ||
         type == DUAL_MESSAGE_ROLE_ACK;
     QueueHandle_t target = safety ? s_safety_tx_queue :
@@ -1314,6 +1351,7 @@ static bool send_status_frame(uint8_t type, const uint8_t *payload, uint8_t leng
     }
     if (uart_write_bytes(LINK_UART, serialized, serialized_length) == (int)serialized_length) {
         ++s_tx_count;
+        ++s_tx_type_count[type];
         dual_diag_stream_record(DUAL_DIAG_SOURCE_UART1_TX, type, payload, length);
         if (type == DUAL_MESSAGE_PROFILE_REQUEST ||
             type == DUAL_MESSAGE_PROFILE_OFFER ||
@@ -2046,6 +2084,64 @@ static void link_tx_task(void *argument)
                       s_mouse_connection_id, s_gone_retries, s_gone_failures,
                       s_request_retries, s_offer_retries, s_commit_replays,
                       s_budget_exhausted);
+            /*
+             * 帧级收发统计：板间每帧都带全局序号，两板打同一行，
+             * 工具据此做流入/流出对照（M.tx_move ↔ P.rx_move 等）。
+             */
+            const uint32_t tx_move = s_tx_type_count[DUAL_MESSAGE_RAW_HID_INPUT] +
+                s_tx_type_count[DUAL_MESSAGE_PHYSICAL_MOUSE];
+            const uint32_t rx_move = s_rx_type_count[DUAL_MESSAGE_RAW_HID_INPUT] +
+                s_rx_type_count[DUAL_MESSAGE_PHYSICAL_MOUSE];
+            const uint32_t tx_ctrl = s_tx_type_count[DUAL_MESSAGE_HID_SET_REPORT] +
+                s_tx_type_count[DUAL_MESSAGE_HID_GET_REPORT_REQUEST] +
+                s_tx_type_count[DUAL_MESSAGE_HID_GET_REPORT_RESPONSE] +
+                s_tx_type_count[DUAL_MESSAGE_VENDOR_CONTROL_REQUEST] +
+                s_tx_type_count[DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE];
+            const uint32_t rx_ctrl = s_rx_type_count[DUAL_MESSAGE_HID_SET_REPORT] +
+                s_rx_type_count[DUAL_MESSAGE_HID_GET_REPORT_REQUEST] +
+                s_rx_type_count[DUAL_MESSAGE_HID_GET_REPORT_RESPONSE] +
+                s_rx_type_count[DUAL_MESSAGE_VENDOR_CONTROL_REQUEST] +
+                s_rx_type_count[DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE];
+            const uint32_t tx_ack = s_tx_type_count[DUAL_MESSAGE_FLOW_ACK] +
+                s_tx_type_count[DUAL_MESSAGE_PROFILE_ACK] +
+                s_tx_type_count[DUAL_MESSAGE_ROLE_ACK];
+            const uint32_t rx_ack = s_rx_type_count[DUAL_MESSAGE_FLOW_ACK] +
+                s_rx_type_count[DUAL_MESSAGE_PROFILE_ACK] +
+                s_rx_type_count[DUAL_MESSAGE_ROLE_ACK];
+            const uint32_t tx_beat = s_tx_type_count[DUAL_MESSAGE_LINK_HELLO] +
+                s_tx_type_count[DUAL_MESSAGE_LINK_PING];
+            const uint32_t rx_beat = s_rx_type_count[DUAL_MESSAGE_LINK_HELLO] +
+                s_rx_type_count[DUAL_MESSAGE_LINK_PING];
+            const uint32_t tx_prof = s_tx_type_count[DUAL_MESSAGE_PROFILE_REQUEST] +
+                s_tx_type_count[DUAL_MESSAGE_PROFILE_OFFER] +
+                s_tx_type_count[DUAL_MESSAGE_PROFILE_BEGIN] +
+                s_tx_type_count[DUAL_MESSAGE_PROFILE_CHUNK] +
+                s_tx_type_count[DUAL_MESSAGE_PROFILE_COMMIT];
+            const uint32_t rx_prof = s_rx_type_count[DUAL_MESSAGE_PROFILE_REQUEST] +
+                s_rx_type_count[DUAL_MESSAGE_PROFILE_OFFER] +
+                s_rx_type_count[DUAL_MESSAGE_PROFILE_BEGIN] +
+                s_rx_type_count[DUAL_MESSAGE_PROFILE_CHUNK] +
+                s_rx_type_count[DUAL_MESSAGE_PROFILE_COMMIT];
+            const uint32_t tx_soft = s_tx_type_count[DUAL_MESSAGE_SOFTWARE_MOUSE] +
+                s_tx_type_count[DUAL_MESSAGE_SOFTWARE_RELEASE] +
+                s_tx_type_count[DUAL_MESSAGE_PHYSICAL_RELEASE] +
+                s_tx_type_count[DUAL_MESSAGE_DEVICE_GONE];
+            const uint32_t rx_soft = s_rx_type_count[DUAL_MESSAGE_SOFTWARE_MOUSE] +
+                s_rx_type_count[DUAL_MESSAGE_SOFTWARE_RELEASE] +
+                s_rx_type_count[DUAL_MESSAGE_PHYSICAL_RELEASE] +
+                s_rx_type_count[DUAL_MESSAGE_DEVICE_GONE];
+            ESP_LOGI(TAG, "UART1帧统计 tx_move=%" PRIu32 " rx_move=%" PRIu32
+                     " tx_ctrl=%" PRIu32 " rx_ctrl=%" PRIu32
+                     " tx_ack=%" PRIu32 " rx_ack=%" PRIu32
+                     " tx_beat=%" PRIu32 " rx_beat=%" PRIu32
+                     " tx_prof=%" PRIu32 " rx_prof=%" PRIu32
+                     " tx_soft=%" PRIu32 " rx_soft=%" PRIu32
+                     " seq_gap=%" PRIu32 " seq_evt=%" PRIu32
+                     " seq_max=%" PRIu32 " seq_back=%" PRIu32,
+                     tx_move, rx_move, tx_ctrl, rx_ctrl, tx_ack, rx_ack,
+                     tx_beat, rx_beat, tx_prof, rx_prof, tx_soft, rx_soft,
+                     s_peer_seq_gap, s_peer_seq_gap_events,
+                     s_peer_seq_gap_max, s_peer_seq_back);
             log_queue_metrics("uart1_tx", &s_tx_queue_metrics);
             log_queue_metrics("uart1_motion", &s_motion_tx_queue_metrics);
             log_queue_metrics("uart1_safety", &s_safety_tx_queue_metrics);
@@ -2191,6 +2287,12 @@ esp_err_t dual_uart1_start(
     } while (s_generation == 0U);
     s_next_sequence = 0;
     s_peer_sequence_initialized = false;
+    memset(s_tx_type_count, 0, sizeof(s_tx_type_count));
+    memset(s_rx_type_count, 0, sizeof(s_rx_type_count));
+    s_peer_seq_gap = 0;
+    s_peer_seq_gap_events = 0;
+    s_peer_seq_gap_max = 0;
+    s_peer_seq_back = 0;
     s_peer_generation_initialized = false;
     s_peer_online = false;
     s_peer_usb_state = DUAL_USB_STATE_WAITING;
@@ -2665,6 +2767,43 @@ esp_err_t dual_uart1_send_hid_get_response(
         return ESP_ERR_INVALID_ARG;
     }
     return enqueue_item(DUAL_MESSAGE_HID_GET_REPORT_RESPONSE, payload, payload_length);
+}
+
+esp_err_t dual_uart1_send_vendor_control_request(
+    uint16_t transaction_id,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    uint16_t w_length,
+    const uint8_t *data,
+    size_t data_length)
+{
+    uint8_t payload[DUAL_PROXY_MAX_PAYLOAD] = {0};
+    uint8_t payload_length = 0;
+    if (!dual_vendor_control_request_encode(transaction_id, bm_request_type,
+                                            b_request, w_value, w_index, w_length,
+                                            data, data_length, payload,
+                                            sizeof(payload), &payload_length)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return enqueue_item(DUAL_MESSAGE_VENDOR_CONTROL_REQUEST, payload, payload_length);
+}
+
+esp_err_t dual_uart1_send_vendor_control_response(
+    uint16_t transaction_id,
+    uint8_t status,
+    const uint8_t *data,
+    size_t data_length)
+{
+    uint8_t payload[DUAL_PROXY_MAX_PAYLOAD] = {0};
+    uint8_t payload_length = 0;
+    if (!dual_vendor_control_response_encode(transaction_id, status, data,
+                                             data_length, payload, sizeof(payload),
+                                             &payload_length)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return enqueue_item(DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE, payload, payload_length);
 }
 
 esp_err_t dual_uart1_queue_profile(

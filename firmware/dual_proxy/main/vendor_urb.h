@@ -42,6 +42,23 @@ esp_err_t dual_vendor_urb_set_report(
     size_t length,
     uint32_t timeout_ms);
 
+/*
+ * 通用 EP0 控制传输（2026-09-27）：供设备级 Vendor 请求转发使用。
+ * IN 方向（bmRequestType bit7=1）把设备返回的数据写入 out_data，长度写入 out_length。
+ */
+esp_err_t dual_vendor_urb_control(
+    uint8_t device_address,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    const uint8_t *data,
+    size_t length,
+    uint32_t timeout_ms,
+    uint8_t *out_data,
+    size_t out_capacity,
+    size_t *out_length);
+
 /* 计数（供统计行观测）：提交/成功/超时/退役/设备重开。 */
 void dual_vendor_urb_stats(
     uint32_t *submitted,

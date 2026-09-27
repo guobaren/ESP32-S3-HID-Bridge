@@ -269,6 +269,133 @@ static esp_err_t urb_set_report_once(
     return result;
 }
 
+/*
+ * 通用 EP0 控制传输（2026-09-27 新增，用于设备级 Vendor 请求转发）。
+ * 与 urb_set_report_once 的差别：bmRequestType/bRequest/wValue/wIndex 全由调用方给出，
+ * 且 IN 方向会把设备返回的数据拷回 out_data。
+ * 刻意与 SET_REPORT 那条路径分开实现——后者已在真机验证过，不去动它。
+ */
+static esp_err_t urb_control_once(
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    const uint8_t *data,
+    size_t length,
+    uint32_t timeout_ms,
+    uint8_t *out_data,
+    size_t out_capacity,
+    size_t *out_length)
+{
+    if (out_length != NULL) {
+        *out_length = 0U;
+    }
+    const bool is_in = (bm_request_type & 0x80U) != 0U;
+    /* IN 请求的 length 是"期望读取长度"，此时 data 必须是 NULL；
+     * OUT 请求则要求 length 与 data 一致。（首版忘了区分，IN 一律被这里挡掉。） */
+    if (length > (sizeof(((usb_transfer_t *)0)->data_buffer) - 8U) ||
+        (is_in ? (data != NULL) : (data == NULL && length != 0U))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_device_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_device == NULL) {
+        xSemaphoreGive(s_device_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = ESP_OK;
+    usb_transfer_t *transfer = NULL;
+    result = usb_host_transfer_alloc(8U + length, 0, &transfer);
+    if (result != ESP_OK || transfer == NULL) {
+        xSemaphoreGive(s_device_mutex);
+        return result == ESP_OK ? ESP_ERR_NO_MEM : result;
+    }
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t *)transfer->data_buffer;
+    setup->bmRequestType = bm_request_type;
+    setup->bRequest = b_request;
+    setup->wValue = w_value;
+    setup->wIndex = w_index;
+    setup->wLength = (uint16_t)length;
+    if (!is_in && length != 0U) {
+        memcpy(transfer->data_buffer + 8U, data, length);
+    }
+
+    urb_wait_t *wait = (urb_wait_t *)calloc(1, sizeof(urb_wait_t));
+    if (wait == NULL) {
+        usb_host_transfer_free(transfer);
+        xSemaphoreGive(s_device_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+    wait->done = xSemaphoreCreateBinary();
+    wait->transfer = transfer;
+    if (wait->done == NULL) {
+        free(wait);
+        usb_host_transfer_free(transfer);
+        xSemaphoreGive(s_device_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+
+    transfer->device_handle = s_device;
+    transfer->bEndpointAddress = 0;
+    transfer->callback = urb_transfer_callback;
+    transfer->context = wait;
+    transfer->num_bytes = (int)(8U + length);
+
+    ++s_submitted;
+    const int64_t transfer_start_us = esp_timer_get_time();
+    result = usb_host_transfer_submit_control(s_client, transfer);
+    if (result == ESP_OK) {
+        if (xSemaphoreTake(wait->done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+            /* 与 SET_REPORT 路径同样的处理：EP0 不支持 flush，超时只能挂孤儿。 */
+            ++s_timeouts;
+            wait->orphan = true;
+            if (wait->completed) {
+                xSemaphoreGive(s_device_mutex);
+                return ESP_ERR_TIMEOUT;
+            }
+            ESP_LOGW(TAG, "Vendor 控制传输超时（%u ms）：挂为孤儿等待回收",
+                     (unsigned)timeout_ms);
+            xSemaphoreGive(s_device_mutex);
+            return ESP_ERR_TIMEOUT;
+        }
+        ++s_completed;
+        const int64_t elapsed_us = esp_timer_get_time() - transfer_start_us;
+        if (elapsed_us > s_latency_max_us) {
+            s_latency_max_us = elapsed_us;
+        }
+        if (elapsed_us > 10000) {
+            ++s_latency_over_10ms;
+        }
+        if (elapsed_us > 100000) {
+            ++s_latency_over_100ms;
+        }
+        result = (wait->status == 0U) ? ESP_OK : ESP_FAIL;
+        /* IN 方向（bmRequestType bit7 = 1）：把设备回的数据拷给调用方。 */
+        if (result == ESP_OK && (bm_request_type & 0x80U) != 0U &&
+            out_data != NULL && out_length != NULL) {
+            const int actual = transfer->actual_num_bytes;
+            size_t copied = (actual > 8) ? (size_t)(actual - 8) : 0U;
+            if (copied > out_capacity) {
+                copied = out_capacity;
+            }
+            if (copied != 0U) {
+                memcpy(out_data, transfer->data_buffer + 8U, copied);
+            }
+            *out_length = copied;
+        }
+    } else {
+        ++s_aborted;
+    }
+
+    vSemaphoreDelete(wait->done);
+    usb_host_transfer_free(transfer);
+    free(wait);
+    xSemaphoreGive(s_device_mutex);
+    return result;
+}
+
 esp_err_t dual_vendor_urb_set_report(
     uint8_t device_address,
     uint8_t interface_number,
@@ -295,6 +422,51 @@ esp_err_t dual_vendor_urb_set_report(
     for (uint32_t attempt = 0; attempt < VENDOR_URB_ATTEMPTS; ++attempt) {
         result = urb_set_report_once(interface_number, report_type, report_id,
                                      data, length, timeout_ms);
+        if (result != ESP_ERR_TIMEOUT) {
+            break;
+        }
+        if (attempt + 1U < VENDOR_URB_ATTEMPTS) {
+            ++s_retries;
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    return result;
+}
+
+/*
+ * 通用 EP0 控制传输对外接口（2026-09-27）：供设备级 Vendor 请求转发使用。
+ * IN 方向（bmRequestType bit7=1）把设备返回的数据写入 out_data/out_length。
+ */
+esp_err_t dual_vendor_urb_control(
+    uint8_t device_address,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    const uint8_t *data,
+    size_t length,
+    uint32_t timeout_ms,
+    uint8_t *out_data,
+    size_t out_capacity,
+    size_t *out_length)
+{
+    if (s_client == NULL || s_device_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_device_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const esp_err_t open_result = ensure_device_locked(device_address);
+    xSemaphoreGive(s_device_mutex);
+    if (open_result != ESP_OK) {
+        return open_result;
+    }
+
+    esp_err_t result = ESP_ERR_TIMEOUT;
+    for (uint32_t attempt = 0; attempt < VENDOR_URB_ATTEMPTS; ++attempt) {
+        result = urb_control_once(bm_request_type, b_request, w_value, w_index,
+                                  data, length, timeout_ms, out_data,
+                                  out_capacity, out_length);
         if (result != ESP_ERR_TIMEOUT) {
             break;
         }

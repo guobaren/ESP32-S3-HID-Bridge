@@ -357,6 +357,56 @@ static tusb_desc_device_t s_clone_device_descriptor;
 static volatile bool s_clone_active;
 static uint8_t s_clone_mouse_instance;
 static hid_mouse_report_layout_t s_clone_mouse_layout;
+/*
+ * 「转发输出的位移」统计（2026-09-27）：M 转发的鼠标报告在 P 侧真正提交给主机时累加。
+ * 注意与 HID统计 里的 output=(...) 的区别：那个只统计 P 自己生成的**软件输入**，
+ * 不覆盖 M→P 转发路径——实测转发期间 output 一直是 (0,0)，所以必须单独统计这一路。
+ * 与 M 侧 motion_rx_dx/dy 对比即可看出桥接层有没有吞掉/放大位移。
+ */
+static volatile int64_t s_motion_fwd_dx;
+static volatile int64_t s_motion_fwd_dy;
+/* 解析诊断（2026-09-27）：与 M 侧同源，定位两侧位移不一致的原因。 */
+static volatile uint32_t s_motion_fwd_ok;
+static volatile uint32_t s_motion_fwd_skip;
+
+static void note_forwarded_motion(const uint8_t *payload, uint8_t length,
+                                  uint8_t interface_number, uint8_t report_id)
+{
+    /* 判据必须**同时**满足两条，缺一不可（两轮实测得出）：
+     *   ① 源接口号 == 鼠标接口号 —— 厂商接口的报告 report_id 与鼠标相同，只靠 ID 拦不住；
+     *   ② report_id == 鼠标报告 ID —— 鼠标接口上还有滚轮等其它 report_id 的报告，
+     *      只靠接口号会多统计约 19% 的帧（其字节被误当作 X/Y，位移偏高约 8%）。 */
+    if (payload == NULL || length == 0U || !s_clone_mouse_layout.valid ||
+        length != s_clone_mouse_layout.report_bytes ||
+        report_id != s_clone_mouse_layout.report_id || !s_clone_active ||
+        s_clone_mouse_instance >= s_clone_descriptors.hid_count ||
+        s_clone_descriptors.hid_interface_numbers[s_clone_mouse_instance] !=
+            interface_number) {
+        __atomic_add_fetch(&s_motion_fwd_skip, 1U, __ATOMIC_RELAXED);
+        return;
+    }
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t wheel = 0;
+    int32_t pan = 0;
+    if (hid_mouse_report_read_axes(payload, length, &s_clone_mouse_layout,
+                                   &x, &y, &wheel, &pan)) {
+        __atomic_add_fetch(&s_motion_fwd_dx, x, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&s_motion_fwd_dy, y, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&s_motion_fwd_ok, 1U, __ATOMIC_RELAXED);
+        /* 样本级对比（2026-09-27）：前 10 帧连字节一起打出来，与 M 侧 M样本#k 逐帧对齐。 */
+        const uint32_t sample_index =
+            (uint32_t)__atomic_load_n(&s_motion_fwd_ok, __ATOMIC_RELAXED);
+        if (sample_index <= 10U || (sample_index % 1000U) == 0U) {
+            ESP_LOGI(TAG, "P样本#%u 长度=%u字节 布局=%u字节 dx=%d dy=%d",
+                     (unsigned)sample_index, (unsigned)length,
+                     (unsigned)s_clone_mouse_layout.report_bytes, (int)x, (int)y);
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, payload, length, ESP_LOG_INFO);
+        }
+    } else {
+        __atomic_add_fetch(&s_motion_fwd_skip, 1U, __ATOMIC_RELAXED);
+    }
+}
 static uint8_t s_clone_mouse_template[DUAL_HID_RAW_INPUT_MAX_DATA];
 static uint8_t s_clone_mouse_template_length;
 static bool s_clone_mouse_template_valid;
@@ -390,6 +440,17 @@ typedef struct {
     uint8_t report_type;
     uint8_t requested_length;
     uint8_t length;
+    /*
+     * 设备级 Vendor 控制请求（2026-09-27）：is_vendor_control 为 true 时上面的
+     * interface/report 字段无意义，改由下面四个字段描述一笔任意 EP0 控制传输。
+     * 它与厂商控制共用同一条队列（用户指令），转发到 M 侧后用通用 URB 发往物理设备。
+     */
+    bool is_vendor_control;
+    uint8_t bm_request_type;
+    uint8_t b_request;
+    uint16_t w_value;
+    uint16_t w_index;
+    uint16_t w_length;
     uint8_t data[DUAL_HID_CONTROL_MAX_DATA];
 } vendor_control_item_t;
 
@@ -840,6 +901,9 @@ static void vendor_input_task(void *argument)
                 diag_capture_report_submit(report_queued, instance,
                                            item.report_id, item.data, item.length);
                 if (report_queued) {
+                    /* 判据：源接口号 + 报告 ID（见 note_forwarded_motion 的说明）。 */
+                    note_forwarded_motion(item.data, (uint8_t)item.length,
+                                          item.interface_number, item.report_id);
                     submitted = true;
                     xSemaphoreGive(s_vendor_session_mutex);
                     break;
@@ -866,6 +930,22 @@ static void vendor_control_task(void *argument)
         }
         if (!vendor_session_lock_if_current(item.session_generation)) {
             ++s_vendor_set_dropped;
+            continue;
+        }
+        if (item.is_vendor_control) {
+            /*
+             * 设备级 Vendor 控制请求：不针对克隆的某个 HID 接口，所以跳过下面的
+             * 克隆/接口校验，直接按原始 bmRequestType 转发给 M（用户 2026-09-27
+             * 指令：与厂商控制同队列）。M 侧用通用 EP0 URB 发往物理设备。
+             */
+            if (dual_uart1_send_vendor_control_request(
+                    item.transaction_id, item.bm_request_type, item.b_request,
+                    item.w_value, item.w_index, item.w_length, item.data,
+                    item.length) != ESP_OK) {
+                ++s_vendor_set_dropped;
+                clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+            }
+            xSemaphoreGive(s_vendor_session_mutex);
             continue;
         }
         uint8_t instance = 0;
@@ -1053,33 +1133,131 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 }
 
 /*
- * G HUB 将 C092 标记为 DEVIO。先记录所有落到设备级 vendor request
- * 的 SETUP 包，以确认其是否还依赖 HID++ 之外的 EP0 控制事务。
- * 尚未实现跨板转发时返回 false，让 TinyUSB 明确 STALL，禁止伪造成功。
+ * 设备级 Vendor 控制请求转发（2026-09-27 实现）。
+ *
+ * 背景：G HUB 把接收器标记为 DEVIO，历史上怀疑它除了 HID++ 之外还依赖厂商自定义的
+ * EP0 事务；此前这里一律返回 false，让 TinyUSB 明确 STALL，以免"假装成功"。
+ * 现在按用户指令改为真正转发：请求进厂商控制队列 → M 侧用通用 EP0 URB 发往物理设备
+ * → 响应经板间链路带回后在这里完成控制传输。
+ *
+ * 复用 GET_REPORT 的等待设施（s_get_gate / s_get_response_sem / s_get_* 状态），
+ * 保证同一时刻只有一笔厂商事务在等响应，不必再引入一套状态机。
+ *
+ * v1 限制：只支持设备级/接口级请求，且仅覆盖「OUT 且 wLength==0」与「IN」两类；
+ * 带数据的 OUT（wLength>0 且方向为 OUT）需要在 DATA 阶段取数据，本版明确 STALL。
  */
+static uint8_t s_vendor_xfer_buffer[DUAL_VENDOR_CONTROL_MAX_DATA];
+
 bool tud_vendor_control_xfer_cb(
     uint8_t rhport,
     uint8_t stage,
     tusb_control_request_t const *request)
 {
-    (void)rhport;
-    if (stage == CONTROL_STAGE_SETUP && request != NULL) {
-        uint8_t event[10] = {0};
-        event[0] = stage;
-        event[1] = request->bmRequestType;
-        event[2] = request->bRequest;
-        memcpy(&event[3], &request->wValue, sizeof(request->wValue));
-        memcpy(&event[5], &request->wIndex, sizeof(request->wIndex));
-        memcpy(&event[7], &request->wLength, sizeof(request->wLength));
-        event[9] = 0U; /* tud_vendor_control_xfer_cb 返回 false：STALL。 */
-        dual_diag_stream_record(DUAL_DIAG_SOURCE_P_USB,
-                                DUAL_DIAG_KIND_P_VENDOR_SETUP, event, sizeof(event));
-        ESP_LOGI(TAG,
-                 "PC VENDOR_CONTROL: bm=%02X request=%02X value=%04X index=%04X length=%u",
-                 request->bmRequestType, request->bRequest, request->wValue,
-                 request->wIndex, request->wLength);
+    if (request == NULL) {
+        return false;
     }
-    return false;
+    if (stage != CONTROL_STAGE_SETUP) {
+        /* DATA/STATUS 阶段由 tud_control_xfer()/tud_control_status() 驱动。 */
+        return true;
+    }
+    uint8_t event[10] = {0};
+    event[0] = stage;
+    event[1] = request->bmRequestType;
+    event[2] = request->bRequest;
+    memcpy(&event[3], &request->wValue, sizeof(request->wValue));
+    memcpy(&event[5], &request->wIndex, sizeof(request->wIndex));
+    memcpy(&event[7], &request->wLength, sizeof(request->wLength));
+    dual_diag_stream_record(DUAL_DIAG_SOURCE_P_USB,
+                            DUAL_DIAG_KIND_P_VENDOR_SETUP, event, sizeof(event));
+    ESP_LOGI(TAG,
+             "PC VENDOR_CONTROL: bm=%02X request=%02X value=%04X index=%04X length=%u",
+             request->bmRequestType, request->bRequest, request->wValue,
+             request->wIndex, request->wLength);
+
+    const uint8_t recipient = request->bmRequestType & 0x1FU;
+    const bool is_in = (request->bmRequestType & 0x80U) != 0U;
+    const uint16_t w_length = request->wLength;
+    const bool forwardable = s_vendor_control_queue != NULL && s_get_gate != NULL &&
+        s_get_response_sem != NULL && s_get_state_mutex != NULL &&
+        !s_usb_reconfigure_in_progress && s_clone_active && s_installed &&
+        tud_mounted() && recipient <= 1U &&
+        w_length <= DUAL_VENDOR_CONTROL_MAX_DATA && (is_in || w_length == 0U);
+    if (!forwardable) {
+        event[9] = 0U;   /* 不可转发：保持原来的明确 STALL，不伪造成功。 */
+        return false;
+    }
+    if (xSemaphoreTake(s_get_gate, 0) != pdTRUE) {
+        return false;   /* 已有厂商事务在等响应，本笔不排队。 */
+    }
+    while (s_get_response_sem != NULL &&
+           xSemaphoreTake(s_get_response_sem, 0) == pdTRUE) {
+        /* 丢掉过期完成，避免误配到本笔事务。 */
+    }
+    const uint16_t transaction_id = next_vendor_transaction_id();
+    const uint32_t request_generation = vendor_session_generation();
+    xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+    s_get_inflight = true;
+    s_get_response_ready = false;
+    s_get_transaction_id = transaction_id;
+    s_get_interface_number = UINT8_MAX;   /* vendor 请求按事务号匹配，不按接口 */
+    s_get_report_id = 0U;
+    s_get_status = DUAL_HID_REPORT_STATUS_TIMEOUT;
+    s_get_response_length = 0;
+    s_get_session_generation = request_generation;
+    xSemaphoreGive(s_get_state_mutex);
+
+    vendor_control_item_t item = {
+        .session_generation = request_generation,
+        .get_report = false,
+        .transaction_id = transaction_id,
+        .is_vendor_control = true,
+        .bm_request_type = request->bmRequestType,
+        .b_request = request->bRequest,
+        .w_value = request->wValue,
+        .w_index = request->wIndex,
+        .w_length = w_length,
+        .length = 0U,
+    };
+    if (xQueueSend(s_vendor_control_queue, &item, 0) != pdTRUE) {
+        xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+        s_get_inflight = false;
+        xSemaphoreGive(s_get_state_mutex);
+        xSemaphoreGive(s_get_gate);
+        return false;
+    }
+    const bool signaled = xSemaphoreTake(
+        s_get_response_sem, pdMS_TO_TICKS(VENDOR_GET_REPORT_TIMEOUT_MS)) == pdTRUE;
+    uint8_t status = DUAL_HID_REPORT_STATUS_TIMEOUT;
+    uint8_t response_length = 0;
+    xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+    if (signaled && s_get_response_ready && s_get_inflight &&
+        s_get_transaction_id == transaction_id) {
+        status = s_get_status;
+        response_length = s_get_response_length;
+        if (response_length > sizeof(s_vendor_xfer_buffer)) {
+            response_length = sizeof(s_vendor_xfer_buffer);
+        }
+        if (response_length != 0U) {
+            memcpy(s_vendor_xfer_buffer, s_get_response_data, response_length);
+        }
+    }
+    s_get_inflight = false;
+    s_get_response_ready = false;
+    xSemaphoreGive(s_get_state_mutex);
+    xSemaphoreGive(s_get_gate);
+
+    if (status != DUAL_HID_REPORT_STATUS_OK) {
+        ++s_vendor_get_timeouts;
+        return false;   /* 失败/超时：STALL，让主机看到真实结果而不是假成功。 */
+    }
+    if (w_length == 0U) {
+        return tud_control_status(rhport, request);
+    }
+    uint16_t send_length = response_length;
+    if (send_length > w_length) {
+        send_length = w_length;
+    }
+    return tud_control_xfer(rhport, request, s_vendor_xfer_buffer, send_length);
 }
 
 uint16_t tud_hid_get_report_cb(
@@ -1346,6 +1524,43 @@ void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame)
                                    s_vendor_input_queue);
         return;
     }
+    if (frame->type == DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE) {
+        /*
+         * 设备级 Vendor 控制请求的响应（2026-09-27）：因为复用 GET_REPORT 的等待
+         * 状态，这里按事务号匹配后同样写状态并放行信号量即可。
+         */
+        uint16_t vendor_transaction_id = 0;
+        uint8_t vendor_status = 0;
+        const uint8_t *vendor_data = NULL;
+        size_t vendor_data_length = 0;
+        if (!dual_vendor_control_response_decode(
+                frame->payload, frame->payload_length, &vendor_transaction_id,
+                &vendor_status, &vendor_data, &vendor_data_length) ||
+            vendor_data_length > sizeof(s_get_response_data) ||
+            s_get_state_mutex == NULL) {
+            return;
+        }
+        xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+        const bool vendor_matches = s_get_inflight &&
+            s_get_session_generation == vendor_session_generation() &&
+            s_get_transaction_id == vendor_transaction_id;
+        if (!vendor_matches) {
+            ++s_vendor_get_mismatches;
+            xSemaphoreGive(s_get_state_mutex);
+            return;
+        }
+        s_get_status = vendor_status;
+        s_get_response_length = (uint8_t)vendor_data_length;
+        if (vendor_data_length != 0U) {
+            memcpy(s_get_response_data, vendor_data, vendor_data_length);
+        }
+        s_get_response_ready = true;
+        if (s_get_response_sem != NULL) {
+            xSemaphoreGive(s_get_response_sem);
+        }
+        xSemaphoreGive(s_get_state_mutex);
+        return;
+    }
     if (frame->type != DUAL_MESSAGE_HID_GET_REPORT_RESPONSE) {
         return;
     }
@@ -1537,7 +1752,9 @@ static void log_hid_statistics_if_due(void)
                   " motion_skipped=%" PRIu32
                   " motion_merged=%" PRIu32
                   " motion_q_peak=%" PRIu32 " motion_lat_peak_us=%" PRId64
-                   " cleanup_retry=%" PRIu32 " ack_retry=%" PRIu32,
+                   " cleanup_retry=%" PRIu32 " ack_retry=%" PRIu32
+                   " motion_fwd_dx=%lld motion_fwd_dy=%lld"
+                   " motion_fwd_ok=%" PRIu32 " motion_fwd_skip=%" PRIu32,
                  timer_hz, physical_rx_hz, submitted_hz, completion_hz,
                  s_hid_timer_ticks, s_hid_not_mounted, s_hid_not_ready,
                   s_hid_attempts, s_hid_submitted, s_hid_submit_failures,
@@ -1559,7 +1776,11 @@ static void log_hid_statistics_if_due(void)
                  s_vendor_motion_skipped,
                  s_motion_merged_total,
                  s_motion_queue_peak, s_motion_latency_peak_us,
-                  s_reconfigure_cleanup_retries, s_reconfigure_ack_retries);
+                  s_reconfigure_cleanup_retries, s_reconfigure_ack_retries,
+                  (long long)__atomic_load_n(&s_motion_fwd_dx, __ATOMIC_RELAXED),
+                  (long long)__atomic_load_n(&s_motion_fwd_dy, __ATOMIC_RELAXED),
+                  (uint32_t)__atomic_load_n(&s_motion_fwd_ok, __ATOMIC_RELAXED),
+                  (uint32_t)__atomic_load_n(&s_motion_fwd_skip, __ATOMIC_RELAXED));
         log_queue_metrics("pc_vendor_input", &s_vendor_input_queue_metrics);
         log_queue_metrics("pc_motion_input", &s_motion_input_queue_metrics);
         log_queue_metrics("pc_vendor_control", &s_vendor_control_queue_metrics);

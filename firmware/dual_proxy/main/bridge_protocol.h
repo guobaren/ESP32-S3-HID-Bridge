@@ -40,6 +40,21 @@ typedef enum {
     DUAL_MESSAGE_DIAG_STREAM_STATUS = 0x16,
     DUAL_MESSAGE_DIAG_INJECT_REQUEST = 0x17,
     DUAL_MESSAGE_DIAG_INJECT_RESULT = 0x18,
+    /*
+     * 设备级 Vendor 控制传输自测（2026-09-27）：让 M 板直接对物理设备发一笔
+     * 厂商自定义 EP0 请求，用于单独验证 vendor_urb 的通用控制通道。
+     * 请求 payload：[bmRequestType:1][bRequest:1][wValue:2][wIndex:2][wLength:2][timeout_ms:2]
+     * 结果 payload：[result:1][status:1][length:2][data:length]
+     */
+    DUAL_MESSAGE_DIAG_VENDOR_TEST_REQUEST = 0x19,
+    DUAL_MESSAGE_DIAG_VENDOR_TEST_RESULT = 0x1A,
+    /*
+     * 物理报告注入（2026-09-27）：payload 就是一段原始鼠标报告字节（格式同
+     * RAW_HID_INPUT 的 data：带 report ID 时首字节即 ID）。M 侧收到后把它投进
+     * 物理 RX 回调，使位移统计 / 入队 / 转发与真实报告走完全相同的路径，
+     * 从而用**完全已知的位移**做受控实验。
+     */
+    DUAL_MESSAGE_DIAG_REPORT_INJECT_REQUEST = 0x1B,
     DUAL_MESSAGE_LINK_HELLO = 0x20,
     DUAL_MESSAGE_PHYSICAL_MOUSE = 0x21,
     DUAL_MESSAGE_PHYSICAL_RELEASE = 0x22,
@@ -59,6 +74,14 @@ typedef enum {
     DUAL_MESSAGE_PROFILE_REQUEST = 0x30,
     DUAL_MESSAGE_PROFILE_OFFER = 0x31,
     DUAL_MESSAGE_FLOW_ACK = 0x32,
+    /*
+     * 设备级 Vendor 控制请求转发（2026-09-27）：P 侧收到 bmRequestType 的 type 字段
+     * 为 0b10（厂商自定义）的 EP0 请求后不再直接 STALL，而是交给 M 侧用直连 URB
+     * 发往物理设备；IN 方向由 RESPONSE 把数据带回。OUT 方向同样回一条 RESPONSE，
+     * 让 P 侧能区分“设备受理”与“超时/不支持”，而不是无条件假装成功。
+     */
+    DUAL_MESSAGE_VENDOR_CONTROL_REQUEST = 0x33,
+    DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE = 0x34,
 } dual_message_type_t;
 
 typedef enum {
@@ -204,6 +227,24 @@ typedef enum {
 #define DUAL_HID_CONTROL_MAX_DATA \
     (DUAL_PROXY_MAX_PAYLOAD - DUAL_HID_SET_REPORT_HEADER_LENGTH)
 
+/*
+ * 设备级 Vendor 控制请求/响应的 payload 布局（2026-09-27 新增 + 同日修订）：
+ *   请求：[transaction_id:2][bmRequestType:1][bRequest:1][wValue:2][wIndex:2]
+ *         [data_length:2][wLength:2][data:data_length]
+ *   响应：[transaction_id:2][status:1][length:2][data:length]
+ * 为什么把 data_length 与 wLength 分成两个字段：IN 请求（bmRequestType bit7=1）的
+ * wLength 表示"期望读取多少"，payload 里并不携带数据；首版用一个字段兼表两者，
+ * 导致 IN 请求的长度校验必然失败（注入探针实测：OUT 能过、IN 一直被解码拒绝）。
+ * 约定：
+ *   OUT（bit7=0）：data_length == wLength，data 正好这么长；
+ *   IN （bit7=1）：data_length == 0，wLength 为期望长度。
+ * status 复用 dual_hid_report_status_t（OK/INVALID/TIMEOUT/UNSUPPORTED）。
+ */
+#define DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH 12U
+#define DUAL_VENDOR_CONTROL_RESPONSE_HEADER_LENGTH 5U
+#define DUAL_VENDOR_CONTROL_MAX_DATA \
+    (DUAL_PROXY_MAX_PAYLOAD - DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH)
+
 typedef enum {
     DUAL_HID_REPORT_TYPE_INPUT = 1,
     DUAL_HID_REPORT_TYPE_OUTPUT = 2,
@@ -311,6 +352,47 @@ bool dual_hid_get_response_decode(
     uint8_t *status,
     uint8_t *interface_number,
     uint8_t *report_id,
+    const uint8_t **data,
+    size_t *data_length);
+
+/* 设备级 Vendor 控制请求/响应（2026-09-27）：见上面的 payload 布局说明。 */
+bool dual_vendor_control_request_encode(
+    uint16_t transaction_id,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    uint16_t w_length,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length);
+bool dual_vendor_control_request_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint16_t *transaction_id,
+    uint8_t *bm_request_type,
+    uint8_t *b_request,
+    uint16_t *w_value,
+    uint16_t *w_index,
+    uint16_t *w_length,
+    const uint8_t **data,
+    size_t *data_length);
+
+bool dual_vendor_control_response_encode(
+    uint16_t transaction_id,
+    uint8_t status,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length);
+bool dual_vendor_control_response_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint16_t *transaction_id,
+    uint8_t *status,
     const uint8_t **data,
     size_t *data_length);
 

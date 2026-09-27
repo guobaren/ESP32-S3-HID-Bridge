@@ -191,6 +191,12 @@ static void handle_diagnostic_injection(const dual_frame_t *request)
     uint8_t report_id = 0U;
     uint8_t report_type = 0U;
     uint8_t requested_length = 0U;
+    /* 设备级 Vendor 控制请求用的字段（2026-09-27）。 */
+    uint8_t bm_request_type = 0U;
+    uint8_t b_request = 0U;
+    uint16_t w_value = 0U;
+    uint16_t w_index = 0U;
+    uint16_t w_length = 0U;
     const uint8_t *data = NULL;
     size_t data_length = 0U;
     bool valid = false;
@@ -209,6 +215,11 @@ static void handle_diagnostic_injection(const dual_frame_t *request)
         valid = dual_hid_get_request_decode(injected.payload, injected.payload_length,
                                              &transaction_id, &interface_number, &report_id,
                                              &report_type, &requested_length);
+    } else if (type == DUAL_MESSAGE_VENDOR_CONTROL_REQUEST) {
+        /* 2026-09-27：设备级 Vendor 控制请求也走注入通道（验证 M 侧通用 EP0 转发）。 */
+        valid = dual_vendor_control_request_decode(
+            injected.payload, injected.payload_length, &transaction_id, &bm_request_type,
+            &b_request, &w_value, &w_index, &w_length, &data, &data_length);
     }
     if (!valid) {
         reply[1] = 1U;
@@ -222,7 +233,11 @@ static void handle_diagnostic_injection(const dual_frame_t *request)
         reply[1] = 0U;
     } else if (route == 2U && s_role == DUAL_ROLE_MOUSE_HOST &&
                (type == DUAL_MESSAGE_HID_SET_REPORT ||
-                type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST)) {
+                type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST ||
+                /* 2026-09-27：注入通道也允许投递设备级 Vendor 控制请求——
+                 * Windows 用户态对 HID 类设备发不了 vendor 请求，没有主机侧触发
+                 * 手段时，用这条注入路径单独验证 M 侧的通用 EP0 转发链路。 */
+                type == DUAL_MESSAGE_VENDOR_CONTROL_REQUEST)) {
         dual_hid_host_handle_control_frame(&injected);
         reply[1] = 0U;
     } else {
@@ -504,6 +519,16 @@ static void on_control_frame(const dual_frame_t *frame, void *context)
     }
     if (frame->type == DUAL_MESSAGE_DIAG_INJECT_REQUEST) {
         handle_diagnostic_injection(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_DIAG_REPORT_INJECT_REQUEST) {
+        /* 物理报告注入（2026-09-27）：payload 即原始报告字节，投进 M 的 RX 回调，
+         * 使位移统计/入队/转发与真实鼠标报告完全同路。 */
+        const bool ok = frame->payload_length != 0U &&
+            dual_hid_host_inject_report(frame->payload, frame->payload_length);
+        ESP_LOGI(TAG, "报告注入：%u 字节 → %s",
+                 (unsigned)frame->payload_length,
+                 ok ? "已投入物理RX路径" : "失败（无活动鼠标接口或长度非法）");
         return;
     }
     if (frame->type == DUAL_MESSAGE_DIAG_STREAM_CONTROL) {

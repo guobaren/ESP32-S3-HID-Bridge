@@ -290,6 +290,135 @@ bool dual_hid_set_report_decode(
     return true;
 }
 
+/*
+ * 设备级 Vendor 控制请求/响应编解码（2026-09-27）。
+ * 与 SET_REPORT 那套的区别：请求里带完整的 bmRequestType/bRequest/wValue/wIndex，
+ * 这样 M 侧可以原样构造任意 EP0 控制传输，而不只是 HID 类 SET_REPORT。
+ */
+bool dual_vendor_control_request_encode(
+    uint16_t transaction_id,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    uint16_t w_length,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || payload_length == NULL ||
+        data_length > DUAL_VENDOR_CONTROL_MAX_DATA ||
+        w_length > DUAL_VENDOR_CONTROL_MAX_DATA ||
+        capacity < DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH + data_length ||
+        (data == NULL && data_length != 0U) ||
+        /* OUT 必须自带与 wLength 等长的数据；IN 不携带数据。 */
+        (((bm_request_type & 0x80U) == 0U) ? (data_length != (size_t)w_length)
+                                           : (data_length != 0U))) {
+        return false;
+    }
+    write_u16_le(payload, transaction_id);
+    payload[2] = bm_request_type;
+    payload[3] = b_request;
+    write_u16_le(&payload[4], w_value);
+    write_u16_le(&payload[6], w_index);
+    write_u16_le(&payload[8], (uint16_t)data_length);
+    write_u16_le(&payload[10], w_length);
+    if (data_length != 0U) {
+        memcpy(&payload[DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH], data, data_length);
+    }
+    *payload_length = (uint8_t)(DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH + data_length);
+    return true;
+}
+
+bool dual_vendor_control_request_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint16_t *transaction_id,
+    uint8_t *bm_request_type,
+    uint8_t *b_request,
+    uint16_t *w_value,
+    uint16_t *w_index,
+    uint16_t *w_length,
+    const uint8_t **data,
+    size_t *data_length)
+{
+    if (payload == NULL || transaction_id == NULL || bm_request_type == NULL ||
+        b_request == NULL || w_value == NULL || w_index == NULL ||
+        w_length == NULL || data == NULL || data_length == NULL ||
+        payload_length < DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH) {
+        return false;
+    }
+    const uint16_t carried = read_u16_le(&payload[8]);
+    const uint16_t requested = read_u16_le(&payload[10]);
+    if (carried > DUAL_VENDOR_CONTROL_MAX_DATA ||
+        requested > DUAL_VENDOR_CONTROL_MAX_DATA ||
+        payload_length != DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH + carried ||
+        (((payload[2] & 0x80U) == 0U) ? (carried != requested) : (carried != 0U))) {
+        return false;
+    }
+    *transaction_id = read_u16_le(payload);
+    *bm_request_type = payload[2];
+    *b_request = payload[3];
+    *w_value = read_u16_le(&payload[4]);
+    *w_index = read_u16_le(&payload[6]);
+    *w_length = requested;
+    *data = &payload[DUAL_VENDOR_CONTROL_REQUEST_HEADER_LENGTH];
+    *data_length = carried;
+    return true;
+}
+
+bool dual_vendor_control_response_encode(
+    uint16_t transaction_id,
+    uint8_t status,
+    const uint8_t *data,
+    size_t data_length,
+    uint8_t *payload,
+    size_t capacity,
+    uint8_t *payload_length)
+{
+    if (payload == NULL || payload_length == NULL ||
+        data_length > DUAL_VENDOR_CONTROL_MAX_DATA ||
+        capacity < DUAL_VENDOR_CONTROL_RESPONSE_HEADER_LENGTH + data_length ||
+        (data == NULL && data_length != 0U)) {
+        return false;
+    }
+    write_u16_le(payload, transaction_id);
+    payload[2] = status;
+    write_u16_le(&payload[3], (uint16_t)data_length);
+    if (data_length != 0U) {
+        memcpy(&payload[DUAL_VENDOR_CONTROL_RESPONSE_HEADER_LENGTH], data, data_length);
+    }
+    *payload_length = (uint8_t)(DUAL_VENDOR_CONTROL_RESPONSE_HEADER_LENGTH + data_length);
+    return true;
+}
+
+bool dual_vendor_control_response_decode(
+    const uint8_t *payload,
+    size_t payload_length,
+    uint16_t *transaction_id,
+    uint8_t *status,
+    const uint8_t **data,
+    size_t *data_length)
+{
+    if (payload == NULL || transaction_id == NULL || status == NULL ||
+        data == NULL || data_length == NULL ||
+        payload_length < DUAL_VENDOR_CONTROL_RESPONSE_HEADER_LENGTH) {
+        return false;
+    }
+    const uint16_t declared = read_u16_le(&payload[3]);
+    if (declared > DUAL_VENDOR_CONTROL_MAX_DATA ||
+        payload_length != DUAL_VENDOR_CONTROL_RESPONSE_HEADER_LENGTH + declared) {
+        return false;
+    }
+    *transaction_id = read_u16_le(payload);
+    *status = payload[2];
+    *data = &payload[DUAL_VENDOR_CONTROL_RESPONSE_HEADER_LENGTH];
+    *data_length = declared;
+    return true;
+}
+
 bool dual_hid_get_request_encode(
     uint16_t transaction_id,
     uint8_t interface_number,
