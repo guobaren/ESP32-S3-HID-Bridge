@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "bridge_protocol.h"
@@ -22,6 +23,9 @@ esp_err_t dual_hid_host_start(
 esp_err_t dual_hid_host_stop(void);
 bool dual_hid_host_device_present(void);
 bool dual_hid_host_mouse_present(void);
+/* 复制当前已序列化的物理设备 Profile；没有完整快照时返回 0。 */
+size_t dual_hid_host_copy_profile_blob(uint32_t offset, uint8_t *output, size_t capacity,
+                                       uint32_t *total_length);
 
 /* 厂商控制事务是否仍在 400 ms 窗口内（G HUB 初始化/查询期间为真）。 */
 bool dual_hid_host_vendor_busy(void);

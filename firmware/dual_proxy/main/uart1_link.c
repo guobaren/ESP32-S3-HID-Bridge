@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "hal/uart_ll.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -16,6 +17,7 @@
 #include "freertos/portmacro.h"
 
 #include "dual_proxy_runtime_config.h"
+#include "diag_stream.h"
 #include "dual_status_led.h"
 #include "hid_device_profile.h"
 #include "link_recovery_logic.h"
@@ -36,11 +38,15 @@ static volatile int64_t s_last_heartbeat_us;
 /* 原始输入帧（移动）从入队到发出的停留峰值，单位微秒。 */
 static volatile int64_t s_raw_tx_latency_peak_us;
 #define LINK_TX_BUFFER_SIZE 4096
-#define LINK_EVENT_QUEUE_LENGTH 32
+#define LINK_EVENT_QUEUE_LENGTH 128
+/* 成功出队后按 waiting+1 估算深度：96..127 算近满，128 算满。 */
+#define LINK_EVENT_QUEUE_NEAR_DEPTH 96U
+#define LINK_BREAK_SUPPRESSION_US 250000U
+#define LINK_BREAK_REARM_RETRY_US 10000U
 #define LINK_TX_QUEUE_LENGTH 128
 /* 实体报文与厂商/控制报文各自 128 槽：移动（1 kHz）不再因为浅队列被大量丢弃，
  * 两条队列等长也避免一边满一边空造成的丢弃偏差。 */
-#define LINK_SAFETY_QUEUE_LENGTH 8
+#define LINK_SAFETY_QUEUE_LENGTH 128
 #define LINK_SOFTWARE_QUEUE_LENGTH 128
 #define LINK_VENDOR_QUEUE_LENGTH 128
 #define LINK_RX_CHUNK_SIZE 128
@@ -72,6 +78,329 @@ _Static_assert(CONFIG_FREERTOS_HZ == DUAL_PROXY_REQUIRED_FREERTOS_HZ,
 _Static_assert(pdMS_TO_TICKS(1) == 1, "1ms必须正好折算为1 tick");
 
 static const char *TAG = "dual_uart1";
+static QueueHandle_t s_uart_event_queue;
+static esp_timer_handle_t s_uart_break_rearm_timer;
+static portMUX_TYPE s_uart_break_suppression_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_uart_break_suppression_active;
+static uint32_t s_uart_break_seen;
+static uint32_t s_uart_break_suppression_windows;
+static uint32_t s_uart_break_rearms;
+static uint32_t s_uart_break_suppression_failures;
+
+typedef struct {
+    volatile uint32_t received;
+    volatile uint32_t rejected;
+    volatile uint32_t dropped;
+    volatile uint32_t peak;
+} queue_metrics_t;
+
+static queue_metrics_t s_tx_queue_metrics;
+static queue_metrics_t s_safety_tx_queue_metrics;
+static queue_metrics_t s_software_tx_queue_metrics;
+static queue_metrics_t s_vendor_tx_queue_metrics;
+static volatile uint32_t s_uart_event_consumed;
+static volatile uint32_t s_uart_event_overflow;
+static volatile uint32_t s_uart_event_reset_dropped;
+static volatile uint32_t s_uart_event_peak;
+static volatile uint32_t s_uart_event_current;
+static volatile uint32_t s_uart_event_waiting;
+
+typedef enum {
+    UART_EVENT_METRIC_DATA = 0,
+    UART_EVENT_METRIC_FIFO_OVF,
+    UART_EVENT_METRIC_BUFFER_FULL,
+    UART_EVENT_METRIC_BREAK,
+    UART_EVENT_METRIC_PARITY_ERR,
+    UART_EVENT_METRIC_FRAME_ERR,
+    UART_EVENT_METRIC_PATTERN_DET,
+    UART_EVENT_METRIC_OTHER,
+    UART_EVENT_METRIC_COUNT,
+} uart_event_metric_type_t;
+
+typedef struct {
+    uint32_t type_count[UART_EVENT_METRIC_COUNT];
+    uint32_t near_samples;
+    uint32_t full_samples;
+    uint32_t handle_samples;
+    uint64_t handle_sum_us;
+    uint64_t handle_max_us;
+    uint32_t interval_samples;
+    uint64_t interval_sum_us;
+    uint64_t interval_max_us;
+    uint32_t parse_samples;
+    uint64_t parse_sum_us;
+    uint64_t parse_max_us;
+} uart_event_window_metrics_t;
+
+static uart_event_window_metrics_t s_uart_event_window_metrics;
+static portMUX_TYPE s_uart_event_metrics_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static const char *const s_uart_event_metric_names[UART_EVENT_METRIC_COUNT] = {
+    "DATA", "FIFO_OVF", "BUFFER_FULL", "BREAK", "PARITY_ERR",
+    "FRAME_ERR", "PATTERN_DET", "OTHER",
+};
+
+static void queue_metric_increment(volatile uint32_t *counter)
+{
+    __atomic_fetch_add(counter, 1U, __ATOMIC_RELAXED);
+}
+
+static void queue_metric_add(volatile uint32_t *counter, uint32_t amount)
+{
+    if (amount != 0U) {
+        __atomic_fetch_add(counter, amount, __ATOMIC_RELAXED);
+    }
+}
+
+static void queue_metric_observe_depth(queue_metrics_t *metrics,
+                                       QueueHandle_t queue)
+{
+    if (queue == NULL) {
+        return;
+    }
+    uint32_t peak = __atomic_load_n(&metrics->peak, __ATOMIC_RELAXED);
+    const uint32_t depth = (uint32_t)uxQueueMessagesWaiting(queue);
+    while (depth > peak && !__atomic_compare_exchange_n(
+               &metrics->peak, &peak, depth, true,
+               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
+static void queue_reset_count_dropped(QueueHandle_t queue,
+                                      queue_metrics_t *metrics)
+{
+    if (queue != NULL) {
+        queue_metric_add(&metrics->dropped,
+                         (uint32_t)uxQueueMessagesWaiting(queue));
+        xQueueReset(queue);
+    }
+}
+
+static void uart_event_note_depth(uint32_t waiting_depth)
+{
+    const uint32_t depth = waiting_depth + 1U;
+    __atomic_store_n(&s_uart_event_current, depth, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_uart_event_waiting, waiting_depth, __ATOMIC_RELAXED);
+    uint32_t peak = __atomic_load_n(&s_uart_event_peak, __ATOMIC_RELAXED);
+    while (depth > peak && !__atomic_compare_exchange_n(
+               &s_uart_event_peak, &peak, depth, true,
+               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
+static uart_event_metric_type_t uart_event_metric_type(uart_event_type_t type)
+{
+    switch (type) {
+    case UART_DATA:
+        return UART_EVENT_METRIC_DATA;
+    case UART_FIFO_OVF:
+        return UART_EVENT_METRIC_FIFO_OVF;
+    case UART_BUFFER_FULL:
+        return UART_EVENT_METRIC_BUFFER_FULL;
+    case UART_BREAK:
+        /* BREAK 只计入本板窗口统计，不编码成链路帧。 */
+        return UART_EVENT_METRIC_BREAK;
+    case UART_PARITY_ERR:
+        return UART_EVENT_METRIC_PARITY_ERR;
+    case UART_FRAME_ERR:
+        return UART_EVENT_METRIC_FRAME_ERR;
+    case UART_PATTERN_DET:
+        return UART_EVENT_METRIC_PATTERN_DET;
+    default:
+        /* 包括当前 IDF 的 UART_DATA_BREAK、UART_WAKEUP 等未单列事件。 */
+        return UART_EVENT_METRIC_OTHER;
+    }
+}
+
+static void uart_event_record_metrics(uart_event_metric_type_t type,
+                                      uint32_t waiting_depth,
+                                      uint64_t handle_us,
+                                      bool has_interval,
+                                      uint64_t interval_us,
+                                      bool has_parse_sample,
+                                      uint64_t parse_us)
+{
+    taskENTER_CRITICAL(&s_uart_event_metrics_mux);
+    ++s_uart_event_window_metrics.type_count[type];
+    const uint32_t estimated_depth = waiting_depth + 1U;
+    if (estimated_depth >= LINK_EVENT_QUEUE_NEAR_DEPTH &&
+        estimated_depth < LINK_EVENT_QUEUE_LENGTH) {
+        ++s_uart_event_window_metrics.near_samples;
+    } else if (estimated_depth == LINK_EVENT_QUEUE_LENGTH) {
+        ++s_uart_event_window_metrics.full_samples;
+    }
+    ++s_uart_event_window_metrics.handle_samples;
+    s_uart_event_window_metrics.handle_sum_us += handle_us;
+    if (handle_us > s_uart_event_window_metrics.handle_max_us) {
+        s_uart_event_window_metrics.handle_max_us = handle_us;
+    }
+    if (has_interval) {
+        ++s_uart_event_window_metrics.interval_samples;
+        s_uart_event_window_metrics.interval_sum_us += interval_us;
+        if (interval_us > s_uart_event_window_metrics.interval_max_us) {
+            s_uart_event_window_metrics.interval_max_us = interval_us;
+        }
+    }
+    if (has_parse_sample) {
+        ++s_uart_event_window_metrics.parse_samples;
+        s_uart_event_window_metrics.parse_sum_us += parse_us;
+        if (parse_us > s_uart_event_window_metrics.parse_max_us) {
+            s_uart_event_window_metrics.parse_max_us = parse_us;
+        }
+    }
+    taskEXIT_CRITICAL(&s_uart_event_metrics_mux);
+}
+
+static void log_uart_event_window_metrics(void)
+{
+    uart_event_window_metrics_t metrics;
+    uint32_t break_seen;
+    uint32_t suppression_windows;
+    uint32_t rearms;
+    uint32_t suppression_failures;
+    taskENTER_CRITICAL(&s_uart_event_metrics_mux);
+    metrics = s_uart_event_window_metrics;
+    memset(&s_uart_event_window_metrics, 0, sizeof(s_uart_event_window_metrics));
+    taskEXIT_CRITICAL(&s_uart_event_metrics_mux);
+    taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+    break_seen = s_uart_break_seen;
+    suppression_windows = s_uart_break_suppression_windows;
+    rearms = s_uart_break_rearms;
+    suppression_failures = s_uart_break_suppression_failures;
+    taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+
+    ESP_LOGI(TAG, "U1EV queue current_est=%" PRIu32 " waiting=%" PRIu32
+             " peak=%" PRIu32 " consumed=%" PRIu32 " overflow=%" PRIu32
+             " reset_dropped=%" PRIu32 " driver_enqueue_dropped=unknown",
+             __atomic_load_n(&s_uart_event_current, __ATOMIC_RELAXED),
+             __atomic_load_n(&s_uart_event_waiting, __ATOMIC_RELAXED),
+             __atomic_load_n(&s_uart_event_peak, __ATOMIC_RELAXED),
+             __atomic_load_n(&s_uart_event_consumed, __ATOMIC_RELAXED),
+             __atomic_load_n(&s_uart_event_overflow, __ATOMIC_RELAXED),
+             __atomic_load_n(&s_uart_event_reset_dropped, __ATOMIC_RELAXED));
+    ESP_LOGI(TAG, "U1EV pressure near_samples=%" PRIu32 " full_samples=%" PRIu32
+             " near_est=%" PRIu32 "..%" PRIu32 " full_est=%" PRIu32,
+             metrics.near_samples, metrics.full_samples,
+             (uint32_t)LINK_EVENT_QUEUE_NEAR_DEPTH,
+             (uint32_t)LINK_EVENT_QUEUE_LENGTH - 1U,
+             (uint32_t)LINK_EVENT_QUEUE_LENGTH);
+    ESP_LOGI(TAG, "U1EV break seen=%" PRIu32 " suppression_windows=%" PRIu32
+             " rearms=%" PRIu32 " failures=%" PRIu32,
+             break_seen, suppression_windows, rearms, suppression_failures);
+    for (size_t index = 0; index < UART_EVENT_METRIC_COUNT; ++index) {
+        ESP_LOGI(TAG, "U1EV type=%s n=%" PRIu32,
+                 s_uart_event_metric_names[index], metrics.type_count[index]);
+    }
+    ESP_LOGI(TAG, "U1EV handle n=%" PRIu32 " sum_us=%" PRIu64 " max_us=%" PRIu64
+             " avg_us=%" PRIu64,
+             metrics.handle_samples, metrics.handle_sum_us, metrics.handle_max_us,
+             metrics.handle_samples == 0U ? 0U :
+                 metrics.handle_sum_us / metrics.handle_samples);
+    ESP_LOGI(TAG, "U1EV interval n=%" PRIu32 " sum_us=%" PRIu64 " max_us=%" PRIu64
+             " avg_us=%" PRIu64,
+             metrics.interval_samples, metrics.interval_sum_us, metrics.interval_max_us,
+             metrics.interval_samples == 0U ? 0U :
+                 metrics.interval_sum_us / metrics.interval_samples);
+    ESP_LOGI(TAG, "U1EV parse n=%" PRIu32 " sum_us=%" PRIu64 " max_us=%" PRIu64
+             " avg_us=%" PRIu64,
+             metrics.parse_samples, metrics.parse_sum_us, metrics.parse_max_us,
+             metrics.parse_samples == 0U ? 0U :
+                 metrics.parse_sum_us / metrics.parse_samples);
+}
+
+static bool uart_break_try_rearm(void)
+{
+    taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+    if (!s_uart_break_suppression_active) {
+        taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+        return true;
+    }
+    const esp_err_t result =
+        uart_enable_intr_mask(LINK_UART, UART_INTR_BRK_DET);
+    if (result == ESP_OK) {
+        s_uart_break_suppression_active = false;
+        ++s_uart_break_rearms;
+    } else {
+        ++s_uart_break_suppression_failures;
+    }
+    taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+    return result == ESP_OK;
+}
+
+static void uart_break_schedule_retry(void)
+{
+    /* 保持 active 并用同一独立 timer 重试，避免一次失败后永久屏蔽。 */
+    const esp_err_t result = esp_timer_start_once(s_uart_break_rearm_timer,
+                                                  LINK_BREAK_REARM_RETRY_US);
+    if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
+        /* timer 自身不可重新调度时再直接尝试恢复一次。 */
+        taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+        ++s_uart_break_suppression_failures;
+        taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+        (void)uart_break_try_rearm();
+    }
+}
+
+static void uart_break_rearm_timer_callback(void *argument)
+{
+    (void)argument;
+    if (!uart_break_try_rearm()) {
+        uart_break_schedule_retry();
+    }
+}
+
+static void uart_break_note_and_suppress(void)
+{
+    bool start_suppression = false;
+    taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+    ++s_uart_break_seen;
+    if (!s_uart_break_suppression_active) {
+        /* 先占位，避免同一突发中已排队的 BREAK 重复启动定时器。 */
+        s_uart_break_suppression_active = true;
+        start_suppression = true;
+    }
+    taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+    if (!start_suppression) {
+        return;
+    }
+
+    esp_err_t result = uart_disable_intr_mask(LINK_UART, UART_INTR_BRK_DET);
+    if (result != ESP_OK) {
+        taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+        s_uart_break_suppression_active = false;
+        ++s_uart_break_suppression_failures;
+        taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+        return;
+    }
+    taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+    ++s_uart_break_suppression_windows;
+    taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+
+    result = esp_timer_start_once(s_uart_break_rearm_timer,
+                                  LINK_BREAK_SUPPRESSION_US);
+    if (result == ESP_OK) {
+        return;
+    }
+
+    /* 定时器启动失败时立刻恢复 BREAK 检测，避免永久屏蔽该中断。 */
+    taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+    ++s_uart_break_suppression_failures;
+    taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
+    if (!uart_break_try_rearm()) {
+        uart_break_schedule_retry();
+    }
+}
+
+static void log_queue_metrics(const char *name, const queue_metrics_t *metrics)
+{
+    ESP_LOGI(TAG, "QUEUE name=%s received=%" PRIu32 " rejected=%" PRIu32
+             " dropped=%" PRIu32 " peak=%" PRIu32,
+             name,
+             __atomic_load_n(&metrics->received, __ATOMIC_RELAXED),
+             __atomic_load_n(&metrics->rejected, __ATOMIC_RELAXED),
+             __atomic_load_n(&metrics->dropped, __ATOMIC_RELAXED),
+             __atomic_load_n(&metrics->peak, __ATOMIC_RELAXED));
+}
 
 typedef struct {
     uint8_t type;
@@ -113,7 +442,6 @@ static volatile uint32_t s_tx_queue_peak;
 static volatile uint32_t s_tx_queue_overflows;
 static volatile uint32_t s_tx_queue_drops;
 static volatile uint32_t s_tx_write_failures;
-static QueueHandle_t s_uart_event_queue;
 static QueueHandle_t s_tx_queue;
 static QueueHandle_t s_safety_tx_queue;
 static QueueHandle_t s_software_tx_queue;
@@ -308,15 +636,19 @@ static void update_tx_queue_metrics(void)
 {
     UBaseType_t current = 0;
     if (s_tx_queue != NULL) {
+        queue_metric_observe_depth(&s_tx_queue_metrics, s_tx_queue);
         current += uxQueueMessagesWaiting(s_tx_queue);
     }
     if (s_safety_tx_queue != NULL) {
+        queue_metric_observe_depth(&s_safety_tx_queue_metrics, s_safety_tx_queue);
         current += uxQueueMessagesWaiting(s_safety_tx_queue);
     }
     if (s_software_tx_queue != NULL) {
+        queue_metric_observe_depth(&s_software_tx_queue_metrics, s_software_tx_queue);
         current += uxQueueMessagesWaiting(s_software_tx_queue);
     }
     if (s_vendor_tx_queue != NULL) {
+        queue_metric_observe_depth(&s_vendor_tx_queue_metrics, s_vendor_tx_queue);
         current += uxQueueMessagesWaiting(s_vendor_tx_queue);
     }
     s_tx_queue_current = (uint32_t)current;
@@ -327,18 +659,10 @@ static void update_tx_queue_metrics(void)
 
 static void reset_tx_queues(void)
 {
-    if (s_tx_queue != NULL) {
-        xQueueReset(s_tx_queue);
-    }
-    if (s_safety_tx_queue != NULL) {
-        xQueueReset(s_safety_tx_queue);
-    }
-    if (s_software_tx_queue != NULL) {
-        xQueueReset(s_software_tx_queue);
-    }
-    if (s_vendor_tx_queue != NULL) {
-        xQueueReset(s_vendor_tx_queue);
-    }
+    queue_reset_count_dropped(s_tx_queue, &s_tx_queue_metrics);
+    queue_reset_count_dropped(s_safety_tx_queue, &s_safety_tx_queue_metrics);
+    queue_reset_count_dropped(s_software_tx_queue, &s_software_tx_queue_metrics);
+    queue_reset_count_dropped(s_vendor_tx_queue, &s_vendor_tx_queue_metrics);
     update_tx_queue_metrics();
 }
 
@@ -843,6 +1167,8 @@ static void on_link_frame(const dual_frame_t *frame, void *context)
         return;
     }
     ++s_rx_count;
+    dual_diag_stream_record(DUAL_DIAG_SOURCE_UART1_RX, frame->type,
+                            frame->payload, frame->payload_length);
     if (frame->type == DUAL_MESSAGE_PHYSICAL_MOUSE) {
         ++s_rx_physical_count;
     } else if (frame->type == DUAL_MESSAGE_SOFTWARE_MOUSE) {
@@ -855,22 +1181,6 @@ static void on_link_frame(const dual_frame_t *frame, void *context)
 
 static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t length)
 {
-    if (s_tx_queue == NULL || s_safety_tx_queue == NULL ||
-        s_software_tx_queue == NULL || s_vendor_tx_queue == NULL ||
-        length > DUAL_PROXY_MAX_PAYLOAD) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    tx_item_t item = {
-        .type = type,
-        .length = length,
-        .enqueued_us = esp_timer_get_time(),
-        .vendor_session_generation = is_vendor_hid_message(type) ?
-            vendor_hid_session_generation() : 0U,
-    };
-    if (length > 0 && payload != NULL) {
-        memcpy(item.payload, payload, length);
-    }
-
     const bool safety = type == DUAL_MESSAGE_PHYSICAL_RELEASE ||
         type == DUAL_MESSAGE_SOFTWARE_RELEASE ||
         type == DUAL_MESSAGE_DEVICE_GONE ||
@@ -885,6 +1195,27 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
     QueueHandle_t target = safety ? s_safety_tx_queue :
         software ? s_software_tx_queue :
         vendor ? s_vendor_tx_queue : s_tx_queue;
+    queue_metrics_t *target_metrics = safety ? &s_safety_tx_queue_metrics :
+        software ? &s_software_tx_queue_metrics :
+        vendor ? &s_vendor_tx_queue_metrics : &s_tx_queue_metrics;
+    queue_metric_increment(&target_metrics->received);
+    if (target == NULL || s_tx_queue == NULL || s_safety_tx_queue == NULL ||
+        s_software_tx_queue == NULL || s_vendor_tx_queue == NULL ||
+        length > DUAL_PROXY_MAX_PAYLOAD) {
+        queue_metric_increment(&target_metrics->rejected);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    tx_item_t item = {
+        .type = type,
+        .length = length,
+        .enqueued_us = esp_timer_get_time(),
+        .vendor_session_generation = is_vendor_hid_message(type) ?
+            vendor_hid_session_generation() : 0U,
+    };
+    if (length > 0 && payload != NULL) {
+        memcpy(item.payload, payload, length);
+    }
     if (xQueueSend(target, &item, 0) != pdTRUE) {
         ++s_tx_queue_overflows;
         if (safety) {
@@ -894,24 +1225,37 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
             reset_tx_queues();
             s_tx_queue_drops += (uint32_t)discarded;
             if (xQueueSend(s_safety_tx_queue, &item, 0) != pdTRUE) {
+                queue_metric_increment(&s_safety_tx_queue_metrics.dropped);
                 ++s_tx_queue_drops;
+            } else {
+                queue_metric_observe_depth(&s_safety_tx_queue_metrics,
+                                           s_safety_tx_queue);
             }
         } else if (software) {
             const UBaseType_t discarded = uxQueueMessagesWaiting(s_software_tx_queue);
-            xQueueReset(s_software_tx_queue);
+            queue_reset_count_dropped(s_software_tx_queue,
+                                      &s_software_tx_queue_metrics);
+            queue_metric_increment(&s_software_tx_queue_metrics.dropped);
             s_tx_queue_drops += (uint32_t)discarded + 1U;
             const tx_item_t release = {
                 .type = DUAL_MESSAGE_SOFTWARE_RELEASE,
                 .length = 0,
             };
+            queue_metric_increment(&s_safety_tx_queue_metrics.received);
             if (xQueueSend(s_safety_tx_queue, &release, 0) != pdTRUE) {
+                queue_metric_increment(&s_safety_tx_queue_metrics.dropped);
                 ++s_tx_queue_drops;
                 queue_fault();
+            } else {
+                queue_metric_observe_depth(&s_safety_tx_queue_metrics,
+                                           s_safety_tx_queue);
             }
         } else if (vendor) {
+            queue_metric_increment(&s_vendor_tx_queue_metrics.dropped);
             ++s_vendor_queue_overflows;
             ++s_vendor_queue_drops;
         } else {
+            queue_metric_increment(&s_tx_queue_metrics.dropped);
             ++s_tx_queue_drops;
             queue_fault();
         }
@@ -919,6 +1263,7 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
         notify_tx_task();
         return ESP_ERR_TIMEOUT;
     }
+    queue_metric_observe_depth(target_metrics, target);
     update_tx_queue_metrics();
     notify_tx_task();
     return ESP_OK;
@@ -942,6 +1287,7 @@ static bool send_status_frame(uint8_t type, const uint8_t *payload, uint8_t leng
     }
     if (uart_write_bytes(LINK_UART, serialized, serialized_length) == (int)serialized_length) {
         ++s_tx_count;
+        dual_diag_stream_record(DUAL_DIAG_SOURCE_UART1_TX, type, payload, length);
         if (type == DUAL_MESSAGE_PROFILE_REQUEST ||
             type == DUAL_MESSAGE_PROFILE_OFFER ||
             type == DUAL_MESSAGE_FLOW_ACK) {
@@ -1666,6 +2012,11 @@ static void link_tx_task(void *argument)
                       s_mouse_connection_id, s_gone_retries, s_gone_failures,
                       s_request_retries, s_offer_retries, s_commit_replays,
                       s_budget_exhausted);
+            log_queue_metrics("uart1_tx", &s_tx_queue_metrics);
+            log_queue_metrics("uart1_safety", &s_safety_tx_queue_metrics);
+            log_queue_metrics("uart1_software", &s_software_tx_queue_metrics);
+            log_queue_metrics("uart1_vendor", &s_vendor_tx_queue_metrics);
+            log_uart_event_window_metrics();
             last_tx_physical = s_tx_physical_count;
             last_rx_physical = s_rx_physical_count;
             last_tx_software = s_tx_software_count;
@@ -1688,10 +2039,27 @@ static void link_rx_task(void *argument)
     dual_parser_t parser;
     dual_parser_init(&parser, on_link_frame, NULL);
     uart_event_t event;
+    int64_t last_dequeue_us = 0;
     while (true) {
         if (xQueueReceive(s_uart_event_queue, &event, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        const int64_t dequeued_us = esp_timer_get_time();
+        const bool has_interval = last_dequeue_us > 0 &&
+            dequeued_us >= last_dequeue_us;
+        const uint64_t interval_us = has_interval ?
+            (uint64_t)(dequeued_us - last_dequeue_us) : 0U;
+        last_dequeue_us = dequeued_us;
+        const uint32_t waiting_depth =
+            (uint32_t)uxQueueMessagesWaiting(s_uart_event_queue);
+        const uart_event_metric_type_t metric_type = uart_event_metric_type(event.type);
+        uart_event_note_depth(waiting_depth);
+        queue_metric_increment(&s_uart_event_consumed);
+        if (event.type == UART_BREAK) {
+            /* BREAK 只在本板计数；收到后短暂屏蔽其源中断，避免持续入队。 */
+            uart_break_note_and_suppress();
+        }
+        uint64_t parse_us = 0U;
         if (event.type == UART_DATA) {
             size_t remaining = event.size;
             while (remaining > 0) {
@@ -1726,7 +2094,12 @@ static void link_rx_task(void *argument)
                         ESP_LOGW(TAG, "UART1原始字节(%d)：%s", received, hex);
                     }
                 }
+                const int64_t parse_begin_us = esp_timer_get_time();
                 dual_parser_feed(&parser, receive_buffer, (size_t)received);
+                const int64_t parse_end_us = esp_timer_get_time();
+                if (parse_end_us >= parse_begin_us) {
+                    parse_us += (uint64_t)(parse_end_us - parse_begin_us);
+                }
                 remaining -= (size_t)received;
             }
         } else if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
@@ -1738,15 +2111,25 @@ static void link_rx_task(void *argument)
              * 现在只清缓冲、重同步解析器并计数，克隆保持在线。
              */
             ++s_rx_overflows;
+            queue_metric_increment(&s_uart_event_overflow);
             ESP_LOGW(TAG, "UART1接收缓冲溢出：丢弃并重同步（累计=%" PRIu32 "），不断开接收端",
                      s_rx_overflows);
             uart_flush_input(LINK_UART);
+            queue_metric_add(&s_uart_event_reset_dropped,
+                             (uint32_t)uxQueueMessagesWaiting(s_uart_event_queue));
             xQueueReset(s_uart_event_queue);
             dual_parser_init(&parser, on_link_frame, NULL);
         }
 
-        /* Avoid spinning if a burst left more hardware events queued. */
-        if (uxQueueMessagesWaiting(s_uart_event_queue) > 0) {
+        const int64_t handled_us = esp_timer_get_time();
+        const uint64_t handle_us = handled_us >= dequeued_us ?
+            (uint64_t)(handled_us - dequeued_us) : 0U;
+        uart_event_record_metrics(metric_type, waiting_depth, handle_us, has_interval,
+                                  interval_us, event.type == UART_DATA, parse_us);
+
+        /* BREAK 只记本板，不人为延迟排空；其他事件维持原来的 1 tick 让步。 */
+        if (event.type != UART_BREAK &&
+            uxQueueMessagesWaiting(s_uart_event_queue) > 0) {
             vTaskDelay(1);
         }
     }
@@ -1796,6 +2179,24 @@ esp_err_t dual_uart1_start(
     s_tx_write_failures = 0;
     s_vendor_queue_overflows = 0;
     s_vendor_queue_drops = 0;
+    memset(&s_tx_queue_metrics, 0, sizeof(s_tx_queue_metrics));
+    memset(&s_safety_tx_queue_metrics, 0, sizeof(s_safety_tx_queue_metrics));
+    memset(&s_software_tx_queue_metrics, 0, sizeof(s_software_tx_queue_metrics));
+    memset(&s_vendor_tx_queue_metrics, 0, sizeof(s_vendor_tx_queue_metrics));
+    s_uart_event_consumed = 0U;
+    s_uart_event_overflow = 0U;
+    s_uart_event_reset_dropped = 0U;
+    s_uart_event_peak = 0U;
+    s_uart_event_current = 0U;
+    s_uart_event_waiting = 0U;
+    memset(&s_uart_event_window_metrics, 0, sizeof(s_uart_event_window_metrics));
+    taskENTER_CRITICAL(&s_uart_break_suppression_mux);
+    s_uart_break_suppression_active = false;
+    s_uart_break_seen = 0U;
+    s_uart_break_suppression_windows = 0U;
+    s_uart_break_rearms = 0U;
+    s_uart_break_suppression_failures = 0U;
+    taskEXIT_CRITICAL(&s_uart_break_suppression_mux);
     s_frame_callback = frame_callback;
     s_fault_callback = fault_callback;
     s_fault_in_progress = false;
@@ -1864,6 +2265,27 @@ esp_err_t dual_uart1_start(
                                  LINK_EVENT_QUEUE_LENGTH, &s_uart_event_queue, 0);
     if (result != ESP_OK) {
         return result;
+    }
+    result = uart_set_rx_full_threshold(LINK_UART, 96);
+    if (result != ESP_OK) {
+        uart_driver_delete(LINK_UART);
+        s_uart_event_queue = NULL;
+        return result;
+    }
+    if (s_uart_break_rearm_timer == NULL) {
+        const esp_timer_create_args_t break_rearm_timer_args = {
+            .callback = uart_break_rearm_timer_callback,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "uart1_break_rearm",
+        };
+        result = esp_timer_create(&break_rearm_timer_args,
+                                  &s_uart_break_rearm_timer);
+        if (result != ESP_OK) {
+            uart_driver_delete(LINK_UART);
+            s_uart_event_queue = NULL;
+            return result;
+        }
     }
     s_tx_queue = xQueueCreate(LINK_TX_QUEUE_LENGTH, sizeof(tx_item_t));
     s_safety_tx_queue = xQueueCreate(LINK_SAFETY_QUEUE_LENGTH, sizeof(tx_item_t));

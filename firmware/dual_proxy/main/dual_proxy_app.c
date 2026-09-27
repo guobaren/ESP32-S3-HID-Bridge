@@ -11,6 +11,7 @@
 #include "tusb.h"
 
 #include "bridge_protocol.h"
+#include "dual_proxy_app.h"
 #include "dual_status_led.h"
 #include "hid_host_mouse.h"
 #include "hid_device_profile.h"
@@ -64,6 +65,7 @@ static uint32_t s_mouse_input_errors;
 /* Profile 传输在途时被让路（丢弃）的纯移动报文数。 */
 static uint32_t s_mouse_motion_yielded;
 static uint32_t s_duplicate_commit_replays;
+static volatile bool s_manual_profile;
 
 static void on_profile_published(const hid_device_profile_t *profile, void *context);
 
@@ -98,9 +100,7 @@ static void on_software_frame(const dual_frame_t *frame)
         return;
     }
     if (s_role == DUAL_ROLE_MOUSE_HOST) {
-        if (!dual_hid_host_mouse_present()) {
-            return;
-        }
+        /* 诊断注入不依赖物理鼠标是否在位；后续链路/克隆门控如实决定能否送达。 */
         if (dual_uart1_send_software_mouse(frame->payload, frame->payload_length) != ESP_OK) {
             ESP_LOGW(TAG, "软件MouseReport无法送入板间UART，发送release");
             (void)dual_uart1_send_software_release();
@@ -135,9 +135,33 @@ static void pc_device_gone(
     }
 }
 
+void dual_proxy_set_manual_profile(bool enabled)
+{
+    if (s_role != DUAL_ROLE_PC_DEVICE) {
+        return;
+    }
+    const bool previous = __atomic_exchange_n(&s_manual_profile, enabled,
+                                               __ATOMIC_ACQ_REL);
+    if (enabled) {
+        dual_uart1_set_profile_request_ready(false);
+        ESP_LOGW(TAG, "手动Profile模式已启用：暂停接受M侧Profile与输入");
+    } else if (previous) {
+        ESP_LOGW(TAG, "手动Profile模式已关闭：清理克隆并重新申请真实Profile");
+        pc_device_gone("退出手动Profile模式", dual_uart1_peer_generation(), 0U);
+    }
+}
+
+bool dual_proxy_manual_profile_enabled(void)
+{
+    return __atomic_load_n(&s_manual_profile, __ATOMIC_ACQUIRE);
+}
+
 static void on_link_fault(void)
 {
     if (s_role == DUAL_ROLE_PC_DEVICE) {
+        if (__atomic_load_n(&s_manual_profile, __ATOMIC_ACQUIRE)) {
+            return;
+        }
         const uint32_t peer_generation = dual_uart1_peer_generation();
         s_peer_mouse_usb_state_initialized = false;
         s_peer_mouse_usb_state = DUAL_USB_STATE_WAITING;
@@ -159,6 +183,10 @@ static void on_link_fault(void)
 static void on_link_frame(const dual_frame_t *frame)
 {
     if (frame == NULL) {
+        return;
+    }
+    if (s_role == DUAL_ROLE_PC_DEVICE &&
+        __atomic_load_n(&s_manual_profile, __ATOMIC_ACQUIRE)) {
         return;
     }
     if (frame->type == DUAL_MESSAGE_LINK_HELLO) {
@@ -608,6 +636,7 @@ static void on_mouse_release(bool device_gone)
 
 static esp_err_t start_pc_role(void)
 {
+    __atomic_store_n(&s_manual_profile, false, __ATOMIC_RELEASE);
     s_peer_mouse_usb_state_initialized = false;
     s_peer_mouse_usb_state = DUAL_USB_STATE_WAITING;
     s_peer_mouse_generation_initialized = false;

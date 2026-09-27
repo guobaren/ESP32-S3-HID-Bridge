@@ -33,7 +33,12 @@ from pathlib import Path
 
 # 判定阈值与前置检查标识。
 FIRST_MOVE_LIMIT_MS = 10.0
-CLONE_INSTANCE_HINT = "VID_046D&PID_C092"
+# 克隆设备型号随被代理的鼠标变化：046D:C092（有线 G102）与 046D:C539（Lightspeed
+# 接收器）都在实机出现过。因此前置检查默认按“当前枚举到的任意 USB 罗技节点”判定，
+# 需要精确型号时用 --expect-vidpid 046D:xxxx。
+CLONE_VENDOR_HINT = "VID_046D"
+CLONE_USB_PREFIX = "USB\\VID_046D&PID_"
+CLONE_INSTANCE_HINT = "VID_046D&PID_C092"  # 历史样本，仅用于文案提示
 SINGLE_DISTANCE_PX = 20
 CONTINUOUS_COMMANDS = 3
 
@@ -81,15 +86,16 @@ def restore_cursor(x: int, y: int) -> None:
     raise RuntimeError(f"无法恢复鼠标位置：目标=({x},{y})，当前=({current[0]},{current[1]})")
 
 
-def clone_device_present() -> bool | None:
-    """只读检查本机是否已枚举电脑侧板(P)克隆出来的鼠标设备。
+def present_logitech_nodes() -> list[str] | None:
+    """列出本机当前枚举的罗技（VID_046D）设备 InstanceId；无法查询时返回 None。
 
-    返回 True/False 表示检查成功，None 表示无法完成检查（例如没有 PowerShell）。
+    用 `-PresentOnly`：只统计当前真实存在的节点，已拔掉的残留记录（Status=Unknown）
+    不会算进来——这正是原来“明明接过 C092 却说没有节点”的原因之一。
     """
     query = (
         "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
-        f"Where-Object {{ $_.InstanceId -like '*{CLONE_INSTANCE_HINT}*' }} | "
-        "Measure-Object | Select-Object -ExpandProperty Count"
+        f"Where-Object {{ $_.InstanceId -like '*{CLONE_VENDOR_HINT}*' }} | "
+        "Select-Object -ExpandProperty InstanceId"
     )
     try:
         completed = subprocess.run(
@@ -100,13 +106,32 @@ def clone_device_present() -> bool | None:
         return None
     if completed.returncode != 0:
         return None
-    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-    if not lines:
-        return None
-    try:
-        return int(lines[-1]) > 0
-    except ValueError:
-        return None
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def normalize_expected_vidpid(value: str) -> str:
+    """把 `046D:C539` / `VID_046D&PID_C539` 统一成 InstanceId 子串写法。"""
+    text = value.strip().upper()
+    if not text:
+        return ""
+    if text.startswith("VID_"):
+        return text
+    if ":" in text:
+        vid, pid = text.split(":", 1)
+        return f"VID_{vid}&PID_{pid}"
+    return text
+
+
+def clone_device_present(expected: str, nodes: list[str]) -> bool:
+    """判断本机当前是否枚举了电脑侧板(P)克隆出来的设备。
+
+    expected 为空时按“存在任意 USB\\VID_046D&PID_* 节点”判定：只认真实 USB 设备
+    节点，G HUB 的 LGHUBDEVICE\\VID_046D&PID_C231/C232 虚拟设备不会误判为克隆。
+    给了 expected 时要求 InstanceId 含该子串（精确到型号）。
+    """
+    if expected:
+        return any(expected in node.upper() for node in nodes)
+    return any(node.upper().startswith(CLONE_USB_PREFIX) for node in nodes)
 
 
 def first_move_latency_ms(result: dict) -> float | None:
@@ -329,19 +354,36 @@ def main() -> int:
                              "EXE 在另一台机器时改成那台的地址）")
     parser.add_argument("--port", type=int, default=24814)
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/tests/udp-smoothing-measurement"))
+    parser.add_argument("--expect-vidpid", default="",
+                        help="前置检查期望的克隆型号（如 046D:C539 或 VID_046D&PID_C539）；"
+                             "缺省自动：本机当前枚举到任意 USB 罗技设备即通过")
     parser.add_argument("--force", action="store_true",
                         help="跳过“本机是否已枚举电脑侧板克隆设备”的前置检查")
+    parser.add_argument("--print-json", action="store_true",
+                        help="额外在标准输出打印完整判定 JSON（缺省只写入 summary.json）")
     args = parser.parse_args()
 
     if not args.force:
-        present = clone_device_present()
-        if present is False:
-            print(f"前置条件不满足：本机没有 {CLONE_INSTANCE_HINT} 节点。本脚本只在电脑侧板(P)"
-                  f"输出到本机、克隆设备已枚举、且 HidBridge.Host.exe 正在运行时可用。",
-                  file=sys.stderr, flush=True)
-            return 2
-        if present is None:
+        expected = normalize_expected_vidpid(args.expect_vidpid)
+        nodes = present_logitech_nodes()
+        if nodes is None:
             print("[前置] 无法查询 PnP 设备，跳过前置检查（可用 --force 显式跳过）", flush=True)
+        elif clone_device_present(expected, nodes):
+            print(f"[前置] 已在本机枚举到克隆设备（匹配 {expected or CLONE_USB_PREFIX + '*'}）",
+                  flush=True)
+        else:
+            hint = expected or (CLONE_USB_PREFIX + "*")
+            print(f"前置条件不满足：本机当前没有匹配 {hint} 的设备节点。本脚本只在电脑侧板(P)"
+                  "输出到本机、克隆设备已枚举、且 HidBridge.Host.exe 正在运行时可用。",
+                  file=sys.stderr, flush=True)
+            if nodes:
+                print("  当前枚举到的 046D 节点：", file=sys.stderr, flush=True)
+                for node in nodes:
+                    print("    " + node, file=sys.stderr, flush=True)
+            else:
+                print("  当前枚举到的 046D 节点：无（电脑侧板未接本机或克隆未挂载）",
+                      file=sys.stderr, flush=True)
+            return 2
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[连接] UDP 目标 {args.host}:{args.port}，观测源=本机光标；"
@@ -380,9 +422,12 @@ def main() -> int:
         "continuous": continuous,
         "failures": failures,
     }
-    (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    print(f"图表和原始采样已写入：{args.output_dir}")
+    (args.output_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.print_json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f"图表、原始采样与判定已写入：{args.output_dir}"
+          f"（summary.json / *.csv / *.svg；需要贴到终端时用 --print-json）")
     if failures:
         print("[结论] FAIL", flush=True)
         for reason in failures:

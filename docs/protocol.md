@@ -115,6 +115,30 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 | `0x0A` | LOG_CLEAR_REQUEST | 空；清空全部日志文件后回一条 `total_bytes=0` 的 `LOG_READ_RESPONSE` |
 | `0x0B` | LOG_DUMP_REQUEST | `offset:u32`、`max_bytes:u32`；设备**连续**回多条 `LOG_READ_RESPONSE` 后以空 `data` 帧收尾 |
 
+### UART0 实时诊断与手动注入（双板固件）
+
+下表沿用本节 `A5 5A` 帧头、版本 2、序号回显和 CRC16。P、M 各自的 UART0 均可订阅；命令的结果只表示板端已接收或已排队，USB 提交、完成与电脑软件消费需要分别观察。
+
+| Type | 名称 | Payload / 回复 |
+|---:|---|---|
+| `0x0D` | DIAG_PROFILE_READ | M 上请求 `offset:u32`；`0x0E` 回 `offset:u32,total:u32,data:0..56`。逐块读取原始 Profile v2，`total=0` 表示暂无快照。 |
+| `0x0F` | DIAG_PROFILE_BEGIN | P 上请求 `length:u32,crc32:u32`，长度 1..4096；`0x12` 回单字节状态。 |
+| `0x10` | DIAG_PROFILE_CHUNK | P 上请求 `offset:u32,data:1..60`，必须连续；每块回 `0x12`。 |
+| `0x11` | DIAG_PROFILE_COMMIT | P 上空载荷提交；校验 CRC32 与完整反序列化，成功后进入手动 Profile 模式并排队重建 USB 克隆；回 `0x12`。在线 M 会话可以被手动 Profile 覆盖。 |
+| `0x12` | DIAG_PROFILE_RESULT | `status:u8`；0=受理/排队，1=格式或顺序错误，2=角色不符，3=没有有效在途写入或超时，4=CRC/解码错误，5=重配置无法排队。0 **不是** USB 挂载成功。 |
+| `0x13` | DIAG_PROFILE_MODE | P 上请求 `0` 退出手动模式；先清理现有克隆，再重新申请 M 的真实 Profile；回 `0x12`。 |
+| `0x14` | DIAG_STREAM_CONTROL | `0` 退订 / `1` 订阅并查询；回 `0x16`，序号与命令相同。 |
+| `0x15` | DIAG_STREAM_EVENT | 板端主动发送；`event_id:u32,timestamp_us_low32:u32,source:u8,kind:u8,total_length:u8,offset:u8,data:0..52`。同一事件按 `event_id`、`offset` 重组；时间戳约 71 分钟回绕。 |
+| `0x16` | DIAG_STREAM_STATUS | `captured:u32,dropped:u32`。`dropped>0` 或事件重组缺口表示采集不完整。 |
+| `0x17` | DIAG_INJECT_REQUEST | `route:u8,type:u8,inner_payload:1..62`；route 1 仅 P 可用，接受 `RAW_HID_INPUT(0x27)` / `HID_GET_REPORT_RESPONSE(0x2A)`；route 2 仅 M 可用，接受 `HID_SET_REPORT(0x28)` / `HID_GET_REPORT_REQUEST(0x29)`。内层字段按同名 UART1 帧解码，非法载荷拒绝。 |
+| `0x18` | DIAG_INJECT_RESULT | `route:u8,status:u8`；0=已交给目标处理函数，1=格式错误，2=路由/角色/类型不支持。目标队列和 USB 后续失败须看事件与各队列统计。 |
+
+`source`：1=P 的 USB 应用回调，2=M 的 USB Host HID 报告，3=UART1 接收，4=UART1 已写出，5=UART0 已解析输入帧。UART0/1 的 `kind` 为原消息 type；USB `kind`：`0x80` SET_REPORT、`0x81` GET_REPORT 请求、`0x82` GET_REPORT 结果、`0x83` 设备级 vendor SETUP、`0x84` M 原始 HID 输入、`0x85` P USB 提交尝试、`0x86` USB 完成、`0x87` USB 失败。P 的 `0x83` 目前记录 SETUP 后仍返回 STALL，并不伪造厂商响应。各 USB 事件的 payload 前缀见 `diag_event_details()`；声明长度大于保存长度时客户端标记截断。
+
+固件把 USB 与 UART 数据路径的相关队列设为 128 项，逐队列输出 `QUEUE name=... received=... rejected=... dropped=... peak=... current=...`。`received` 是进入该队列入口的尝试，`rejected` 是校验/会话状态不允许入队，`dropped` 是容量满或显式清空的条目，`peak` 是观察到的深度峰值。UART 驱动自行管理的事件队列用 `consumed` 代替无法得知的内部入队次数；`overflow` 是驱动通知数。诊断事件队列本身也独立报告丢弃。
+
+`tools/dual_uart_inspect.py` 会实时显示并以 JSONL 保存事件，同时保存各端 UART0 原始 RX/TX 字节。示例：`python tools/dual_uart_inspect.py --ports COM3,COM13 --inject-move 20 0` 可经 M 的既有软件鼠标帧注入相对位移，观察 M UART0→M UART1 TX→P UART1 RX→P USB 提交/完成。P USB 提交成功仅表示 TinyUSB 接受报告，完成回调表示 USB 端传输完成，均不能单独证明目标应用已消费；两板事件目前按载荷与时间窗关联，尚无跨板统一 trace ID。串口订阅只覆盖固件已接入的 USB/HID 与 UART1 观察点，不包括控制器内部 ACK/NAK、总线重试和电脑端 USB 包。
+
 逻辑字节流按「最旧 → 最新」排列，`offset` 从 0 开始；`total_bytes` 是板端当前可读的
 总字节数（**上限 2 MB**）。客户端的推荐做法是发一条 `LOG_DUMP_REQUEST`，然后流式解析
 响应帧直到遇到空 `data` 帧。

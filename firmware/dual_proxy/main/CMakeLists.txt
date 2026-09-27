@@ -8,6 +8,8 @@ idf_component_register(
         "usb_cdc_control.c"
         "usb_cdc_control_logic.c"
         "uart0_control.c"
+        "uart0_output.c"
+        "diag_stream.c"
         "uart1_link.c"
         "hid_device_profile.c"
         "hid_clone_descriptor.c"

@@ -16,6 +16,7 @@
 #include "usb/usb_host.h"
 
 #include "dual_status_led.h"
+#include "diag_stream.h"
 #include "hid_device_profile.h"
 #include "hid_report_layout.h"
 #include "vendor_urb.h"
@@ -27,12 +28,12 @@
 #define VENDOR_USE_DIRECT_URB 1
 #include "uart1_link.h"
 
-#define HID_EVENT_QUEUE_LENGTH 16
-#define HID_REPORT_QUEUE_LENGTH 64
+#define HID_EVENT_QUEUE_LENGTH 128
+#define HID_REPORT_QUEUE_LENGTH 128
 #define HID_RAW_REPORT_MAX 64
 #define HID_PROFILE_DEBOUNCE_MS 200
 #define HID_INTERFACE_SLOT_COUNT HID_PROFILE_MAX_REPORT_DESCRIPTORS
-#define HID_CONTROL_QUEUE_LENGTH 8
+#define HID_CONTROL_QUEUE_LENGTH 128
 #define HID_CONTROL_TASK_STACK 4096
 #define HID_HOST_STOP_TIMEOUT_MS 2000
 #define HID_HOST_STOP_POLL_MS 10
@@ -51,6 +52,64 @@
                            TASK_EXIT_CONTROL | TASK_EXIT_STATS)
 
 static const char *TAG = "dual_hid_host";
+
+typedef struct {
+    volatile uint32_t received;
+    volatile uint32_t rejected;
+    volatile uint32_t dropped;
+    volatile uint32_t peak;
+} queue_metrics_t;
+
+static queue_metrics_t s_hid_event_queue_metrics;
+static queue_metrics_t s_report_queue_metrics;
+static queue_metrics_t s_control_queue_metrics;
+
+static void queue_metric_increment(volatile uint32_t *counter)
+{
+    __atomic_fetch_add(counter, 1U, __ATOMIC_RELAXED);
+}
+
+static void queue_metric_add(volatile uint32_t *counter, uint32_t amount)
+{
+    if (amount != 0U) {
+        __atomic_fetch_add(counter, amount, __ATOMIC_RELAXED);
+    }
+}
+
+static void queue_metric_observe_depth(queue_metrics_t *metrics,
+                                       QueueHandle_t queue)
+{
+    if (queue == NULL) {
+        return;
+    }
+    uint32_t peak = __atomic_load_n(&metrics->peak, __ATOMIC_RELAXED);
+    const uint32_t depth = (uint32_t)uxQueueMessagesWaiting(queue);
+    while (depth > peak && !__atomic_compare_exchange_n(
+               &metrics->peak, &peak, depth, true,
+               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
+static void queue_reset_count_dropped(QueueHandle_t queue,
+                                      queue_metrics_t *metrics)
+{
+    if (queue != NULL) {
+        queue_metric_add(&metrics->dropped,
+                         (uint32_t)uxQueueMessagesWaiting(queue));
+        xQueueReset(queue);
+    }
+}
+
+static void log_queue_metrics(const char *name, const queue_metrics_t *metrics)
+{
+    ESP_LOGI(TAG, "QUEUE name=%s received=%" PRIu32 " rejected=%" PRIu32
+             " dropped=%" PRIu32 " peak=%" PRIu32,
+             name,
+             __atomic_load_n(&metrics->received, __ATOMIC_RELAXED),
+             __atomic_load_n(&metrics->rejected, __ATOMIC_RELAXED),
+             __atomic_load_n(&metrics->dropped, __ATOMIC_RELAXED),
+             __atomic_load_n(&metrics->peak, __ATOMIC_RELAXED));
+}
 
 typedef enum {
     HID_EVENT_CONNECTED,
@@ -168,6 +227,8 @@ static uint8_t s_logged_device_addr = UINT8_MAX;
 static hid_device_profile_t s_profile_build;
 static hid_device_profile_t s_profile_snapshot;
 static uint8_t s_profile_serialized_blob[HID_PROFILE_MAX_BLOB];
+static uint8_t s_profile_serialized_staging[HID_PROFILE_MAX_BLOB];
+static size_t s_profile_serialized_length;
 static uint8_t s_profile_device_addr = UINT8_MAX;
 static volatile uint32_t s_profile_revision;
 static volatile bool s_profile_refresh_requested;
@@ -390,11 +451,12 @@ static void profile_reset_collector(void)
         xSemaphoreTake(s_profile_mutex, portMAX_DELAY);
     }
     s_profile_device_addr = UINT8_MAX;
+    s_profile_serialized_length = 0U;
     ++s_profile_revision;
     hid_device_profile_init(&s_profile_build);
     memset(s_interface_slots, 0, sizeof(s_interface_slots));
     if (s_control_queue != NULL) {
-        xQueueReset(s_control_queue);
+        queue_reset_count_dropped(s_control_queue, &s_control_queue_metrics);
     }
     if (s_profile_mutex != NULL) {
         xSemaphoreGive(s_profile_mutex);
@@ -585,8 +647,8 @@ static void profile_publish_task(void *argument)
         xSemaphoreGive(s_profile_mutex);
         size_t blob_length = 0;
         if (!hid_device_profile_serialize(
-                &s_profile_snapshot, s_profile_serialized_blob,
-                sizeof(s_profile_serialized_blob), &blob_length)) {
+                &s_profile_snapshot, s_profile_serialized_staging,
+                sizeof(s_profile_serialized_staging), &blob_length)) {
             ++s_errors;
             dual_status_led_set_flow_error(true);
             ESP_LOGW(TAG, "Profile序列化失败：interfaces=%u partial=%s",
@@ -594,7 +656,7 @@ static void profile_publish_task(void *argument)
                      (s_profile_snapshot.flags & HID_PROFILE_FLAG_PARTIAL) != 0 ? "yes" : "no");
             continue;
         }
-        const uint32_t crc32 = hid_profile_crc32(s_profile_serialized_blob, blob_length);
+        const uint32_t crc32 = hid_profile_crc32(s_profile_serialized_staging, blob_length);
         if (stopping_requested()) {
             break;
         }
@@ -603,6 +665,8 @@ static void profile_publish_task(void *argument)
             xSemaphoreGive(s_profile_mutex);
             continue;
         }
+        memcpy(s_profile_serialized_blob, s_profile_serialized_staging, blob_length);
+        s_profile_serialized_length = blob_length;
         const esp_err_t queued = dual_uart1_queue_profile(
             s_profile_serialized_blob, blob_length, crc32);
         xSemaphoreGive(s_profile_mutex);
@@ -1017,6 +1081,9 @@ static void hid_stats_task(void *argument)
                  s_hid_recoveries, s_root_port_cycles,
                  s_preclone_motion_drops, s_vendor_motion_drops, s_wheel_reports,
                  (long long)s_vendor_arrival_min_gap_us, s_errors);
+        log_queue_metrics("host_hid_event", &s_hid_event_queue_metrics);
+        log_queue_metrics("host_hid_report", &s_report_queue_metrics);
+        log_queue_metrics("host_hid_control", &s_control_queue_metrics);
     }
     finish_owned_task(TASK_EXIT_STATS);
 }
@@ -1027,13 +1094,21 @@ static void hid_interface_callback(
     void *argument)
 {
     (void)argument;
+    const bool report_candidate = event == HID_HOST_INTERFACE_EVENT_INPUT_REPORT;
+    if (report_candidate) {
+        queue_metric_increment(&s_report_queue_metrics.received);
+    }
     hid_host_dev_params_t params;
     if (hid_host_device_get_params(handle, &params) != ESP_OK) {
         ++s_errors;
+        if (report_candidate) {
+            queue_metric_increment(&s_report_queue_metrics.rejected);
+        }
         return;
     }
     if (event == HID_HOST_INTERFACE_EVENT_INPUT_REPORT) {
         if (stopping_requested()) {
+            queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
         uint8_t data[HID_RAW_REPORT_MAX];
@@ -1041,11 +1116,16 @@ static void hid_interface_callback(
         if (hid_host_device_get_raw_input_report_data(handle, data, sizeof(data), &length) != ESP_OK ||
             length > sizeof(data) || length > UINT8_MAX) {
             ++s_errors;
+            queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
+        dual_diag_stream_record(DUAL_DIAG_SOURCE_M_USB,
+                                DUAL_DIAG_KIND_M_RAW_HID_INPUT,
+                                data, (uint8_t)length);
         hid_interface_slot_t *slot = find_interface_slot(params.iface_num);
         if (slot == NULL || !slot->active) {
             ++s_errors;
+            queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
         uint8_t report_id = 0;
@@ -1053,6 +1133,7 @@ static void hid_interface_callback(
         if (slot->has_report_id) {
             if (length < 1U) {
                 ++s_errors;
+                queue_metric_increment(&s_report_queue_metrics.rejected);
                 return;
             }
             report_id = data[0];
@@ -1062,6 +1143,7 @@ static void hid_interface_callback(
         if (forwarded_length > DUAL_HID_RAW_INPUT_MAX_DATA) {
             ++s_errors;
             ++s_vendor_input_failures;
+            queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
         raw_report_event_t queued = {
@@ -1072,11 +1154,20 @@ static void hid_interface_callback(
                 report_id == slot->mouse_report_id,
         };
         memcpy(queued.data, &data[data_offset], forwarded_length);
-        if (xQueueSend(s_report_queue, &queued, 0) != pdTRUE) {
+        if (s_report_queue == NULL) {
+            queue_metric_increment(&s_report_queue_metrics.rejected);
             ++s_errors;
             if (s_release_callback != NULL) {
                 s_release_callback(false);
             }
+        } else if (xQueueSend(s_report_queue, &queued, 0) != pdTRUE) {
+            queue_metric_increment(&s_report_queue_metrics.dropped);
+            ++s_errors;
+            if (s_release_callback != NULL) {
+                s_release_callback(false);
+            }
+        } else {
+            queue_metric_observe_depth(&s_report_queue_metrics, s_report_queue);
         }
         return;
     }
@@ -1101,9 +1192,7 @@ static void hid_interface_callback(
             dual_status_led_set_host_mouse_ready(false);
         } else {
             ESP_LOGI(TAG, "vendor HID接口断开：interface=%u", params.iface_num);
-            if (s_control_queue != NULL) {
-                xQueueReset(s_control_queue);
-            }
+            queue_reset_count_dropped(s_control_queue, &s_control_queue_metrics);
         }
         if (device_gone) {
             /*
@@ -1139,16 +1228,23 @@ static void hid_driver_callback(
     void *argument)
 {
     (void)argument;
-    if (event != HID_HOST_DRIVER_EVENT_CONNECTED || s_hid_event_queue == NULL ||
-        stopping_requested()) {
+    if (event != HID_HOST_DRIVER_EVENT_CONNECTED) {
+        return;
+    }
+    queue_metric_increment(&s_hid_event_queue_metrics.received);
+    if (s_hid_event_queue == NULL || stopping_requested()) {
+        queue_metric_increment(&s_hid_event_queue_metrics.rejected);
         return;
     }
     const hid_event_t queued = {.handle = handle, .type = HID_EVENT_CONNECTED};
     if (xQueueSend(s_hid_event_queue, &queued, 0) != pdTRUE) {
+        queue_metric_increment(&s_hid_event_queue_metrics.dropped);
         ++s_errors;
         if (s_release_callback != NULL) {
             s_release_callback(false);
         }
+    } else {
+        queue_metric_observe_depth(&s_hid_event_queue_metrics, s_hid_event_queue);
     }
 }
 
@@ -1572,20 +1668,35 @@ static esp_err_t stop_owned_workers(void)
     if ((mask & TASK_EXIT_HID_EVENT) != 0U &&
         (completed & TASK_EXIT_HID_EVENT) == 0U && s_hid_event_queue != NULL) {
         const hid_event_t stop_event = {.handle = NULL, .type = HID_EVENT_STOP};
-        xQueueReset(s_hid_event_queue);
-        (void)xQueueSend(s_hid_event_queue, &stop_event, 0);
+        queue_reset_count_dropped(s_hid_event_queue, &s_hid_event_queue_metrics);
+        queue_metric_increment(&s_hid_event_queue_metrics.received);
+        if (xQueueSend(s_hid_event_queue, &stop_event, 0) == pdTRUE) {
+            queue_metric_observe_depth(&s_hid_event_queue_metrics, s_hid_event_queue);
+        } else {
+            queue_metric_increment(&s_hid_event_queue_metrics.dropped);
+        }
     }
     if ((mask & TASK_EXIT_REPORT) != 0U &&
         (completed & TASK_EXIT_REPORT) == 0U && s_report_queue != NULL) {
         const raw_report_event_t stop_event = {.stop = true};
-        xQueueReset(s_report_queue);
-        (void)xQueueSend(s_report_queue, &stop_event, 0);
+        queue_reset_count_dropped(s_report_queue, &s_report_queue_metrics);
+        queue_metric_increment(&s_report_queue_metrics.received);
+        if (xQueueSend(s_report_queue, &stop_event, 0) == pdTRUE) {
+            queue_metric_observe_depth(&s_report_queue_metrics, s_report_queue);
+        } else {
+            queue_metric_increment(&s_report_queue_metrics.dropped);
+        }
     }
     if ((mask & TASK_EXIT_CONTROL) != 0U &&
         (completed & TASK_EXIT_CONTROL) == 0U && s_control_queue != NULL) {
         const hid_control_event_t stop_event = {.stop = true};
-        xQueueReset(s_control_queue);
-        (void)xQueueSend(s_control_queue, &stop_event, 0);
+        queue_reset_count_dropped(s_control_queue, &s_control_queue_metrics);
+        queue_metric_increment(&s_control_queue_metrics.received);
+        if (xQueueSend(s_control_queue, &stop_event, 0) == pdTRUE) {
+            queue_metric_observe_depth(&s_control_queue_metrics, s_control_queue);
+        } else {
+            queue_metric_increment(&s_control_queue_metrics.dropped);
+        }
     }
     if ((mask & TASK_EXIT_STATS) != 0U &&
         (completed & TASK_EXIT_STATS) == 0U && s_stats_task != NULL) {
@@ -1684,6 +1795,9 @@ static void delete_runtime_storage(void)
     s_vendor_input_failures = 0;
     s_vendor_control_requests = 0;
     s_vendor_control_failures = 0;
+    memset(&s_hid_event_queue_metrics, 0, sizeof(s_hid_event_queue_metrics));
+    memset(&s_report_queue_metrics, 0, sizeof(s_report_queue_metrics));
+    memset(&s_control_queue_metrics, 0, sizeof(s_control_queue_metrics));
     s_logged_device_addr = UINT8_MAX;
     __atomic_store_n(&s_device_present, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_mouse_present, false, __ATOMIC_RELEASE);
@@ -1983,9 +2097,37 @@ bool dual_hid_host_mouse_present(void)
     return __atomic_load_n(&s_mouse_present, __ATOMIC_ACQUIRE);
 }
 
+size_t dual_hid_host_copy_profile_blob(uint32_t offset, uint8_t *output, size_t capacity,
+                                       uint32_t *total_length)
+{
+    if (s_profile_mutex == NULL || total_length == NULL ||
+        (output == NULL && capacity != 0U)) {
+        return 0U;
+    }
+    xSemaphoreTake(s_profile_mutex, portMAX_DELAY);
+    const size_t total = s_profile_serialized_length;
+    *total_length = (uint32_t)total;
+    size_t copied = 0U;
+    if (offset < total) {
+        copied = total - offset;
+        if (copied > capacity) {
+            copied = capacity;
+        }
+        memcpy(output, &s_profile_serialized_blob[offset], copied);
+    }
+    xSemaphoreGive(s_profile_mutex);
+    return copied;
+}
+
 void dual_hid_host_handle_control_frame(const dual_frame_t *frame)
 {
     __atomic_add_fetch(&s_control_api_users, 1U, __ATOMIC_ACQUIRE);
+    const bool queue_candidate = frame != NULL &&
+        (frame->type == DUAL_MESSAGE_HID_SET_REPORT ||
+         frame->type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST);
+    if (queue_candidate) {
+        queue_metric_increment(&s_control_queue_metrics.received);
+    }
     /*
      * 到达节奏打点：用"请求到达时刻"判密集突发，而不是"控制任务处理时刻"。
      * 实测教训：原先用处理时刻，超时期间每次处理要等 800 ms → 节奏永远稀疏 →
@@ -1997,6 +2139,9 @@ void dual_hid_host_handle_control_frame(const dual_frame_t *frame)
         host_vendor_note_arrival();
     }
     if (frame == NULL || stopping_requested() || s_control_queue == NULL) {
+        if (queue_candidate) {
+            queue_metric_increment(&s_control_queue_metrics.rejected);
+        }
         __atomic_sub_fetch(&s_control_api_users, 1U, __ATOMIC_RELEASE);
         return;
     }
@@ -2024,17 +2169,23 @@ void dual_hid_host_handle_control_frame(const dual_frame_t *frame)
     }
     if (!decoded) {
         ++s_vendor_control_failures;
+        if (queue_candidate) {
+            queue_metric_increment(&s_control_queue_metrics.rejected);
+        }
         __atomic_sub_fetch(&s_control_api_users, 1U, __ATOMIC_RELEASE);
         return;
     }
     ++s_vendor_control_requests;
     if (xQueueSend(s_control_queue, &request, 0) != pdTRUE) {
+        queue_metric_increment(&s_control_queue_metrics.dropped);
         ++s_vendor_control_failures;
         if (request.get_report) {
             (void)dual_uart1_send_hid_get_response(
                 request.transaction_id, DUAL_HID_REPORT_STATUS_TIMEOUT,
                 request.interface_number, request.report_id, NULL, 0);
         }
+    } else {
+        queue_metric_observe_depth(&s_control_queue_metrics, s_control_queue);
     }
     __atomic_sub_fetch(&s_control_api_users, 1U, __ATOMIC_RELEASE);
 }
@@ -2043,7 +2194,7 @@ void dual_hid_host_clear_control_queue(void)
 {
     __atomic_add_fetch(&s_control_api_users, 1U, __ATOMIC_ACQUIRE);
     if (!stopping_requested() && s_control_queue != NULL) {
-        xQueueReset(s_control_queue);
+        queue_reset_count_dropped(s_control_queue, &s_control_queue_metrics);
     }
     __atomic_sub_fetch(&s_control_api_users, 1U, __ATOMIC_RELEASE);
 }

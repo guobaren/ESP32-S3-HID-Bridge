@@ -10,8 +10,14 @@
 #include "freertos/task.h"
 
 #include "bridge_protocol.h"
+#include "diag_stream.h"
+#include "dual_proxy_app.h"
+#include "hid_device_profile.h"
+#include "hid_host_mouse.h"
 #include "onboard_log.h"
+#include "pc_hid_output.h"
 #include "uart1_link.h"
+#include "uart0_output.h"
 
 #define CONTROL_UART UART_NUM_0
 #define CONTROL_BAUD 921600
@@ -41,6 +47,189 @@ typedef struct {
 } control_state_t;
 
 static control_state_t s_state;
+static uint8_t s_injected_blob[HID_PROFILE_MAX_BLOB];
+static hid_device_profile_t s_injected_profile;
+static uint32_t s_injected_length;
+static uint32_t s_injected_received;
+static uint32_t s_injected_crc32;
+static TickType_t s_injected_started;
+static bool s_injection_active;
+
+static void send_diag_frame(const dual_frame_t *request, uint8_t type,
+                            const uint8_t *payload, uint8_t length)
+{
+    dual_frame_t response = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = type,
+        .sequence = request->sequence,
+        .payload_length = length,
+    };
+    if (length != 0U) {
+        memcpy(response.payload, payload, length);
+    }
+    uint8_t serialized[9 + DUAL_PROXY_MAX_PAYLOAD];
+    size_t serialized_length = 0U;
+    if (dual_frame_serialize(&response, serialized, sizeof(serialized),
+                             &serialized_length) == ESP_OK) {
+        (void)dual_uart0_output_write(serialized, serialized_length);
+    }
+}
+
+static void send_injection_result(const dual_frame_t *request, uint8_t status)
+{
+    send_diag_frame(request, DUAL_MESSAGE_DIAG_PROFILE_RESULT, &status, 1U);
+}
+
+static void handle_profile_read(const dual_frame_t *request)
+{
+    if (request->payload_length != 4U || s_role != DUAL_ROLE_MOUSE_HOST) {
+        send_injection_result(request, 1U);
+        return;
+    }
+    uint32_t offset = 0U;
+    memcpy(&offset, request->payload, sizeof(offset));
+    uint8_t payload[DUAL_PROXY_MAX_PAYLOAD] = {0};
+    uint32_t total = 0U;
+    const size_t copied = dual_hid_host_copy_profile_blob(
+        offset, &payload[8], DUAL_PROXY_MAX_PAYLOAD - 8U, &total);
+    memcpy(&payload[0], &offset, sizeof(offset));
+    memcpy(&payload[4], &total, sizeof(total));
+    send_diag_frame(request, DUAL_MESSAGE_DIAG_PROFILE_DATA, payload,
+                    (uint8_t)(8U + copied));
+}
+
+static void handle_profile_injection(const dual_frame_t *request)
+{
+    if (s_role != DUAL_ROLE_PC_DEVICE) {
+        s_injection_active = false;
+        send_injection_result(request, 2U);
+        return;
+    }
+    if (request->type == DUAL_MESSAGE_DIAG_PROFILE_BEGIN) {
+        s_injection_active = false;
+        if (request->payload_length != 8U) {
+            send_injection_result(request, 1U);
+            return;
+        }
+        memcpy(&s_injected_length, &request->payload[0], 4U);
+        memcpy(&s_injected_crc32, &request->payload[4], 4U);
+        if (s_injected_length == 0U || s_injected_length > HID_PROFILE_MAX_BLOB) {
+            send_injection_result(request, 1U);
+            return;
+        }
+        s_injected_received = 0U;
+        s_injected_started = xTaskGetTickCount();
+        s_injection_active = true;
+        send_injection_result(request, 0U);
+        return;
+    }
+    if (!s_injection_active ||
+        xTaskGetTickCount() - s_injected_started > pdMS_TO_TICKS(10000)) {
+        s_injection_active = false;
+        send_injection_result(request, 3U);
+        return;
+    }
+    if (request->type == DUAL_MESSAGE_DIAG_PROFILE_CHUNK) {
+        uint32_t offset = 0U;
+        if (request->payload_length < 5U) {
+            send_injection_result(request, 1U);
+            return;
+        }
+        memcpy(&offset, request->payload, 4U);
+        const uint32_t count = request->payload_length - 4U;
+        if (offset != s_injected_received || count > s_injected_length - s_injected_received) {
+            s_injection_active = false;
+            send_injection_result(request, 1U);
+            return;
+        }
+        memcpy(&s_injected_blob[offset], &request->payload[4], count);
+        s_injected_received += count;
+        send_injection_result(request, 0U);
+        return;
+    }
+    s_injection_active = false;
+    if (request->payload_length != 0U || s_injected_received != s_injected_length ||
+        hid_profile_crc32(s_injected_blob, s_injected_length) != s_injected_crc32 ||
+        !hid_device_profile_deserialize(&s_injected_profile, s_injected_blob,
+                                        s_injected_length)) {
+        send_injection_result(request, 4U);
+        return;
+    }
+    const bool was_manual = dual_proxy_manual_profile_enabled();
+    dual_proxy_set_manual_profile(true);
+    const esp_err_t result = dual_pc_hid_schedule_reconfigure(
+        &s_injected_profile, 0U, s_injected_crc32);
+    if (result != ESP_OK && !was_manual) {
+        dual_proxy_set_manual_profile(false);
+    }
+    send_injection_result(request, result == ESP_OK ? 0U : 5U);
+    ESP_LOGW(TAG, "离线Profile注入：length=%" PRIu32 " crc=%08" PRIX32 " result=%s",
+             s_injected_length, s_injected_crc32, esp_err_to_name(result));
+}
+
+static void handle_diagnostic_injection(const dual_frame_t *request)
+{
+    /* route=1: P 的 UART1 接收侧；route=2: M 的物理鼠标控制侧。 */
+    uint8_t reply[2] = {0U, 1U};
+    if (request->payload_length < 3U) {
+        send_diag_frame(request, DUAL_MESSAGE_DIAG_INJECT_RESULT, reply, sizeof(reply));
+        return;
+    }
+    const uint8_t route = request->payload[0];
+    const uint8_t type = request->payload[1];
+    reply[0] = route;
+    dual_frame_t injected = {
+        .version = DUAL_PROXY_PROTOCOL_VERSION,
+        .type = type,
+        .sequence = request->sequence,
+        .payload_length = (uint8_t)(request->payload_length - 2U),
+    };
+    memcpy(injected.payload, &request->payload[2], injected.payload_length);
+    uint16_t transaction_id = 0U;
+    uint8_t status = 0U;
+    uint8_t interface_number = 0U;
+    uint8_t report_id = 0U;
+    uint8_t report_type = 0U;
+    uint8_t requested_length = 0U;
+    const uint8_t *data = NULL;
+    size_t data_length = 0U;
+    bool valid = false;
+    if (type == DUAL_MESSAGE_RAW_HID_INPUT) {
+        valid = dual_hid_raw_input_decode(injected.payload, injected.payload_length,
+                                          &interface_number, &report_id, &data, &data_length);
+    } else if (type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE) {
+        valid = dual_hid_get_response_decode(injected.payload, injected.payload_length,
+                                              &transaction_id, &status, &interface_number,
+                                              &report_id, &data, &data_length);
+    } else if (type == DUAL_MESSAGE_HID_SET_REPORT) {
+        valid = dual_hid_set_report_decode(injected.payload, injected.payload_length,
+                                            &transaction_id, &interface_number, &report_id,
+                                            &report_type, &data, &data_length);
+    } else if (type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST) {
+        valid = dual_hid_get_request_decode(injected.payload, injected.payload_length,
+                                             &transaction_id, &interface_number, &report_id,
+                                             &report_type, &requested_length);
+    }
+    if (!valid) {
+        reply[1] = 1U;
+        send_diag_frame(request, DUAL_MESSAGE_DIAG_INJECT_RESULT, reply, sizeof(reply));
+        return;
+    }
+    if (route == 1U && s_role == DUAL_ROLE_PC_DEVICE &&
+        (type == DUAL_MESSAGE_RAW_HID_INPUT ||
+         type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE)) {
+        dual_pc_hid_handle_vendor_frame(&injected);
+        reply[1] = 0U;
+    } else if (route == 2U && s_role == DUAL_ROLE_MOUSE_HOST &&
+               (type == DUAL_MESSAGE_HID_SET_REPORT ||
+                type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST)) {
+        dual_hid_host_handle_control_frame(&injected);
+        reply[1] = 0U;
+    } else {
+        reply[1] = 2U;
+    }
+    send_diag_frame(request, DUAL_MESSAGE_DIAG_INJECT_RESULT, reply, sizeof(reply));
+}
 
 static void send_device_hello(const dual_frame_t *probe)
 {
@@ -62,9 +251,7 @@ static void send_device_hello(const dual_frame_t *probe)
     if (dual_frame_serialize(&hello, serialized, sizeof(serialized), &serialized_length) != ESP_OK) {
         return;
     }
-    if (uart_write_bytes(CONTROL_UART, serialized, serialized_length) == (int)serialized_length) {
-        (void)uart_wait_tx_done(CONTROL_UART, pdMS_TO_TICKS(100));
-    }
+    (void)dual_uart0_output_write(serialized, serialized_length);
 }
 
 static bool accept_input_frame(const dual_frame_t *frame)
@@ -124,8 +311,7 @@ static void send_log_chunk(const dual_frame_t *request, uint32_t offset, const u
                              &serialized_length) != ESP_OK) {
         return;
     }
-    if (uart_write_bytes(CONTROL_UART, serialized, serialized_length) ==
-        (int)serialized_length) {
+    if (dual_uart0_output_write(serialized, serialized_length) == ESP_OK) {
         ++s_state.log_chunks;
     }
 }
@@ -173,10 +359,8 @@ static void send_log_dump(const dual_frame_t *request)
         block_offset += chunk;
         sent += (uint32_t)chunk;
     }
-    (void)uart_wait_tx_done(CONTROL_UART, pdMS_TO_TICKS(500));
     /* 以空分片收尾，客户端据此确认流结束。 */
     send_log_chunk(request, offset + sent, NULL, 0U);
-    (void)uart_wait_tx_done(CONTROL_UART, pdMS_TO_TICKS(500));
 }
 
 static void send_log_response(const dual_frame_t *request)
@@ -213,9 +397,7 @@ static void send_log_response(const dual_frame_t *request)
                              &serialized_length) != ESP_OK) {
         return;
     }
-    if (uart_write_bytes(CONTROL_UART, serialized, serialized_length) ==
-        (int)serialized_length) {
-        (void)uart_wait_tx_done(CONTROL_UART, pdMS_TO_TICKS(200));
+    if (dual_uart0_output_write(serialized, serialized_length) == ESP_OK) {
         ++s_state.log_chunks;
     }
 }
@@ -241,13 +423,15 @@ static void send_log_cleared(const dual_frame_t *request)
                              &serialized_length) != ESP_OK) {
         return;
     }
-    (void)uart_write_bytes(CONTROL_UART, serialized, serialized_length);
+    (void)dual_uart0_output_write(serialized, serialized_length);
     ESP_LOGW(TAG, "板载日志已清空：%s", esp_err_to_name(cleared));
 }
 
 static void on_control_frame(const dual_frame_t *frame, void *context)
 {
     (void)context;
+    dual_diag_stream_record(DUAL_DIAG_SOURCE_UART0_RX, frame->type,
+                            frame->payload, frame->payload_length);
     if (frame->type == DUAL_MESSAGE_DEVICE_PROBE) {
         send_device_hello(frame);
         return;
@@ -281,7 +465,7 @@ static void on_control_frame(const dual_frame_t *frame, void *context)
             size_t serialized_length = 0;
             if (dual_frame_serialize(&response, serialized, sizeof(serialized),
                                      &serialized_length) == ESP_OK) {
-                (void)uart_write_bytes(CONTROL_UART, serialized, serialized_length);
+                (void)dual_uart0_output_write(serialized, serialized_length);
             }
         }
         return;
@@ -294,6 +478,39 @@ static void on_control_frame(const dual_frame_t *frame, void *context)
     if (frame->type == DUAL_MESSAGE_LOG_CLEAR_REQUEST) {
         ++s_state.accepted;
         send_log_cleared(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_DIAG_PROFILE_READ) {
+        ++s_state.accepted;
+        handle_profile_read(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_DIAG_PROFILE_BEGIN ||
+        frame->type == DUAL_MESSAGE_DIAG_PROFILE_CHUNK ||
+        frame->type == DUAL_MESSAGE_DIAG_PROFILE_COMMIT) {
+        ++s_state.accepted;
+        handle_profile_injection(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_DIAG_PROFILE_MODE) {
+        if (frame->payload_length != 1U || frame->payload[0] != 0U ||
+            s_role != DUAL_ROLE_PC_DEVICE) {
+            send_injection_result(frame, 1U);
+        } else {
+            dual_proxy_set_manual_profile(false);
+            send_injection_result(frame, 0U);
+        }
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_DIAG_INJECT_REQUEST) {
+        handle_diagnostic_injection(frame);
+        return;
+    }
+    if (frame->type == DUAL_MESSAGE_DIAG_STREAM_CONTROL) {
+        if (frame->payload_length == 1U && frame->payload[0] <= 1U) {
+            dual_diag_stream_set_enabled(frame->payload[0] != 0U);
+        }
+        dual_diag_stream_send_status(frame->sequence);
         return;
     }
     if (s_log_only) {
@@ -391,6 +608,10 @@ static esp_err_t uart0_control_start(
     if (role != DUAL_ROLE_PC_DEVICE && role != DUAL_ROLE_MOUSE_HOST) {
         return ESP_ERR_INVALID_ARG;
     }
+    esp_err_t result = dual_uart0_output_init();
+    if (result != ESP_OK) {
+        return result;
+    }
     s_role = role;
     s_report_callback = report_callback;
     s_release_callback = release_callback;
@@ -404,7 +625,7 @@ static esp_err_t uart0_control_start(
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    esp_err_t result = uart_param_config(CONTROL_UART, &config);
+    result = uart_param_config(CONTROL_UART, &config);
     if (result != ESP_OK) {
         return result;
     }
@@ -415,6 +636,11 @@ static esp_err_t uart0_control_start(
     }
     result = uart_driver_install(CONTROL_UART, CONTROL_RX_BUFFER_SIZE, CONTROL_TX_BUFFER_SIZE, 0, NULL, 0);
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
+        return result;
+    }
+    dual_uart0_output_set_driver_ready(true);
+    result = dual_diag_stream_start(CONTROL_UART);
+    if (result != ESP_OK) {
         return result;
     }
     if (xTaskCreate(control_task, "dual_uart0", 4096, NULL, 7, NULL) != pdPASS) {

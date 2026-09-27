@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "uart0_output.h"
 
 #define LOG_PARTITION_LABEL "storage"
 #define LOG_MOUNT_POINT "/spiffs"
@@ -336,8 +337,14 @@ static int log_capture_vprintf(const char *format, va_list arguments)
 {
     va_list copy;
     va_copy(copy, arguments);
-    const int written = s_previous_vprintf != NULL ? s_previous_vprintf(format, arguments)
-                                                   : vprintf(format, arguments);
+    int written = 0;
+    if (dual_uart0_output_lock() == ESP_OK) {
+        written = s_previous_vprintf != NULL ? s_previous_vprintf(format, arguments)
+                                             : vprintf(format, arguments);
+        /* 整条日志离开 UART0 后才释放共享输出锁。 */
+        (void)dual_uart0_output_wait_tx_idle();
+        dual_uart0_output_unlock();
+    }
     /*
      * 写盘任务自身的日志不回灌（避免“写日志触发日志”），中断上下文不采集。
      * 发送不阻塞：缓冲满就丢行并计数，绝不拖慢调用方——1 kHz 路径也走这里。
@@ -557,12 +564,22 @@ static void log_writer_task(void *argument)
 /*
  * A/B 实验开关：置 1 时板载日志"开机即暂停"——完全不写 flash（复位也不会恢复
  * 写盘，运行时暂停做不到这一点，因为暂停标志在 RAM 里、复位即失效）。
- * 用来判定"控制传输失败"是否由写盘停顿引起。判定完请改回 0。
+ * 历史上用于判定"控制传输失败"是否由写盘停顿引起；2026-09-27 起用于
+ * UART1 硬件 FIFO_OVF 的 A/B（flash 写/擦除期间 cache 关、双核停是否饿到
+ * UART ISR）。判定完请改回 0。
+ * 注意：暂停分支在 UART0 输出之后返回，因此 UART0 控制台日志照常输出，
+ * 但会同时跳过日志的格式化与入队——本开关对比的是"整条板载日志落盘路径"，
+ * 不是单独隔离 fwrite。
  */
-#define ONBOARD_LOG_PAUSED_AT_BOOT 0
+#define ONBOARD_LOG_PAUSED_AT_BOOT 1
 
 esp_err_t dual_onboard_log_start(void)
 {
+    /* UART0 console logging starts before uart0_control installs its driver. */
+    const esp_err_t output_result = dual_uart0_output_init();
+    if (output_result != ESP_OK) {
+        return output_result;
+    }
     const esp_vfs_spiffs_conf_t config = {
         .base_path = LOG_MOUNT_POINT,
         .partition_label = LOG_PARTITION_LABEL,
@@ -576,6 +593,9 @@ esp_err_t dual_onboard_log_start(void)
     s_mounted = true;
 #if ONBOARD_LOG_PAUSED_AT_BOOT
     s_paused = true;
+    /* 明确宣告本次启动不写 flash：采集侧据此确认 A/B 条件确实生效。 */
+    ESP_LOGW(TAG, "板载写盘开机即暂停（A/B 对照 ONBOARD_LOG_PAUSED_AT_BOOT=1）："
+                  "本次启动不写 flash，日志只走 UART0");
 #endif
     s_queue = xQueueCreate(LOG_QUEUE_LENGTH, sizeof(log_entry_t));
     if (s_queue == NULL) {
@@ -711,5 +731,3 @@ esp_err_t dual_onboard_log_clear(void)
     s_ready = true;
     return ESP_OK;
 }
-
-
