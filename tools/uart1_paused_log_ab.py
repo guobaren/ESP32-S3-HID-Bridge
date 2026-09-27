@@ -63,7 +63,7 @@ UART_EXTRA_RE = re.compile(
 # HID 统计行里的丢弃/放弃口径（两板字段不同，取交集与各自特有项）。
 COUNTER_NAMES = (
     'vendor_dropped', 'motion_skipped', 'motion_merged', 'transfer_fail',
-    'input_fail', 'preclone_motion', 'vendor_motion', 'failed', 'not_ready',
+    'input_fail', 'failed', 'not_ready',
     'control_fail', 'cleanup_retry', 'ack_retry', 'errors',
 )
 COUNTER_RE = re.compile(r'\b(' + '|'.join(COUNTER_NAMES) + r')=(\d+)')
@@ -235,8 +235,13 @@ def build_report(tag, stamp, reset_label, reset_at, pre_at, post_seconds,
         # 暂停标记只在启动期打印，必须按整段采集扫描，否则会误判“条件未生效”。
         report['P_full'] = summarize(rows_p, 0.0, float('inf'))
         report['P_queues_full'] = report['P_full']['queues']
-        report['P_queues_post_delta'] = queue_delta(report['P_pre'],
-                                                   report['P_post'])
+        if reset_label == 'P':
+            # 被复位的那块板在窗口起点丢了 RAM 计数，post−pre 没有物理意义：
+            # 用窗口末值表示"复位后累计"，避免把清零前后相减得出错误增量。
+            report['P_queues_after_reset'] = report['P_post']['queues']
+        else:
+            report['P_queues_post_delta'] = queue_delta(report['P_pre'],
+                                                        report['P_post'])
         report['P_counters_full'] = report['P_full']['counters']
         report['P_counters_post_delta'] = counter_delta(report['P_pre'],
                                                         report['P_post'])
@@ -250,8 +255,12 @@ def build_report(tag, stamp, reset_label, reset_at, pre_at, post_seconds,
         report['M_post'] = summarize(rows_m, reset_at * 1000.0, post_end * 1000.0)
         report['M_full'] = summarize(rows_m, 0.0, float('inf'))
         report['M_queues_full'] = report['M_full']['queues']
-        report['M_queues_post_delta'] = queue_delta(report['M_pre'],
-                                                    report['M_post'])
+        if reset_label == 'M':
+            # 同上：M 在窗口起点被硬复位，改用复位后累计值。
+            report['M_queues_after_reset'] = report['M_post']['queues']
+        else:
+            report['M_queues_post_delta'] = queue_delta(report['M_pre'],
+                                                        report['M_post'])
         report['M_counters_full'] = report['M_full']['counters']
         report['M_counters_post_delta'] = counter_delta(report['M_pre'],
                                                         report['M_post'])
@@ -363,10 +372,19 @@ def print_summary(report, post_seconds, min_reports):
     print('M 侧报告增量：%s（下限 %d，平均 %s/s）' % (
         delta, min_reports, 'n/a' if rate_m is None else '%.0f' % rate_m))
 
-    print_queues('P', report.get('P_queues_full', {}),
-                 report.get('P_queues_post_delta', {}))
-    print_queues('M', report.get('M_queues_full', {}),
-                 report.get('M_queues_post_delta', {}))
+    for label in ('P', 'M'):
+        if label == report.get('reset_label'):
+            after = report.get(label + '_queues_after_reset', {})
+            # print_queues 的 delta 参数需要 peak_abs 字段：复位后直接用累计值本身充当。
+            as_delta = {name: {'received': q['received'], 'rejected': q['rejected'],
+                               'dropped': q['dropped'], 'peak_abs': q['peak']}
+                        for name, q in after.items()}
+            print_queues('%s（窗口起点被复位：显示复位后累计与峰值）' % label,
+                         after, as_delta)
+        else:
+            print_queues('%s（显示统计窗口内增量）' % label,
+                         report.get(label + '_queues_full', {}),
+                         report.get(label + '_queues_post_delta', {}))
     print_counters('P', report.get('P_counters_full', {}),
                    report.get('P_counters_post_delta', {}))
     print_counters('M', report.get('M_counters_full', {}),

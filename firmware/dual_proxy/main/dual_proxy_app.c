@@ -62,8 +62,6 @@ static uint32_t s_offer_seen_flow_id;
 static bool s_offer_seen_valid;
 static uint32_t s_duplicate_offer_ignored;
 static uint32_t s_mouse_input_errors;
-/* Profile 传输在途时被让路（丢弃）的纯移动报文数。 */
-static uint32_t s_mouse_motion_yielded;
 static uint32_t s_duplicate_commit_replays;
 static volatile bool s_manual_profile;
 
@@ -594,18 +592,11 @@ static void on_mouse_report(
         ESP_LOGI(TAG, "按键边沿：buttons=0x%02X（点击延迟测量打点）", buttons);
     }
     /*
-     * 纯移动报文在两种“控制事务在途”时让路：
-     * 1) Profile 传输在途（复位后 OFFER→最终 ACK）：鼠标侧板要重新枚举物理鼠标
-     *    并采集整份描述符；
-     * 2) 厂商事务在途（G HUB 的初始化/查询往返）：实测接线/复位期间持续移动会让
-     *    G HUB 的初始化序列中途中断（约第 76 条 SET，正常 171 条）→ 灰卡「恢复设备」。
-     * 带按键的报文绝不让路，避免吞掉点击。
+     * 2026-09-27：按用户要求**移除全部纯移动抑制**。这里原先在「Profile 传输在途」或
+     * 「厂商事务在途」时丢弃无按键的纯移动；现已删除——纯移动在任何阶段都照常转发。
+     * 提醒：本回调在物理路径上不会被调用（生效路径是 `hid_host_mouse.c` 的
+     * `raw_report_task`），此处保留仅为记录转发语义，避免将来误以为让它路仍在生效。
      */
-    if (buttons == 0U &&
-        (dual_uart1_profile_transfer_in_flight() || dual_hid_host_vendor_busy())) {
-        ++s_mouse_motion_yielded;
-        return;
-    }
     if (dual_uart1_send_mouse(interface_number, report_id, buttons, x, y, wheel, pan) != ESP_OK) {
         (void)dual_uart1_send_release(1);
     }

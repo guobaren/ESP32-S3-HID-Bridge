@@ -43,7 +43,14 @@ static volatile int64_t s_raw_tx_latency_peak_us;
 #define LINK_EVENT_QUEUE_NEAR_DEPTH 96U
 #define LINK_BREAK_SUPPRESSION_US 250000U
 #define LINK_BREAK_REARM_RETRY_US 10000U
+/* 移动独占一个 128 槽队列；厂商/控制（含 PROFILE_ACK/ROLE_ACK）走另一条 128 槽队列。
+ * 2026-09-27 按用户要求归位：此前 RAW_HID_INPUT 被归入 vendor 类别，导致移动与
+ * HID++ 控制帧共用 s_vendor_tx_queue，与本段注释声明的"实体报文与厂商/控制报文
+ * 各自 128 槽"不符。用户的判据是：厂商信息只在克隆完成之后才需要处理，与 Profile
+ * 传输期在时间上错开，因此**厂商与 Profile 共用一条通道**即可，而 1 kHz 移动必须独占，
+ * 避免与厂商突发互相挤占槽位。 */
 #define LINK_TX_QUEUE_LENGTH 128
+#define LINK_MOTION_QUEUE_LENGTH 128
 /* 实体报文与厂商/控制报文各自 128 槽：移动（1 kHz）不再因为浅队列被大量丢弃，
  * 两条队列等长也避免一边满一边空造成的丢弃偏差。 */
 #define LINK_SAFETY_QUEUE_LENGTH 128
@@ -95,6 +102,7 @@ typedef struct {
 } queue_metrics_t;
 
 static queue_metrics_t s_tx_queue_metrics;
+static queue_metrics_t s_motion_tx_queue_metrics;
 static queue_metrics_t s_safety_tx_queue_metrics;
 static queue_metrics_t s_software_tx_queue_metrics;
 static queue_metrics_t s_vendor_tx_queue_metrics;
@@ -443,6 +451,7 @@ static volatile uint32_t s_tx_queue_overflows;
 static volatile uint32_t s_tx_queue_drops;
 static volatile uint32_t s_tx_write_failures;
 static QueueHandle_t s_tx_queue;
+static QueueHandle_t s_motion_tx_queue;
 static QueueHandle_t s_safety_tx_queue;
 static QueueHandle_t s_software_tx_queue;
 static QueueHandle_t s_vendor_tx_queue;
@@ -471,6 +480,8 @@ static uint32_t s_profile_chunks;
 static uint32_t s_profile_commits;
 static uint32_t s_profile_restarts;
 static uint32_t s_profile_failures;
+static volatile uint32_t s_motion_queue_overflows;
+static volatile uint32_t s_motion_queue_drops;
 static volatile uint32_t s_vendor_queue_overflows;
 static volatile uint32_t s_vendor_queue_drops;
 static uint32_t s_vendor_hid_session_generation = 1U;
@@ -639,6 +650,10 @@ static void update_tx_queue_metrics(void)
         queue_metric_observe_depth(&s_tx_queue_metrics, s_tx_queue);
         current += uxQueueMessagesWaiting(s_tx_queue);
     }
+    if (s_motion_tx_queue != NULL) {
+        queue_metric_observe_depth(&s_motion_tx_queue_metrics, s_motion_tx_queue);
+        current += uxQueueMessagesWaiting(s_motion_tx_queue);
+    }
     if (s_safety_tx_queue != NULL) {
         queue_metric_observe_depth(&s_safety_tx_queue_metrics, s_safety_tx_queue);
         current += uxQueueMessagesWaiting(s_safety_tx_queue);
@@ -660,6 +675,7 @@ static void update_tx_queue_metrics(void)
 static void reset_tx_queues(void)
 {
     queue_reset_count_dropped(s_tx_queue, &s_tx_queue_metrics);
+    queue_reset_count_dropped(s_motion_tx_queue, &s_motion_tx_queue_metrics);
     queue_reset_count_dropped(s_safety_tx_queue, &s_safety_tx_queue_metrics);
     queue_reset_count_dropped(s_software_tx_queue, &s_software_tx_queue_metrics);
     queue_reset_count_dropped(s_vendor_tx_queue, &s_vendor_tx_queue_metrics);
@@ -1186,20 +1202,26 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
         type == DUAL_MESSAGE_DEVICE_GONE ||
         type == DUAL_MESSAGE_FLOW_ACK;
     const bool software = type == DUAL_MESSAGE_SOFTWARE_MOUSE;
-    const bool vendor = type == DUAL_MESSAGE_RAW_HID_INPUT ||
-        type == DUAL_MESSAGE_HID_SET_REPORT ||
+    /* 移动独占队列；厂商控制帧与 PROFILE_ACK/ROLE_ACK 共用另一条。
+     * PHYSICAL_MOUSE（归一化实体报文，当前无活跃发送者）与 RAW_HID_INPUT 同属移动。 */
+    const bool motion = type == DUAL_MESSAGE_RAW_HID_INPUT ||
+        type == DUAL_MESSAGE_PHYSICAL_MOUSE;
+    const bool vendor = type == DUAL_MESSAGE_HID_SET_REPORT ||
         type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST ||
         type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE ||
         type == DUAL_MESSAGE_PROFILE_ACK ||
         type == DUAL_MESSAGE_ROLE_ACK;
     QueueHandle_t target = safety ? s_safety_tx_queue :
         software ? s_software_tx_queue :
+        motion ? s_motion_tx_queue :
         vendor ? s_vendor_tx_queue : s_tx_queue;
     queue_metrics_t *target_metrics = safety ? &s_safety_tx_queue_metrics :
         software ? &s_software_tx_queue_metrics :
+        motion ? &s_motion_tx_queue_metrics :
         vendor ? &s_vendor_tx_queue_metrics : &s_tx_queue_metrics;
     queue_metric_increment(&target_metrics->received);
-    if (target == NULL || s_tx_queue == NULL || s_safety_tx_queue == NULL ||
+    if (target == NULL || s_tx_queue == NULL || s_motion_tx_queue == NULL ||
+        s_safety_tx_queue == NULL ||
         s_software_tx_queue == NULL || s_vendor_tx_queue == NULL ||
         length > DUAL_PROXY_MAX_PAYLOAD) {
         queue_metric_increment(&target_metrics->rejected);
@@ -1250,6 +1272,11 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
                 queue_metric_observe_depth(&s_safety_tx_queue_metrics,
                                            s_safety_tx_queue);
             }
+        } else if (motion) {
+            /* 移动队列满：只丢这一条移动；点击/释放走安全队列，不受影响。 */
+            queue_metric_increment(&s_motion_tx_queue_metrics.dropped);
+            ++s_motion_queue_overflows;
+            ++s_motion_queue_drops;
         } else if (vendor) {
             queue_metric_increment(&s_vendor_tx_queue_metrics.dropped);
             ++s_vendor_queue_overflows;
@@ -1495,6 +1522,7 @@ static bool tx_queues_have_items(void)
 {
     return (s_safety_tx_queue != NULL && uxQueueMessagesWaiting(s_safety_tx_queue) > 0) ||
         (s_tx_queue != NULL && uxQueueMessagesWaiting(s_tx_queue) > 0) ||
+        (s_motion_tx_queue != NULL && uxQueueMessagesWaiting(s_motion_tx_queue) > 0) ||
         (s_software_tx_queue != NULL && uxQueueMessagesWaiting(s_software_tx_queue) > 0) ||
         (s_vendor_tx_queue != NULL && uxQueueMessagesWaiting(s_vendor_tx_queue) > 0);
 }
@@ -1863,17 +1891,23 @@ static void link_tx_task(void *argument)
             ++processed;
         }
 
-        /* 实体输入先于软件输入；每批至少给两者各一个机会。 */
+        /* 移动独占队列：先于软件输入，每批至少给两者各一个机会。
+         * 移动条数计入 s_profile_motion_since_send，供 Profile 分片的公平性判据使用。 */
         if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
-            xQueueReceive(s_tx_queue, &item, 0) == pdTRUE) {
+            xQueueReceive(s_motion_tx_queue, &item, 0) == pdTRUE) {
             (void)send_tx_item(&item);
-            if (item.type == DUAL_MESSAGE_PHYSICAL_MOUSE) {
-                ++motion_processed;
-            }
+            ++motion_processed;
             ++processed;
         }
         if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
             xQueueReceive(s_software_tx_queue, &item, 0) == pdTRUE) {
+            (void)send_tx_item(&item);
+            ++processed;
+        }
+
+        /* 心跳/链路状态（s_tx_queue）：低频，放在移动与厂商之后，通常队列为空不占配额。 */
+        if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
+            xQueueReceive(s_tx_queue, &item, 0) == pdTRUE) {
             (void)send_tx_item(&item);
             ++processed;
         }
@@ -1894,11 +1928,9 @@ static void link_tx_task(void *argument)
         }
 
         while (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
-               xQueueReceive(s_tx_queue, &item, 0) == pdTRUE) {
+               xQueueReceive(s_motion_tx_queue, &item, 0) == pdTRUE) {
             (void)send_tx_item(&item);
-            if (item.type == DUAL_MESSAGE_PHYSICAL_MOUSE) {
-                ++motion_processed;
-            }
+            ++motion_processed;
             ++processed;
             if (processed < DUAL_PROXY_LINK_TX_BATCH_LIMIT &&
                 xQueueReceive(s_software_tx_queue, &item, 0) == pdTRUE) {
@@ -1925,8 +1957,8 @@ static void link_tx_task(void *argument)
         }
         const bool safety_pending = s_safety_tx_queue != NULL &&
             uxQueueMessagesWaiting(s_safety_tx_queue) > 0;
-        const bool motion_pending = s_tx_queue != NULL &&
-            (uxQueueMessagesWaiting(s_tx_queue) > 0 ||
+        const bool motion_pending = s_motion_tx_queue != NULL &&
+            (uxQueueMessagesWaiting(s_motion_tx_queue) > 0 ||
              uxQueueMessagesWaiting(s_software_tx_queue) > 0);
         if (hid_profile_stream_can_send(
                 s_peer_online, safety_pending, motion_pending,
@@ -1993,6 +2025,7 @@ static void link_tx_task(void *argument)
                      " rx_pend_peak=%" PRIu32 " hb_gap_peak_ms=%" PRIu32 " raw_lat_peak_us=%" PRId64 " q=%" PRIu32 " peak=%" PRIu32
                      " overflow=%" PRIu32 " drop=%" PRIu32 " write_fail=%" PRIu32
                      " vendor_overflow=%" PRIu32 " vendor_drop=%" PRIu32
+                     " motion_overflow=%" PRIu32 " motion_drop=%" PRIu32
                      " peer=%s profile=%" PRIu32 "/%" PRIu32 "/%" PRIu32
                      " restart=%" PRIu32 " fail=%" PRIu32
                      " conn=%" PRIu32 " gone_retry=%" PRIu32 " gone_fail=%" PRIu32
@@ -2006,6 +2039,7 @@ static void link_tx_task(void *argument)
                      s_rx_pending_peak, s_heartbeat_gap_peak_ms, s_raw_tx_latency_peak_us, s_tx_queue_current,
                       s_tx_queue_peak, s_tx_queue_overflows, s_tx_queue_drops,
                       s_tx_write_failures, s_vendor_queue_overflows, s_vendor_queue_drops,
+                      s_motion_queue_overflows, s_motion_queue_drops,
                       s_peer_online ? "online" : "offline",
                       s_profile_starts, s_profile_chunks, s_profile_commits,
                       s_profile_restarts, s_profile_failures,
@@ -2013,6 +2047,7 @@ static void link_tx_task(void *argument)
                       s_request_retries, s_offer_retries, s_commit_replays,
                       s_budget_exhausted);
             log_queue_metrics("uart1_tx", &s_tx_queue_metrics);
+            log_queue_metrics("uart1_motion", &s_motion_tx_queue_metrics);
             log_queue_metrics("uart1_safety", &s_safety_tx_queue_metrics);
             log_queue_metrics("uart1_software", &s_software_tx_queue_metrics);
             log_queue_metrics("uart1_vendor", &s_vendor_tx_queue_metrics);
@@ -2177,9 +2212,12 @@ esp_err_t dual_uart1_start(
     s_tx_queue_overflows = 0;
     s_tx_queue_drops = 0;
     s_tx_write_failures = 0;
+    s_motion_queue_overflows = 0;
+    s_motion_queue_drops = 0;
     s_vendor_queue_overflows = 0;
     s_vendor_queue_drops = 0;
     memset(&s_tx_queue_metrics, 0, sizeof(s_tx_queue_metrics));
+    memset(&s_motion_tx_queue_metrics, 0, sizeof(s_motion_tx_queue_metrics));
     memset(&s_safety_tx_queue_metrics, 0, sizeof(s_safety_tx_queue_metrics));
     memset(&s_software_tx_queue_metrics, 0, sizeof(s_software_tx_queue_metrics));
     memset(&s_vendor_tx_queue_metrics, 0, sizeof(s_vendor_tx_queue_metrics));
@@ -2288,10 +2326,11 @@ esp_err_t dual_uart1_start(
         }
     }
     s_tx_queue = xQueueCreate(LINK_TX_QUEUE_LENGTH, sizeof(tx_item_t));
+    s_motion_tx_queue = xQueueCreate(LINK_MOTION_QUEUE_LENGTH, sizeof(tx_item_t));
     s_safety_tx_queue = xQueueCreate(LINK_SAFETY_QUEUE_LENGTH, sizeof(tx_item_t));
     s_software_tx_queue = xQueueCreate(LINK_SOFTWARE_QUEUE_LENGTH, sizeof(tx_item_t));
     s_vendor_tx_queue = xQueueCreate(LINK_VENDOR_QUEUE_LENGTH, sizeof(tx_item_t));
-    if (s_tx_queue == NULL || s_safety_tx_queue == NULL ||
+    if (s_tx_queue == NULL || s_motion_tx_queue == NULL || s_safety_tx_queue == NULL ||
         s_software_tx_queue == NULL || s_vendor_tx_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -2306,10 +2345,12 @@ esp_err_t dual_uart1_start(
             s_tx_task = NULL;
         }
         vQueueDelete(s_tx_queue);
+        vQueueDelete(s_motion_tx_queue);
         vQueueDelete(s_safety_tx_queue);
         vQueueDelete(s_software_tx_queue);
         vQueueDelete(s_vendor_tx_queue);
         s_tx_queue = NULL;
+        s_motion_tx_queue = NULL;
         s_safety_tx_queue = NULL;
         s_software_tx_queue = NULL;
         s_vendor_tx_queue = NULL;
@@ -2708,7 +2749,10 @@ void dual_uart1_deferred_refresh(void)
 
 /*
  * 克隆是否已就绪（鼠标侧板判定）：只有收到绑定当前传输的成功 Profile ACK 之后
- * 才算完成。用户要求：克隆完成前完全不转发鼠标移动，避免干扰克隆建立流程。
+ * 才算完成。
+ * 2026-09-27：按用户要求移除了"克隆完成前不转发纯移动"的抑制，本函数当前在
+ * 固件内**没有调用者**，保留接口以便回退或将来复用（P 侧克隆未挂载时会按既有
+ * 入口条件自行拒收并计数，不需要本侧提前拦截）。
  */
 bool dual_uart1_clone_ready(void)
 {

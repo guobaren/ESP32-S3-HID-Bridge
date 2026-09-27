@@ -750,10 +750,6 @@ static void log_report_descriptor(
 
 /* 上一次鼠标报文首字节（按键位）：仅用于按键边沿打点。 */
 static uint8_t s_last_button_byte;
-/* 克隆完成前被抑制的鼠标移动条数（用户要求：克隆前不转发移动，避免干扰建立流程）。 */
-static volatile uint32_t s_preclone_motion_drops;
-/* 厂商密集突发期间让路的移动条数（与克隆前抑制分开计数，便于区分）。 */
-static volatile uint32_t s_vendor_motion_drops;
 /* 滚轮字节偏移（相对报表正文，不含 report ID）；0xFF 表示未知。 */
 static volatile uint8_t s_wheel_byte_offset = 0xFFU;
 static volatile uint32_t s_wheel_reports;
@@ -816,24 +812,16 @@ static void raw_report_task(void *argument)
             }
         }
         /*
-         * 纯移动让路（带按键的报文照常转发，绝不吞点击）：
-         *   1) 克隆完成前（未收到成功 Profile ACK）：移动不占链路、不干扰建立；
-         *   2) **厂商事务密集突发期间**（G HUB 初始化/查询往返）：设备此时要同时
-         *      应付"刚枚举完的自身初始化 + 1 kHz 中断上报 + 密集控制传输"，
-         *      移动会把某笔控制传输挤到超时（实测：不动时 168/168 全过，一动就超时）。
-         * 注意：本模块的 on_mouse_report 回调在物理路径上**不会被调用**，所以让路
-         * 必须加在这里——之前只加在那边，等于没生效。
+         * 2026-09-27：按用户要求**移除全部纯移动抑制**。原先这里有两支让路：
+         *   (1) 克隆完成前（`!dual_uart1_clone_ready()`）不转发纯移动；
+         *   (2) 厂商事务密集突发期间（`dual_hid_host_vendor_busy()`，30 ms 窗）让路，
+         *       用于保护 HID++ 控制传输（历史实测"不动时 168/168 全过，一动就超时"）。
+         * 两支均已删除：任何时刻的纯移动都照常转发；带按键的报文一如既往不丢。
+         * 通道上移动走 `s_vendor_tx_queue`（每 4 轮取一次），Profile 分片走 `s_tx_queue`
+         * 且每轮优先取用（`uart1_link.c:1866-1889`），不存在"移动挤占克隆建立"的竞争。
+         * 注意：本模块的 `on_mouse_report` 回调在物理路径上不会被调用，这里的判定才是
+         * 生效路径——历史教训是"只改那边等于没生效"。
          */
-        if (event.mouse_report && event.length > 0U && event.data[0] == 0U) {
-            if (!dual_uart1_clone_ready()) {
-                ++s_preclone_motion_drops;
-                continue;
-            }
-            if (dual_hid_host_vendor_busy()) {
-                ++s_vendor_motion_drops;
-                continue;
-            }
-        }
         if (event.length == 0U ||
             dual_uart1_send_raw_hid_input(
                 event.interface_number, event.report_id, event.data,
@@ -1073,13 +1061,14 @@ static void hid_stats_task(void *argument)
                               &urb_latency_max_us, &urb_over_10ms, &urb_over_100ms);
         ESP_LOGI(TAG, "Host HID统计：reports=%" PRIu32 " vendor_reports=%" PRIu32
                  " input_fail=%" PRIu32 " control=%" PRIu32
-                 " control_fail=%" PRIu32 " ctrl_retry=%" PRIu32 " urb_sub=%" PRIu32 " urb_ok=%" PRIu32 " urb_to=%" PRIu32 " urb_retry=%" PRIu32 " recover=%" PRIu32 " port_cycle=%" PRIu32 " preclone_motion=%" PRIu32 " vendor_motion=%" PRIu32 " wheel=%" PRIu32 " ctrl_lat_max_us=%lld slow10=%" PRIu32 " slow100=%" PRIu32 " vmin_gap_us=%lld"
+                 " control_fail=%" PRIu32 " ctrl_retry=%" PRIu32 " urb_sub=%" PRIu32 " urb_ok=%" PRIu32 " urb_to=%" PRIu32 " urb_retry=%" PRIu32 " recover=%" PRIu32 " port_cycle=%" PRIu32 " wheel=%" PRIu32 " ctrl_lat_max_us=%lld slow10=%" PRIu32 " slow100=%" PRIu32 " vmin_gap_us=%lld"
                  " errors=%" PRIu32,
                  s_reports, s_vendor_reports, s_vendor_input_failures,
                  s_vendor_control_requests, s_vendor_control_failures, s_vendor_control_retries,
                  urb_submitted, urb_completed, urb_timeouts, urb_retries,
                  s_hid_recoveries, s_root_port_cycles,
-                 s_preclone_motion_drops, s_vendor_motion_drops, s_wheel_reports,
+                 s_wheel_reports,
+                 urb_latency_max_us, urb_over_10ms, urb_over_100ms,
                  (long long)s_vendor_arrival_min_gap_us, s_errors);
         log_queue_metrics("host_hid_event", &s_hid_event_queue_metrics);
         log_queue_metrics("host_hid_report", &s_report_queue_metrics);
@@ -2207,6 +2196,10 @@ bool dual_hid_host_vendor_busy(void)
      * vmin_gap_us = 9410），根本不存在"5 ms 内的密集突发"——按密度判会永远不成立
      * （曾实测 vendor_motion=0，修复空转）。窗口取 30 ms（约 3 倍实测间隔）：
      * G HUB 初始化/查询期间持续成立 → 移动持续让路；稳态稀疏轮询时基本不触发。
+     *
+     * 2026-09-27：移动抑制全部移除后，本函数在固件内**已无调用者**（原两处调用分别是
+     * hid_host_mouse.c 的活跃让路与 dual_proxy_app.c 的 on_mouse_report 死路径，后者
+     * 物理上不会被调用）。保留接口以便回退或将来复用。
      */
     return s_vendor_arrival_last_us != 0 &&
         esp_timer_get_time() - s_vendor_arrival_last_us < 30000LL;
