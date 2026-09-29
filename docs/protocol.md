@@ -40,6 +40,8 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 
 双板 `dual_proxy` 的 UART1 复用同一帧封装，并使用以下内部消息；它们不属于主机 CDC 控制 API：
 
+UART0 诊断另有 `0x1C DIAG_PROFILE_REFRESH_REQUEST`（可选 1 字节载荷），只由 M 角色受理：重新采集物理鼠标 Profile 并提议给 P，回现有 `DIAG_INJECT_RESULT`。这用于按需复现 Profile 流程，不会直接复位或重枚举物理鼠标。
+
 | Type | 名称 | Payload |
 |---:|---|---|
 | `0x20` | LINK_HELLO | `role:u8`、`usb_state:u8`、`node_id:6 bytes`、`generation:u32` |
@@ -56,7 +58,7 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | `0x2B` | SOFTWARE_MOUSE | 来自电脑 A 的 7/8 字节标准化软件鼠标报告 |
 | `0x2C` | SOFTWARE_RELEASE | 软件输入租约结束、断线或队列故障时释放软件按键 |
 | `0x2D` | DEVICE_GONE | `sender_generation:u32`、`target_generation:u32`、非零 `event_id:u32`、`reason:u8`；长度 13 字节 |
-| `0x2E` | PROFILE_ACK | `transfer_id:u32`、`crc32:u32`、`status:u8`、`recipient_generation:u32`、`sender_generation:u32`；长度 17 字节，电脑侧在新 Profile 成功配置并 `tud_mounted()` 后回 ACK，`status=1` 表示不可克隆 |
+| `0x2E` | PROFILE_ACK | `transfer_id:u32`、`crc32:u32`、`status:u8`、`recipient_generation:u32`、`sender_generation:u32`；长度 17 字节，电脑侧仅在同一 transfer/CRC 已安装且 `tud_mounted()` 后回 `status=0`；最终安装或挂载失败回 `status=1` |
 | `0x2F` | ROLE_ACK | `role:u8`、`generation:u32`；确认收到并接受对应身份声明 |
 | `0x30` | PROFILE_REQUEST | `generation:u32`、`flow_id:u32`；P 发起一次重新采集申请 |
 | `0x31` | PROFILE_OFFER | `flow_id:u32`、`transfer_id:u32`、`crc32:u32`；M 已采集到新 Profile，提议 P 清空旧会话并重新克隆 |
@@ -68,7 +70,7 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 
 P 锁定身份后先完成本地 USB Device 卸载、清空活动 Profile/描述符/报告模板及厂商 HID 会话，成功后才开放并发送本会话唯一一次 `PROFILE_REQUEST`。M generation 变化等同 M 重新上电：P 关闭申请门，重新执行同一套本地清理，完成后再发送新的单次申请。M 收到 REQUEST 后取消尚未完成的旧提议，安排重新读取当前 USB Device/Configuration 描述符并重新发布 HID Profile，同时以 `FLOW_ACK(REQUEST, flow_id, status)` 确认是否接受。
 
-M 每次采集到 Profile 时发起 `PROFILE_OFFER`。该 OFFER 自身也是清理请求：P 先释放输入、卸载 TinyUSB、清空旧 Profile/描述符/报告模板并使旧厂商 HID 会话失效，全部成功后才发送 `FLOW_ACK(OFFER, flow_id, accepted)`；排入异步任务不算成功。M 只有收到双方 generation 与 flow ID 都匹配的 accepted ACK 后，才发送 BEGIN/CHUNK/COMMIT。P 对完整且校验成功的 COMMIT 回 `FLOW_ACK(COMMIT, transfer_id, status)`，随后执行 USB 克隆；`tud_mounted()` 后再发最终 `PROFILE_ACK(transfer_id, crc32, status)`。
+M 每次采集到 Profile 时发起 `PROFILE_OFFER`。该 OFFER 自身也是清理请求：P 先释放输入、卸载 TinyUSB、清空旧 Profile/描述符/报告模板并使旧厂商 HID 会话失效，全部成功后才发送 `FLOW_ACK(OFFER, flow_id, accepted)`；排入异步任务不算成功。M 只有收到双方 generation 与 flow ID 都匹配的 accepted ACK 后，才发送 BEGIN/CHUNK/COMMIT。P 对完整且校验成功的 COMMIT 回 `FLOW_ACK(COMMIT, transfer_id, accepted)` 表示数据已接收并进入安装流程；这不是 USB 挂载成功。P 对挂载超时最多进行两次、每次最多等待 3 秒的安装尝试，中间等待 200 ms；其它安装错误直接终止并回 `PROFILE_ACK(status=1)`。只有相同 transfer/CRC 实际安装并 `tud_mounted()` 后，P 才回最终 `PROFILE_ACK(status=0)`。
 
 鼠标物理拔出时，M 生成非零 event ID 并发送 `DEVICE_GONE(sender_generation, target_generation, event_id, reason)`。P 只接受两个 generation 与当前会话匹配的事件，取消任何旧 pending Profile，并用操作 epoch 使已经开始但尚未完成的重配置快照失效。P 必须实际完成 TinyUSB 卸载与旧会话清空后，才回 `FLOW_ACK(DEVICE_GONE, event_id, accepted)`。M 在收到匹配确认前禁止发送 PROFILE_OFFER 和任何 Profile 分片；即使新鼠标已采集到 Profile，也只缓存等待。鼠标重新插入后，顺序为：GONE 清理 ACK → 新 OFFER 清理 ACK（即便清理是幂等的也要执行并确认）→ BEGIN/CHUNK/COMMIT → P 挂载后的最终 PROFILE_ACK。重复/迟到的 GONE 按 peer generation 与 event ID 去重，不得撤销更新会话中的新克隆。清理失败或确认超时按“有界重试与去重规则”处理：先在同一 generation 内重试同一事务，预算耗尽才闪红灯终止本轮；新 peer generation/板复位开启新的恢复流程。M 侧报告的输入异常（`on_mouse_release(false)`，如报告队列满或传输错误）不属于物理拔出，只释放按钮并记录输入错误，不发送 `DEVICE_GONE`。
 
@@ -82,13 +84,13 @@ FLOW_ACK 的字段偏移为：`acknowledged_type@0`、`flow_id@1`、`status@5`�
 - `DEVICE_GONE` 按 0.7 秒间隔、最多 8 次重发同一 `event_id`；P 若报告清理失败，M 保留同一事务继续重试。等待窗口 5 秒或次数用尽才判失败，但双方 generation 与 event ID 都匹配的迟到确认仍然有效。快速插回时新 Profile 只缓存，必须等旧屏障完成才能 OFFER。
 - P 清理失败保持克隆门关闭并本地重试同一事务最多 3 次；清理成功后立即登记结果，只有确认帧入队失败时最多补发 3 次，不重复卸载 USB、不清输入、不递增 epoch。
 - 重复 `PROFILE_REQUEST`/`PROFILE_OFFER` 按 generation + flow ID 去重；物理鼠标尚未枚举时 M 受理并等待，设备到达后继续当前流程。
-- 接收端对重复到达的前缀分片幂等（内容一致才忽略，冲突则失败）；同一 `transfer_id` 的重复 BEGIN/CHUNK/COMMIT 返回既有结果，不重新发布，因此不会第二次重枚举 USB。最终 `PROFILE_ACK` 丢失时 M 只重放同一 transfer 的 COMMIT，P 只补发确认。
-- 恢复总预算 10 秒，各阶段共用剩余预算，不串联多个完整等待窗口；预算耗尽后明确终止本轮，新物理事件或新会话可重新发起。
-- 当前 `FLOW_ACK` 的**阶段超时为 5 秒**（`LINK_PROFILE_STAGE_TIMEOUT_US`，即 `LINK_FLOW_ACK_TIMEOUT_US`），占 10 秒共享预算的一半；原计划恢复为 1 秒尚未执行。控制传输（EP0）另有一套独立参数：单次等待 800 ms、每请求最多 2 次尝试、连续 3 次失败升级恢复，枚举后 10 秒预热期内只重试不升级（见 `docs/连接流程.md` §12）。
+- 接收端对重复到达的前缀分片幂等（内容一致才忽略，冲突则失败）。同一 transfer 的重复 COMMIT 在安装中只回 `FLOW_ACK` 收件回执，不启动第二个安装任务；若相同 transfer/CRC 已实际挂载则补发成功 `PROFILE_ACK`，若该 transfer 已最终失败则补发 NACK。P 端挂载超时最多尝试 2 次，每次等待最多 3 秒，间隔 200 ms；其他 USB 安装错误直接 NACK。操作 epoch/generation 失效后停止旧尝试，不为旧事务补发结果。
+- M 每排入一份新 Profile（新 transfer）时刷新恢复预算；同 transfer 的 COMMIT 重放不刷新预算。恢复总预算为 14 秒，各阶段共用剩余预算；COMMIT 等待窗口为 8 秒，最多 10 次、每秒重放一次，以覆盖 P 的两次挂载等待与退避，同时保持有界。预算耗尽后明确终止本轮，新物理事件、新 Profile 或新会话可重新发起。
+- 普通 `FLOW_ACK` 阶段超时为 5 秒（`LINK_PROFILE_STAGE_TIMEOUT_US`，即 `LINK_FLOW_ACK_TIMEOUT_US`）；`PROFILE_COMMIT` 单独使用 8 秒窗口（`LINK_COMMIT_STAGE_TIMEOUT_US`）。控制传输（EP0）另有一套独立参数：单次等待 800 ms、每请求最多 2 次尝试；无 reset 版记录连续失败，但默认不升级为接口重挂或根端口断电，枚举后 10 秒预热期内只重试（见 `docs/鼠标随机断连分析.md` §8）。
 
 Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`version:u16`、`header_length:u16`、Device descriptor 长度、Configuration descriptor 长度、manufacturer/product/serial UTF-8 长度、报告项数量和 `flags:u8`；随后按长度排列各段数据。每个报告项为 `interface_number:u8`、`subclass:u8`、`protocol:u8`、保留字节、`report_length:u16` 和原始 HID Report descriptor。所有整数均为小端，完整 blob 上限 4096 字节，最多 8 个接口、单份报告描述符 512 字节、每个字符串 128 字节。
 
-接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。电脑侧每收到完整 Profile 都必须覆盖旧 Profile 并重新插拔电脑 USB：先使旧 vendor HID 会话代号失效、清空输入/控制队列和待处理 GET_REPORT，卸载旧 TinyUSB 设备并清空活动 Profile/报告模板；USB 断开后才构建并安装新描述符，避免枚举期间新旧描述符混用。无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许回退呈现旧 Profile 或通用设备冒充物理鼠标。
+接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。若新 Profile CRC 与当前已安装且已挂载的克隆一致，且无在途清理或安装，P 可复用当前克隆而不重新枚举；否则先使旧 vendor HID 会话代号失效、清空输入/控制队列和待处理 GET_REPORT，卸载旧 TinyUSB 设备并清空活动 Profile/报告模板，USB 断开后才构建并安装新描述符。无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许回退呈现旧 Profile 或通用设备冒充物理鼠标。
 
 实体 raw Input 优先于软件输入；软件 move/release 使用独立有界队列；HID 厂商控制使用独立队列；Profile 只在安全/输入队列允许时分片发送。鼠标拔出、UART1 超时、鼠标侧掉电或 Profile 超时都先释放输入，再由电脑侧卸载 USB Device；重新插入后只有完整新 Profile 校验通过才重新枚举。
 **（主机 EXE / 早期单板）** 主机同步程序打开 UART 或原生 USB CDC 对应的 COM 口后，会由同一个 `SerialPort` 实例读取设备日志并缓冲写入 `deviceLogPath` 指定的文件（默认是 EXE 同目录 `log/device/host-serial-{timestamp}.log`），并按 `deviceLogRetentionCount` 清理最旧文件，因此不需要、也不能再同时运行 `idf.py monitor` 独占同一个 COM 口。为避免高频 BLE notify 日志重复触发主机日志落盘和 WinForms 重绘，`showDeviceLogInUi` 默认关闭；该选项只影响窗口镜像，不影响独立设备日志文件。

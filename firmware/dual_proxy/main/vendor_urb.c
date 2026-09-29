@@ -22,19 +22,21 @@ static const char *TAG = "vendor_urb";
 #define VENDOR_URB_TIMEOUT_MS 800U
 /*
  * 每次请求最多尝试次数：瞬时抖动靠第 2 次吃掉；两次都超时才认为设备不响应，
- * 以免无脑重发把 URB 堆成孤儿、并推迟真正有效的端口断电恢复。
+ * 以免无脑重发把 URB 堆成孤儿；在途孤儿另有硬上限。
  */
 #define VENDOR_URB_ATTEMPTS 2U
+#define VENDOR_URB_MAX_ORPHANS 4U
+#define URB_WAIT_PENDING 0U
+#define URB_WAIT_COMPLETED 1U
+#define URB_WAIT_ORPHAN 2U
 #define VENDOR_URB_CLIENT_TASK_STACK 4096
 #define VENDOR_URB_CLIENT_TASK_PRIORITY 4
 
 typedef struct {
     SemaphoreHandle_t done;
     usb_transfer_t *transfer;
-    volatile bool completed;
-    /* 调用方已放弃等待：由回调负责释放 URB 与上下文（flush EP0 不被支持，
-     * 只能等它自己完成；per-request URB 保证它不影响其它请求）。 */
-    volatile bool orphan;
+    /* 超时线程与完成回调通过原子状态转移决定唯一释放者。 */
+    volatile uint8_t state;
     volatile uint8_t status;
 } urb_wait_t;
 
@@ -50,6 +52,7 @@ static volatile uint32_t s_timeouts;
 static volatile uint32_t s_aborted;
 static volatile uint32_t s_device_reopens;
 static volatile uint32_t s_orphans_reaped;
+static volatile uint32_t s_orphans_outstanding;
 static volatile uint32_t s_retries;
 /*
  * 控制传输耗时分布（区分"拥堵"与"设备拒答"）：
@@ -67,10 +70,12 @@ static void urb_transfer_callback(usb_transfer_t *transfer)
         return;
     }
     wait->status = (uint8_t)transfer->status;
-    wait->completed = true;
-    if (wait->orphan) {
+    const uint8_t previous = __atomic_exchange_n(
+        &wait->state, URB_WAIT_COMPLETED, __ATOMIC_ACQ_REL);
+    if (previous == URB_WAIT_ORPHAN) {
         /* 调用方已放弃等待：这里负责收尾，避免泄漏在飞的 URB。 */
         ++s_orphans_reaped;
+        __atomic_sub_fetch(&s_orphans_outstanding, 1U, __ATOMIC_RELAXED);
         vSemaphoreDelete(wait->done);
         usb_host_transfer_free(transfer);
         free(wait);
@@ -184,6 +189,11 @@ static esp_err_t urb_set_report_once(
         xSemaphoreGive(s_device_mutex);
         return ESP_ERR_INVALID_STATE;
     }
+    if (__atomic_load_n(&s_orphans_outstanding, __ATOMIC_ACQUIRE) >=
+        VENDOR_URB_MAX_ORPHANS) {
+        xSemaphoreGive(s_device_mutex);
+        return ESP_ERR_NO_MEM;
+    }
     esp_err_t result = ESP_OK;
     usb_transfer_t *transfer = NULL;
     result = usb_host_transfer_alloc(8U + length, 0, &transfer);
@@ -234,17 +244,22 @@ static esp_err_t urb_set_report_once(
              * 所以把这笔挂成"孤儿"交给回调收尾：per-request URB 下它不会
              * 影响任何其它请求，通道保持可用。
              */
-            ++s_timeouts;
-            wait->orphan = true;
-            if (wait->completed) {
-                /* 回调刚刚跑完并已自行释放：这里不能再碰 wait。 */
+            __atomic_add_fetch(&s_orphans_outstanding, 1U, __ATOMIC_RELAXED);
+            uint8_t pending = URB_WAIT_PENDING;
+            if (__atomic_compare_exchange_n(&wait->state, &pending,
+                                            URB_WAIT_ORPHAN, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                ++s_timeouts;
+                ESP_LOGW(TAG, "控制传输超时（%u ms）：挂为孤儿等待回收（在途 %u/%u）",
+                         (unsigned)timeout_ms,
+                         (unsigned)__atomic_load_n(&s_orphans_outstanding, __ATOMIC_RELAXED),
+                         (unsigned)VENDOR_URB_MAX_ORPHANS);
                 xSemaphoreGive(s_device_mutex);
                 return ESP_ERR_TIMEOUT;
             }
-            ESP_LOGW(TAG, "控制传输超时（%u ms）：挂为孤儿等待回收（已回收 %u 次）",
-                     (unsigned)timeout_ms, (unsigned)s_orphans_reaped);
-            xSemaphoreGive(s_device_mutex);
-            return ESP_ERR_TIMEOUT;
+            __atomic_sub_fetch(&s_orphans_outstanding, 1U, __ATOMIC_RELAXED);
+            /* 完成回调已认领释放权，等它发信号后由本线程释放。 */
+            (void)xSemaphoreTake(wait->done, portMAX_DELAY);
         }
         ++s_completed;
         const int64_t elapsed_us = esp_timer_get_time() - transfer_start_us;
@@ -304,6 +319,11 @@ static esp_err_t urb_control_once(
         xSemaphoreGive(s_device_mutex);
         return ESP_ERR_INVALID_STATE;
     }
+    if (__atomic_load_n(&s_orphans_outstanding, __ATOMIC_ACQUIRE) >=
+        VENDOR_URB_MAX_ORPHANS) {
+        xSemaphoreGive(s_device_mutex);
+        return ESP_ERR_NO_MEM;
+    }
     esp_err_t result = ESP_OK;
     usb_transfer_t *transfer = NULL;
     result = usb_host_transfer_alloc(8U + length, 0, &transfer);
@@ -349,16 +369,21 @@ static esp_err_t urb_control_once(
     if (result == ESP_OK) {
         if (xSemaphoreTake(wait->done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
             /* 与 SET_REPORT 路径同样的处理：EP0 不支持 flush，超时只能挂孤儿。 */
-            ++s_timeouts;
-            wait->orphan = true;
-            if (wait->completed) {
+            __atomic_add_fetch(&s_orphans_outstanding, 1U, __ATOMIC_RELAXED);
+            uint8_t pending = URB_WAIT_PENDING;
+            if (__atomic_compare_exchange_n(&wait->state, &pending,
+                                            URB_WAIT_ORPHAN, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                ++s_timeouts;
+                ESP_LOGW(TAG, "Vendor 控制传输超时（%u ms）：挂为孤儿等待回收（在途 %u/%u）",
+                         (unsigned)timeout_ms,
+                         (unsigned)__atomic_load_n(&s_orphans_outstanding, __ATOMIC_RELAXED),
+                         (unsigned)VENDOR_URB_MAX_ORPHANS);
                 xSemaphoreGive(s_device_mutex);
                 return ESP_ERR_TIMEOUT;
             }
-            ESP_LOGW(TAG, "Vendor 控制传输超时（%u ms）：挂为孤儿等待回收",
-                     (unsigned)timeout_ms);
-            xSemaphoreGive(s_device_mutex);
-            return ESP_ERR_TIMEOUT;
+            __atomic_sub_fetch(&s_orphans_outstanding, 1U, __ATOMIC_RELAXED);
+            (void)xSemaphoreTake(wait->done, portMAX_DELAY);
         }
         ++s_completed;
         const int64_t elapsed_us = esp_timer_get_time() - transfer_start_us;

@@ -51,6 +51,14 @@ static bool s_profile_offer_valid;
 static uint32_t s_profile_offer_transfer_id;
 static uint32_t s_profile_offer_crc32;
 static bool s_profile_schedule_ok;
+/*
+ * Profile CRC 复用（2026-09-28，按用户决策启用）：本次 clone 会话的 CRC32 与本机
+ * 已挂载克隆完全一致时置位——OFFER 阶段不排清理屏障，Profile 收全后不卸载不重装。
+ * 每次 OFFER 都会重新赋值，publish 前还会用 dual_pc_hid_installed_profile_matches()
+ * 复核，因此不会因为残留标志走进错误路径。
+ */
+static bool s_profile_reuse_pending;
+static uint32_t s_profile_reuse_hits;
 /* 鼠标侧对电脑侧本次 Profile 申请的受理状态（按 flow ID 去重）。 */
 static uint32_t s_peer_request_flow_id;
 static uint32_t s_peer_request_generation;
@@ -257,9 +265,13 @@ static void on_link_frame(const dual_frame_t *frame)
             const bool accepted = hid_profile_receiver_accept_frame(&s_profile_receiver, frame);
             if (frame->type == DUAL_MESSAGE_PROFILE_COMMIT &&
                 accepted && s_profile_receiver.last_commit_was_duplicate) {
-                /* 同一 transfer 的重放（M 丢失了最终确认）：只补发两个确认，
-                 * 不重新安装 USB、不重新枚举电脑侧设备。 */
+                /* 同一 transfer 的重放只补发数据接收确认；只有 USB 确实挂载
+                 * 才能补发最终成功，安装中绝不能把已发布 Profile 当成已挂载。 */
                 const uint32_t transfer_id = read_u32_le(&frame->payload[0]);
+                const link_profile_replay_result_t profile_result =
+                    dual_pc_hid_profile_result(
+                        s_profile_receiver.published_transfer_id,
+                        s_profile_receiver.published_crc32);
                 s_profile_started_us = 0;
                 s_profile_schedule_ok = true;
                 ++s_duplicate_commit_replays;
@@ -267,18 +279,21 @@ static void on_link_frame(const dual_frame_t *frame)
                         transfer_id, DUAL_FLOW_STATUS_ACCEPTED) != ESP_OK) {
                     dual_status_led_set_flow_error(true);
                 }
-                const esp_err_t replay_ack = dual_uart1_send_profile_ack_for_generation(
-                    s_profile_receiver.published_transfer_id,
-                    s_profile_receiver.published_crc32, 0U,
-                    dual_uart1_peer_generation());
-                if (replay_ack != ESP_OK) {
-                    dual_status_led_set_flow_error(true);
-                    ESP_LOGW(TAG, "重复COMMIT的最终确认无法排队：%s",
-                             esp_err_to_name(replay_ack));
+                if (profile_result != LINK_PROFILE_REPLAY_PENDING) {
+                    const esp_err_t replay_ack = dual_uart1_send_profile_ack_for_generation(
+                        s_profile_receiver.published_transfer_id,
+                        s_profile_receiver.published_crc32,
+                        profile_result == LINK_PROFILE_REPLAY_MOUNTED ? 0U : 1U,
+                        dual_uart1_peer_generation());
+                    if (replay_ack != ESP_OK) {
+                        dual_status_led_set_flow_error(true);
+                        ESP_LOGW(TAG, "重复COMMIT的最终确认无法排队：%s",
+                                 esp_err_to_name(replay_ack));
+                    }
                 }
-                ESP_LOGW(TAG, "收到重复COMMIT：仅补发确认，不重新枚举USB；"
+                ESP_LOGW(TAG, "收到重复COMMIT：安装结果=%u，仅补发已有确认；"
                          "transfer=%" PRIu32 " replays=%" PRIu32,
-                         transfer_id, s_duplicate_commit_replays);
+                         (unsigned)profile_result, transfer_id, s_duplicate_commit_replays);
                 return;
             }
             if (frame->type == DUAL_MESSAGE_PROFILE_COMMIT &&
@@ -375,8 +390,12 @@ static void on_link_frame(const dual_frame_t *frame)
             }
             /* M 发起的新克隆先撤掉旧设备，再确认接收。Profile 的最终
              * 成败仍由安装挂载后的 PROFILE_ACK 报告。
-             * 注意：不做“同 Profile 就沿用”的优化——产品要求无论 Profile 是否
-             * 相同都必须完整走一次卸载 + 重装，因此这里始终排清理屏障。 */
+             * 例外（2026-09-28 用户决策）：本次 Profile 的 CRC32 与本机当前
+             * 已挂载克隆完全一致时**复用**它——不卸载、不重装。实测省时间的
+             * 正是这一步（卸载→安装→Windows 重新枚举 609~962 ms，尾部 2.7 s），
+             * 而板间数据段只有 12~30 ms。判定条件全部在纯函数
+             * link_profile_reuse_allowed() 里，任一条不成立就退回完整路径。 */
+            const bool reuse_ok = dual_pc_hid_installed_profile_matches(crc32);
             hid_profile_receiver_init(&s_profile_receiver, on_profile_published,
                                       &s_profile_receiver);
             s_profile_started_us = 0;
@@ -387,6 +406,26 @@ static void on_link_frame(const dual_frame_t *frame)
             s_profile_offer_transfer_id = transfer_id;
             s_profile_offer_crc32 = crc32;
             s_profile_offer_valid = true;
+            s_profile_reuse_pending = reuse_ok;
+            if (reuse_ok) {
+                /* 复用路径没有清理屏障要等，直接确认提议让 M 送完这一小段数据。 */
+                const esp_err_t reuse_ack = dual_uart1_send_flow_ack(
+                    DUAL_MESSAGE_PROFILE_OFFER, flow_id, DUAL_FLOW_STATUS_ACCEPTED);
+                if (reuse_ack == ESP_OK) {
+                    ++s_profile_reuse_hits;
+                    ESP_LOGW(TAG, "Profile CRC 命中：本机已挂载同一份Profile，"
+                             "跳过卸载+重装；flow=%" PRIu32 " transfer=%" PRIu32
+                             " crc=%08" PRIX32 " hits=%" PRIu32,
+                             flow_id, transfer_id, crc32, s_profile_reuse_hits);
+                    return;
+                }
+                /* 确认排不上队（队列拥塞）：作废复用意图，落到下面的完整清理路径，
+                 * 由它在清理完成后按既有重试策略补发同一条确认。 */
+                s_profile_reuse_pending = false;
+                dual_status_led_set_flow_error(true);
+                ESP_LOGW(TAG, "Profile复用的提议确认无法排队(%s)：退回完整卸载+重装路径",
+                         esp_err_to_name(reuse_ack));
+            }
             const esp_err_t result = dual_pc_hid_schedule_disconnect(
                 offer_generation, 0U,
                 DUAL_MESSAGE_PROFILE_OFFER, flow_id);
@@ -554,10 +593,30 @@ static void on_profile_published(const hid_device_profile_t *profile, void *cont
              profile != NULL && profile->serial.length != 0 ? "yes" : "no",
              profile != NULL ? profile->report_descriptor_count : 0,
              profile != NULL ? profile->flags : 0);
-    const esp_err_t result = dual_pc_hid_schedule_reconfigure(
-        profile,
-        receiver != NULL ? receiver->published_transfer_id : 0U,
-        receiver != NULL ? receiver->published_crc32 : 0U);
+    const uint32_t transfer_id = receiver != NULL ? receiver->published_transfer_id : 0U;
+    const uint32_t crc32 = receiver != NULL ? receiver->published_crc32 : 0U;
+    /* 初值故意取失败值：只有复用真正完成才跳过下面的完整安装路径。 */
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    if (s_profile_reuse_pending) {
+        s_profile_reuse_pending = false;
+        /*
+         * 复用路径（2026-09-28）：Profile 与已挂载克隆完全一致 → 不卸载、不重装。
+         * 这里复核一次，避免 OFFER 与 COMMIT 之间克隆被卸载/换掉的竞态；
+         * 复核不通过时自动退回下面的完整路径。
+         */
+        if (dual_pc_hid_installed_profile_matches(crc32)) {
+            result = dual_pc_hid_reuse_installed_profile(transfer_id, crc32);
+            if (result != ESP_OK) {
+                ESP_LOGW(TAG, "Profile复用复核未通过（%s）：退回完整卸载+重装",
+                         esp_err_to_name(result));
+            }
+        } else {
+            ESP_LOGW(TAG, "Profile复用复核未通过（克隆已变化）：退回完整卸载+重装");
+        }
+    }
+    if (result != ESP_OK) {
+        result = dual_pc_hid_schedule_reconfigure(profile, transfer_id, crc32);
+    }
     s_profile_started_us = 0;
     s_profile_schedule_ok = result == ESP_OK;
     if (result != ESP_OK) {

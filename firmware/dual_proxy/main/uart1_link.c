@@ -914,6 +914,7 @@ static bool accept_peer_frame(const dual_frame_t *frame)
         bool accepted = false;
         bool stale_session = false;
         bool repeated = false;
+        bool success_after_failure = false;
         const int64_t now_us = esp_timer_get_time();
         taskENTER_CRITICAL(&s_profile_mux);
         matched = link_profile_ack_is_for_session(
@@ -921,10 +922,13 @@ static bool accept_peer_frame(const dual_frame_t *frame)
             s_peer_generation_initialized, s_peer_generation,
             transfer_id, crc32, s_profile_transfer_id, s_profile_crc32);
         /* 重复到达的同一确认只刷新 LED，不再重复更新状态或打印。 */
-        repeated = matched && s_commit_flow.state == LINK_FLOW_ACCEPTED;
+        /* 同一事务晚到的 NACK 必须能撤销先前的成功状态；仅成功 ACK 去重。 */
+        repeated = matched && s_commit_flow.state == LINK_FLOW_ACCEPTED && status == 0U;
+        /* 已收到终态 NACK 后，迟到的旧成功确认不能重新点亮 HID_CONNECTED。 */
+        success_after_failure = matched && s_commit_flow.state == LINK_FLOW_FAILED && status == 0U;
         stale_session = !matched && transfer_id == s_profile_transfer_id &&
             s_profile_transfer_id != 0U;
-        if (matched && !repeated) {
+        if (matched && !repeated && !success_after_failure) {
             accepted = status == 0U;
             if (accepted) {
                 (void)link_flow_ack(&s_commit_flow, true);
@@ -946,7 +950,7 @@ static bool accept_peer_frame(const dual_frame_t *frame)
             }
         }
         taskEXIT_CRITICAL(&s_profile_mux);
-        if (matched && !repeated) {
+        if (matched && !repeated && !success_after_failure) {
             dual_status_led_set_flow_error(!accepted);
             if (link_profile_ack_updates_hid_state(true, accepted)) {
                 /* M 侧只有绑定当前活动传输的成功确认才能推进 HID 状态。 */
@@ -955,6 +959,7 @@ static bool accept_peer_frame(const dual_frame_t *frame)
                          " conn=%" PRIu32 "；本端HID状态更新为已连接",
                          "ACK", transfer_id, crc32, s_mouse_connection_id);
             } else {
+                dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
                 ESP_LOGE(TAG, "收到Profile NACK：transfer=%" PRIu32 " crc=%08" PRIX32
                          " status=%u；终止本轮克隆", transfer_id, crc32, (unsigned)status);
             }
@@ -1486,7 +1491,7 @@ static bool profile_stream_send_one(void)
         link_flow_start(&s_commit_flow, DUAL_MESSAGE_PROFILE_COMMIT, transfer_id,
                         commit_us, LINK_COMMIT_MAX_ATTEMPTS,
                         LINK_COMMIT_RETRY_INTERVAL_US,
-                        recovery_stage_timeout(commit_us, LINK_FLOW_ACK_TIMEOUT_US));
+                        recovery_stage_timeout(commit_us, LINK_COMMIT_STAGE_TIMEOUT_US));
         s_commit_flow.peer_generation = s_peer_generation;
         s_profile_commit_receipt_seen = false;
         link_flow_mark_sent(&s_commit_flow, commit_us);
@@ -2843,6 +2848,9 @@ esp_err_t dual_uart1_queue_profile(
         s_mouse_connection_id = 1U;
     }
     const int64_t queue_us = esp_timer_get_time();
+    /* 鼠标可能在 P 的请求后数小时才接入；新采集是新的恢复触发点。
+     * 同一 transfer 的 COMMIT 重放不经过这里，因此不会无限延长预算。 */
+    recovery_note_trigger(queue_us);
     link_flow_start(&s_offer_flow, DUAL_MESSAGE_PROFILE_OFFER, next_flow_id(),
                     queue_us, LINK_FLOW_MAX_ATTEMPTS, LINK_FLOW_RETRY_INTERVAL_US,
                     recovery_stage_timeout(queue_us, LINK_FLOW_ACK_TIMEOUT_US));

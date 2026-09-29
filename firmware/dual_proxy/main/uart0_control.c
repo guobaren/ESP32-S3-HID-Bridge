@@ -531,6 +531,19 @@ static void on_control_frame(const dual_frame_t *frame, void *context)
                  ok ? "已投入物理RX路径" : "失败（无活动鼠标接口或长度非法）");
         return;
     }
+    if (frame->type == DUAL_MESSAGE_DIAG_PROFILE_REFRESH_REQUEST) {
+        /*
+         * 强制重新采集并重新提议（2026-09-28）：用于按需复现恢复流程里的
+         * "M 重新提议 → P 复用/重装" 一段。只在鼠标侧板有意义。
+         */
+        const bool present = dual_hid_host_mouse_present();
+        const esp_err_t refresh = (s_role == DUAL_ROLE_MOUSE_HOST && present)
+            ? dual_hid_host_request_profile_refresh() : ESP_ERR_INVALID_STATE;
+        ESP_LOGI(TAG, "强制Profile重采集：role=%u mouse_present=%u → %s",
+                 (unsigned)s_role, present ? 1U : 0U, esp_err_to_name(refresh));
+        send_injection_result(frame, refresh == ESP_OK ? 0U : 1U);
+        return;
+    }
     if (frame->type == DUAL_MESSAGE_DIAG_STREAM_CONTROL) {
         if (frame->payload_length == 1U && frame->payload[0] <= 1U) {
             dual_diag_stream_set_enabled(frame->payload[0] != 0U);
@@ -613,11 +626,17 @@ static void control_task(void *argument)
         if (xTaskGetTickCount() - last_statistics >= pdMS_TO_TICKS(1000)) {
             const uint64_t mouse_reports_window =
                 s_state.mouse_reports - s_state.last_mouse_reports;
-            ESP_LOGI(TAG, "UART0协议统计：接收=%" PRIu64 " MouseReport=%" PRIu64
-                     " MouseReportHz=%" PRIu64
-                     " 接受=%" PRIu64 " 拒绝=%" PRIu64 " 序号不连续=%" PRIu64,
-                     s_state.received, s_state.mouse_reports, mouse_reports_window,
-                     s_state.accepted, s_state.rejected, s_state.discontinuities);
+            /*
+             * 本周期没有鼠标报告就不打印（2026-09-28）：空闲时这条统计每秒刷一行没有信息量。
+             * 注意计数器与时间戳仍要无条件推进，否则窗口增量会越算越错。
+             */
+            if (mouse_reports_window > 0U) {
+                ESP_LOGI(TAG, "UART0协议统计：接收=%" PRIu64 " MouseReport=%" PRIu64
+                         " MouseReportHz=%" PRIu64
+                         " 接受=%" PRIu64 " 拒绝=%" PRIu64 " 序号不连续=%" PRIu64,
+                         s_state.received, s_state.mouse_reports, mouse_reports_window,
+                         s_state.accepted, s_state.rejected, s_state.discontinuities);
+            }
             s_state.last_mouse_reports = s_state.mouse_reports;
             last_statistics = xTaskGetTickCount();
         }

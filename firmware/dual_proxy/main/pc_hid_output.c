@@ -308,6 +308,10 @@ static uint32_t s_reconfigure_cleanup_retries;
 static uint32_t s_reconfigure_ack_retries;
 static uint32_t s_reconfigure_installed_transfer_id;
 static uint32_t s_reconfigure_installed_crc32;
+static uint32_t s_reconfigure_failed_transfer_id;
+static uint32_t s_reconfigure_failed_crc32;
+/* Profile CRC 命中并复用已挂载克隆的次数（跳过卸载+重装）。 */
+static uint32_t s_profile_reused;
 /* 同一 (type, flow) 的“已完成重复请求”只打印一次，避免刷屏。 */
 static uint8_t s_reconfigure_dup_logged_type;
 static uint32_t s_reconfigure_dup_logged_flow_id;
@@ -1754,7 +1758,8 @@ static void log_hid_statistics_if_due(void)
                   " motion_q_peak=%" PRIu32 " motion_lat_peak_us=%" PRId64
                    " cleanup_retry=%" PRIu32 " ack_retry=%" PRIu32
                    " motion_fwd_dx=%lld motion_fwd_dy=%lld"
-                   " motion_fwd_ok=%" PRIu32 " motion_fwd_skip=%" PRIu32,
+                   " motion_fwd_ok=%" PRIu32 " motion_fwd_skip=%" PRIu32
+                   " profile_reused=%" PRIu32,
                  timer_hz, physical_rx_hz, submitted_hz, completion_hz,
                  s_hid_timer_ticks, s_hid_not_mounted, s_hid_not_ready,
                   s_hid_attempts, s_hid_submitted, s_hid_submit_failures,
@@ -1780,7 +1785,8 @@ static void log_hid_statistics_if_due(void)
                   (long long)__atomic_load_n(&s_motion_fwd_dx, __ATOMIC_RELAXED),
                   (long long)__atomic_load_n(&s_motion_fwd_dy, __ATOMIC_RELAXED),
                   (uint32_t)__atomic_load_n(&s_motion_fwd_ok, __ATOMIC_RELAXED),
-                  (uint32_t)__atomic_load_n(&s_motion_fwd_skip, __ATOMIC_RELAXED));
+                  (uint32_t)__atomic_load_n(&s_motion_fwd_skip, __ATOMIC_RELAXED),
+                  s_profile_reused);
         log_queue_metrics("pc_vendor_input", &s_vendor_input_queue_metrics);
         log_queue_metrics("pc_motion_input", &s_motion_input_queue_metrics);
         log_queue_metrics("pc_vendor_control", &s_vendor_control_queue_metrics);
@@ -2056,6 +2062,54 @@ esp_err_t dual_pc_hid_prepare_for_profile(void){
     return result;
 }
 
+static esp_err_t install_profile_attempt(uint32_t operation_epoch, uint8_t attempt)
+{
+    esp_err_t result = stop_installed_usb();
+    if (result == ESP_OK && reconfigure_epoch_is_current(operation_epoch)) {
+        ESP_LOGI(TAG, "旧Profile、描述符、鼠标报告模板及厂商HID会话已清空；准备安装新Profile");
+        vTaskDelay(pdMS_TO_TICKS(300));
+        if (!reconfigure_epoch_is_current(operation_epoch)) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (!prepare_clone_descriptor_set(&s_reconfigure_work_profile)) {
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    if (result == ESP_OK && reconfigure_epoch_is_current(operation_epoch)) {
+        memcpy(&s_active_profile, &s_reconfigure_work_profile,
+               sizeof(s_active_profile));
+        s_clone_active = true;
+        s_clone_mount_us = esp_timer_get_time();
+        result = install_tinyusb(true);
+        if (result == ESP_OK) {
+            result = restart_runtime_after_install();
+        }
+    }
+    int64_t wait_ms = 0;
+    if (result == ESP_OK) {
+        const int64_t wait_start_us = esp_timer_get_time();
+        const TickType_t mount_deadline =
+            xTaskGetTickCount() + pdMS_TO_TICKS(3000);
+        while (!tud_mounted() && xTaskGetTickCount() < mount_deadline &&
+               reconfigure_epoch_is_current(operation_epoch)) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        wait_ms = (esp_timer_get_time() - wait_start_us) / 1000;
+        if (!tud_mounted()) {
+            result = ESP_ERR_TIMEOUT;
+        }
+    }
+    ESP_LOGW(TAG, "USB克隆安装尝试：transfer=%" PRIu32 " epoch=%" PRIu32
+             " attempt=%u result=%s wait_ms=%" PRId64 " attached=%u mounted=%u",
+             s_work_transfer_id, operation_epoch, (unsigned)attempt,
+             esp_err_to_name(result), wait_ms,
+             (unsigned)s_pc_usb_attached, (unsigned)tud_mounted());
+    if (!reconfigure_epoch_is_current(operation_epoch)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return result;
+}
+
 static void reconfigure_task(void *argument)
 {
     (void)argument;
@@ -2230,74 +2284,58 @@ static void reconfigure_task(void *argument)
             }
             dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
             s_usb_reconfigure_in_progress = true;
-            esp_err_t result = stop_installed_usb();
-            if (result == ESP_OK && reconfigure_epoch_is_current(operation_epoch)) {
-                ESP_LOGI(TAG, "旧Profile、描述符、鼠标报告模板及厂商HID会话已清空；准备安装新Profile");
-                vTaskDelay(pdMS_TO_TICKS(300));
-                if (!reconfigure_epoch_is_current(operation_epoch)) {
-                    continue;
+            esp_err_t result = ESP_ERR_INVALID_STATE;
+            for (uint8_t attempt = 1U;
+                 attempt <= LINK_PROFILE_MOUNT_MAX_ATTEMPTS; ++attempt) {
+                result = install_profile_attempt(operation_epoch, attempt);
+                if (!link_profile_mount_should_retry(
+                        result == ESP_ERR_TIMEOUT, attempt,
+                        reconfigure_epoch_is_current(operation_epoch))) {
+                    break;
                 }
-                if (!prepare_clone_descriptor_set(&s_reconfigure_work_profile)) {
-                    result = ESP_ERR_INVALID_RESPONSE;
-                }
+                ESP_LOGW(TAG, "USB挂载超时，保留同一Profile重试：transfer=%" PRIu32
+                         " epoch=%" PRIu32 " next_attempt=%u",
+                         s_work_transfer_id, operation_epoch, (unsigned)(attempt + 1U));
+                vTaskDelay(pdMS_TO_TICKS(200));
             }
-            if (result == ESP_OK && reconfigure_epoch_is_current(operation_epoch)) {
-                memcpy(&s_active_profile, &s_reconfigure_work_profile,
-                       sizeof(s_active_profile));
-                s_clone_active = true;
-                s_clone_mount_us = esp_timer_get_time();
-                result = install_tinyusb(true);
-                if (result == ESP_OK) {
-                    result = restart_runtime_after_install();
+            if (!reconfigure_epoch_is_current(operation_epoch)) {
+                /* DEVICE_GONE 或新会话取消了旧安装；只清理，不回旧事务 ACK。 */
+                const esp_err_t stale_cleanup = stop_installed_usb();
+                if (stale_cleanup != ESP_OK) {
+                    dual_status_led_set_flow_error(true);
+                    ESP_LOGE(TAG, "已取消旧Profile，但临时USB实例卸载失败：%s",
+                             esp_err_to_name(stale_cleanup));
+                    s_usb_reconfigure_in_progress = true;
                 }
+                continue;
             }
             if (result == ESP_OK) {
-                const TickType_t mount_deadline =
-                    xTaskGetTickCount() + pdMS_TO_TICKS(3000);
-                while (!tud_mounted() && xTaskGetTickCount() < mount_deadline &&
-                       reconfigure_epoch_is_current(operation_epoch)) {
-                    vTaskDelay(pdMS_TO_TICKS(10));
+                xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+                const bool current = dual_profile_operation_is_current(
+                    operation_epoch, s_reconfigure_epoch,
+                    s_reconfigure_disconnect_requested);
+                /* transfer=0 保留给 UART0 离线注入；没有 M 时无需板间 ACK。 */
+                const esp_err_t ack_result = !current ? ESP_ERR_INVALID_STATE :
+                    s_work_transfer_id == 0U ? ESP_OK :
+                    dual_uart1_send_profile_ack(s_work_transfer_id,
+                                                s_work_crc32, 0U);
+                if (ack_result == ESP_OK) {
+                    s_reconfigure_installed_transfer_id = s_work_transfer_id;
+                    s_reconfigure_installed_crc32 = s_work_crc32;
                 }
-                if (!reconfigure_epoch_is_current(operation_epoch)) {
-                    /* DEVICE_GONE/new peer epoch won the race.  Uninstall this
-                     * stale candidate before acknowledging any flow. */
-                    const esp_err_t stale_cleanup = stop_installed_usb();
-                    if (stale_cleanup != ESP_OK) {
-                        dual_status_led_set_flow_error(true);
-                        ESP_LOGE(TAG, "已取消旧Profile，但临时USB实例卸载失败：%s",
-                                 esp_err_to_name(stale_cleanup));
-                        s_usb_reconfigure_in_progress = true;
-                    }
-                    continue;
-                }
-                if (!tud_mounted()) {
-                    result = ESP_ERR_TIMEOUT;
+                xSemaphoreGive(s_reconfigure_mutex);
+                if (ack_result != ESP_OK) {
+                    result = ack_result;
                 } else {
                     dual_uart1_set_usb_state(DUAL_USB_STATE_HID_CONNECTED);
-                    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
-                    const bool current = dual_profile_operation_is_current(
-                        operation_epoch, s_reconfigure_epoch,
-                        s_reconfigure_disconnect_requested);
-                    /* transfer=0 保留给 UART0 离线注入；没有 M 时无需板间 ACK。 */
-                    const esp_err_t ack_result = !current ? ESP_ERR_INVALID_STATE :
-                        s_work_transfer_id == 0U ? ESP_OK :
-                        dual_uart1_send_profile_ack(s_work_transfer_id,
-                                                    s_work_crc32, 0U);
-                    xSemaphoreGive(s_reconfigure_mutex);
-                    if (ack_result != ESP_OK) {
-                        result = ack_result;
-                    } else {
-                        s_reconfigure_installed_transfer_id = s_work_transfer_id;
-                        s_reconfigure_installed_crc32 = s_work_crc32;
-                        ESP_LOGI(TAG, "%s：transfer=%" PRIu32 " crc=%08" PRIX32,
-                                 s_work_transfer_id == 0U ?
-                                     "手动Profile已配置并挂载" :
-                                     "Profile已配置并挂载，最终ACK已排队",
-                                 s_work_transfer_id, s_work_crc32);
-                        dual_status_led_set_flow_error(false);
-                        s_usb_reconfigure_guard_until_us = esp_timer_get_time() +
-                            (int64_t)USB_RECONFIGURE_EVENT_GUARD_MS * 1000LL;
-                    }
+                    ESP_LOGI(TAG, "%s：transfer=%" PRIu32 " crc=%08" PRIX32,
+                             s_work_transfer_id == 0U ?
+                                 "手动Profile已配置并挂载" :
+                                 "Profile已配置并挂载，最终ACK已排队",
+                             s_work_transfer_id, s_work_crc32);
+                    dual_status_led_set_flow_error(false);
+                    s_usb_reconfigure_guard_until_us = esp_timer_get_time() +
+                        (int64_t)USB_RECONFIGURE_EVENT_GUARD_MS * 1000LL;
                 }
             }
 
@@ -2312,16 +2350,10 @@ static void reconfigure_task(void *argument)
                 continue;
             }
 
-            if (!reconfigure_epoch_is_current(operation_epoch)) {
-                /* A disconnect barrier will own cleanup and its matching ACK. */
-                continue;
-            }
             ESP_LOGE(TAG, "动态USB克隆启动失败：%s；旧设备不回退",
                      esp_err_to_name(result));
+            dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
             dual_status_led_set_flow_error(true);
-            if (s_work_transfer_id != 0U) {
-                (void)dual_uart1_send_profile_ack(s_work_transfer_id, s_work_crc32, 1U);
-            }
             const esp_err_t failure_cleanup = stop_installed_usb();
             if (failure_cleanup == ESP_OK) {
                 s_usb_reconfigure_in_progress = false;
@@ -2329,6 +2361,18 @@ static void reconfigure_task(void *argument)
                 s_usb_reconfigure_in_progress = true;
                 ESP_LOGE(TAG, "克隆失败后的TinyUSB清理也失败：%s",
                          esp_err_to_name(failure_cleanup));
+            }
+            xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+            const bool failure_current = dual_profile_operation_is_current(
+                operation_epoch, s_reconfigure_epoch,
+                s_reconfigure_disconnect_requested);
+            if (failure_current) {
+                s_reconfigure_failed_transfer_id = s_work_transfer_id;
+                s_reconfigure_failed_crc32 = s_work_crc32;
+            }
+            xSemaphoreGive(s_reconfigure_mutex);
+            if (failure_current && s_work_transfer_id != 0U) {
+                (void)dual_uart1_send_profile_ack(s_work_transfer_id, s_work_crc32, 1U);
             }
         }
     }
@@ -2461,12 +2505,108 @@ void dual_pc_hid_enable_reconfigure(void)
     s_reconfigure_ack_retries = 0;
     s_reconfigure_installed_transfer_id = 0U;
     s_reconfigure_installed_crc32 = 0U;
+    s_reconfigure_failed_transfer_id = 0U;
+    s_reconfigure_failed_crc32 = 0U;
+    s_profile_reused = 0U;
     s_reconfigure_epoch = 1U;
     s_reconfigure_peer_generation = 0U;
     s_reconfigure_last_gone_peer_generation = 0U;
     s_reconfigure_last_gone_event_id = 0U;
     s_reconfigure_last_offer_peer_generation = 0U;
     s_reconfigure_last_offer_flow_id = 0U;
+}
+
+/*
+ * Profile CRC 复用判定（2026-09-28）：本轮 OFFER 的 CRC32 与"已安装 Profile"一致、
+ * 且克隆确实挂载、没有在途操作时返回 true。判定本身是纯函数
+ * link_profile_reuse_allowed()（link_recovery_logic.h），并有纯逻辑回归覆盖。
+ * 只读、无副作用：调用方据此决定 OFFER 阶段是否排清理屏障。
+ */
+link_profile_replay_result_t dual_pc_hid_profile_result(uint32_t transfer_id, uint32_t crc32)
+{
+    if (s_reconfigure_mutex == NULL || transfer_id == 0U) {
+        return LINK_PROFILE_REPLAY_PENDING;
+    }
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    const link_profile_replay_result_t result = link_profile_replay_result(
+        transfer_id, crc32,
+        s_reconfigure_installed_transfer_id, s_reconfigure_installed_crc32,
+        s_reconfigure_failed_transfer_id, s_reconfigure_failed_crc32,
+        s_clone_active, s_installed, tud_mounted(),
+        s_usb_reconfigure_in_progress || s_reconfigure_disconnect_requested);
+    xSemaphoreGive(s_reconfigure_mutex);
+    return result;
+}
+
+bool dual_pc_hid_installed_profile_matches(uint32_t crc32)
+{
+    if (s_reconfigure_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    const bool reusable = link_profile_reuse_allowed(
+        s_reconfigure_enabled, s_clone_active, tud_mounted(),
+        s_usb_reconfigure_in_progress, s_reconfigure_profile_pending,
+        s_reconfigure_disconnect_requested, s_reconfigure_disconnect_failed,
+        crc32, s_reconfigure_installed_crc32);
+    xSemaphoreGive(s_reconfigure_mutex);
+    return reusable;
+}
+
+/*
+ * 执行复用：不卸载、不安装、不重枚举，只把本次 clone 会话的 transfer id 登记进来，
+ * 作废旧厂商会话、释放按键与按钮，然后立即回最终确认。
+ * 返回 ESP_OK 表示"复用已完成"；ESP_ERR_INVALID_STATE 表示复核时前提已不成立，
+ * 调用方必须退回完整路径（卸载 + 重装）。
+ */
+esp_err_t dual_pc_hid_reuse_installed_profile(uint32_t transfer_id, uint32_t crc32)
+{
+    if (s_reconfigure_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    const bool reusable = link_profile_reuse_allowed(
+        s_reconfigure_enabled, s_clone_active, tud_mounted(),
+        s_usb_reconfigure_in_progress, s_reconfigure_profile_pending,
+        s_reconfigure_disconnect_requested, s_reconfigure_disconnect_failed,
+        crc32, s_reconfigure_installed_crc32);
+    if (!reusable) {
+        xSemaphoreGive(s_reconfigure_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_reconfigure_installed_transfer_id = transfer_id;
+    s_reconfigure_failed_transfer_id = 0U;
+    s_reconfigure_failed_crc32 = 0U;
+    xSemaphoreGive(s_reconfigure_mutex);
+
+    /*
+     * 物理设备刚经历过复位/重枚举：旧 HID++ 会话一律作废；克隆保持在位，
+     * 因此必须显式释放按键与按钮，否则目标机会一直认为键还按着（输入安全硬要求）。
+     */
+    dual_pc_hid_vendor_link_fault();
+    dual_pc_hid_release_all();
+    dual_uart1_set_usb_state(DUAL_USB_STATE_HID_CONNECTED);
+
+    /* transfer=0 保留给 UART0 离线注入；没有 M 时无需板间 ACK。 */
+    const esp_err_t ack_result = transfer_id == 0U ? ESP_OK :
+        dual_uart1_send_profile_ack(transfer_id, crc32, 0U);
+    if (ack_result != ESP_OK) {
+        /*
+         * 最终确认没排上队不改动克隆：M 侧的 COMMIT 重放（1 秒后）会走
+         * "重复 COMMIT"分支，用接收器里的 published transfer/crc 补发同一条确认。
+         */
+        dual_status_led_set_flow_error(true);
+        ESP_LOGW(TAG, "Profile 复用的最终确认入队失败(%s)：保持已挂载克隆，"
+                 "等 M 侧重放 COMMIT 补发；transfer=%" PRIu32,
+                 esp_err_to_name(ack_result), transfer_id);
+        return ESP_OK;
+    }
+    ++s_profile_reused;
+    ESP_LOGW(TAG, "Profile CRC 命中：跳过卸载+重装，沿用已挂载克隆；"
+             "transfer=%" PRIu32 " crc=%08" PRIX32 " reused=%" PRIu32,
+             transfer_id, crc32, s_profile_reused);
+    dual_status_led_set_flow_error(false);
+    return ESP_OK;
 }
 
 esp_err_t dual_pc_hid_schedule_reconfigure(
@@ -2486,6 +2626,8 @@ esp_err_t dual_pc_hid_schedule_reconfigure(
     memcpy(&s_reconfigure_profile, profile, sizeof(s_reconfigure_profile));
     s_reconfigure_transfer_id = transfer_id;
     s_reconfigure_crc32 = crc32;
+    s_reconfigure_failed_transfer_id = 0U;
+    s_reconfigure_failed_crc32 = 0U;
     s_reconfigure_profile_epoch = operation_epoch;
     s_reconfigure_profile_pending = true;
     xSemaphoreGive(s_reconfigure_mutex);

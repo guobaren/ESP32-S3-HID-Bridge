@@ -58,6 +58,8 @@ TYPE_DIAG_STREAM_EVENT = 0x15
 TYPE_DIAG_STREAM_STATUS = 0x16
 TYPE_DIAG_INJECT_REQUEST = 0x17
 TYPE_DIAG_INJECT_RESULT = 0x18
+# 强制重新采集并重新提议克隆（2026-09-28）：顶层 UART0 诊断命令，只在 M 板有意义。
+TYPE_DIAG_PROFILE_REFRESH_REQUEST = 0x1C
 
 FRAME_NAMES = {
     TYPE_DEVICE_PROBE: "DEVICE_PROBE",
@@ -1478,6 +1480,9 @@ def make_arg_parser() -> argparse.ArgumentParser:
                         help="经 M UART0 注入一次无按键相对移动，并实时观察 M/P 通路")
     parser.add_argument("--inject-frame", nargs=3, metavar=("ROUTE", "TYPE", "PAYLOAD_HEX"),
                         help="显式注入已支持的载荷；ROUTE=p 表示送入 P 的虚拟 USB 输入，m 表示送入 M 的物理鼠标控制队列")
+    parser.add_argument("--force-profile-refresh", action="store_true",
+                        help="让已识别的 MOUSE_HOST 重新采集 Profile 并重新提议克隆"
+                             "（按需复现恢复流程里的「M 重新提议 → P 复用/重装」一段）")
     parser.add_argument("--outdir", type=Path, default=Path("artifacts/tests/dual-uart-inspect"))
     parser.add_argument("--tag", default="", help="采集文件名后缀")
     parser.add_argument("--status-interval", type=float, default=1.0,
@@ -1500,7 +1505,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--bootstrap-tail-bytes 不能为负")
     actions = (bool(args.save_profile), bool(args.inject_profile),
                bool(args.restore_auto_profile), args.inject_move is not None,
-               args.inject_frame is not None)
+               args.inject_frame is not None, bool(args.force_profile_refresh))
     if sum(actions) > 1:
         parser.error("Profile 备份、写入、恢复自动模式和移动探针一次只能执行一种")
     try:
@@ -1592,6 +1597,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             stages = run_move_probe(sessions, action_session, move_payload)
             action_session.action_info = {"kind": "move_probe", "payload_hex": move_payload.hex(),
                                           "observed_stages": stages}
+        elif args.force_profile_refresh:
+            candidates = [s for s in sessions if s.status.role_verified and s.status.role == 2]
+            if len(candidates) != 1:
+                raise RuntimeError("--force-profile-refresh 需要且只需要一个已识别的 MOUSE_HOST UART0")
+            action_session = candidates[0]
+            sequence = action_session.send_frame(TYPE_DIAG_PROFILE_REFRESH_REQUEST, b"\x00")
+            response = wait_for_frame(sessions, action_session, sequence,
+                                      (TYPE_DIAG_PROFILE_RESULT,), args.request_timeout)
+            if response is None or len(response.payload) != 1:
+                raise RuntimeError("强制Profile重采集的结果超时或格式无效")
+            action_session.action_info = {"kind": "force_profile_refresh",
+                                          "dispatch_status": response.payload[0]}
+            if response.payload[0] != 0:
+                raise RuntimeError(f"固件拒绝强制重采集：status={response.payload[0]}")
+            print("[重采集] 固件已受理：M 将重新采集 Profile 并重新提议克隆。")
         elif injected_frame is not None:
             route, frame_type, frame_data = injected_frame
             role = 1 if route == 1 else 2

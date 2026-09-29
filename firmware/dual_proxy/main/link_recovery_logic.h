@@ -14,8 +14,8 @@
 
 #include "bridge_protocol.h"
 
-/* 端到端恢复上限：从触发条件成立起 10 秒内没恢复即判失败。 */
-#define LINK_RECOVERY_BUDGET_US 10000000LL
+/* 新 Profile 的恢复预算须覆盖 P 侧两次最长 3 秒的 USB 挂载尝试。 */
+#define LINK_RECOVERY_BUDGET_US 14000000LL
 /* 单个事务阶段的期望等待窗口；实际等待会被剩余总预算裁剪。 */
 #define LINK_PROFILE_STAGE_TIMEOUT_US 5000000LL
 
@@ -27,12 +27,47 @@
 #define LINK_GONE_RETRY_INTERVAL_US 700000LL
 #define LINK_GONE_STAGE_TIMEOUT_US 5000000LL
 /* COMMIT 发出后等待“数据接收确认 + 最终挂载结果”的事务参数。 */
-#define LINK_COMMIT_MAX_ATTEMPTS 5U
+#define LINK_COMMIT_MAX_ATTEMPTS 10U
 #define LINK_COMMIT_RETRY_INTERVAL_US 1000000LL
+#define LINK_COMMIT_STAGE_TIMEOUT_US 8000000LL
+#define LINK_PROFILE_MOUNT_MAX_ATTEMPTS 2U
+
+static inline bool link_profile_mount_should_retry(
+    bool timed_out, uint8_t attempt, bool epoch_current)
+{
+    return timed_out && epoch_current && attempt > 0U &&
+        attempt < LINK_PROFILE_MOUNT_MAX_ATTEMPTS;
+}
 /* 电脑侧本地清理失败后的重试次数（同一事务、同一 generation）。 */
 #define LINK_CLEANUP_MAX_ATTEMPTS 3U
 /* 清理已成功、只有确认帧入队失败时的补发次数。 */
 #define LINK_ACK_ENQUEUE_MAX_ATTEMPTS 3U
+
+typedef enum {
+    LINK_PROFILE_REPLAY_PENDING = 0,
+    LINK_PROFILE_REPLAY_MOUNTED,
+    LINK_PROFILE_REPLAY_FAILED,
+} link_profile_replay_result_t;
+
+/* COMMIT 的数据发布不是 USB 挂载；重复帧只可回放真实的最终结果。 */
+static inline link_profile_replay_result_t link_profile_replay_result(
+    uint32_t transfer_id, uint32_t crc32,
+    uint32_t installed_transfer_id, uint32_t installed_crc32,
+    uint32_t failed_transfer_id, uint32_t failed_crc32,
+    bool clone_active, bool installed, bool mounted, bool reconfiguring)
+{
+    if (transfer_id == 0U) {
+        return LINK_PROFILE_REPLAY_PENDING;
+    }
+    if (installed_transfer_id == transfer_id && installed_crc32 == crc32 &&
+        clone_active && installed && mounted && !reconfiguring) {
+        return LINK_PROFILE_REPLAY_MOUNTED;
+    }
+    if (failed_transfer_id == transfer_id && failed_crc32 == crc32) {
+        return LINK_PROFILE_REPLAY_FAILED;
+    }
+    return LINK_PROFILE_REPLAY_PENDING;
+}
 
 typedef enum {
     LINK_FLOW_IDLE = 0,
@@ -383,6 +418,39 @@ static inline bool link_cleanup_result_is_accepted(link_failure_cause_t cause)
 static inline bool link_profile_ack_updates_hid_state(bool matched, bool accepted)
 {
     return matched && accepted;
+}
+
+/*
+ * Profile CRC 复用判定（2026-09-28，纯逻辑）。
+ *
+ * 背景（实测，见 docs/交接.md Next Steps 第 0 条）：板间 Profile 数据段只有 12~30 ms，
+ * 而 P 侧"卸载 → 安装 → Windows 重新枚举"要 609~962 ms（典型）、尾部 2.7 s。
+ * 因此真正省时间的一步是**跳过卸载+重装**，而不是跳过数据。
+ *
+ * 只有下列条件全部成立才允许复用当前已挂载的克隆：
+ *   - 重配置通道已启用，且克隆处于活动 + 真正挂载状态；
+ *   - 没有在途的卸载请求、卸载失败、安装请求或安装任务；
+ *   - 本次提议的 CRC32 与"已安装 Profile"的 CRC32 完全一致且非 0。
+ * 任何一条不成立都必须退回完整路径（卸载 + 重装），宁可慢也不把陈旧克隆留给接收端。
+ * CRC32 为 0 专门表示"当前没有已安装 Profile"或离线注入（transfer=0），一律不复用。
+ */
+static inline bool link_profile_reuse_allowed(
+    bool reconfigure_enabled,
+    bool clone_active,
+    bool usb_mounted,
+    bool operation_in_progress,
+    bool profile_pending,
+    bool disconnect_requested,
+    bool disconnect_failed,
+    uint32_t offered_crc32,
+    uint32_t installed_crc32)
+{
+    if (!reconfigure_enabled || !clone_active || !usb_mounted ||
+        operation_in_progress || profile_pending ||
+        disconnect_requested || disconnect_failed) {
+        return false;
+    }
+    return offered_crc32 != 0U && offered_crc32 == installed_crc32;
 }
 
 typedef struct {

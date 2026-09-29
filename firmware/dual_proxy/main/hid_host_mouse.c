@@ -128,6 +128,9 @@ typedef struct {
     uint8_t report_id;
     uint8_t length;
     bool mouse_report;
+    bool has_report_id;
+    uint8_t mouse_report_id;
+    hid_mouse_report_layout_t mouse_layout;
     bool stop;
     uint8_t data[HID_RAW_REPORT_MAX];
 } raw_report_event_t;
@@ -779,29 +782,36 @@ static uint8_t s_last_button_byte;
 /* 滚轮字节偏移（相对报表正文，不含 report ID）；0xFF 表示未知。 */
 static volatile uint8_t s_wheel_byte_offset = 0xFFU;
 static volatile uint32_t s_wheel_reports;
-/* 控制传输重试与自愈：详见 request_hid_device_recovery() 的说明。 */
+/* 控制传输重试与异常记录。 */
 #define VENDOR_CONTROL_RETRIES 2U
 #define VENDOR_CONTROL_RETRY_DELAY_MS 3U
+#define HID_GET_REPORT_TIMEOUT_MS 100U /* 两次尝试合计不超过 P 侧 250 ms 等待 */
 #define HID_RECOVER_FAIL_STREAK 5U
 static volatile uint32_t s_vendor_control_retries;
 static volatile uint32_t s_ctrl_fail_streak;
 /* 直连通道连续失败计数（与组件路径分开统计）。 */
 static volatile uint32_t s_vendor_urb_fail_streak;
-/*
- * "设备数据冻结 + 控制传输失败"判据（2026-09-27 新增，针对 ESP-IDF issue #14996）：
- * 挂死的特征不是"连续 N 次超时"，而是设备**整体不再产生数据**的同时 EP0 也不回。
- * 靠连续超时要凑 3 批、白等约 9 秒（现场实测：首次超时→触发耗时 9055 ms）；
- * 这里改用时间窗判据，触发后端口断电重枚举，实测从触发到输入恢复约 1.85 秒。
- * 判据三重保险，避免"用户没在用鼠标"被误判：
- *   ① 已有 ≥1 秒没收到任何 HID 输入报告（2026-09-27 按用户要求由 2 秒收紧到 1 秒：
- *      1 kHz 鼠标下 1 秒已是 1000 个报告周期，足够判定"数据停了"）；
- *   ② 该窗口内出现过控制传输失败，且失败晚于最后一次报告；
- *   ③ 失败之后没有成功的控制传输（设备真的不回，而不是偶尔慢）。
- */
+/* 控制连续失败时核对物理鼠标输入；停滞只释放按钮，不断电。 */
 #define STALL_REPORT_FREEZE_US     (1 * 1000 * 1000LL)   /* 多久没报告算"数据冻结" */
 #define STALL_CTRL_FAIL_FRESH_US   (3 * 1000 * 1000LL)   /* 控制失败的新鲜度窗口 */
 #define STALL_RECOVERY_COOLDOWN_US (30 * 1000 * 1000LL)  /* 两次冻结恢复的最小间隔 */
-static volatile int64_t s_last_report_us;      /* 最近一次收到 HID 输入报告 */
+/* 自动恢复只记录故障并释放卡住的按钮；不重挂接口或切断物理鼠标供电。 */
+#define USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY 0
+/* 两次心跳失败只标记控制通道异常，不能据此推断输入端点已停。 */
+#define STALL_PROBE_FAIL_LIMIT     2U
+static volatile uint32_t s_probe_fail_streak;
+/*
+ * USB 心跳探测（2026-09-28，用户要求 0.5 秒一次）：主动向设备发一笔最轻量的标准请求，
+ * 成败直接喂给 s_last_ctrl_ok_us / s_last_ctrl_fail_us，于是上面这套"数据冻结判据"
+ * 不必再等外部软件碰巧发控制请求。
+ * 起因：现场实测 13:58 那次冻结期间**没有任何控制请求发出**，判据白等了 42 秒才成立。
+ */
+#define USB_HEARTBEAT_PERIOD_US    (500 * 1000LL)        /* 探测周期 */
+#define USB_HEARTBEAT_TIMEOUT_MS   (200U)                /* 单次探测超时（正常控制传输 ≤1.7 ms，200 ms 仍留百倍余量） */
+static volatile int64_t s_last_heartbeat_us;
+static volatile uint32_t s_heartbeat_ok_count;
+static volatile uint32_t s_heartbeat_fail_count;
+static volatile int64_t s_last_report_us;      /* 最近一次收到物理鼠标接口报告 */
 /*
  * 「M 收到的位移」统计（2026-09-27）：把物理鼠标报告里的相对位移累加起来，
  * 与 P 侧「输出的位移」对比即可看出桥接层有没有吞掉/放大位移（帧计数看不出来）。
@@ -857,6 +867,61 @@ static void raw_report_task(void *argument)
         if (stopping_requested()) {
             continue;
         }
+        dual_diag_stream_record(DUAL_DIAG_SOURCE_M_USB,
+                                DUAL_DIAG_KIND_M_RAW_HID_INPUT,
+                                event.data, event.length);
+        if (event.mouse_report) {
+            const uint8_t *axis_report = event.data;
+            size_t axis_length = event.length;
+            uint8_t axis_report_id = 0U;
+            if (event.has_report_id && axis_length > 0U) {
+                axis_report_id = event.data[0];
+                axis_report = &event.data[1];
+                --axis_length;
+            }
+            if (!event.has_report_id || axis_report_id == event.mouse_report_id) {
+                int32_t axis_x = 0, axis_y = 0, axis_wheel = 0, axis_pan = 0;
+                if (axis_length != event.mouse_layout.report_bytes) {
+                    __atomic_add_fetch(&s_motion_rx_bad_length, 1U, __ATOMIC_RELAXED);
+                } else if (hid_mouse_report_read_axes(axis_report, axis_length,
+                                                       &event.mouse_layout, &axis_x, &axis_y,
+                                                       &axis_wheel, &axis_pan)) {
+                    __atomic_add_fetch(&s_motion_rx_dx, axis_x, __ATOMIC_RELAXED);
+                    __atomic_add_fetch(&s_motion_rx_dy, axis_y, __ATOMIC_RELAXED);
+                    const uint32_t sample_index = __atomic_add_fetch(
+                        &s_motion_rx_ok, 1U, __ATOMIC_RELAXED);
+                    if (sample_index <= 10U || (sample_index % 1000U) == 0U) {
+                        ESP_LOGI(TAG,
+                                 "M样本#%u 原始=%u字节 剥离后=%u字节 布局=%u字节 dx=%d dy=%d",
+                                 (unsigned)sample_index, (unsigned)event.length,
+                                 (unsigned)axis_length,
+                                 (unsigned)event.mouse_layout.report_bytes,
+                                 (int)axis_x, (int)axis_y);
+                        ESP_LOG_BUFFER_HEX_LEVEL(TAG, axis_report, axis_length, ESP_LOG_INFO);
+                    }
+                } else {
+                    __atomic_add_fetch(&s_motion_rx_bad_parse, 1U, __ATOMIC_RELAXED);
+                }
+            }
+        }
+        if (event.has_report_id) {
+            if (event.length == 0U) {
+                ++s_errors;
+                queue_metric_increment(&s_report_queue_metrics.rejected);
+                continue;
+            }
+            event.report_id = event.data[0];
+            --event.length;
+            memmove(event.data, &event.data[1], event.length);
+        }
+        event.mouse_report = event.mouse_report &&
+            event.report_id == event.mouse_report_id;
+        if (event.length > DUAL_HID_RAW_INPUT_MAX_DATA) {
+            ++s_errors;
+            ++s_vendor_input_failures;
+            queue_metric_increment(&s_report_queue_metrics.rejected);
+            continue;
+        }
         /*
          * 按键边沿打点（点击延迟测量用）：物理鼠标的移动/按键走的是原始透传路径
          * （不在 on_mouse_report 里，那条回调在本版本根本不会被调用），所以打点
@@ -899,13 +964,7 @@ static void raw_report_task(void *argument)
     finish_owned_task(TASK_EXIT_REPORT);
 }
 
-/*
- * 请求重挂 HID 设备：一次控制传输超时之后，那一笔传输对象仍"在飞"，
- * 后续所有提交都会被 USB 主机栈以 ESP_ERR_NOT_FINISHED 拒绝——整条厂商通道
- * 就此瘫痪（实测：G HUB 收不到任何 HDI++ 回应 → 设备在但不识别），
- * 只有关闭/重开设备（中止在飞传输）或复位才能恢复。
- * 这里把恢复请求交给事件任务执行，避免在控制任务里跨任务操作句柄。
- */
+/* 连续控制失败交给事件任务记录；默认不重挂仍在工作的输入接口。 */
 static void request_hid_device_recovery(const char *reason)
 {
     ++s_ctrl_fail_streak;
@@ -1024,15 +1083,34 @@ static void hid_control_task(void *argument)
                 response_length < DUAL_HID_CONTROL_MAX_DATA) {
                 ++response_length;
             }
-            const esp_err_t result = hid_class_request_get_report(
+            esp_err_t result;
+#if VENDOR_USE_DIRECT_URB
+            hid_host_dev_params_t get_params;
+            size_t received_length = 0U;
+            if (hid_host_device_get_params(slot->handle, &get_params) == ESP_OK) {
+                result = dual_vendor_urb_control(
+                    get_params.addr, 0xA1U, 0x01U,
+                    (uint16_t)(((uint16_t)request.report_type << 8) | request.report_id),
+                    request.interface_number, NULL, response_length,
+                    HID_GET_REPORT_TIMEOUT_MS, response, sizeof(response), &received_length);
+                response_length = received_length;
+            } else {
+                result = ESP_ERR_INVALID_STATE;
+                response_length = 0U;
+            }
+#else
+            result = hid_class_request_get_report(
                 slot->handle, request.report_type, request.report_id,
                 response, &response_length);
+#endif
             const uint8_t status = result == ESP_OK
                 ? DUAL_HID_REPORT_STATUS_OK : DUAL_HID_REPORT_STATUS_UNSUPPORTED;
             if (result == ESP_OK) {
                 s_ctrl_fail_streak = 0;
+                __atomic_store_n(&s_last_ctrl_ok_us, esp_timer_get_time(), __ATOMIC_RELEASE);
             } else {
                 ++s_vendor_control_failures;
+                __atomic_store_n(&s_last_ctrl_fail_us, esp_timer_get_time(), __ATOMIC_RELEASE);
                 request_hid_device_recovery("GET_REPORT 失败");
             }
             ESP_LOGI(TAG,
@@ -1117,20 +1195,13 @@ static void hid_control_task(void *argument)
                  * 不必像下面这样凑满 3 批超时才动手。 */
                 __atomic_store_n(&s_last_ctrl_fail_us, esp_timer_get_time(), __ATOMIC_RELEASE);
                 if (++s_vendor_urb_fail_streak >= VENDOR_URB_RECOVER_STREAK) {
-                    /*
-                     * 直连通道每请求独立 URB，所以"连续超时"不再代表通道被锁死，
-                     * 而是**设备本身不响应**的直接信号（实测：此时 reports/vendor_reports
-                     * 全部冻结、探针无回应）。
-                     *
-                     * 2026-09-27 修正：这里**只安排端口断电重枚举**，不再同时请求一级
-                     * "重挂接口"。实测发现一级的 hid_host_device_stop/start 会被在飞传输
-                     * 挡住、把整个 hid_event_task 卡死，使排在它后面的二级永远没机会执行
-                     * （现场：打了"自动恢复第 1 次：重挂 3 个 HID 接口"，随后没有任何
-                     * interface 重挂日志，port_cycle 始终为 0，设备只能靠人工复位）。
-                     * 端口断电会中止在飞传输并强制重新枚举，实测能把设备救回。
-                     */
                     s_vendor_urb_fail_streak = 0;
+#if USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY
+                    /* 历史回退模式才安排根端口断电；默认保持物理鼠标供电。 */
                     s_root_port_cycle_requested = true;
+#else
+                    ESP_LOGW(TAG, "SET_REPORT 连续失败：保留 USB 供电，继续接受后续独立 URB 请求");
+#endif
                 }
             }
 #else
@@ -1138,6 +1209,8 @@ static void hid_control_task(void *argument)
                 slot->handle, request.report_type, request.report_id,
                 mutable_data, mutable_length);
 #endif
+            /* 直连路径已在每请求独立 URB 上重试；不能再退回组件的共享 EP0 URB。 */
+#if !VENDOR_USE_DIRECT_URB
             for (uint32_t attempt = 0; result != ESP_OK && attempt < VENDOR_CONTROL_RETRIES;
                  ++attempt) {
                 ++s_vendor_control_retries;
@@ -1146,6 +1219,7 @@ static void hid_control_task(void *argument)
                     slot->handle, request.report_type, request.report_id,
                     mutable_data, mutable_length);
             }
+#endif
 #if !VENDOR_USE_DIRECT_URB
             /* 仅组件路径需要：单例 URB 被在飞对象锁死时必须重挂设备。
              * 直连路径每请求独立 URB，通道不会被锁死，不需要这套重手段。 */
@@ -1198,7 +1272,8 @@ static void hid_stats_task(void *argument)
                  " control_fail=%" PRIu32 " ctrl_retry=%" PRIu32 " urb_sub=%" PRIu32 " urb_ok=%" PRIu32 " urb_to=%" PRIu32 " urb_retry=%" PRIu32 " recover=%" PRIu32 " port_cycle=%" PRIu32 " wheel=%" PRIu32 " ctrl_lat_max_us=%lld slow10=%" PRIu32 " slow100=%" PRIu32 " vmin_gap_us=%lld"
                  " errors=%" PRIu32 " motion_rx_dx=%lld motion_rx_dy=%lld"
                  " motion_rx_ok=%" PRIu32 " motion_rx_badlen=%" PRIu32
-                 " motion_rx_badparse=%" PRIu32,
+                 " motion_rx_badparse=%" PRIu32
+                 " hb_ok=%" PRIu32 " hb_fail=%" PRIu32,
                  s_reports, s_vendor_reports, s_vendor_input_failures,
                  s_vendor_control_requests, s_vendor_control_failures, s_vendor_control_retries,
                  urb_submitted, urb_completed, urb_timeouts, urb_retries,
@@ -1210,7 +1285,9 @@ static void hid_stats_task(void *argument)
                  (long long)__atomic_load_n(&s_motion_rx_dy, __ATOMIC_RELAXED),
                  (uint32_t)__atomic_load_n(&s_motion_rx_ok, __ATOMIC_RELAXED),
                  (uint32_t)__atomic_load_n(&s_motion_rx_bad_length, __ATOMIC_RELAXED),
-                 (uint32_t)__atomic_load_n(&s_motion_rx_bad_parse, __ATOMIC_RELAXED));
+                 (uint32_t)__atomic_load_n(&s_motion_rx_bad_parse, __ATOMIC_RELAXED),
+                 (uint32_t)__atomic_load_n(&s_heartbeat_ok_count, __ATOMIC_RELAXED),
+                 (uint32_t)__atomic_load_n(&s_heartbeat_fail_count, __ATOMIC_RELAXED));
         log_queue_metrics("host_hid_event", &s_hid_event_queue_metrics);
         log_queue_metrics("host_hid_report", &s_report_queue_metrics);
         log_queue_metrics("host_hid_control", &s_control_queue_metrics);
@@ -1233,15 +1310,15 @@ static void hid_interface_callback(
      */
     if (event == HID_HOST_INTERFACE_EVENT_INPUT_REPORT) {
         queue_metric_increment(&s_report_queue_metrics.received);
-        /* "设备还活着"的最强信号：供数据冻结判据（maybe_trigger_stall_recovery）使用。 */
-        __atomic_store_n(&s_last_report_us, esp_timer_get_time(), __ATOMIC_RELEASE);
         hid_interface_slot_t *slot = find_interface_slot_by_handle(handle);
         if (slot == NULL || !slot->active) {
             ++s_errors;
             queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
-        const uint8_t iface_number = slot->interface_number;
+        if (slot->mouse_interface) {
+            __atomic_store_n(&s_last_report_us, esp_timer_get_time(), __ATOMIC_RELEASE);
+        }
         if (stopping_requested()) {
             queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
@@ -1262,82 +1339,15 @@ static void hid_interface_callback(
             queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
-        dual_diag_stream_record(DUAL_DIAG_SOURCE_M_USB,
-                                DUAL_DIAG_KIND_M_RAW_HID_INPUT,
-                                data, (uint8_t)length);
-        if (slot->mouse_interface) {
-            /* 统计「收到的位移」：剥掉 report ID 前缀后按布局解析相对位移。
-             * 只做累加，不改变转发内容（原始字节照旧透传）。 */
-            const uint8_t *axis_report = data;
-            size_t axis_length = length;
-            uint8_t axis_report_id = 0U;
-            if (slot->has_report_id && axis_length > 0U) {
-                axis_report_id = data[0];
-                axis_report = &data[1];
-                axis_length -= 1U;
-            }
-            int32_t axis_x = 0;
-            int32_t axis_y = 0;
-            int32_t axis_wheel = 0;
-            int32_t axis_pan = 0;
-            /* 只统计**鼠标报告 ID**：与 M 的 reports、P 的 motion_fwd_* 同口径。
-             * 只判"鼠标接口 + 长度"会把该接口上滚轮等其它 report_id 的 8 字节报告
-             * 也算进来（实测使三方对不上账），所以这里必须再限 report_id。 */
-            const bool axis_is_mouse_report =
-                !slot->has_report_id || axis_report_id == slot->mouse_report_id;
-            if (!axis_is_mouse_report) {
-                /* 同接口的其它报告：不计位移、也不算异常，静默跳过。 */
-            } else if (axis_length != slot->mouse_layout.report_bytes) {
-                __atomic_add_fetch(&s_motion_rx_bad_length, 1U, __ATOMIC_RELAXED);
-            } else if (hid_mouse_report_read_axes(axis_report, axis_length,
-                                                  &slot->mouse_layout, &axis_x, &axis_y,
-                                                  &axis_wheel, &axis_pan)) {
-                __atomic_add_fetch(&s_motion_rx_dx, axis_x, __ATOMIC_RELAXED);
-                __atomic_add_fetch(&s_motion_rx_dy, axis_y, __ATOMIC_RELAXED);
-                __atomic_add_fetch(&s_motion_rx_ok, 1U, __ATOMIC_RELAXED);
-                /* 样本级对比（2026-09-27）：前 10 帧连字节一起打出来，供与 P 侧逐帧对齐，
-                 * 判断两侧位移差到底来自 layout 不同还是字节不同。 */
-                const uint32_t sample_index =
-                    (uint32_t)__atomic_load_n(&s_motion_rx_ok, __ATOMIC_RELAXED);
-                if (sample_index <= 10U || (sample_index % 1000U) == 0U) {
-                    ESP_LOGI(TAG,
-                             "M样本#%u 原始=%u字节 剥离后=%u字节 布局=%u字节 dx=%d dy=%d",
-                             (unsigned)sample_index, (unsigned)length,
-                             (unsigned)axis_length,
-                             (unsigned)slot->mouse_layout.report_bytes,
-                             (int)axis_x, (int)axis_y);
-                    ESP_LOG_BUFFER_HEX_LEVEL(TAG, axis_report, axis_length, ESP_LOG_INFO);
-                }
-            } else {
-                __atomic_add_fetch(&s_motion_rx_bad_parse, 1U, __ATOMIC_RELAXED);
-            }
-        }
-        uint8_t report_id = 0;
-        size_t data_offset = 0;
-        if (slot->has_report_id) {
-            if (length < 1U) {
-                ++s_errors;
-                queue_metric_increment(&s_report_queue_metrics.rejected);
-                return;
-            }
-            report_id = data[0];
-            data_offset = 1U;
-        }
-        const size_t forwarded_length = length - data_offset;
-        if (forwarded_length > DUAL_HID_RAW_INPUT_MAX_DATA) {
-            ++s_errors;
-            ++s_vendor_input_failures;
-            queue_metric_increment(&s_report_queue_metrics.rejected);
-            return;
-        }
         raw_report_event_t queued = {
-            .interface_number = iface_number,
-            .report_id = report_id,
-            .length = (uint8_t)forwarded_length,
-            .mouse_report = slot->mouse_interface &&
-                report_id == slot->mouse_report_id,
+            .interface_number = slot->interface_number,
+            .length = (uint8_t)length,
+            .mouse_report = slot->mouse_interface,
+            .has_report_id = slot->has_report_id,
+            .mouse_report_id = slot->mouse_report_id,
+            .mouse_layout = slot->mouse_layout,
         };
-        memcpy(queued.data, &data[data_offset], forwarded_length);
+        memcpy(queued.data, data, length);
         if (s_report_queue == NULL) {
             queue_metric_increment(&s_report_queue_metrics.rejected);
             ++s_errors;
@@ -1409,6 +1419,14 @@ static void hid_interface_callback(
         if (s_release_callback != NULL) {
             s_release_callback(false);
         }
+        queue_metric_increment(&s_hid_event_queue_metrics.received);
+        const hid_event_t retry = {.handle = handle, .type = HID_EVENT_TRANSFER_ERROR};
+        if (s_hid_event_queue == NULL ||
+            xQueueSend(s_hid_event_queue, &retry, 0) != pdTRUE) {
+            queue_metric_increment(&s_hid_event_queue_metrics.dropped);
+        } else {
+            queue_metric_observe_depth(&s_hid_event_queue_metrics, s_hid_event_queue);
+        }
     }
 }
 
@@ -1465,12 +1483,7 @@ static void maybe_report_mouse_gone(void)
     }
 }
 
-/*
- * 执行自动恢复：对所有活动接口做一次 stop→start（会中止该接口管道上的在飞传输，
- * 并让接口重新 CONNECTED → 重新采集 Profile → 对端完整重装克隆）。
- * 实测依据：控制传输超时后，那笔传输对象仍"在飞"，后续提交会被主机栈
- * 以 ESP_ERR_NOT_FINISHED 永久拒绝；必须把在飞传输中止掉才能恢复。
- */
+/* 历史重挂路径由显式开关保留；默认只报告控制异常。 */
 static void maybe_run_hid_recovery(void)
 {
     if (!s_hid_recover_requested) {
@@ -1478,6 +1491,12 @@ static void maybe_run_hid_recovery(void)
     }
     s_hid_recover_requested = false;
     const char *reason = s_hid_recover_reason;
+#if !USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY
+    ESP_LOGW(TAG, "控制通道异常，保持物理输入与克隆会话（原因：%s）",
+             reason != NULL ? reason : "");
+    s_ctrl_fail_streak = 0;
+    return;
+#else
     hid_host_device_handle_t handles[HID_INTERFACE_SLOT_COUNT];
     size_t count = 0;
     portENTER_CRITICAL(&s_interface_state_mux);
@@ -1504,25 +1523,68 @@ static void maybe_run_hid_recovery(void)
         }
     }
     s_ctrl_fail_streak = 0;
+#endif
 }
 
-/*
- * 数据冻结判据（2026-09-27 新增）：设备**整体不再上报** + EP0 也不回，就是
- * ESP-IDF issue #14996 的挂死特征。比"连续 3 批直连超时"快得多——现场实测后者
- * 要 9055 ms 才凑齐、而设备早已哑掉；本判据只需 1 秒冻结 + 一次新鲜的控制失败。
- * 触发后直接安排端口断电重枚举（实测触发到输入恢复约 1.85 秒）。
- */
+/* 每 0.5 秒主动发 GET_DESCRIPTOR(Device)；其失败只代表 EP0 未完成。 */
+static void maybe_run_usb_heartbeat(void)
+{
+    const int64_t now = esp_timer_get_time();
+    const int64_t last = __atomic_load_n(&s_last_heartbeat_us, __ATOMIC_ACQUIRE);
+    if (last != 0 && now - last < USB_HEARTBEAT_PERIOD_US) {
+        return;
+    }
+    __atomic_store_n(&s_last_heartbeat_us, now, __ATOMIC_RELEASE);
+
+    /* 锁内只取 handle；参数查询可能阻塞，必须放到锁外。 */
+    hid_host_device_handle_t handle = NULL;
+    portENTER_CRITICAL(&s_interface_state_mux);
+    for (size_t index = 0; index < HID_INTERFACE_SLOT_COUNT; ++index) {
+        const hid_interface_slot_t *slot = &s_interface_slots[index];
+        if (slot->active && slot->handle != NULL && slot->mouse_interface) {
+            handle = slot->handle;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_interface_state_mux);
+    if (handle == NULL) {
+        return;   /* 没有活动鼠标接口，探测没有意义 */
+    }
+
+    hid_host_dev_params_t params;
+    if (hid_host_device_get_params(handle, &params) != ESP_OK) {
+        return;
+    }
+
+    uint8_t descriptor[18];
+    size_t out_length = 0;
+    const esp_err_t result = dual_vendor_urb_control(
+        params.addr, 0x80U, 0x06U, (uint16_t)((1U << 8) | 0U), 0U, NULL,
+        (uint16_t)sizeof(descriptor), USB_HEARTBEAT_TIMEOUT_MS,
+        descriptor, sizeof(descriptor), &out_length);
+    const int64_t done = esp_timer_get_time();
+    if (result == ESP_OK) {
+        __atomic_store_n(&s_last_ctrl_ok_us, done, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_probe_fail_streak, 0U, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&s_heartbeat_ok_count, 1U, __ATOMIC_RELAXED);
+    } else {
+        __atomic_store_n(&s_last_ctrl_fail_us, done, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&s_probe_fail_streak, 1U, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&s_heartbeat_fail_count, 1U, __ATOMIC_RELAXED);
+    }
+}
+
+/* 心跳失败只表明 EP0 异常；单独核对物理鼠标接口报告是否也已停滞。 */
 static void maybe_trigger_stall_recovery(void)
 {
     const int64_t now = esp_timer_get_time();
+    /* 连续心跳失败用于发现控制通道异常，不直接断开输入。 */
+    const uint32_t probe_streak = __atomic_load_n(&s_probe_fail_streak, __ATOMIC_ACQUIRE);
+    if (probe_streak < STALL_PROBE_FAIL_LIMIT) {
+        return;
+    }
     const int64_t last_report = __atomic_load_n(&s_last_report_us, __ATOMIC_ACQUIRE);
-    if (last_report == 0 || now - last_report < STALL_REPORT_FREEZE_US) {
-        return;   /* 从未收到报告，或数据仍在流动 */
-    }
     const int64_t last_fail = __atomic_load_n(&s_last_ctrl_fail_us, __ATOMIC_ACQUIRE);
-    if (last_fail <= last_report) {
-        return;   /* 冻结期间没有控制失败：更可能只是没人动鼠标 */
-    }
     if (now - last_fail > STALL_CTRL_FAIL_FRESH_US) {
         return;   /* 失败太旧，不足以代表设备当前状态 */
     }
@@ -1535,23 +1597,31 @@ static void maybe_trigger_stall_recovery(void)
         return;   /* 冷却期内，避免恢复风暴 */
     }
     __atomic_store_n(&s_stall_recovery_us, now, __ATOMIC_RELEASE);
-    s_root_port_cycle_requested = true;
+    const bool input_stalled = last_report != 0 &&
+        now - last_report >= STALL_REPORT_FREEZE_US;
+    if (input_stalled && s_release_callback != NULL) {
+        /* 输入真正停止时防止卡键；false 保持克隆会话与 Profile。 */
+        s_release_callback(false);
+    }
     ESP_LOGW(TAG,
-             "设备数据冻结 %lld ms 且期间控制传输失败（最近失败 %lld ms 前）："
-             "直接安排端口断电重枚举",
-             (now - last_report) / 1000, (now - last_fail) / 1000);
+             "心跳连续 %u 次失败（最近失败 %lld ms 前；距最后报告 %lld ms）："
+             "输入%s，保持 USB 供电与克隆会话",
+             (unsigned)probe_streak, (now - last_fail) / 1000,
+             last_report == 0 ? -1LL : (now - last_report) / 1000,
+             input_stalled ? "已停滞，已释放按钮" : "仍在活动或未建立基线");
 }
 
-/*
- * 二级恢复：根端口断电 300 ms 再上电，强制设备重新枚举（等价于拔插一次 USB）。
- * 用于一级"重挂接口"被在飞传输挡住、设备保持沉默的情况。
- */
+/* 保留显式开关以便回退；默认禁止自动切断鼠标 USB 供电。 */
 static void maybe_run_root_port_cycle(void)
 {
     if (!s_root_port_cycle_requested) {
         return;
     }
     s_root_port_cycle_requested = false;
+#if !USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY
+    ESP_LOGW(TAG, "已抑制自动根端口断电：保留物理鼠标供电与克隆会话");
+    return;
+#else
     ++s_root_port_cycles;
     ESP_LOGW(TAG, "二级恢复第 %u 次：根端口断电重枚举", (unsigned)s_root_port_cycles);
     const esp_err_t off_result = usb_host_lib_set_root_port_power(false);
@@ -1561,6 +1631,7 @@ static void maybe_run_root_port_cycle(void)
              esp_err_to_name(off_result), esp_err_to_name(on_result));
     /* 给设备重新枚举留出时间；随后的 CONNECTED 事件会重新采集 Profile。 */
     vTaskDelay(pdMS_TO_TICKS(1500));
+#endif
 }
 
 static void hid_event_task(void *argument)
@@ -1568,9 +1639,15 @@ static void hid_event_task(void *argument)
     (void)argument;
     hid_event_t event;
     while (true) {
+        /*
+         * 主动心跳探测（2026-09-28）：每 0.5 秒一次，成败喂给下面的冻结判据。
+         * 放在循环顶部而不是超时分支里，否则报告事件密集时它会被饿住，
+         * 而这恰恰是"设备刚开始冻结、还在冒报告"的那一小段关键时间。
+         */
+        maybe_run_usb_heartbeat();
         if (xQueueReceive(s_hid_event_queue, &event, pdMS_TO_TICKS(100)) != pdTRUE) {
             maybe_report_mouse_gone();
-            /* 先判"数据冻结"：符合特征就立刻安排端口断电，不必等连续 3 批超时。 */
+            /* 分别记录控制失败和输入停滞，必要时只释放按钮。 */
             maybe_trigger_stall_recovery();
             /* 再跑二级（端口断电）：它会中止在飞传输，避免下面一级的 stop/start 被挡住；
              * 反过来若一级先跑并卡住，二级就永远没机会执行（2026-09-27 现场缺陷）。 */
@@ -1580,6 +1657,21 @@ static void hid_event_task(void *argument)
         }
         if (event.type == HID_EVENT_STOP) {
             break;
+        }
+        if (event.type == HID_EVENT_TRANSFER_ERROR) {
+            /* 只对组件已经归还的 IN transfer 重提交；不重挂接口或切断供电。 */
+            for (uint32_t attempt = 0; attempt < 3U; ++attempt) {
+                const esp_err_t rearm = hid_host_device_rearm_input(event.handle);
+                if (rearm == ESP_OK) {
+                    break;
+                }
+                ESP_LOGW(TAG, "输入端点重提交第 %u 次失败：%s",
+                         (unsigned)(attempt + 1U), esp_err_to_name(rearm));
+                if (attempt < 2U) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+            }
+            continue;
         }
         if (event.type == HID_EVENT_CONNECTED) {
             /* 设备回来了：取消待定的“消失”，避免一次瞬断引发拆卸+重装。 */
@@ -2270,7 +2362,8 @@ esp_err_t dual_hid_host_start(
         goto startup_failed_with_error;
     }
     s_worker_task_mask |= TASK_EXIT_HID_EVENT;
-    if (xTaskCreate(raw_report_task, "hid_raw_reports", 3072, NULL, 6,
+    /* 低于 HID 组件任务(5)：入队唤醒消费者后，先让组件重提交下一次 IN。 */
+    if (xTaskCreate(raw_report_task, "hid_raw_reports", 3072, NULL, 4,
                     &s_report_task) != pdPASS) {
         result = ESP_ERR_NO_MEM;
         goto startup_failed_with_error;

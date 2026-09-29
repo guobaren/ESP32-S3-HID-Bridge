@@ -927,8 +927,9 @@ static void test_link_recovery_shared_budget(void)
     /* 预算充足：本阶段拿走自己的窗口。 */
     assert(link_recovery_stage_timeout_us(start, start, 5000000LL) == 5000000LL);
     /* 预算不足：本阶段被裁剪到剩余预算，不串联第二个完整 5 秒等待。 */
-    assert(link_recovery_stage_timeout_us(start, start + 8000000LL, 5000000LL) ==
-           LINK_RECOVERY_BUDGET_US - 8000000LL);
+    assert(link_recovery_stage_timeout_us(
+        start, start + LINK_RECOVERY_BUDGET_US - 2000000LL, 5000000LL) ==
+        2000000LL);
     assert(link_recovery_stage_timeout_us(start, start + LINK_RECOVERY_BUDGET_US,
                                           5000000LL) == 0);
     assert(link_recovery_budget_exhausted(start, start + LINK_RECOVERY_BUDGET_US));
@@ -1382,7 +1383,7 @@ static void test_injection_commit_replay_without_reenumeration(void)
     link_flow_reset(&commit);
     link_flow_start(&commit, DUAL_MESSAGE_PROFILE_COMMIT, 41U, 1000,
                     LINK_COMMIT_MAX_ATTEMPTS, LINK_COMMIT_RETRY_INTERVAL_US,
-                    LINK_PROFILE_STAGE_TIMEOUT_US);
+                    LINK_COMMIT_STAGE_TIMEOUT_US);
     link_flow_mark_sent(&commit, 1000);
     assert(link_flow_poll(&commit, 1000 + LINK_COMMIT_RETRY_INTERVAL_US) ==
            LINK_FLOW_ACTION_RESEND);
@@ -1397,8 +1398,117 @@ static void test_injection_commit_replay_without_reenumeration(void)
     assert(capture.count == 1);
     /* 补发最终确认后事务结束，不再重放。 */
     assert(link_flow_ack(&commit, true));
-    assert(link_flow_poll(&commit, 1000 + LINK_PROFILE_STAGE_TIMEOUT_US) ==
+    assert(link_flow_poll(&commit, 1000 + LINK_COMMIT_STAGE_TIMEOUT_US) ==
            LINK_FLOW_ACTION_NONE);
+}
+
+static void test_profile_final_ack_requires_mounted_clone(void)
+{
+    const uint32_t transfer = 41U;
+    const uint32_t crc = 0x01234567U;
+    /* 已发布数据或安装中的重复 COMMIT 都只能得到接收确认。 */
+    assert(link_profile_replay_result(transfer, crc, 0U, 0U, 0U, 0U,
+                                      false, false, false, true) ==
+           LINK_PROFILE_REPLAY_PENDING);
+    assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
+                                      true, true, false, true) ==
+           LINK_PROFILE_REPLAY_PENDING);
+    /* 身份相同但挂载尚未完成，或旧 epoch 正在清理，不能声称成功。 */
+    assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
+                                      true, true, false, false) ==
+           LINK_PROFILE_REPLAY_PENDING);
+    assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
+                                      true, true, true, true) ==
+           LINK_PROFILE_REPLAY_PENDING);
+    assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
+                                      true, true, true, false) ==
+           LINK_PROFILE_REPLAY_MOUNTED);
+    assert(link_profile_replay_result(transfer, crc ^ 1U, transfer, crc, 0U, 0U,
+                                      true, true, true, false) ==
+           LINK_PROFILE_REPLAY_PENDING);
+    /* 两次挂载均失败后的同一 transfer 重放必须补发失败确认。 */
+    assert(link_profile_replay_result(transfer, crc, 0U, 0U, transfer, crc,
+                                      false, false, false, false) ==
+           LINK_PROFILE_REPLAY_FAILED);
+    assert(link_profile_replay_result(transfer + 1U, crc, 0U, 0U, transfer, crc,
+                                      false, false, false, false) ==
+           LINK_PROFILE_REPLAY_PENDING);
+
+    link_flow_t commit;
+    link_flow_reset(&commit);
+    link_flow_start(&commit, DUAL_MESSAGE_PROFILE_COMMIT, transfer, 1000,
+                    LINK_COMMIT_MAX_ATTEMPTS, LINK_COMMIT_RETRY_INTERVAL_US,
+                    LINK_COMMIT_STAGE_TIMEOUT_US);
+    link_flow_mark_sent(&commit, 1000);
+    assert(link_flow_poll(&commit, 1000 + 6500000LL) == LINK_FLOW_ACTION_RESEND);
+    assert(link_flow_poll(&commit, 1000 + LINK_COMMIT_STAGE_TIMEOUT_US) ==
+           LINK_FLOW_ACTION_GIVE_UP);
+}
+
+static void test_profile_mount_retry_and_epoch_cancel(void)
+{
+    /* 第一轮挂载超时才允许保留同一 Profile 再装一次。 */
+    assert(link_profile_mount_should_retry(true, 1U, true));
+    assert(!link_profile_mount_should_retry(false, 1U, true));
+    assert(!link_profile_mount_should_retry(true, 2U, true));
+    assert(!link_profile_mount_should_retry(true, 1U, false));
+    assert(!link_profile_mount_should_retry(true, 0U, true));
+
+    const uint32_t epoch = 7U;
+    assert(dual_profile_operation_is_current(epoch, epoch, false));
+    assert(link_profile_mount_should_retry(
+        true, 1U, dual_profile_operation_is_current(epoch, epoch, false)));
+    /* DEVICE_GONE/新 peer 更新 epoch 时，旧安装不能进入第二次尝试。 */
+    assert(!link_profile_mount_should_retry(
+        true, 1U, dual_profile_operation_is_current(epoch, epoch + 1U, false)));
+    assert(!link_profile_mount_should_retry(
+        true, 1U, dual_profile_operation_is_current(epoch, epoch, true)));
+
+    /* 迟到鼠标的新 Profile 从新的触发时间重新获得 COMMIT 窗口。 */
+    const int64_t old_trigger = 1000000LL;
+    const int64_t new_trigger = old_trigger + LINK_RECOVERY_BUDGET_US + 1000000LL;
+    assert(link_recovery_stage_timeout_us(old_trigger, new_trigger,
+        LINK_COMMIT_STAGE_TIMEOUT_US) == 0LL);
+    assert(link_recovery_stage_timeout_us(new_trigger, new_trigger,
+        LINK_COMMIT_STAGE_TIMEOUT_US) == LINK_COMMIT_STAGE_TIMEOUT_US);
+}
+
+/*
+ * Profile CRC 复用判定（2026-09-28）：只有"克隆确实挂载 + 无在途操作 + CRC 完全一致"
+ * 才允许跳过卸载+重装；任何一条不成立都必须退回完整路径。
+ */
+static void test_profile_reuse_predicate(void)
+{
+    const uint32_t installed = 0x85A85778U;
+    /* 基准：一切正常且 CRC 一致 → 允许复用。 */
+    assert(link_profile_reuse_allowed(true, true, true, false, false, false, false,
+                                      installed, installed));
+    /* CRC 不同（换了鼠标/Profile 变了）→ 必须完整卸载+重装。 */
+    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, false,
+                                       installed ^ 1U, installed));
+    /* 当前没有已安装 Profile（P 刚重启过，缓存为空）→ 完整路径。 */
+    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, false,
+                                       installed, 0U));
+    /* CRC32 为 0 的提议（离线注入 transfer=0）永不视为命中。 */
+    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, false,
+                                       0U, 0U));
+    /* 克隆未活动 / 未真正挂载 → 完整路径（避免把陈旧或已卸载的克隆留下）。 */
+    assert(!link_profile_reuse_allowed(true, false, true, false, false, false, false,
+                                       installed, installed));
+    assert(!link_profile_reuse_allowed(true, true, false, false, false, false, false,
+                                       installed, installed));
+    /* 有在途操作（安装请求、安装中、卸载请求、卸载失败）→ 完整路径。 */
+    assert(!link_profile_reuse_allowed(true, true, true, true, false, false, false,
+                                       installed, installed));
+    assert(!link_profile_reuse_allowed(true, true, true, false, true, false, false,
+                                       installed, installed));
+    assert(!link_profile_reuse_allowed(true, true, true, false, false, true, false,
+                                       installed, installed));
+    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, true,
+                                       installed, installed));
+    /* 重配置通道未启用 → 不复用。 */
+    assert(!link_profile_reuse_allowed(false, true, true, false, false, false, false,
+                                       installed, installed));
 }
 
 int main(void)
@@ -1438,6 +1548,9 @@ int main(void)
     test_injection_duplicate_frames_single_reenumeration();
     test_injection_terminal_failure_is_distinguishable();
     test_injection_commit_replay_without_reenumeration();
+    test_profile_final_ack_requires_mounted_clone();
+    test_profile_mount_retry_and_epoch_cancel();
+    test_profile_reuse_predicate();
     puts("dual_proxy_logic_test: PASS");
     return 0;
 }

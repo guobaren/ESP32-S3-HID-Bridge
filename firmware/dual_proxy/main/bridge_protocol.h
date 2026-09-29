@@ -55,6 +55,13 @@ typedef enum {
      * 从而用**完全已知的位移**做受控实验。
      */
     DUAL_MESSAGE_DIAG_REPORT_INJECT_REQUEST = 0x1B,
+    /*
+     * 强制重新采集并重新提议克隆（2026-09-28）：让 M 板重新读一遍物理设备的
+     * Profile、生成新的 transfer id 并重新发 OFFER，用来**按需复现**恢复流程里
+     * 的 "M 重新提议 → P 复用/重装" 这一段。自然触发（upstream USB Host 挂死）
+     * 稀少且不可控，没有这个注入就只能靠碰运气。payload ≤1 字节（内容忽略）。
+     */
+    DUAL_MESSAGE_DIAG_PROFILE_REFRESH_REQUEST = 0x1C,
     DUAL_MESSAGE_LINK_HELLO = 0x20,
     DUAL_MESSAGE_PHYSICAL_MOUSE = 0x21,
     DUAL_MESSAGE_PHYSICAL_RELEASE = 0x22,

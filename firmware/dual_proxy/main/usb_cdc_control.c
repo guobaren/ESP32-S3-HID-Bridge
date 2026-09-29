@@ -285,6 +285,7 @@ static void control_task(void *argument)
     dual_parser_t parser;
     dual_parser_init(&parser, on_control_frame, NULL);
     TickType_t last_statistics = xTaskGetTickCount();
+    uint64_t last_statistics_mouse_reports = s_mouse_reports;
     while (!s_stop_requested) {
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         if (s_stop_requested) {
@@ -308,9 +309,18 @@ static void control_task(void *argument)
             ESP_LOGW(TAG, "CDC软件输入租约超时，已释放软件输入");
         }
         if (xTaskGetTickCount() - last_statistics >= pdMS_TO_TICKS(CDC_STATISTICS_PERIOD_MS)) {
-            ESP_LOGI(TAG, "CDC协议统计：接收=%" PRIu64 " 接受=%" PRIu64
-                     " MouseReport=%" PRIu64 " 拒绝=%" PRIu64 " 序号不连续=%" PRIu64,
-                     s_received, s_accepted, s_mouse_reports, s_rejected, s_discontinuities);
+            /*
+             * 本周期没有鼠标报告就不打印（2026-09-28）：空闲时每秒一行没有信息量。
+             * 计数器仍要无条件推进，否则窗口增量会越算越错。
+             */
+            const uint64_t mouse_reports_window =
+                s_mouse_reports - last_statistics_mouse_reports;
+            if (mouse_reports_window > 0U) {
+                ESP_LOGI(TAG, "CDC协议统计：接收=%" PRIu64 " 接受=%" PRIu64
+                         " MouseReport=%" PRIu64 " 拒绝=%" PRIu64 " 序号不连续=%" PRIu64,
+                         s_received, s_accepted, s_mouse_reports, s_rejected, s_discontinuities);
+            }
+            last_statistics_mouse_reports = s_mouse_reports;
             last_statistics = xTaskGetTickCount();
         }
     }

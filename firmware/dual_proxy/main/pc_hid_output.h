@@ -6,6 +6,7 @@
 #include "esp_err.h"
 #include "bridge_protocol.h"
 #include "hid_device_profile.h"
+#include "link_recovery_logic.h"
 
 esp_err_t dual_pc_hid_install_device(void);
 esp_err_t dual_pc_hid_start_sender(void);
@@ -13,10 +14,16 @@ esp_err_t dual_pc_hid_stop_sender(void);
 esp_err_t dual_pc_hid_prepare_for_profile(void);
 
 /*
- * 同一条 Profile（同 transfer + 同 crc）已挂载时，OFFER 阶段就不再排清理屏障：
- * 卸载 + 重装会让 USB 设备在总线上真实消失再出现一次，而鼠标侧板重启正是
- * “立刻移动鼠标就识别异常”的高发窗口。返回 true 表示可沿用现有克隆。
+ * Profile CRC 复用（2026-09-28，按用户决策启用，替换下面这段早已失效的旧注释）：
+ * 当本机当前挂载的克隆与本次提议的 Profile 完全一致（CRC32 相同）时，跳过
+ * 「卸载 + 重装」。实测省时间的正是这一步——卸载→安装→Windows 重新枚举要
+ * 609~962 ms（典型）、尾部到 2.7 s，而板间 Profile 数据段本身只有 12~30 ms。
+ * 判定为纯函数 link_profile_reuse_allowed()（见 link_recovery_logic.h），
+ * 任何一条前提不成立都退回完整路径，绝不把陈旧克隆留给接收端。
  */
+bool dual_pc_hid_installed_profile_matches(uint32_t crc32);
+link_profile_replay_result_t dual_pc_hid_profile_result(uint32_t transfer_id, uint32_t crc32);
+esp_err_t dual_pc_hid_reuse_installed_profile(uint32_t transfer_id, uint32_t crc32);
 esp_err_t dual_pc_hid_schedule_reconfigure(
     const hid_device_profile_t *profile, uint32_t transfer_id, uint32_t crc32);
 /* ack_type is zero for local cleanup, PROFILE_OFFER, or DEVICE_GONE otherwise.
