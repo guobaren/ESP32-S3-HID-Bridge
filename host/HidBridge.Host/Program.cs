@@ -28,6 +28,7 @@ internal static class Program
         SimulationLogGenerator? simulation = null;
         RemoteInputServer? remoteInput = null;
         FirmwareFlashService? firmwareFlash = null;
+        DeviceLogMirror? logMirror = null;
         FirmwareUpdateApiServer? firmwareUpdateApi = null;
         try
         {
@@ -71,23 +72,36 @@ internal static class Program
             automation.DiagnosticLog += automationLogWriter.WriteLine;
             if (serialBridge is not null)
             {
+                /*
+                 * 对端板卡日志监听（2026-09-28）：主串口已被 SerialBridge 占用，这里自动挑
+                 * "另一个能喷 ESP-IDF 日志"的串口做镜像，日志实时写入按 COM 命名的独立文件。
+                 * 任何文件写入失败都只影响该路日志，不影响串口读取与命令写入。
+                 */
+                logMirror = new DeviceLogMirror(
+                    options.BaudRate,
+                    options.DeviceLogPath,
+                    options.DeviceLogRetentionCount,
+                    serialBridge.GetConnectedPortName);
+                /* 让固件刷写等独占任务也能让对端监听让出串口（2026-09-28）。 */
+                serialBridge.AttachPeerLogMirror(logMirror);
+                logMirror.Start();
                 firmwareFlash = new FirmwareFlashService(options, serialBridge, input);
                 firmwareUpdateApi = new FirmwareUpdateApiServer(
                     options.FirmwareUpdateApiPort,
                     firmwareFlash,
-                    () => automation.Settings.FirmwareFlashPortName);
-                if (automation.Settings.FirmwareUpdateApiEnabled)
+                    () => automation.Settings.FirmwareFlashPortName,
+                    serialBridge.GetOpenPortNames,
+                    serialBridge.WriteToOpenPort,
+                    serialBridge.RefreshOpenSerialPorts);
+                try
                 {
-                    try
-                    {
-                        firmwareUpdateApi.SetEnabled(true);
-                    }
-                    catch (Exception exception) when (exception is SocketException or InvalidOperationException)
-                    {
-                        automation.Settings.FirmwareUpdateApiEnabled = false;
-                        automation.SaveSettings();
-                        Console.Error.WriteLine($"局域网固件刷写接口启动失败，已恢复为关闭：{exception.Message}");
-                    }
+                    firmwareUpdateApi.SetEnabled(automation.Settings.FirmwareUpdateApiEnabled);
+                }
+                catch (Exception exception) when (exception is SocketException or InvalidOperationException)
+                {
+                    automation.Settings.FirmwareUpdateApiEnabled = false;
+                    automation.SaveSettings();
+                    Console.Error.WriteLine($"主机 HTTP API 监听启动失败：{exception.Message}");
                 }
             }
             if (options.RemoteInputEnabled)
@@ -153,6 +167,7 @@ internal static class Program
             automationLogWriter.Dispose();
             input?.Stop();
             input?.Dispose();
+            logMirror?.Dispose();
             transport?.Dispose();
             logWriter.Dispose();
         }

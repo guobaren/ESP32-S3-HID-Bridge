@@ -24,6 +24,7 @@ typedef enum {
     DUAL_MESSAGE_LOG_CLEAR_REQUEST = 0x0A,
     /* 流式下载：一条请求换来连续多个 LOG_READ_RESPONSE，避免逐块往返。 */
     DUAL_MESSAGE_LOG_DUMP_REQUEST = 0x0B,
+    DUAL_MESSAGE_LOG_STATS_CONTROL_REQUEST = 0x0C,
     /* 运行时暂停/恢复板载写盘（payload 1 字节：0=恢复，1=暂停）。 */
     DUAL_MESSAGE_LOG_CONTROL_REQUEST = 0x0C,
     /* UART0 诊断：Profile 分块读取与离线写入 P。 */

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using HidBridge.Host.Transport;
 
 namespace HidBridge.Host.FirmwareUpdate;
 
@@ -10,7 +11,13 @@ internal delegate bool FirmwareFlashStarter(
     string portName,
     out FirmwareFlashSnapshot snapshot);
 
-internal sealed record FirmwareFlashRequest(string ManifestPath);
+/// <summary>
+/// 刷写请求。<paramref name="PortName"/>（2026-09-28 新增）为**可选**：
+/// 远程调用可以显式指定端口；不填则回落到 UI 里选择的刷写端口（默认行为不变）。
+/// </summary>
+internal sealed record FirmwareFlashRequest(string ManifestPath, string? PortName = null);
+
+internal sealed record SerialCommandWriteRequest(string? PortName, string? Hex);
 
 internal sealed class FirmwareUpdateApiServer : IDisposable
 {
@@ -18,21 +25,61 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
     internal const string ConfirmationHeaderValue = "flash-firmware";
     private const int MaximumHeaderBytes = 8192;
     private const int MaximumBodyBytes = 4096;
+    private const int MaximumSerialRequestBodyBytes = 16384;
+    private const int MaximumSerialWriteBytes = 4096;
+
+    /// <summary>
+    /// 校验远程传入的端口名（2026-09-28）：只接受 `COM` + 数字形式的 Windows 串口名，
+    /// 避免请求体把任意字符串当作端口转交给刷写器。
+    /// </summary>
+    private static bool IsValidPortName(string value)
+    {
+        if (value.Length <= 3 || value.Length > 16 ||
+            !value.StartsWith("COM", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        for (int index = 3; index < value.Length; index++)
+        {
+            if (!char.IsAsciiDigit(value[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
     private readonly int _port;
     private readonly Func<FirmwareFlashSnapshot> _getSnapshot;
     private readonly FirmwareFlashStarter _tryStart;
     private readonly Func<string?> _selectedPortProvider;
+    private readonly Func<IReadOnlyList<string>>? _getOpenSerialPorts;
+    private readonly Func<string, byte[], CancellationToken, int?>? _writeSerialPort;
+    private readonly Func<CancellationToken, SerialPortRefreshSnapshot>? _refreshSerialPorts;
+    private readonly bool _serialApiConfigured;
     private readonly object _sync = new();
     private TcpListener? _listener;
     private CancellationTokenSource? _cancellation;
     private Task? _listenerTask;
     private bool _disposed;
+    private volatile bool _firmwareApiEnabled;
 
     internal FirmwareUpdateApiServer(
         int port,
         FirmwareFlashService service,
-        Func<string?> selectedPortProvider)
-        : this(port, service.GetSnapshot, service.TryStartFromManifest, selectedPortProvider)
+        Func<string?> selectedPortProvider,
+        Func<IReadOnlyList<string>>? getOpenSerialPorts = null,
+        Func<string, byte[], CancellationToken, int?>? writeSerialPort = null,
+        Func<CancellationToken, SerialPortRefreshSnapshot>? refreshSerialPorts = null)
+        : this(
+            port,
+            service.GetSnapshot,
+            service.TryStartFromManifest,
+            selectedPortProvider,
+            getOpenSerialPorts,
+            writeSerialPort,
+            refreshSerialPorts)
     {
     }
 
@@ -40,12 +87,20 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         int port,
         Func<FirmwareFlashSnapshot> getSnapshot,
         FirmwareFlashStarter tryStart,
-        Func<string?> selectedPortProvider)
+        Func<string?> selectedPortProvider,
+        Func<IReadOnlyList<string>>? getOpenSerialPorts = null,
+        Func<string, byte[], CancellationToken, int?>? writeSerialPort = null,
+        Func<CancellationToken, SerialPortRefreshSnapshot>? refreshSerialPorts = null)
     {
         _port = port;
         _getSnapshot = getSnapshot;
         _tryStart = tryStart;
         _selectedPortProvider = selectedPortProvider;
+        _getOpenSerialPorts = getOpenSerialPorts;
+        _writeSerialPort = writeSerialPort;
+        _refreshSerialPorts = refreshSerialPorts;
+        _serialApiConfigured = getOpenSerialPorts is not null && writeSerialPort is not null &&
+                               refreshSerialPorts is not null;
     }
 
     internal bool Enabled
@@ -54,7 +109,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         {
             lock (_sync)
             {
-                return _listener is not null;
+                return _firmwareApiEnabled;
             }
         }
     }
@@ -78,17 +133,24 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (enabled == (_listener is not null))
-            {
-                return;
-            }
-            if (enabled)
+            bool wasEnabled = _firmwareApiEnabled;
+            bool wasListening = _listener is not null;
+            _firmwareApiEnabled = enabled;
+            bool shouldListen = enabled || _serialApiConfigured;
+            if (shouldListen && _listener is null)
             {
                 StartLocked();
             }
-            else
+            else if (!shouldListen && _listener is not null)
             {
                 StopLocked();
+            }
+
+            if (wasEnabled != enabled && wasListening && _listener is not null)
+            {
+                Console.WriteLine(enabled
+                    ? "局域网固件刷写 API 已启用。"
+                    : "局域网固件刷写 API 已关闭；loopback 串口命令 API 继续运行。");
             }
         }
     }
@@ -102,8 +164,15 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         _cancellation = cancellation;
         _listenerTask = Task.Run(() => AcceptLoopAsync(listener, cancellation.Token));
         int actualPort = ((IPEndPoint)listener.LocalEndpoint).Port;
-        Console.WriteLine(
-            $"局域网固件刷写接口已启用：0.0.0.0:{actualPort}/api/v1/firmware；仅限受信任局域网。");
+        if (_firmwareApiEnabled)
+        {
+            Console.WriteLine(
+                $"局域网固件刷写接口已启用：0.0.0.0:{actualPort}/api/v1/firmware；仅限受信任局域网。");
+        }
+        if (_serialApiConfigured)
+        {
+            Console.WriteLine($"loopback 串口命令 API 已启用：127.0.0.1:{actualPort}/api/v1/serial。");
+        }
     }
 
     private void StopLocked()
@@ -129,7 +198,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
             }
         }
         cancellation?.Dispose();
-        Console.WriteLine("局域网固件刷写接口已关闭。");
+        Console.WriteLine("主机 HTTP API 监听已关闭。");
     }
 
     private async Task AcceptLoopAsync(TcpListener listener, CancellationToken cancellationToken)
@@ -173,12 +242,243 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                         .ConfigureAwait(false);
                     return;
                 }
+                if (path == "/api/v1/serial/refresh")
+                {
+                    requestTimeout.CancelAfter(TimeSpan.FromSeconds(15));
+                }
+                bool serialRoute = path is
+                    "/api/v1/serial/ports" or
+                    "/api/v1/serial/write" or
+                    "/api/v1/serial/refresh";
+                if (serialRoute && !IsLoopbackClient(client))
+                {
+                    await WriteJsonAsync(stream, 403, new { error = "loopback_only" }, requestTimeout.Token)
+                        .ConfigureAwait(false);
+                    return;
+                }
+                bool firmwareRoute = path is "/api/v1/firmware/status" or "/api/v1/firmware/flash";
+                if (firmwareRoute && !_firmwareApiEnabled)
+                {
+                    await WriteJsonAsync(stream, 404, new { error = "not_found" }, requestTimeout.Token)
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                int maximumBodyBytes = path == "/api/v1/serial/write"
+                    ? MaximumSerialRequestBodyBytes
+                    : MaximumBodyBytes;
                 int contentLength = 0;
                 if (headers.TryGetValue("content-length", out string? contentLengthText) &&
                     (!int.TryParse(contentLengthText, out contentLength) ||
-                     contentLength < 0 || contentLength > MaximumBodyBytes))
+                     contentLength < 0))
                 {
                     await WriteJsonAsync(stream, 400, new { error = "invalid_content_length" }, requestTimeout.Token)
+                        .ConfigureAwait(false);
+                    return;
+                }
+                if (contentLength > maximumBodyBytes)
+                {
+                    int statusCode = path == "/api/v1/serial/write" ? 413 : 400;
+                    await WriteJsonAsync(
+                            stream,
+                            statusCode,
+                            new { error = statusCode == 413 ? "request_body_too_large" : "invalid_content_length" },
+                            requestTimeout.Token)
+                        .ConfigureAwait(false);
+                    return;
+                }
+
+                if (method == "POST" && path == "/api/v1/serial/refresh")
+                {
+                    if (contentLength != 0)
+                    {
+                        await WriteJsonAsync(
+                                stream,
+                                400,
+                                new { error = "request_body_not_allowed" },
+                                requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (_refreshSerialPorts is null)
+                    {
+                        await WriteJsonAsync(stream, 503, new { error = "serial_api_unavailable" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    try
+                    {
+                        SerialPortRefreshSnapshot result = _refreshSerialPorts(requestTimeout.Token);
+                        await WriteJsonAsync(
+                                stream,
+                                200,
+                                new { availablePorts = result.AvailablePorts, openPorts = result.OpenPorts },
+                                requestTimeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception exception)
+                    {
+                        Console.Error.WriteLine($"串口刷新失败：{exception.Message}");
+                        await WriteJsonAsync(
+                                stream,
+                                500,
+                                new { error = "serial_refresh_failed", message = exception.Message },
+                                requestTimeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                    return;
+                }
+
+                if (method == "GET" && path == "/api/v1/serial/ports")
+                {
+                    if (contentLength != 0)
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "request_body_not_allowed" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (_getOpenSerialPorts is null)
+                    {
+                        await WriteJsonAsync(stream, 503, new { error = "serial_api_unavailable" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    try
+                    {
+                        string[] ports = _getOpenSerialPorts()
+                            .Where(name => !string.IsNullOrWhiteSpace(name) && IsValidPortName(name))
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToArray();
+                        await WriteJsonAsync(stream, 200, new { ports }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception exception)
+                    {
+                        await WriteJsonAsync(
+                                stream,
+                                500,
+                                new { error = "serial_port_list_failed", message = exception.Message },
+                                requestTimeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                    return;
+                }
+
+                if (method == "POST" && path == "/api/v1/serial/write")
+                {
+                    if (_writeSerialPort is null)
+                    {
+                        await WriteJsonAsync(stream, 503, new { error = "serial_api_unavailable" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (contentLength == 0)
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "request_body_required" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+
+                    string body = await ReadBodyAsync(stream, contentLength, requestTimeout.Token)
+                        .ConfigureAwait(false);
+                    SerialCommandWriteRequest? request;
+                    try
+                    {
+                        request = JsonSerializer.Deserialize<SerialCommandWriteRequest>(
+                            body,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    }
+                    catch (JsonException)
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "invalid_json" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (request is null || string.IsNullOrWhiteSpace(request.PortName))
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "port_name_required" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (!IsValidPortName(request.PortName))
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "invalid_port_name" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (string.IsNullOrEmpty(request.Hex))
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "hex_required" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (request.Hex.Length > MaximumSerialWriteBytes * 2)
+                    {
+                        await WriteJsonAsync(stream, 413, new { error = "serial_write_too_large" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (request.Hex.Length % 2 != 0 || request.Hex.Any(character => !char.IsAsciiHexDigit(character)))
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "invalid_hex" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+
+                    byte[] bytes = Convert.FromHexString(request.Hex);
+                    int? bytesWritten;
+                    try
+                    {
+                        bytesWritten = _writeSerialPort(request.PortName, bytes, requestTimeout.Token);
+                    }
+                    catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception exception)
+                    {
+                        Console.Error.WriteLine($"串口命令写入 {request.PortName} 失败：{exception.Message}");
+                        await WriteJsonAsync(
+                                stream,
+                                exception is TimeoutException ? 504 : 500,
+                                new { error = "serial_write_failed", message = exception.Message },
+                                requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (bytesWritten is null)
+                    {
+                        await WriteJsonAsync(stream, 409, new { error = "serial_port_not_open" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (bytesWritten.Value != bytes.Length)
+                    {
+                        await WriteJsonAsync(
+                                stream,
+                                500,
+                                new
+                                {
+                                    error = "serial_write_incomplete",
+                                    expectedBytes = bytes.Length,
+                                    bytesWritten = bytesWritten.Value,
+                                },
+                                requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+
+                    await WriteJsonAsync(
+                            stream,
+                            200,
+                            new { portName = request.PortName, bytesWritten = bytesWritten.Value, queued = false },
+                            requestTimeout.Token)
                         .ConfigureAwait(false);
                     return;
                 }
@@ -231,7 +531,20 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                             .ConfigureAwait(false);
                         return;
                     }
-                    string selectedPort = _selectedPortProvider()?.Trim() ?? string.Empty;
+                    /*
+                     * 端口选择（2026-09-28）：请求里显式给了 portName 就用它（远程刷写可以
+                     * 指定任意一块板），否则回落到 UI 选择的刷写端口——默认行为不变。
+                     */
+                    string requestedPort = request.PortName?.Trim() ?? string.Empty;
+                    if (requestedPort.Length > 0 && !IsValidPortName(requestedPort))
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "invalid_port_name" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    string selectedPort = requestedPort.Length > 0
+                        ? requestedPort
+                        : _selectedPortProvider()?.Trim() ?? string.Empty;
                     if (string.IsNullOrWhiteSpace(selectedPort))
                     {
                         await WriteJsonAsync(stream, 400, new { error = "firmware_flash_port_not_selected" }, requestTimeout.Token)
@@ -311,6 +624,25 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         return Encoding.UTF8.GetString(body);
     }
 
+    private static bool IsLoopbackClient(TcpClient client)
+    {
+        if (client.Client.RemoteEndPoint is not IPEndPoint remoteEndpoint)
+        {
+            return false;
+        }
+
+        return IsLoopbackAddress(remoteEndpoint.Address);
+    }
+
+    internal static bool IsLoopbackAddress(IPAddress address)
+    {
+        if (address.IsIPv4MappedToIPv6)
+        {
+            address = address.MapToIPv4();
+        }
+        return IPAddress.IsLoopback(address);
+    }
+
     internal static bool TryParseRequest(
         string headerText,
         out string method,
@@ -363,6 +695,10 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
             403 => "Forbidden",
             404 => "Not Found",
             409 => "Conflict",
+            413 => "Payload Too Large",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
             _ => "Error",
         };
         byte[] headers = Encoding.ASCII.GetBytes(

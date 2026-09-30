@@ -377,9 +377,10 @@ internal sealed class BridgeMainForm : Form
                 : RuntimeLogMode.Reduced;
             if (_logSettings.SetMode(mode))
             {
+                _serialBridge?.SetDevicePeriodicStats(mode == RuntimeLogMode.Full);
                 AppendLog(mode == RuntimeLogMode.Full
-                    ? "日志模式已切换为完整诊断；设备原始日志将写入文件并镜像到窗口，可能降低高频输入性能。"
-                    : "日志模式已切换为精简高性能；仅保留连接参数、统计、警告和错误等关键设备日志。");
+                    ? "日志窗口显示完整诊断；文件始终后台完整保存，大量界面刷新可能增加开销。"
+                    : "日志窗口仅显示连接、统计、警告和错误；文件仍后台完整保存全部设备日志。");
             }
         };
         _onboardLogButton = new Button

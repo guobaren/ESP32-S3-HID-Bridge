@@ -7,7 +7,7 @@
 
     注入 N 帧 × 每帧 dx=10 → 预期 M `motion_rx_dx` = +10N、P `motion_fwd_dx` = +10N
 
-报告的 8 字节布局（由真实样本反推，与固件布局一致）：
+报告正文的 8 字节布局（由真实样本反推，与固件布局一致）：
     [0] 按键位  [1] 保留  [2:3] dx(int16 LE)  [4:5] dy(int16 LE)  [6] 滚轮  [7] pan
 
 用法：
@@ -66,6 +66,7 @@ def main() -> int:
                         help="帧间隔（默认 2 ms，避免把 UART0 一次灌满）")
     args = parser.parse_args()
 
+    # 固件会根据当前枚举到的鼠标布局自动补上 Report ID，避免工具硬编码 ID。
     report = build_report(args.dx, args.dy)
 
     port = serial.Serial()

@@ -4,6 +4,28 @@
 > 「主机局域网模拟鼠标 UDP 接口」整章属于**主机 EXE + 早期单板固件**形态（UDP/kmboxNet 远程输入），双板主线不涉及，保留供该产品线参考。
 > 标注为"早期单板"的段落（原生 USB CDC 探测窗口、BLE 节拍、Wi-Fi TCP）只适用于 `firmware/` 单板工程；双板克隆不开 CDC、无 Wi-Fi/BLE。
 
+## 主机 loopback 串口命令 API
+
+主机 EXE 在现有 `FirmwareUpdateApiServer` HTTP 端口上提供三个仅限 loopback 的接口（当前配置端口为 `24815`）。串口 API 随主串口模式启动，即使设置页关闭“局域网固件刷写 API”仍可使用；该开关只关闭固件状态/刷写路由。旧构造方式或无串口桥接的模拟模式不提供串口路由。
+
+| 方法与路径 | 行为 |
+|---|---|
+| `GET /api/v1/serial/ports` | 返回 `{"ports":["COM12","COM3"]}`；只列出 EXE 当前持有的主控制串口和对端日志镜像串口 |
+| `POST /api/v1/serial/write` | 将 JSON 中的十六进制字节同步写到指定的已打开端口 |
+| `POST /api/v1/serial/refresh` | 不带请求体；重新枚举可用串口并立即尝试接管未监听的对端镜像口，返回 `availablePorts` 与 `openPorts` |
+
+镜像启动后先等待主串口连接，再每 2 秒重试发现晚到的对端口；读线程发现串口断开后会释放镜像句柄并继续重试。每轮最多探测 3 个候选，探测时保持 DTR/RTS 低电平。发现/刷新只操作镜像串口，不会关闭或重开健康的主串口。固件刷写等独占租约期间自动暂停发现并让出镜像口，租约释放后先让主串口恢复，再继续发现。此 API 的 `refresh` 会尝试启动镜像监听；设置页“刷新端口”按钮只刷新刷写下拉列表，两者用途不同。
+
+写入请求示例：`{"portName":"COM12","hex":"<完整帧的十六进制字节>"}`。`hex` 必须是非空、偶数长度的 ASCII 十六进制字符串，单次最多 4096 字节；不接受空格、分隔符或奇数位。命令应包含完整 UART0 帧：帧头、版本、类型、序号、Payload 长度、Payload 和 CRC16，不能只发送 Payload。帧字段见下方「帧格式」。
+
+成功响应包含 `portName`、`bytesWritten` 和 `queued:false`，只在同步串口写入返回后发送。参数错误返回 400，数据超限返回 413，EXE 未持有该端口返回 409，写入失败返回 500 或 504。两个串口接口只接受 `127.0.0.1`、`::1` 或等价 loopback 地址；同一 HTTP 端口上的既有固件接口保持原访问策略。
+
+API 复用 EXE 已打开的串口，不打开、关闭或重连端口，也不切换 DTR/RTS，因此不会通过串口打开动作触发板子复位。主串口的注入写入与 `WriterLoop` 共用 `_writeSync`，完整写操作不会与鼠标帧字节交错。正在写出的完整批次会先释放写锁；已经从队列取出但尚未取得写锁的鼠标批次与注入命令按锁的取得顺序发送，所以先后次序可能不同于鼠标帧入队顺序。响应只确认主机串口 `Write` 已返回，不代表固件已接受或处理该 UART0 帧。写入受串口驱动的写超时限制，HTTP 请求超时前会再次检查取消状态，不会把待写命令留在队列中。
+
+本版根目录 `HidBridge.Host.exe` 已于 2026-09-29 替换并运行；此接口在该进程中可用。
+
+主控制串口的设备日志继续写入现有 `DeviceLogPath` 文件。对端日志镜像另外创建同目录的 `host-serial-COMx-年月日-时分秒-毫秒.log` 文件（例如 `host-serial-COM3-20260929-043012-125.log`），每行写完立即刷新；只记录当前镜像日志策略保留的 ESP-IDF 行。固件刷写让出镜像串口时关闭当前镜像日志文件，恢复监听后为对应 COM 口新建文件。日志文件创建或写入失败只影响该路日志保存，不停止镜像串口读取或串口命令写入。
+
 ## 帧格式
 
 所有多字节整数采用小端序。
@@ -116,6 +138,7 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 | `0x09` | LOG_READ_RESPONSE | `offset:u32`、`total_bytes:u32`、`data:0..56`；`data` 为空表示流结束 |
 | `0x0A` | LOG_CLEAR_REQUEST | 空；清空全部日志文件后回一条 `total_bytes=0` 的 `LOG_READ_RESPONSE` |
 | `0x0B` | LOG_DUMP_REQUEST | `offset:u32`、`max_bytes:u32`；设备**连续**回多条 `LOG_READ_RESPONSE` 后以空 `data` 帧收尾 |
+| `0x0C` | LOG_STATS_CONTROL_REQUEST | Payload 1 字节：`0=关闭周期统计`、`1=开启周期统计`；运行时切换，不改变板载日志写盘开关。 |
 
 ### UART0 实时诊断与手动注入（双板固件）
 
@@ -135,11 +158,67 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 | `0x17` | DIAG_INJECT_REQUEST | `route:u8,type:u8,inner_payload:1..62`；route 1 仅 P 可用，接受 `RAW_HID_INPUT(0x27)` / `HID_GET_REPORT_RESPONSE(0x2A)`；route 2 仅 M 可用，接受 `HID_SET_REPORT(0x28)` / `HID_GET_REPORT_REQUEST(0x29)`。内层字段按同名 UART1 帧解码，非法载荷拒绝。 |
 | `0x18` | DIAG_INJECT_RESULT | `route:u8,status:u8`；0=已交给目标处理函数，1=格式错误，2=路由/角色/类型不支持。目标队列和 USB 后续失败须看事件与各队列统计。 |
 
+#### 鼠标报告注入（`0x1B`）
+
+`DUAL_MESSAGE_DIAG_REPORT_INJECT_REQUEST`（`0x1B`）只能发送到 M（`MOUSE_HOST`）的 UART0。Payload 是一条鼠标 Input Report：
+
+- 无 Report ID 的正文：`buttons:u8, reserved:u8, dx:i16le, dy:i16le, wheel:u8, pan:u8`，共 8 字节；
+- 已包含 Report ID 的完整报告：当前报告 ID + 上述正文，共 9 字节（C539 当前为 `02` + 8 字节）；
+- M 会读取当前枚举到的鼠标布局。8 字节正文会自动补当前 Report ID，9 字节完整报告原样使用；不应把按钮字节误放在 Report ID 位置。
+
+M 收到命令后把报告送入与真实 USB Host 输入相同的 RX 回调，因此会经过 M 解析、UART1、P 分类、HID 提交和完成回调。命令受理不代表 P 已提交；应同时检查 `Host HID统计`、`HID统计`、`UART1帧统计` 和各队列的 `rejected/dropped/peak`。
+
+#### 移动命令与 HID 报告注入的区别
+
+当前有两条不同路径，均不是厂商 HID++ 的“移动命令”：
+
+- `--inject-move X Y` 发送项目自定义 UART0 `MouseReport (0x02)`。Payload 是标准化的 `buttons + x/y + wheel/pan + smoothing_slots` 软件输入格式；M 收到后通过 UART1 转成 `SOFTWARE_MOUSE (0x2B)`，P 再按当前克隆鼠标布局生成 HID 报告。这是**软件鼠标输入通道**，不是 USB 原始报告，也不是厂商请求。
+- `0x1B` `DIAG_REPORT_INJECT_REQUEST` 发送原始 HID Input Report，直接进入 M 的物理 USB Host RX 回调，使用当前鼠标的接口、Report ID 和报告布局。这是**诊断用原始 HID 报告注入**，不是厂商 HID++ 请求。
+- 厂商请求使用 `0x17`/`0x27`/`0x28`/`0x29` 或设备级 Vendor Control 路径，服务 G HUB 等控制事务；它们不用于生成普通鼠标位移。
+
+#### 软件移动命令
+
+1. 通过诊断工具向 M 注入固定位移（工具直连 UART0，不能同时被 EXE 持有）：
+
+```powershell
+python tools/inject_mouse_motion.py --port COM12 --count 200 --dx 10 --dy 0 --interval-ms 2
+```
+
+2. 通过双 UART 工具注入一次**软件鼠标移动**并实时订阅两板事件：
+
+```powershell
+python tools/dual_uart_inspect.py --ports COM3,COM12 --inject-move 20 0
+```
+
+3. EXE 已占用串口时，使用 loopback API 转发完整 UART0 `0x1B` 原始 HID 注入帧。API 不重新打开串口，不切换 DTR/RTS：
+
+```powershell
+$frameHex = "<A5 5A 帧头、0x1B 类型、序号、8/9 字节报告和 CRC16 的连续十六进制>" -replace ' ', ''
+Invoke-RestMethod http://127.0.0.1:24815/api/v1/serial/write `
+  -Method Post -ContentType 'application/json' `
+  -Body (@{ portName = 'COM12'; hex = $frameHex } | ConvertTo-Json)
+```
+
+`tools/fetch_onboard_log.py::build_frame(0x1B, sequence, report)` 可生成完整 UART0 帧；`report` 使用 `struct.pack('<BBhhBB', buttons, 0, dx, dy, wheel, pan)`。API 返回成功只表示 Host 的串口 `Write` 完成。
+
+4. 圆形移动应先按圆周采样点计算相邻整数增量，再逐帧发送；允许 `dx=dy=0`，不要为了“保持频率”强行补 `dx=1`。示意代码：
+
+```python
+for i in range(sample_count):
+    angle = 2 * math.pi * turns * i / (sample_count - 1)
+    point = (round(radius * math.cos(angle)), round(radius * math.sin(angle)))
+    dx, dy = point[0] - previous[0], point[1] - previous[1]
+    send_uart0_inject(dx, dy)  # 通过 EXE /api/v1/serial/write 或直连串口
+    previous = point
+```
+
+EXE 逐帧 HTTP 请求的实际间隔通常大于 1 ms；“目标间隔 1 ms”只能作为采样目标，必须在日志中记录实际发送帧数和耗时，不能据此宣称严格 1 kHz。
+
 `source`：1=P 的 USB 应用回调，2=M 的 USB Host HID 报告，3=UART1 接收，4=UART1 已写出，5=UART0 已解析输入帧。UART0/1 的 `kind` 为原消息 type；USB `kind`：`0x80` SET_REPORT、`0x81` GET_REPORT 请求、`0x82` GET_REPORT 结果、`0x83` 设备级 vendor SETUP、`0x84` M 原始 HID 输入、`0x85` P USB 提交尝试、`0x86` USB 完成、`0x87` USB 失败。P 的 `0x83` 目前记录 SETUP 后仍返回 STALL，并不伪造厂商响应。各 USB 事件的 payload 前缀见 `diag_event_details()`；声明长度大于保存长度时客户端标记截断。
 
 固件把 USB 与 UART 数据路径的相关队列设为 128 项，逐队列输出 `QUEUE name=... received=... rejected=... dropped=... peak=... current=...`。`received` 是进入该队列入口的尝试，`rejected` 是校验/会话状态不允许入队，`dropped` 是容量满或显式清空的条目，`peak` 是观察到的深度峰值。UART 驱动自行管理的事件队列用 `consumed` 代替无法得知的内部入队次数；`overflow` 是驱动通知数。诊断事件队列本身也独立报告丢弃。
 
-`tools/dual_uart_inspect.py` 会实时显示并以 JSONL 保存事件，同时保存各端 UART0 原始 RX/TX 字节。示例：`python tools/dual_uart_inspect.py --ports COM3,COM13 --inject-move 20 0` 可经 M 的既有软件鼠标帧注入相对位移，观察 M UART0→M UART1 TX→P UART1 RX→P USB 提交/完成。P USB 提交成功仅表示 TinyUSB 接受报告，完成回调表示 USB 端传输完成，均不能单独证明目标应用已消费；两板事件目前按载荷与时间窗关联，尚无跨板统一 trace ID。串口订阅只覆盖固件已接入的 USB/HID 与 UART1 观察点，不包括控制器内部 ACK/NAK、总线重试和电脑端 USB 包。
+`tools/dual_uart_inspect.py` 会实时显示并以 JSONL 保存事件，同时保存各端 UART0 原始 RX/TX 字节。示例：`python tools/dual_uart_inspect.py --ports COM3,COM13 --inject-move 20 0` 可经 M 的既有软件鼠标帧注入相对位移，观察 M UART0→M UART1 TX→P UART1 RX→P USB 提交/完成。`0x1B` 注入正文可不含 Report ID；M 会按当前已枚举鼠标布局自动补齐 Report ID，也接受已经带 ID 的完整报告，避免把按钮字节误当成 ID。P USB 提交成功仅表示 TinyUSB 接受报告，完成回调表示 USB 端传输完成，均不能单独证明目标应用已消费；两板事件目前按载荷与时间窗关联，尚无跨板统一 trace ID。串口订阅只覆盖固件已接入的 USB/HID 与 UART1 观察点，不包括控制器内部 ACK/NAK、总线重试和电脑端 USB 包。
 
 逻辑字节流按「最旧 → 最新」排列，`offset` 从 0 开始；`total_bytes` 是板端当前可读的
 总字节数（**上限 2 MB**）。客户端的推荐做法是发一条 `LOG_DUMP_REQUEST`，然后流式解析

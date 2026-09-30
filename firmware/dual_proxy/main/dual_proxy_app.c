@@ -11,6 +11,7 @@
 #include "tusb.h"
 
 #include "bridge_protocol.h"
+#include "dual_proxy_runtime_config.h"
 #include "dual_proxy_app.h"
 #include "dual_status_led.h"
 #include "hid_host_mouse.h"
@@ -933,6 +934,10 @@ void app_main(void)
     ESP_LOGI(TAG, "dual_proxy启动 node=%02X%02X%02X%02X%02X%02X UART1 TX=GPIO17 RX=GPIO18 baud=921600",
              s_node_id[0], s_node_id[1], s_node_id[2],
              s_node_id[3], s_node_id[4], s_node_id[5]);
+    ESP_LOGI(TAG, "诊断开关：hidpp_timeout=%d link_gone_retry=%d periodic_stats=%d",
+             DUAL_PROXY_ENABLE_HIDPP_TIMEOUT_DIAGNOSTIC,
+             DUAL_PROXY_ENABLE_LINK_GONE_RETRY_DIAGNOSTIC,
+             DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG);
     esp_err_t result = dual_uart1_start(
         DUAL_ROLE_UNRESOLVED, s_node_id, on_link_frame, on_link_fault);
     if (result != ESP_OK) {

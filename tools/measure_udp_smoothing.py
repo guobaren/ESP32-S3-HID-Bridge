@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import ctypes
 import csv
 import json
@@ -34,6 +35,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 # 判定阈值与前置检查标识。
 FIRST_MOVE_LIMIT_MS = 10.0
@@ -90,7 +92,9 @@ class Sample:
 @dataclass(frozen=True)
 class Command:
     index: int
+    planned_us: int
     sent_us: int
+    completed_us: int
     dx: int
     dy: int
 
@@ -286,21 +290,56 @@ class UdpSender:
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._address = (host, port)
 
-    def send(self, dx: int, dy: int) -> int:
+    def send(
+        self,
+        dx: int,
+        dy: int,
+        clock_ns: Callable[[], int] = time.perf_counter_ns,
+    ) -> tuple[int, int]:
         payload = json.dumps(
             {"dx": int(dx), "dy": int(dy), "wheel": 0, "pan": 0},
             separators=(",", ":"),
         ).encode("utf-8")
-        return self._socket.sendto(payload, self._address)
+        send_started_ns = clock_ns()
+        self._socket.sendto(payload, self._address)
+        return send_started_ns, clock_ns()
 
     def close(self) -> None:
         self._socket.close()
 
 
-def send_command(sender: UdpSender, start_ns: int, commands: list[Command], dx: int, dy: int) -> None:
-    sent_us = (time.perf_counter_ns() - start_ns) // 1_000
-    sender.send(dx, dy)
-    commands.append(Command(len(commands) + 1, sent_us, dx, dy))
+def send_command(
+    sender: UdpSender,
+    start_ns: int,
+    commands: list[Command],
+    dx: int,
+    dy: int,
+    planned_us: int,
+    clock_ns: Callable[[], int] = time.perf_counter_ns,
+) -> Command:
+    send_started_ns, completed_ns = sender.send(dx, dy, clock_ns)
+    sent_us = (send_started_ns - start_ns) // 1_000
+    completed_us = (completed_ns - start_ns) // 1_000
+    command = Command(
+        len(commands) + 1,
+        planned_us,
+        sent_us,
+        completed_us,
+        dx,
+        dy,
+    )
+    commands.append(command)
+    return command
+
+
+def capture_cursor_sample(
+    start_ns: int,
+    read_cursor: Callable[[], tuple[int, int]] = cursor_position,
+    clock_ns: Callable[[], int] = time.perf_counter_ns,
+) -> Sample:
+    x, y = read_cursor()
+    elapsed_us = (clock_ns() - start_ns) // 1_000
+    return Sample(elapsed_us, x, y)
 
 
 def changed_samples(samples: list[Sample]) -> list[tuple[Sample, int, int]]:
@@ -333,7 +372,10 @@ def command_metrics(
         metrics.append(
             {
                 "index": command.index,
+                "planned_us": command.planned_us,
                 "sent_us": command.sent_us,
+                "send_completed_us": command.completed_us,
+                "send_call_duration_us": command.completed_us - command.sent_us,
                 "target_x": target,
                 "start_latency_us": None if first_change is None else first_change.elapsed_us - command.sent_us,
                 "half_target_x": threshold,
@@ -370,7 +412,17 @@ def svg_plot(path: Path, title: str, samples: list[Sample], commands: list[Comma
     if end_us is not None:
         samples = [sample for sample in samples if sample.elapsed_us <= end_us]
     samples = [Sample(sample.elapsed_us - start_us, sample.x, sample.y) for sample in samples]
-    commands = [Command(command.index, command.sent_us - start_us, command.dx, command.dy) for command in commands]
+    commands = [
+        Command(
+            command.index,
+            command.planned_us - start_us,
+            command.sent_us - start_us,
+            command.completed_us - start_us,
+            command.dx,
+            command.dy,
+        )
+        for command in commands
+    ]
     max_t = max(samples[-1].elapsed_us, 1)
     values = [sample.x - start_x for sample in samples]
     min_v, max_v = min(values + [0]), max(values + [0])
@@ -421,23 +473,65 @@ def write_csv(path: Path, samples: list[Sample]) -> None:
             previous = sample
 
 
-def run_case(name: str, sender: UdpSender, settle_us: int, interval_us: int, count: int) -> tuple[dict, list[Sample], list[Command], int]:
-    start_x, start_y = cursor_position()
+def write_command_csv(path: Path, commands: list[Command]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow((
+            "index",
+            "planned_us",
+            "send_started_us",
+            "send_completed_us",
+            "send_call_duration_us",
+            "send_lag_us",
+            "dx",
+            "dy",
+        ))
+        for command in commands:
+            writer.writerow((
+                command.index,
+                command.planned_us,
+                command.sent_us,
+                command.completed_us,
+                command.completed_us - command.sent_us,
+                max(0, command.sent_us - command.planned_us),
+                command.dx,
+                command.dy,
+            ))
+
+
+def run_case(
+    name: str,
+    sender: UdpSender,
+    settle_us: int,
+    interval_us: int,
+    count: int,
+    *,
+    read_cursor: Callable[[], tuple[int, int]] = cursor_position,
+    clock_ns: Callable[[], int] = time.perf_counter_ns,
+) -> tuple[dict, list[Sample], list[Command], int]:
+    start_x, start_y = read_cursor()
     commands: list[Command] = []
-    start_ns = time.perf_counter_ns()
+    start_ns = clock_ns()
     send_deadlines_us = [settle_us + index * interval_us for index in range(count)]
     end_us = settle_us + (count - 1) * interval_us + 80_000
     next_sample_us = 0
     samples: list[Sample] = []
     next_command = 0
     while next_sample_us <= end_us:
-        now_us = (time.perf_counter_ns() - start_ns) // 1_000
+        now_us = (clock_ns() - start_ns) // 1_000
         while next_command < count and now_us >= send_deadlines_us[next_command]:
-            send_command(sender, start_ns, commands, 20, 0)
+            send_command(
+                sender,
+                start_ns,
+                commands,
+                20,
+                0,
+                send_deadlines_us[next_command],
+                clock_ns,
+            )
             next_command += 1
         if now_us >= next_sample_us:
-            x, y = cursor_position()
-            samples.append(Sample(now_us, x, y))
+            samples.append(capture_cursor_sample(start_ns, read_cursor, clock_ns))
             next_sample_us += 1_000
         # 采样和发送调度路径禁止 sleep：Windows 的线程睡眠粒度可能约为 15.6 ms，
         # 会直接跳过多个 1 ms 桶。这里使用 perf_counter_ns() 忙等到下一个绝对时间点。
@@ -445,7 +539,7 @@ def run_case(name: str, sender: UdpSender, settle_us: int, interval_us: int, cou
         sender.send(-20 * count, 0)
         time.sleep(0.08)
     restore_cursor(start_x, start_y)
-    end_x, end_y = cursor_position()
+    end_x, end_y = read_cursor()
     targets = [start_x + 20 * index for index in range(1, count + 1)]
     result = command_metrics(samples, commands, start_x, targets, start_x + 20 * count)
     result.update({"name": name, "start": [start_x, start_y], "end": [end_x, end_y], "end_restored": [end_x, end_y] == [start_x, start_y]})
@@ -455,24 +549,54 @@ def run_case(name: str, sender: UdpSender, settle_us: int, interval_us: int, cou
 def circle_metrics(
     samples: list[Sample],
     commands: list[Command],
-    send_lags_us: list[int],
     walk_dx: int,
     walk_dy: int,
     expected_end: tuple[int, int],
     actual_end: tuple[int, int],
     end_delta: tuple[int, int],
 ) -> dict:
-    """长时移动的检查指标：发送节奏、位移连续性、路程与**终点核对**。"""
+    """长时移动指标。时间只表示本机发包调用和 Windows 光标采样的观测。"""
     changes = changed_samples(samples)
-    # 最长"无位移"间隔：从首条命令（或上一次观测到位移）到下一次位移之间的时长。
+    sample_times = [sample.elapsed_us for sample in samples]
+    sample_intervals_us = [right - left for left, right in zip(sample_times, sample_times[1:])]
     previous_us = commands[0].sent_us if commands else 0
     max_gap_us = 0
+    max_gap_sample_interval_us = 0
+    max_gap_sample_count = 0
     for sample, _, _ in changes:
-        max_gap_us = max(max_gap_us, sample.elapsed_us - previous_us)
+        gap_us = sample.elapsed_us - previous_us
+        if gap_us > max_gap_us:
+            first_sample = bisect_right(sample_times, previous_us)
+            end_sample = bisect_right(sample_times, sample.elapsed_us)
+            local_sample_times = sample_times[first_sample:end_sample]
+            local_max_sample_interval_us = 0
+            previous_sample_us = previous_us
+            for sample_us in local_sample_times:
+                local_max_sample_interval_us = max(
+                    local_max_sample_interval_us,
+                    sample_us - previous_sample_us,
+                )
+                previous_sample_us = sample_us
+            local_max_sample_interval_us = max(
+                local_max_sample_interval_us,
+                sample.elapsed_us - previous_sample_us,
+            )
+            max_gap_us = gap_us
+            max_gap_sample_interval_us = local_max_sample_interval_us
+            max_gap_sample_count = len(local_sample_times)
         previous_us = sample.elapsed_us
-    ordered = sorted(send_lags_us)
 
-    def percentile(pct: float) -> int | None:
+    send_lags_us = [max(0, command.sent_us - command.planned_us) for command in commands]
+    send_call_durations_us = [
+        max(0, command.completed_us - command.sent_us) for command in commands
+    ]
+    send_intervals_us = [
+        current.sent_us - previous.sent_us
+        for previous, current in zip(commands, commands[1:])
+    ]
+
+    def percentile(values: list[int], pct: float) -> int | None:
+        ordered = sorted(values)
         if not ordered:
             return None
         index = min(len(ordered) - 1, int(round((pct / 100.0) * (len(ordered) - 1))))
@@ -483,11 +607,29 @@ def circle_metrics(
         "sample_count": len(samples),
         "duration_us": samples[-1].elapsed_us if samples else None,
         "send_lag_us_avg": (sum(send_lags_us) / len(send_lags_us)) if send_lags_us else None,
-        "send_lag_us_p99": percentile(99.0),
+        "send_lag_us_p99": percentile(send_lags_us, 99.0),
         "send_lag_us_max": max(send_lags_us) if send_lags_us else None,
         "send_behind_count": sum(1 for lag in send_lags_us if lag > CIRCLE_MAX_SEND_LAG_US),
+        "send_call_duration_us_avg": (
+            sum(send_call_durations_us) / len(send_call_durations_us)
+            if send_call_durations_us else None
+        ),
+        "send_call_duration_us_p99": percentile(send_call_durations_us, 99.0),
+        "send_call_duration_us_max": max(send_call_durations_us) if send_call_durations_us else None,
+        "send_interval_us_avg": (
+            sum(send_intervals_us) / len(send_intervals_us) if send_intervals_us else None
+        ),
+        "send_interval_us_p99": percentile(send_intervals_us, 99.0),
+        "send_interval_us_max": max(send_intervals_us) if send_intervals_us else None,
+        "max_sample_interval_us": max(sample_intervals_us) if sample_intervals_us else None,
+        "p99_sample_interval_us": percentile(sample_intervals_us, 99.0),
+        "sample_intervals_over_2x_period": sum(
+            1 for interval in sample_intervals_us if interval > CIRCLE_SAMPLE_US * 2
+        ),
         "motion_change_count": len(changes),
         "max_no_motion_gap_us": max_gap_us,
+        "max_no_motion_gap_sample_interval_us": max_gap_sample_interval_us,
+        "max_no_motion_gap_sample_count": max_gap_sample_count,
         "total_path_px": sum(abs(dx) + abs(dy) for _, dx, dy in changes),
         "walk_steps": len(commands),
         "walk_px": len(commands) * CIRCLE_STEP_PX,
@@ -512,8 +654,15 @@ def print_circle_report(result: dict) -> None:
           f"最大 {ms(result.get('send_lag_us_max'))} ms，"
           f"超 {CIRCLE_MAX_SEND_LAG_US / 1000.0:.0f}ms 的有 "
           f"{result.get('send_behind_count')} 次", flush=True)
+    print(f"  发送调用：最大耗时 {ms(result.get('send_call_duration_us_max'))} ms，"
+          f"相邻发送最大间隔 {ms(result.get('send_interval_us_max'))} ms；"
+          f"采样最大间隔 {ms(result.get('max_sample_interval_us'))} ms，"
+          f"超过 {CIRCLE_SAMPLE_US * 2 / 1000.0:.0f}ms 的有 "
+          f"{result.get('sample_intervals_over_2x_period')} 次", flush=True)
     print(f"  连续性：最长无位移 {ms(result.get('max_no_motion_gap_us'))} ms"
-          f"（阈值 {CIRCLE_MAX_GAP_US / 1000.0:.0f} ms）；"
+          f"（阈值 {CIRCLE_MAX_GAP_US / 1000.0:.0f} ms；该窗口内最大采样间隔 "
+          f"{ms(result.get('max_no_motion_gap_sample_interval_us'))} ms，"
+          f"采样点 {result.get('max_no_motion_gap_sample_count')}）；"
           f"观测路程 {result.get('total_path_px')} px；"
           f"发出步数 {result.get('walk_steps')}（每步 {CIRCLE_STEP_PX} px）", flush=True)
     end_delta = result.get("end_delta") or [None, None]
@@ -537,8 +686,12 @@ def judge_circle(result: dict) -> list[str]:
             f"{label}：完全没有观测到位移；请确认电脑侧板(P)输出到本机、"
             f"克隆已枚举且 HidBridge.Host.exe 正在运行")
     elif gap > CIRCLE_MAX_GAP_US:
+        sample_gap = result.get("max_no_motion_gap_sample_interval_us") or 0
+        sample_count = result.get("max_no_motion_gap_sample_count")
         failures.append(f"{label}：出现 {gap / 1000.0:.1f}ms 的位移停顿，超过阈值 "
-                        f"{CIRCLE_MAX_GAP_US / 1000.0:.0f}ms")
+                        f"{CIRCLE_MAX_GAP_US / 1000.0:.0f}ms；同一窗口内最大采样间隔 "
+                        f"{sample_gap / 1000.0:.1f}ms，采样点 {sample_count}。"
+                        "这是本机光标观测，不能单独定位输入链路。")
     lag = result.get("send_lag_us_max")
     if lag is not None and lag > CIRCLE_MAX_SEND_LAG_US:
         failures.append(f"{label}：发送节奏最大滞后 {lag / 1000.0:.1f}ms，超过阈值 "
@@ -550,13 +703,18 @@ def judge_circle(result: dict) -> list[str]:
         failures.append(
             f"{label}：最终位置与预期相差 {end_delta_px}px（容差 {CIRCLE_END_TOLERANCE_PX}px）"
             f"——预期 {result.get('expected_end')}、实际 {result.get('actual_end')}，"
-            f"说明存在被吞掉或多发的 {CIRCLE_STEP_PX}px 微步")
+            "位移校验失败；需排查外部鼠标操作、屏幕边界、指针加速及输入链路")
     if not failures:
         print(f"[判定] {label}：发送节奏、位移连续性与终点位置均达标", flush=True)
     return failures
 
 
-def run_circle_case(sender: UdpSender) -> tuple[dict, list[Sample], list[Command], int]:
+def run_circle_case(
+    sender: UdpSender,
+    *,
+    read_cursor: Callable[[], tuple[int, int]] = cursor_position,
+    clock_ns: Callable[[], int] = time.perf_counter_ns,
+) -> tuple[dict, list[Sample], list[Command], int]:
     """长时移动用例：每 1 ms 发一次、持续 10 s，沿 r=100px 的圆**逐像素**行走。
 
     每步只走 1 个像素单位：先按"每步弧长 1 px"推进角度得到理想位置，再从 8 邻域
@@ -565,14 +723,13 @@ def run_circle_case(sender: UdpSender) -> tuple[dict, list[Sample], list[Command
 
     计时与短用例同源：perf_counter_ns() 忙等到**绝对**时间点（step × 1ms），绝不 sleep。
     """
-    start_x, start_y = cursor_position()
+    start_x, start_y = read_cursor()
     total_steps = int(round(CIRCLE_DURATION_S * 1_000_000 / CIRCLE_STEP_US))
     arc_step = CIRCLE_STEP_PX / float(CIRCLE_RADIUS_PX)   # 每步对应的圆心角
     neighbor_steps = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
     commands: list[Command] = []
     samples: list[Sample] = []
-    send_lags_us: list[int] = []
-    start_ns = time.perf_counter_ns()
+    start_ns = clock_ns()
     walk_x = 0      # 相对起点的累积位移，也就是预期终点的偏移量
     walk_y = 0
     step = 0
@@ -580,7 +737,7 @@ def run_circle_case(sender: UdpSender) -> tuple[dict, list[Sample], list[Command
     next_sample_us = 0
     end_us = total_steps * CIRCLE_STEP_US
     while step < total_steps or next_sample_us <= end_us:
-        now_us = (time.perf_counter_ns() - start_ns) // 1_000
+        now_us = (clock_ns() - start_ns) // 1_000
         while step < total_steps and now_us >= next_plan_us:
             angle = arc_step * (step + 1)
             ideal_x = CIRCLE_RADIUS_PX * math.cos(angle)
@@ -595,24 +752,28 @@ def run_circle_case(sender: UdpSender) -> tuple[dict, list[Sample], list[Command
                     best_dx, best_dy = dx, dy
             walk_x += best_dx
             walk_y += best_dy
-            sender.send(best_dx, best_dy)
-            sent_us = (time.perf_counter_ns() - start_ns) // 1_000
-            commands.append(Command(step + 1, sent_us, best_dx, best_dy))
-            send_lags_us.append(max(0, sent_us - next_plan_us))
+            send_command(
+                sender,
+                start_ns,
+                commands,
+                best_dx,
+                best_dy,
+                next_plan_us,
+                clock_ns,
+            )
             step += 1
             next_plan_us += CIRCLE_STEP_US
         if now_us >= next_sample_us:
-            x, y = cursor_position()
-            samples.append(Sample(now_us, x, y))
+            samples.append(capture_cursor_sample(start_ns, read_cursor, clock_ns))
             next_sample_us += CIRCLE_SAMPLE_US
 
     # 终点核对：链路与平滑槽排空都需要时间，等位置**连续两次读数一致**再判定，
     # 否则会把"还没走完的平滑残留"误算成终点偏差（最多等 1.5 s）。
     expected_end = (start_x + walk_x, start_y + walk_y)
-    actual_end = cursor_position()
+    actual_end = read_cursor()
     for _ in range(30):
         time.sleep(0.05)
-        current = cursor_position()
+        current = read_cursor()
         if current == actual_end:
             break
         actual_end = current
@@ -623,13 +784,13 @@ def run_circle_case(sender: UdpSender) -> tuple[dict, list[Sample], list[Command
         time.sleep(0.15)
     restore_cursor(start_x, start_y)
 
-    result = circle_metrics(samples, commands, send_lags_us, walk_x, walk_y,
+    result = circle_metrics(samples, commands, walk_x, walk_y,
                             expected_end, actual_end, end_delta)
     result.update({
         "name": "circle_r100_10s_1px_step",
         "start": [start_x, start_y],
         "end": [actual_end[0], actual_end[1]],
-        "end_restored": cursor_position() == (start_x, start_y),
+        "end_restored": read_cursor() == (start_x, start_y),
         "analysis_start_us": commands[0].sent_us if commands else 0,
         "analysis_end_us": samples[-1].elapsed_us if samples else None,
     })
@@ -701,6 +862,7 @@ def main() -> int:
     single_runs: list[dict] = []
     continuous_runs: list[dict] = []
     circle_runs: list[dict] = []
+    circle_command_runs: list[list[Command]] = []
     single_plot: tuple[list[Sample], list[Command], int] | None = None
     continuous_plot: tuple[list[Sample], list[Command], int] | None = None
     circle_plot: tuple[list[Sample], list[Command], int] | None = None
@@ -737,6 +899,7 @@ def main() -> int:
                   flush=True)
             circle, circle_samples, circle_commands, circle_start = run_circle_case(sender)
             circle_runs.append(circle)
+            circle_command_runs.append(circle_commands)
             if circle_plot is None:
                 circle_plot = (circle_samples, circle_commands, circle_start)
             print_circle_report(circle)
@@ -756,6 +919,11 @@ def main() -> int:
     write_csv(args.output_dir / "single_20px.csv", single_samples)
     write_csv(args.output_dir / "three_20px_every_10ms.csv", continuous_samples)
     write_csv(args.output_dir / "circle_r100_10s.csv", circle_samples)
+    circle_command_csvs = []
+    for attempt, commands in enumerate(circle_command_runs, start=1):
+        command_csv = f"circle_r100_10s_commands_run_{attempt:02d}.csv"
+        write_command_csv(args.output_dir / command_csv, commands)
+        circle_command_csvs.append(command_csv)
     svg_plot(args.output_dir / "single_20px.svg", "单次 20 px UDP 移动", single_samples, single_commands, single_start, single["analysis_start_us"], single["analysis_end_us"])
     svg_plot(args.output_dir / "three_20px_every_10ms.svg", "每 10 ms 发送一次 20 px，共 3 次", continuous_samples, continuous_commands, continuous_start, continuous["analysis_start_us"], continuous["analysis_end_us"])
     svg_plot(args.output_dir / "circle_r100_10s.svg",
@@ -800,6 +968,7 @@ def main() -> int:
         "single": single,
         "continuous": continuous,
         "circle": circle,
+        "circle_command_csvs": circle_command_csvs,
         "failures": failures,
         "failure_count": len(failures),
     }

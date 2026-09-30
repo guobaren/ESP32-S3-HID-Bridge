@@ -12,8 +12,7 @@
  * 本模块的做法（对齐真实主机的行为）：
  *   1. 自建 USB 客户端 + 自建事件任务；
  *   2. **每个请求独立分配 usb_transfer_t**，完成后立即释放——一笔卡住不影响其它请求；
- *   3. 自定超时（默认 600 ms）：超时后用 usb_host_endpoint_flush(dev, 0) 退役该 URB
- *      （EP0 在 usb_host 的端点表里是可寻址的第 0 项），再释放，通道继续可用；
+ *   3. 自定超时（默认 800 ms）：超时后将该 URB 标为孤儿并等待完成回调回收；
  *   4. 设备句柄按地址缓存，设备消失（DEV_GONE）时关闭并重新打开。
  *
  * 中断管道（移动/vendor 输入）仍由 usb_host_hid 组件持有，本模块只接管 EP0。
@@ -70,3 +69,6 @@ void dual_vendor_urb_stats(
     int64_t *latency_max_us,
     uint32_t *latency_over_10ms,
     uint32_t *latency_over_100ms);
+
+/* 非阻塞快照：仅统计已成功提交且尚未收到完成回调的 EP0 URB。 */
+bool dual_vendor_urb_pending_snapshot(int64_t *oldest_start_us, uint32_t *count);

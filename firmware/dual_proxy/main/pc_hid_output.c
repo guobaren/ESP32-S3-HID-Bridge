@@ -1706,6 +1706,10 @@ static int64_t add_stat_axis(int64_t first, int64_t second)
 
 static void log_hid_statistics_if_due(void)
 {
+    if (!DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG &&
+        !dual_proxy_periodic_stats_enabled()) {
+        return;
+    }
     const int64_t now_us = esp_timer_get_time();
     if (s_last_stats_us == 0 || now_us - s_last_stats_us >= 1000000LL) {
         int64_t pending_x = 0;

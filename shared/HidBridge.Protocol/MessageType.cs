@@ -13,6 +13,7 @@ public enum MessageType : byte
     LogReadResponse = 0x09,
     LogClearRequest = 0x0A,
     LogDumpRequest = 0x0B,
+    LogStatsControlRequest = 0x0C,
     DiagProfileRead = 0x0D,
     DiagProfileData = 0x0E,
     DiagProfileBegin = 0x0F,

@@ -1,9 +1,17 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace HidBridge.Host.Ui;
 
 /// <summary>
 /// 向只读日志框追加内容，同时保留用户当前的选区和查看位置。
+///
+/// 跟随策略（2026-09-28 重写）：
+///   默认**持续跟随最新行**；只有"用户自己滚动"才会把跟随关掉；用户一旦滚回最底部，
+///   立刻恢复跟随。程序自身的追加与截断**永不改变**该状态。
+///
+/// 为什么不能再用滚动条位置去推断意图：截断会同时改动 nMax 与 nPos，判定结果会在
+/// "在底部 / 不在底部"之间反复翻转，表现成视图在首行与尾行之间来回跳。
 /// </summary>
 internal static class LogTextBoxAppender
 {
@@ -13,6 +21,20 @@ internal static class LogTextBoxAppender
     private const uint SifRange = 0x0001;
     private const uint SifPage = 0x0002;
     private const uint SifPos = 0x0004;
+
+    /// <summary>每个日志框一份跟随状态；用弱表挂靠，随控件一起回收。</summary>
+    private sealed class FollowState
+    {
+        public bool FollowLatest = true;
+
+        /// <summary>程序上一次操作结束时留下的滚动位置；与当前值不符即说明用户滚动过。</summary>
+        public int LastKnownPosition = -1;
+
+        /// <summary>事件钩子只挂一次。</summary>
+        public bool HookInstalled;
+    }
+
+    private static readonly ConditionalWeakTable<TextBox, FollowState> States = new();
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     private static extern int SendMessage(
@@ -38,49 +60,98 @@ internal static class LogTextBoxAppender
             return;
         }
 
-        bool followLatest = ShouldFollowLatest(textBox);
+        FollowState state = GetState(textBox);
         int selectionStart = textBox.SelectionStart;
         int selectionLength = textBox.SelectionLength;
         int firstVisibleLine = GetFirstVisibleLine(textBox);
 
+        // 首次追加时没有程序位置基线。活动选区代表用户正在查看历史内容，
+        // 即使控件当前没有可滚动范围也必须保留选区。
+        if (state.LastKnownPosition < 0)
+        {
+            state.FollowLatest = selectionLength == 0 && IsAtBottom(textBox);
+        }
+        else if (selectionLength > 0)
+        {
+            // 活动选区优先级最高，即使控件位置恰好与上次程序位置相同。
+            state.FollowLatest = false;
+        }
+
+        // 追加之前先看：滚动位置是否被"我们不在场时"的某次用户操作改掉了。
+        // 这样拖动滚动条、键盘翻页、滚轮都能覆盖到，无需依赖具体事件。
+        if (state.LastKnownPosition >= 0 &&
+            TryGetVerticalScrollInfo(textBox, out ScrollInfo before) &&
+            before.nPos != state.LastKnownPosition)
+        {
+            state.FollowLatest = IsAtBottom(textBox);
+        }
+
         textBox.AppendText(string.Join(Environment.NewLine, lines) + Environment.NewLine);
         (int removedCharacters, int removedLines) = TrimIfNeeded(textBox, maximumVisibleCharacters);
 
-        if (followLatest)
+        if (state.FollowLatest)
         {
             textBox.SelectionStart = textBox.TextLength;
             textBox.SelectionLength = 0;
             textBox.ScrollToCaret();
+        }
+        else
+        {
+            RestoreSelection(textBox, selectionStart, selectionLength, removedCharacters);
+            RestoreFirstVisibleLine(
+                textBox,
+                Math.Max(0, firstVisibleLine - removedLines));
+        }
+
+        // 记录本次程序操作后留下的位置，作为下一次"用户是否滚动过"的基准。
+        // 必须在截断与滚动之后记录，否则截断引起的位移会被误判成用户操作。
+        if (TryGetVerticalScrollInfo(textBox, out ScrollInfo after))
+        {
+            state.LastKnownPosition = after.nPos;
+        }
+    }
+
+    private static FollowState GetState(TextBox textBox)
+    {
+        FollowState state = States.GetOrCreateValue(textBox);
+        if (state.HookInstalled)
+        {
+            return state;
+        }
+
+        state.HookInstalled = true;
+        // 滚轮与键盘即时更新跟随状态（拖动滚动条由 Append 时的位置比较兜底）。
+        textBox.MouseWheel += (_, _) => OnUserScroll(textBox);
+        textBox.KeyDown += (_, _) => OnUserScroll(textBox);
+        return state;
+    }
+
+    private static void OnUserScroll(TextBox textBox)
+    {
+        if (textBox.IsDisposed)
+        {
             return;
         }
 
-        RestoreSelection(textBox, selectionStart, selectionLength, removedCharacters);
-        RestoreFirstVisibleLine(
-            textBox,
-            Math.Max(0, firstVisibleLine - removedLines));
+        FollowState state = States.GetOrCreateValue(textBox);
+        // 用户滚回最底部就恢复跟随，停在别处则暂停跟随。
+        state.FollowLatest = IsAtBottom(textBox);
     }
 
-    private static bool ShouldFollowLatest(TextBox textBox)
+    private static bool IsAtBottom(TextBox textBox)
     {
         if (textBox.TextLength == 0)
         {
             return true;
         }
 
-        // 活动选区必须保持不动，避免用户拖选部分日志时被追加操作打断。
-        // 零长度插入点不影响判断：只要视图仍在底部，就应继续跟随最新日志。
-        if (textBox.SelectionLength > 0)
-        {
-            return false;
-        }
-
         if (TryGetVerticalScrollInfo(textBox, out ScrollInfo scrollInfo))
         {
-            // nPos 到达可滚动范围末尾时才自动跟随，避免用户停在倒数几行历史记录时被跳走。
+            // nPos 到达可滚动范围末尾时视为停在最新行。
             return (long)scrollInfo.nPos + Math.Max(1u, scrollInfo.nPage) >= (long)scrollInfo.nMax + 1;
         }
 
-        // 没有垂直滚动条信息时，退回到 Win32 的当前首可见行判断；该路径与插入点无关。
+        // 没有滚动条信息时退回 Win32 首可见行判断。
         int firstVisibleLine = GetFirstVisibleLine(textBox);
         int lastTextLine = textBox.GetLineFromCharIndex(textBox.TextLength);
         int visibleLineCount = Math.Max(1, textBox.ClientSize.Height / Math.Max(1, textBox.Font.Height));

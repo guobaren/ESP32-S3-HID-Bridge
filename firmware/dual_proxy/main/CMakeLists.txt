@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "dual_proxy_app.c"
+        "dual_proxy_runtime_config.c"
         "bridge_protocol.c"
         "dual_input_aggregator.c"
         "dual_status_led.c"

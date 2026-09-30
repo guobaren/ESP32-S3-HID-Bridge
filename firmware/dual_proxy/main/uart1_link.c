@@ -2059,6 +2059,8 @@ static void link_tx_task(void *argument)
                     s_rx_pending_peak = (uint32_t)rx_pending;
                 }
             }
+            if (DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG ||
+                dual_proxy_periodic_stats_enabled()) {
             ESP_LOGI(TAG, "UART1统计 tx=%" PRIu32 " rx=%" PRIu32
                      " rx_bytes=%" PRIu32 " frame_err=%" PRIu32
                      " peer_silence_ms=%" PRIu32
@@ -2153,6 +2155,7 @@ static void link_tx_task(void *argument)
             log_queue_metrics("uart1_software", &s_software_tx_queue_metrics);
             log_queue_metrics("uart1_vendor", &s_vendor_tx_queue_metrics);
             log_uart_event_window_metrics();
+            }
             last_tx_physical = s_tx_physical_count;
             last_rx_physical = s_rx_physical_count;
             last_tx_software = s_tx_software_count;
@@ -2605,7 +2608,8 @@ esp_err_t dual_uart1_send_device_gone(uint8_t reason)
     s_gone_completed_event_id = 0U;
     s_gone_completed_peer_generation = 0U;
     link_flow_start(&s_gone_flow, DUAL_MESSAGE_DEVICE_GONE, event_id, now_us,
-                    LINK_GONE_MAX_ATTEMPTS, LINK_GONE_RETRY_INTERVAL_US,
+                    LINK_GONE_EFFECTIVE_MAX_ATTEMPTS,
+                    LINK_GONE_EFFECTIVE_RETRY_INTERVAL_US,
                     recovery_stage_timeout(now_us, LINK_GONE_STAGE_TIMEOUT_US));
     s_device_gone_reason = reason;
     /* Drop old bytes and in-flight retransmission state. A new Profile queued

@@ -20,9 +20,11 @@
 #include "hid_device_profile.h"
 #include "hid_report_layout.h"
 #include "vendor_urb.h"
+#include "usb_stall_recovery_logic.h"
+#include "dual_proxy_runtime_config.h"
 
 /*
- * 厂商控制传输走直连通道（每请求独立 URB + 自定超时 + EP0 flush 退役）还是走
+ * 厂商控制传输走直连通道（每请求独立 URB + 自定超时 + 孤儿等待回调回收）还是走
  * usb_host_hid 组件的单例 ctrl_xfer。置 1 用直连通道；置 0 可一键回退对比。
  */
 #define VENDOR_USE_DIRECT_URB 1
@@ -47,9 +49,10 @@
 #define TASK_EXIT_STATS (1U << 6)
 #define TASK_EVENT_ALL_FREE (1U << 7)
 #define TASK_EVENT_HOST_INSTALL_DONE (1U << 8)
+#define TASK_EXIT_STALL_WATCH (1U << 9)
 #define TASK_EXIT_WORKERS (TASK_EXIT_DESCRIPTOR | TASK_EXIT_PROFILE | \
                            TASK_EXIT_HID_EVENT | TASK_EXIT_REPORT | \
-                           TASK_EXIT_CONTROL | TASK_EXIT_STATS)
+                           TASK_EXIT_CONTROL | TASK_EXIT_STATS | TASK_EXIT_STALL_WATCH)
 
 static const char *TAG = "dual_hid_host";
 
@@ -260,6 +263,7 @@ static hid_interface_slot_t s_interface_slots[HID_INTERFACE_SLOT_COUNT];
 static QueueHandle_t s_control_queue;
 static TaskHandle_t s_control_task;
 static TaskHandle_t s_stats_task;
+static TaskHandle_t s_stall_watch_task;
 static EventGroupHandle_t s_task_events;
 static EventBits_t s_worker_task_mask;
 static portMUX_TYPE s_interface_state_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -806,7 +810,7 @@ static volatile uint32_t s_probe_fail_streak;
  * 不必再等外部软件碰巧发控制请求。
  * 起因：现场实测 13:58 那次冻结期间**没有任何控制请求发出**，判据白等了 42 秒才成立。
  */
-#define USB_HEARTBEAT_PERIOD_US    (500 * 1000LL)        /* 探测周期 */
+#define USB_HEARTBEAT_PERIOD_US    (100 * 1000LL)        /* 探测周期 */
 #define USB_HEARTBEAT_TIMEOUT_MS   (200U)                /* 单次探测超时（正常控制传输 ≤1.7 ms，200 ms 仍留百倍余量） */
 static volatile int64_t s_last_heartbeat_us;
 static volatile uint32_t s_heartbeat_ok_count;
@@ -849,7 +853,14 @@ static volatile bool s_hid_recover_requested;
 /* 二级恢复：根端口断电再上电（等价于拔插一次 USB）。一级重挂若被"在飞传输"挡住
  * （start 返回 ESP_ERR_NOT_FINISHED），设备会保持沉默，这时只有端口级功率循环
  * 或整体重启主机栈才能恢复——实测手动拔插鼠标与复位 M 都属这一类。 */
+#if USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY
 static volatile bool s_root_port_cycle_requested;
+#endif
+static volatile uint32_t s_cycle_requests, s_cycle_ok, s_cycle_failed;
+static volatile uint32_t s_cycle_off_fail, s_cycle_on_fail, s_cycle_suppressed;
+static volatile uint32_t s_cycle_input_restored, s_cycle_input_missing, s_cycle_slow;
+static volatile int64_t s_cycle_delay_max_us;
+static int64_t s_cycle_input_wait_us;
 static volatile uint32_t s_root_port_cycles;
 static const char *s_hid_recover_reason;
 
@@ -1197,7 +1208,7 @@ static void hid_control_task(void *argument)
                 if (++s_vendor_urb_fail_streak >= VENDOR_URB_RECOVER_STREAK) {
                     s_vendor_urb_fail_streak = 0;
 #if USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY
-                    /* 历史回退模式才安排根端口断电；默认保持物理鼠标供电。 */
+                    /* 历史回退模式才由此安排断电；自动冻结恢复由独立检查任务处理。 */
                     s_root_port_cycle_requested = true;
 #else
                     ESP_LOGW(TAG, "SET_REPORT 连续失败：保留 USB 供电，继续接受后续独立 URB 请求");
@@ -1255,6 +1266,10 @@ static void hid_stats_task(void *argument)
         if (stopping_requested()) {
             break;
         }
+        if (!DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG &&
+            !dual_proxy_periodic_stats_enabled()) {
+            continue;
+        }
         uint32_t urb_submitted = 0;
         uint32_t urb_completed = 0;
         uint32_t urb_timeouts = 0;
@@ -1288,6 +1303,14 @@ static void hid_stats_task(void *argument)
                  (uint32_t)__atomic_load_n(&s_motion_rx_bad_parse, __ATOMIC_RELAXED),
                  (uint32_t)__atomic_load_n(&s_heartbeat_ok_count, __ATOMIC_RELAXED),
                  (uint32_t)__atomic_load_n(&s_heartbeat_fail_count, __ATOMIC_RELAXED));
+        ESP_LOGI(TAG, "USB诊断：cycle_req=%" PRIu32 " cycle_attempt=%" PRIu32
+                 " cycle_ok=%" PRIu32 " cycle_fail=%" PRIu32 " off_fail=%" PRIu32
+                 " on_fail=%" PRIu32 " suppressed=%" PRIu32 " input_restored=%" PRIu32
+                 " input_missing=%" PRIu32 " late500=%" PRIu32 " detect_max_us=%lld",
+                 s_cycle_requests, s_root_port_cycles, s_cycle_ok, s_cycle_failed,
+                 s_cycle_off_fail, s_cycle_on_fail, s_cycle_suppressed,
+                 s_cycle_input_restored, s_cycle_input_missing, s_cycle_slow,
+                 (long long)__atomic_load_n(&s_cycle_delay_max_us, __ATOMIC_ACQUIRE));
         log_queue_metrics("host_hid_event", &s_hid_event_queue_metrics);
         log_queue_metrics("host_hid_report", &s_report_queue_metrics);
         log_queue_metrics("host_hid_control", &s_control_queue_metrics);
@@ -1316,16 +1339,14 @@ static void hid_interface_callback(
             queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
-        if (slot->mouse_interface) {
-            __atomic_store_n(&s_last_report_us, esp_timer_get_time(), __ATOMIC_RELEASE);
-        }
         if (stopping_requested()) {
             queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
         }
         uint8_t data[HID_RAW_REPORT_MAX];
         size_t length = 0;
-        if (__atomic_load_n(&s_injected_report_pending, __ATOMIC_ACQUIRE)) {
+        const bool injected = __atomic_load_n(&s_injected_report_pending, __ATOMIC_ACQUIRE);
+        if (injected) {
             /* 诊断注入：用注入字节顶替真实报告；后续统计/入队/转发与物理报告完全同路。 */
             __atomic_store_n(&s_injected_report_pending, false, __ATOMIC_RELEASE);
             length = s_injected_report_length;
@@ -1338,6 +1359,12 @@ static void hid_interface_callback(
             ++s_errors;
             queue_metric_increment(&s_report_queue_metrics.rejected);
             return;
+        }
+        const size_t id_bytes = slot->has_report_id ? 1U : 0U;
+        if (!injected && slot->mouse_interface &&
+            length == (size_t)slot->mouse_layout.report_bytes + id_bytes &&
+            (!slot->has_report_id || data[0] == slot->mouse_report_id)) {
+            __atomic_store_n(&s_last_report_us, esp_timer_get_time(), __ATOMIC_RELEASE);
         }
         raw_report_event_t queued = {
             .interface_number = slot->interface_number,
@@ -1574,64 +1601,101 @@ static void maybe_run_usb_heartbeat(void)
     }
 }
 
-/* 心跳失败只表明 EP0 异常；单独核对物理鼠标接口报告是否也已停滞。 */
-static void maybe_trigger_stall_recovery(void)
+/* 独立检查任务：不等待控制线程的800ms超时。 */
+static void run_stall_port_cycle(int64_t last_input, int64_t oldest_ep0)
 {
-    const int64_t now = esp_timer_get_time();
-    /* 连续心跳失败用于发现控制通道异常，不直接断开输入。 */
-    const uint32_t probe_streak = __atomic_load_n(&s_probe_fail_streak, __ATOMIC_ACQUIRE);
-    if (probe_streak < STALL_PROBE_FAIL_LIMIT) {
+    ++s_root_port_cycles;
+    if (s_release_callback != NULL) { s_release_callback(false); }
+    ESP_LOGW(TAG, "USB诊断：根端口循环开始 attempt=%" PRIu32, s_root_port_cycles);
+    /* 包含释放按钮和日志耗时，测量到实际调用关端口前；不是硬件故障时间。 */
+    const int64_t observed_delay_us = usb_stall_observed_delay(
+        esp_timer_get_time(), last_input, oldest_ep0);
+    if (observed_delay_us > s_cycle_delay_max_us) {
+        __atomic_store_n(&s_cycle_delay_max_us, observed_delay_us, __ATOMIC_RELEASE);
+    }
+    if (observed_delay_us > USB_STALL_TARGET_US) { ++s_cycle_slow; }
+    const esp_err_t off = usb_host_lib_set_root_port_power(false);
+    if (off != ESP_OK) {
+        ++s_cycle_off_fail;
+        ++s_cycle_failed;
+        ESP_LOGE(TAG, "USB诊断：关闭根端口失败 %s", esp_err_to_name(off));
         return;
     }
-    const int64_t last_report = __atomic_load_n(&s_last_report_us, __ATOMIC_ACQUIRE);
-    const int64_t last_fail = __atomic_load_n(&s_last_ctrl_fail_us, __ATOMIC_ACQUIRE);
-    if (now - last_fail > STALL_CTRL_FAIL_FRESH_US) {
-        return;   /* 失败太旧，不足以代表设备当前状态 */
+    __atomic_store_n(&s_root_port_powered, false, __ATOMIC_RELEASE);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_err_t on = ESP_FAIL;
+    /* 设备句柄失效后仍执行有界开端口补救，不依赖mouse_present。 */
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        on = usb_host_lib_set_root_port_power(true);
+        if (on == ESP_OK) { break; }
+        ++s_cycle_on_fail;
+        ESP_LOGW(TAG, "USB诊断：开启根端口失败 try=%u result=%s",
+                 attempt + 1U, esp_err_to_name(on));
+        if (attempt < 2U) { vTaskDelay(pdMS_TO_TICKS(100)); }
     }
-    const int64_t last_ok = __atomic_load_n(&s_last_ctrl_ok_us, __ATOMIC_ACQUIRE);
-    if (last_ok > last_fail) {
-        return;   /* 失败之后控制传输又成功过：设备还活着 */
+    if (on == ESP_OK) {
+        __atomic_store_n(&s_root_port_powered, true, __ATOMIC_RELEASE);
+        ++s_cycle_ok;
+        s_cycle_input_wait_us = esp_timer_get_time();
+        ESP_LOGW(TAG, "USB诊断：端口开关完成，等待重新枚举及真实输入");
+    } else {
+        ++s_cycle_failed;
+        ESP_LOGE(TAG, "USB诊断：开启根端口补救耗尽，不执行整板复位");
     }
-    const int64_t last_recovery = __atomic_load_n(&s_stall_recovery_us, __ATOMIC_ACQUIRE);
-    if (last_recovery != 0 && now - last_recovery < STALL_RECOVERY_COOLDOWN_US) {
-        return;   /* 冷却期内，避免恢复风暴 */
-    }
-    __atomic_store_n(&s_stall_recovery_us, now, __ATOMIC_RELEASE);
-    const bool input_stalled = last_report != 0 &&
-        now - last_report >= STALL_REPORT_FREEZE_US;
-    if (input_stalled && s_release_callback != NULL) {
-        /* 输入真正停止时防止卡键；false 保持克隆会话与 Profile。 */
-        s_release_callback(false);
-    }
-    ESP_LOGW(TAG,
-             "心跳连续 %u 次失败（最近失败 %lld ms 前；距最后报告 %lld ms）："
-             "输入%s，保持 USB 供电与克隆会话",
-             (unsigned)probe_streak, (now - last_fail) / 1000,
-             last_report == 0 ? -1LL : (now - last_report) / 1000,
-             input_stalled ? "已停滞，已释放按钮" : "仍在活动或未建立基线");
 }
 
-/* 保留显式开关以便回退；默认禁止自动切断鼠标 USB 供电。 */
-static void maybe_run_root_port_cycle(void)
+static void stall_watch_task(void *argument)
 {
-    if (!s_root_port_cycle_requested) {
-        return;
+    (void)argument;
+    bool suppressed_latched = false;
+    while (!stopping_requested()) {
+        const int64_t now = esp_timer_get_time();
+        const int64_t input = __atomic_load_n(&s_last_report_us, __ATOMIC_ACQUIRE);
+        if (s_cycle_input_wait_us != 0) {
+            if (input > s_cycle_input_wait_us) {
+                ++s_cycle_input_restored;
+                ESP_LOGW(TAG, "USB诊断：根端口循环后真实输入恢复 elapsed_us=%lld",
+                         (long long)(input - s_cycle_input_wait_us));
+                s_cycle_input_wait_us = 0;
+            } else if (now - s_cycle_input_wait_us >= 15000000LL) {
+                ++s_cycle_input_missing;
+                ESP_LOGW(TAG, "USB诊断：循环后15秒未观察到真实输入（静止也可能无报告）");
+                s_cycle_input_wait_us = 0;
+            }
+        }
+        int64_t oldest = 0;
+        uint32_t pending = 0;
+        (void)dual_vendor_urb_pending_snapshot(&oldest, &pending);
+        const int64_t ready = __atomic_load_n(&s_mouse_ready_us, __ATOMIC_ACQUIRE);
+        const bool evidence = usb_stall_evidence_ready(now, ready, input, oldest,
+            __atomic_load_n(&s_mouse_present, __ATOMIC_ACQUIRE), stopping_requested());
+        if (evidence) {
+            if (!usb_stall_cooldown_ready(now, s_stall_recovery_us) ||
+                !try_lifecycle_lock()) {
+                if (!suppressed_latched) { ++s_cycle_suppressed; }
+                suppressed_latched = true;
+            } else {
+                /* 获取生命周期锁后重新采样，避免依据已经恢复的旧快照切端口。 */
+                (void)dual_vendor_urb_pending_snapshot(&oldest, &pending);
+                const int64_t check_now = esp_timer_get_time();
+                const int64_t check_input = __atomic_load_n(&s_last_report_us, __ATOMIC_ACQUIRE);
+                if (usb_stall_evidence_ready(check_now,
+                        __atomic_load_n(&s_mouse_ready_us, __ATOMIC_ACQUIRE),
+                        check_input, oldest,
+                        __atomic_load_n(&s_mouse_present, __ATOMIC_ACQUIRE), stopping_requested())) {
+                    ++s_cycle_requests;
+                    s_stall_recovery_us = check_now;
+                    run_stall_port_cycle(check_input, oldest);
+                }
+                release_lifecycle_lock();
+                suppressed_latched = false;
+            }
+        } else {
+            suppressed_latched = false;
+        }
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(USB_STALL_POLL_MS));
     }
-    s_root_port_cycle_requested = false;
-#if !USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY
-    ESP_LOGW(TAG, "已抑制自动根端口断电：保留物理鼠标供电与克隆会话");
-    return;
-#else
-    ++s_root_port_cycles;
-    ESP_LOGW(TAG, "二级恢复第 %u 次：根端口断电重枚举", (unsigned)s_root_port_cycles);
-    const esp_err_t off_result = usb_host_lib_set_root_port_power(false);
-    vTaskDelay(pdMS_TO_TICKS(300));
-    const esp_err_t on_result = usb_host_lib_set_root_port_power(true);
-    ESP_LOGW(TAG, "  根端口 power off=%s on=%s",
-             esp_err_to_name(off_result), esp_err_to_name(on_result));
-    /* 给设备重新枚举留出时间；随后的 CONNECTED 事件会重新采集 Profile。 */
-    vTaskDelay(pdMS_TO_TICKS(1500));
-#endif
+    finish_owned_task(TASK_EXIT_STALL_WATCH);
 }
 
 static void hid_event_task(void *argument)
@@ -1640,18 +1704,14 @@ static void hid_event_task(void *argument)
     hid_event_t event;
     while (true) {
         /*
-         * 主动心跳探测（2026-09-28）：每 0.5 秒一次，成败喂给下面的冻结判据。
+         * 主动心跳探测：空闲时约每 100 ms 一次；独立检查任务观察在途请求。
          * 放在循环顶部而不是超时分支里，否则报告事件密集时它会被饿住，
          * 而这恰恰是"设备刚开始冻结、还在冒报告"的那一小段关键时间。
          */
         maybe_run_usb_heartbeat();
         if (xQueueReceive(s_hid_event_queue, &event, pdMS_TO_TICKS(100)) != pdTRUE) {
             maybe_report_mouse_gone();
-            /* 分别记录控制失败和输入停滞，必要时只释放按钮。 */
-            maybe_trigger_stall_recovery();
-            /* 再跑二级（端口断电）：它会中止在飞传输，避免下面一级的 stop/start 被挡住；
-             * 反过来若一级先跑并卡住，二级就永远没机会执行（2026-09-27 现场缺陷）。 */
-            maybe_run_root_port_cycle();
+            /* 独立检查任务负责冻结判定；历史接口重挂路径仍默认关闭。 */
             maybe_run_hid_recovery();
             continue;
         }
@@ -1739,7 +1799,7 @@ static void hid_event_task(void *argument)
             }
             if (mouse_interface) {
                 /* 枚举时刻打点：紧随其后的若干秒是设备应答最慢的预热期。 */
-                s_mouse_ready_us = esp_timer_get_time();
+                __atomic_store_n(&s_mouse_ready_us, esp_timer_get_time(), __ATOMIC_RELEASE);
             }
         }
         portEXIT_CRITICAL(&s_interface_state_mux);
@@ -2029,6 +2089,9 @@ static esp_err_t stop_owned_workers(void)
         xTaskNotifyGive(s_stats_task);
     }
 
+    if ((mask & TASK_EXIT_STALL_WATCH) != 0U && s_stall_watch_task != NULL) {
+        xTaskNotifyGive(s_stall_watch_task);
+    }
     const EventBits_t stopped = xEventGroupWaitBits(
         s_task_events, mask, pdFALSE, pdTRUE,
         pdMS_TO_TICKS(HID_HOST_STOP_TIMEOUT_MS));
@@ -2043,6 +2106,7 @@ static esp_err_t stop_owned_workers(void)
     s_report_task = NULL;
     s_control_task = NULL;
     s_stats_task = NULL;
+    s_stall_watch_task = NULL;
     return ESP_OK;
 }
 
@@ -2105,6 +2169,7 @@ static void delete_runtime_storage(void)
     s_report_task = NULL;
     s_control_task = NULL;
     s_stats_task = NULL;
+    s_stall_watch_task = NULL;
     s_worker_task_mask = 0;
     s_host_task_created = false;
     __atomic_store_n(&s_usb_host_installed, false, __ATOMIC_RELEASE);
@@ -2259,6 +2324,10 @@ esp_err_t dual_hid_host_start(
     __atomic_store_n(&s_root_port_powered, false, __ATOMIC_RELEASE);
     s_free_all_requested = false;
     s_worker_task_mask = 0;
+    s_stall_recovery_us = 0;
+    s_cycle_input_wait_us = 0;
+    __atomic_store_n(&s_last_report_us, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_mouse_ready_us, 0, __ATOMIC_RELEASE);
     s_report_callback = report_callback;
     s_release_callback = release_callback;
     s_usb_host_task = NULL;
@@ -2268,6 +2337,7 @@ esp_err_t dual_hid_host_start(
     s_report_task = NULL;
     s_control_task = NULL;
     s_stats_task = NULL;
+    s_stall_watch_task = NULL;
     s_host_task_created = false;
     s_hid_host_installed = false;
     s_descriptor_client = NULL;
@@ -2381,6 +2451,12 @@ esp_err_t dual_hid_host_start(
         goto startup_failed_with_error;
     }
     s_worker_task_mask |= TASK_EXIT_STATS;
+    if (xTaskCreate(stall_watch_task, "usb_stall_watch", 3072, NULL, 6,
+                    &s_stall_watch_task) != pdPASS) {
+        result = ESP_ERR_NO_MEM;
+        goto startup_failed_with_error;
+    }
+    s_worker_task_mask |= TASK_EXIT_STALL_WATCH;
     ESP_LOGI(TAG, "USB Host探测栈已启动；支持protocol=2标准鼠标接口，等待应用确认角色");
     release_lifecycle_lock();
     return ESP_OK;
@@ -2603,8 +2679,8 @@ esp_err_t dual_hid_host_vendor_selftest(
 /*
  * 诊断注入入口（2026-09-27）：把一段原始鼠标报告投进 RX 回调，使统计、入队、转发
  * 与物理报告走**完全相同**的路径（不是复制一套逻辑）。
- * raw_report 的格式必须与 hid_host_device_get_raw_input_report_data() 返回的一致——
- * 设备带 report ID 时首字节就是 report ID。
+ * raw_report 可以是完整 USB 报告（含 Report ID），也可以是当前鼠标布局的正文；
+ * 后者在这里自动补上已枚举到的 Report ID。
  */
 bool dual_hid_host_inject_report(const uint8_t *raw_report, size_t length)
 {
@@ -2624,8 +2700,39 @@ bool dual_hid_host_inject_report(const uint8_t *raw_report, size_t length)
     if (handle == NULL) {
         return false;
     }
-    memcpy(s_injected_report, raw_report, length);
-    s_injected_report_length = length;
+    /* 注入接口同时接受两种形式：
+     * 1. 与 USB Host 回调完全一致的完整报告（含 Report ID）；
+     * 2. 鼠标报告正文（不含 Report ID），由当前已识别布局补上 ID。
+     * 这样诊断工具不需要硬编码某一只鼠标的 Report ID，同时仍保留
+     * 原始报告注入能力。 */
+    bool has_report_id = false;
+    uint8_t mouse_report_id = 0U;
+    size_t body_length = 0U;
+    portENTER_CRITICAL(&s_interface_state_mux);
+    for (size_t index = 0; index < HID_INTERFACE_SLOT_COUNT; ++index) {
+        const hid_interface_slot_t *slot = &s_interface_slots[index];
+        if (slot->active && slot->handle == handle && slot->mouse_interface) {
+            has_report_id = slot->has_report_id;
+            mouse_report_id = slot->mouse_report_id;
+            body_length = slot->mouse_layout.report_bytes;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_interface_state_mux);
+    if (body_length == 0U) {
+        return false;
+    }
+    if (has_report_id && length == body_length) {
+        if (length + 1U > sizeof(s_injected_report)) {
+            return false;
+        }
+        s_injected_report[0] = mouse_report_id;
+        memcpy(&s_injected_report[1], raw_report, length);
+        s_injected_report_length = length + 1U;
+    } else {
+        memcpy(s_injected_report, raw_report, length);
+        s_injected_report_length = length;
+    }
     __atomic_store_n(&s_injected_report_pending, true, __ATOMIC_RELEASE);
     hid_interface_callback(handle, HID_HOST_INTERFACE_EVENT_INPUT_REPORT, NULL);
     return true;

@@ -1,3 +1,4 @@
+#include "usb_stall_recovery_logic.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1511,6 +1512,37 @@ static void test_profile_reuse_predicate(void)
                                        installed, installed));
 }
 
+static void test_usb_stall_watch_bounds(void)
+{
+    const int64_t now = 20000000LL;
+    assert(usb_stall_evidence_ready(now, 1, now - 300000, now - 250000, true, false));
+    assert(!usb_stall_evidence_ready(now, 1, now - 299999, now - 250000, true, false));
+    assert(!usb_stall_evidence_ready(now, 1, now - 300000, now - 249999, true, false));
+    assert(!usb_stall_evidence_ready(now, 1, now - 300000, 0, true, false));
+    assert(!usb_stall_evidence_ready(now, 1, 0, now - 250000, true, false));
+    assert(!usb_stall_evidence_ready(now, now - 9999999, now - 300000, now - 250000, true, false));
+    assert(!usb_stall_evidence_ready(now, 1, now - 300000, now - 250000, false, false));
+    assert(!usb_stall_evidence_ready(now, 1, now - 300000, now - 250000, true, true));
+    assert(usb_stall_cooldown_ready(50000000, 20000000));
+    assert(!usb_stall_cooldown_ready(49999999, 20000000));
+    assert(usb_stall_cooldown_ready(now, 0));
+    assert(usb_stall_observed_delay(now, now - 300000, now - 250000) == 250000);
+    /* 每个心跳相位覆盖独立监测的判定上界；此处验证逻辑，不代表真实调度延迟。 */
+    for (int phase = 0; phase <= 100000; phase += 1000) {
+        const int64_t fault = 20000000;
+        int64_t fired = 0;
+        for (int64_t elapsed = 0; elapsed <= 500000; elapsed += 20000) {
+            if (elapsed >= phase && usb_stall_evidence_ready(fault + elapsed, 1,
+                    fault, fault + phase, true, false)) {
+                fired = elapsed;
+                break;
+            }
+        }
+        assert(fired >= 300000 && fired <= 380000);
+    }
+    puts("usb_stall_watch_bounds: PASS (logic only)");
+}
+
 int main(void)
 {
     test_merge_and_independent_release();
@@ -1551,6 +1583,7 @@ int main(void)
     test_profile_final_ack_requires_mounted_clone();
     test_profile_mount_retry_and_epoch_cancel();
     test_profile_reuse_predicate();
+    test_usb_stall_watch_bounds();
     puts("dual_proxy_logic_test: PASS");
     return 0;
 }

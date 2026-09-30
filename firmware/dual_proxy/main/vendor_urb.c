@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
+#include "dual_proxy_runtime_config.h"
 
 static const char *TAG = "vendor_urb";
 
@@ -26,13 +27,23 @@ static const char *TAG = "vendor_urb";
  */
 #define VENDOR_URB_ATTEMPTS 2U
 #define VENDOR_URB_MAX_ORPHANS 4U
+#if DUAL_PROXY_ENABLE_HIDPP_TIMEOUT_DIAGNOSTIC
+#define VENDOR_URB_EFFECTIVE_TIMEOUT_MS VENDOR_URB_TIMEOUT_MS
+#define VENDOR_URB_EFFECTIVE_ATTEMPTS VENDOR_URB_ATTEMPTS
+#else
+#define VENDOR_URB_EFFECTIVE_TIMEOUT_MS 5000U
+#define VENDOR_URB_EFFECTIVE_ATTEMPTS 1U
+#endif
 #define URB_WAIT_PENDING 0U
 #define URB_WAIT_COMPLETED 1U
 #define URB_WAIT_ORPHAN 2U
 #define VENDOR_URB_CLIENT_TASK_STACK 4096
 #define VENDOR_URB_CLIENT_TASK_PRIORITY 4
 
-typedef struct {
+typedef struct urb_wait {
+    struct urb_wait *pending_next;
+    int64_t started_us;
+    bool submitted;
     SemaphoreHandle_t done;
     usb_transfer_t *transfer;
     /* 超时线程与完成回调通过原子状态转移决定唯一释放者。 */
@@ -63,12 +74,58 @@ static volatile int64_t s_latency_max_us;
 static volatile uint32_t s_latency_over_10ms;
 static volatile uint32_t s_latency_over_100ms;
 
+/* 快照锁只保护元数据；不得在锁内调用 USB API 或等待信号量。 */
+static portMUX_TYPE s_pending_mux = portMUX_INITIALIZER_UNLOCKED;
+static urb_wait_t *s_pending_head;
+
+static void track_pending(urb_wait_t *wait)
+{
+    wait->started_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_pending_mux);
+    wait->pending_next = s_pending_head;
+    s_pending_head = wait;
+    portEXIT_CRITICAL(&s_pending_mux);
+}
+
+static void untrack_pending(urb_wait_t *wait)
+{
+    portENTER_CRITICAL(&s_pending_mux);
+    urb_wait_t **link = &s_pending_head;
+    while (*link != NULL && *link != wait) {
+        link = &(*link)->pending_next;
+    }
+    if (*link == wait) {
+        *link = wait->pending_next;
+    }
+    portEXIT_CRITICAL(&s_pending_mux);
+}
+
+bool dual_vendor_urb_pending_snapshot(int64_t *oldest_start_us, uint32_t *count)
+{
+    int64_t oldest = 0;
+    uint32_t pending = 0;
+    portENTER_CRITICAL(&s_pending_mux);
+    for (urb_wait_t *item = s_pending_head; item != NULL; item = item->pending_next) {
+        if (item->submitted) {
+            ++pending;
+            if (oldest == 0 || item->started_us < oldest) {
+                oldest = item->started_us;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_pending_mux);
+    if (oldest_start_us != NULL) { *oldest_start_us = oldest; }
+    if (count != NULL) { *count = pending; }
+    return pending != 0;
+}
+
 static void urb_transfer_callback(usb_transfer_t *transfer)
 {
     urb_wait_t *wait = (urb_wait_t *)transfer->context;
     if (wait == NULL) {
         return;
     }
+    untrack_pending(wait);
     wait->status = (uint8_t)transfer->status;
     const uint8_t previous = __atomic_exchange_n(
         &wait->state, URB_WAIT_COMPLETED, __ATOMIC_ACQ_REL);
@@ -235,8 +292,12 @@ static esp_err_t urb_set_report_once(
 
     ++s_submitted;
     const int64_t transfer_start_us = esp_timer_get_time();
+    track_pending(wait);
     result = usb_host_transfer_submit_control(s_client, transfer);
     if (result == ESP_OK) {
+        portENTER_CRITICAL(&s_pending_mux);
+        wait->submitted = true;
+        portEXIT_CRITICAL(&s_pending_mux);
         if (xSemaphoreTake(wait->done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
             /*
              * 超时：US B 栈不实现逐传输超时，而 EP0 又不支持 flush
@@ -274,6 +335,7 @@ static esp_err_t urb_set_report_once(
         }
         result = (wait->status == 0U) ? ESP_OK : ESP_FAIL;
     } else {
+        untrack_pending(wait);
         ++s_aborted;
     }
 
@@ -365,8 +427,12 @@ static esp_err_t urb_control_once(
 
     ++s_submitted;
     const int64_t transfer_start_us = esp_timer_get_time();
+    track_pending(wait);
     result = usb_host_transfer_submit_control(s_client, transfer);
     if (result == ESP_OK) {
+        portENTER_CRITICAL(&s_pending_mux);
+        wait->submitted = true;
+        portEXIT_CRITICAL(&s_pending_mux);
         if (xSemaphoreTake(wait->done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
             /* 与 SET_REPORT 路径同样的处理：EP0 不支持 flush，超时只能挂孤儿。 */
             __atomic_add_fetch(&s_orphans_outstanding, 1U, __ATOMIC_RELAXED);
@@ -411,6 +477,7 @@ static esp_err_t urb_control_once(
             *out_length = copied;
         }
     } else {
+        untrack_pending(wait);
         ++s_aborted;
     }
 
@@ -444,13 +511,13 @@ esp_err_t dual_vendor_urb_set_report(
     }
 
     esp_err_t result = ESP_ERR_TIMEOUT;
-    for (uint32_t attempt = 0; attempt < VENDOR_URB_ATTEMPTS; ++attempt) {
+    for (uint32_t attempt = 0; attempt < VENDOR_URB_EFFECTIVE_ATTEMPTS; ++attempt) {
         result = urb_set_report_once(interface_number, report_type, report_id,
-                                     data, length, timeout_ms);
+                                     data, length, DUAL_PROXY_ENABLE_HIDPP_TIMEOUT_DIAGNOSTIC ? timeout_ms : VENDOR_URB_EFFECTIVE_TIMEOUT_MS);
         if (result != ESP_ERR_TIMEOUT) {
             break;
         }
-        if (attempt + 1U < VENDOR_URB_ATTEMPTS) {
+        if (attempt + 1U < VENDOR_URB_EFFECTIVE_ATTEMPTS) {
             ++s_retries;
             vTaskDelay(pdMS_TO_TICKS(5));
         }
@@ -488,14 +555,14 @@ esp_err_t dual_vendor_urb_control(
     }
 
     esp_err_t result = ESP_ERR_TIMEOUT;
-    for (uint32_t attempt = 0; attempt < VENDOR_URB_ATTEMPTS; ++attempt) {
+    for (uint32_t attempt = 0; attempt < VENDOR_URB_EFFECTIVE_ATTEMPTS; ++attempt) {
         result = urb_control_once(bm_request_type, b_request, w_value, w_index,
-                                  data, length, timeout_ms, out_data,
+                                  data, length, DUAL_PROXY_ENABLE_HIDPP_TIMEOUT_DIAGNOSTIC ? timeout_ms : VENDOR_URB_EFFECTIVE_TIMEOUT_MS, out_data,
                                   out_capacity, out_length);
         if (result != ESP_ERR_TIMEOUT) {
             break;
         }
-        if (attempt + 1U < VENDOR_URB_ATTEMPTS) {
+        if (attempt + 1U < VENDOR_URB_EFFECTIVE_ATTEMPTS) {
             ++s_retries;
             vTaskDelay(pdMS_TO_TICKS(5));
         }

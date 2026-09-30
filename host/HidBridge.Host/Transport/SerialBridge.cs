@@ -5,9 +5,10 @@ using HidBridge.Protocol;
 
 namespace HidBridge.Host.Transport;
 
+internal sealed record SerialPortRefreshSnapshot(string[] AvailablePorts, string[] OpenPorts);
+
 internal sealed class SerialBridge : IBridgeTransport
 {
-    private const int TraceFlushIntervalMilliseconds = 500;
     private const int MaxOutboundFrames = 32;
     private static readonly string[] ReducedLogMarkers =
     [
@@ -45,13 +46,18 @@ internal sealed class SerialBridge : IBridgeTransport
     private DateTime _nextConnectAttemptUtc;
     private bool _sessionStarted;
     private bool _exclusivePortLeaseActive;
+    /*
+     * 对端板卡日志监听（2026-09-28）：它占用的是**另一个**串口，但固件刷写等独占任务
+     * 可能正好要刷那一块板，所以让出端口时必须把它也算上——否则 esptool 会打不开端口
+     * （实测 P 板刷写因此失败，报 "esptool 退出码为 2"）。
+     */
+    private DeviceLogMirror? _peerLogMirror;
     private string? _exclusivePortPurpose;
     private bool _writerStopping;
     private bool _disposed;
     private CancellationTokenSource? _traceCancellation;
     private Task? _traceTask;
-    private StreamWriter? _traceWriter;
-    private long _nextTraceFlushTimestamp;
+    private BufferedDeviceLog? _traceWriter;
     private long _nextBatchStatisticsTimestamp;
     private long _batchStatisticsStartTimestamp;
     private long _batchWriteCount;
@@ -130,6 +136,11 @@ internal sealed class SerialBridge : IBridgeTransport
                 _mouseFramesQueued++;
             }
         }
+    }
+
+    internal void SetDevicePeriodicStats(bool enabled)
+    {
+        Send(MessageType.LogStatsControlRequest, new[] { (byte)(enabled ? 1 : 0) });
     }
 
     private bool EnqueueFrameLocked(byte[] frame)
@@ -251,6 +262,83 @@ internal sealed class SerialBridge : IBridgeTransport
         return (batch, frameCount);
     }
 
+    /// <summary>列出当前由控制串口或对端日志镜像实际持有的端口，不主动探测或打开端口。</summary>
+    internal string[] GetOpenPortNames()
+    {
+        string? mainPortName;
+        DeviceLogMirror? peerLogMirror;
+        lock (_sync)
+        {
+            mainPortName = !_exclusivePortLeaseActive && _port?.IsOpen == true
+                ? _port.PortName
+                : null;
+            peerLogMirror = _peerLogMirror;
+        }
+
+        string? mirrorPortName = peerLogMirror?.GetOpenPortName();
+        return new[] { mainPortName, mirrorPortName }
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    internal SerialPortRefreshSnapshot RefreshOpenSerialPorts(CancellationToken cancellationToken)
+    {
+        DeviceLogMirror? peerLogMirror;
+        bool mayRefresh;
+        lock (_sync)
+        {
+            mayRefresh = !_disposed && !_exclusivePortLeaseActive;
+            peerLogMirror = _peerLogMirror;
+        }
+
+        if (mayRefresh)
+        {
+            peerLogMirror?.Refresh(cancellationToken);
+        }
+
+        return new SerialPortRefreshSnapshot(GetAvailablePortNames(), GetOpenPortNames());
+    }
+
+    /// <summary>
+    /// 向当前已打开的主串口或日志镜像串口同步写入原始字节。主串口与 WriterLoop 共用
+    /// _writeSync 写入门，保证两个完整写操作不会交错。
+    /// </summary>
+    /// <returns>写入完成的字节数；端口当前不由本进程持有时返回 null。</returns>
+    internal int? WriteToOpenPort(string portName, byte[] bytes, CancellationToken cancellationToken)
+    {
+        if (bytes.Length == 0)
+        {
+            throw new ArgumentException("串口写入数据不能为空。", nameof(bytes));
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        DeviceLogMirror? peerLogMirror;
+        lock (_sync)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            peerLogMirror = _peerLogMirror;
+            if (!_disposed && !_exclusivePortLeaseActive && _port?.IsOpen == true &&
+                string.Equals(_port.PortName, portName, StringComparison.OrdinalIgnoreCase))
+            {
+                SerialPort port = _port!;
+                lock (_writeSync)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!ReferenceEquals(_port, port) || !port.IsOpen)
+                    {
+                        throw new IOException("主串口在写入前已断开。");
+                    }
+                    port.Write(bytes, 0, bytes.Length);
+                }
+                return bytes.Length;
+            }
+        }
+
+        return peerLogMirror?.WriteToOpenPort(portName, bytes, cancellationToken);
+    }
+
     private void LogBatchStatisticsIfDueLocked()
     {
         long now = Stopwatch.GetTimestamp();
@@ -264,12 +352,17 @@ internal sealed class SerialBridge : IBridgeTransport
         double elapsedSeconds = Math.Max(
             0.001,
             (double)(now - _batchStatisticsStartTimestamp) / Stopwatch.Frequency);
-        Console.WriteLine(
-            $"EXE输出统计：MouseReport={_mouseFramesQueued} " +
-            $"({_mouseFramesQueued / elapsedSeconds:F1} Hz)，串口写入={_batchWriteCount}，" +
-            $"总帧={_batchedFrameCount}，" +
-            $"平均帧/次={average:F2}，最大帧/次={_maxFramesPerBatch}，" +
-            $"队列峰值={_outboundQueuePeak}/{MaxOutboundFrames}，反压={_backpressureCount}。");
+        // 本周期没有鼠标帧就不打印（2026-09-28）：空闲时每秒一行没有信息量。
+        // 注意下面的计数器重置仍要无条件执行，否则窗口增量会越算越错。
+        if (_mouseFramesQueued > 0)
+        {
+            Console.WriteLine(
+                $"EXE输出统计：MouseReport={_mouseFramesQueued} " +
+                $"({_mouseFramesQueued / elapsedSeconds:F1} Hz)，串口写入={_batchWriteCount}，" +
+                $"总帧={_batchedFrameCount}，" +
+                $"平均帧/次={average:F2}，最大帧/次={_maxFramesPerBatch}，" +
+                $"队列峰值={_outboundQueuePeak}/{MaxOutboundFrames}，反压={_backpressureCount}。");
+        }
         _batchWriteCount = 0;
         _batchedFrameCount = 0;
         _mouseFramesQueued = 0;
@@ -388,14 +481,13 @@ internal sealed class SerialBridge : IBridgeTransport
             }
             LogFileRetention.Enforce(template, path, _options.DeviceLogRetentionCount);
 
-            _traceWriter = CreateTraceWriter(path, _logSettings.FullLoggingEnabled);
-            _nextTraceFlushTimestamp = Stopwatch.GetTimestamp() +
-                                       Stopwatch.Frequency * TraceFlushIntervalMilliseconds / 1000;
+            BufferedDeviceLog sink = new(CreateTraceWriter(path, fullLogging: true));
+            _traceWriter = sink;
             _traceCancellation = new CancellationTokenSource();
             CancellationToken cancellation = _traceCancellation.Token;
-            _traceTask = Task.Run(() => TraceDeviceOutput(port, portName, cancellation), cancellation);
+            _traceTask = Task.Run(() => TraceDeviceOutput(port, portName, cancellation, sink), cancellation);
             Console.WriteLine(
-                $"设备日志已启用（异步实时落盘，模式={(_logSettings.FullLoggingEnabled ? "完整诊断" : "精简高性能")}）：{path}");
+                $"设备日志已启用（后台完整保存，界面={(_logSettings.FullLoggingEnabled ? "完整" : "精简")}）：{path}");
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -415,13 +507,12 @@ internal sealed class SerialBridge : IBridgeTransport
             FileOptions.SequentialScan);
         return new StreamWriter(stream, new UTF8Encoding(false))
         {
-            // 精简模式每秒只有少量关键行，立即刷新便于运行中排障；
-            // 完整模式由专用串口日志线程周期刷新，避免每行强制刷新造成高频磁盘 I/O。
-            AutoFlush = !fullLogging,
+            // 显示模式不影响磁盘；后台写入器每500ms刷新。
+            AutoFlush = false,
         };
     }
 
-    private void TraceDeviceOutput(SerialPort port, string portName, CancellationToken cancellation)
+    private void TraceDeviceOutput(SerialPort port, string portName, CancellationToken cancellation, BufferedDeviceLog sink)
     {
         byte[] buffer = new byte[1024];
         char[] textBuffer = new char[2048];
@@ -443,7 +534,6 @@ internal sealed class SerialBridge : IBridgeTransport
 
                 if (available <= 0)
                 {
-                    FlushDeviceTraceIfDue();
                     Thread.Sleep(10);
                     continue;
                 }
@@ -468,10 +558,14 @@ internal sealed class SerialBridge : IBridgeTransport
                     pending.Remove(0, newline + 1);
                     if (!string.IsNullOrWhiteSpace(line))
                     {
-                        WriteDeviceTraceLine(portName, line);
+                        WriteDeviceTraceLine(sink, portName, line);
                     }
                 }
-                FlushDeviceTraceIfDue();
+                if (pending.Length >= 65536)
+                {
+                    WriteDeviceTraceLine(sink, portName, pending.ToString());
+                    pending.Clear();
+                }
             }
         }
         catch (Exception exception) when (exception is IOException or InvalidOperationException or TimeoutException)
@@ -488,51 +582,30 @@ internal sealed class SerialBridge : IBridgeTransport
                 string line = pending.ToString().Trim();
                 if (!string.IsNullOrWhiteSpace(line))
                 {
-                    WriteDeviceTraceLine(portName, line);
+                    WriteDeviceTraceLine(sink, portName, line);
                 }
             }
-            FlushDeviceTraceIfDue(force: true);
         }
     }
 
-    private void WriteDeviceTraceLine(string portName, string line)
+    private void WriteDeviceTraceLine(BufferedDeviceLog sink, string portName, string line)
     {
-        StreamWriter? writer = _traceWriter;
-        if (writer is null)
-        {
-            return;
-        }
-
-        bool fullLogging = _logSettings.FullLoggingEnabled;
-        if (!ShouldPersistDeviceLog(fullLogging, line))
-        {
-            return;
-        }
-
         string stamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{portName}] {line}";
-        try
+        sink.TryWrite(stamped);
+        if (ShouldMirrorDeviceLog(_logSettings.FullLoggingEnabled, line))
         {
-            writer.WriteLine(stamped);
-            if (ShouldMirrorDeviceLog(fullLogging, line))
-            {
-                Console.WriteLine($"[设备] {line}");
-            }
-        }
-        catch (ObjectDisposedException)
-        {
-            // 关闭串口时允许日志线程退出。
-        }
-        catch (IOException)
-        {
-            // 日志文件不可用时不影响 HID 转发。
+            Console.WriteLine($"[设备] {line}");
         }
     }
 
-
+    // 精简模式沿用原有行为：设备原始 ESP-IDF 行只进入文件，不镜像到主界面。
+    // 这样启用完整落盘不会改变用户看到的精简日志内容。
     internal static bool ShouldMirrorDeviceLog(bool fullLogging, string line) =>
         fullLogging && IsEspIdfLogLine(line);
 
-    internal static bool ShouldPersistDeviceLog(bool fullLogging, string line)
+    internal static bool ShouldPersistDeviceLog(bool fullLogging, string line) => true;
+
+    internal static bool ShouldDisplayDeviceLog(bool fullLogging, string line)
     {
         if (fullLogging)
         {
@@ -567,39 +640,6 @@ internal sealed class SerialBridge : IBridgeTransport
         line.StartsWith("D (", StringComparison.Ordinal) ||
         line.StartsWith("V (", StringComparison.Ordinal);
 
-    private void FlushDeviceTraceIfDue(bool force = false)
-    {
-        StreamWriter? writer = _traceWriter;
-        if (writer is null)
-        {
-            return;
-        }
-
-        long now = Stopwatch.GetTimestamp();
-        if (!force && now < _nextTraceFlushTimestamp)
-        {
-            return;
-        }
-
-        try
-        {
-            writer.Flush();
-        }
-        catch (ObjectDisposedException)
-        {
-            // 关闭串口时允许日志线程退出。
-        }
-        catch (IOException)
-        {
-            // 日志文件不可用时不影响 HID 转发。
-        }
-        finally
-        {
-            _nextTraceFlushTimestamp = now +
-                                       Stopwatch.Frequency * TraceFlushIntervalMilliseconds / 1000;
-        }
-    }
-
     private void StopDeviceTrace()
     {
         CancellationTokenSource? cancellation = _traceCancellation;
@@ -623,7 +663,6 @@ internal sealed class SerialBridge : IBridgeTransport
             cancellation?.Dispose();
             try
             {
-                FlushDeviceTraceIfDue(force: true);
                 _traceWriter?.Dispose();
             }
             catch (IOException)
@@ -690,8 +729,21 @@ internal sealed class SerialBridge : IBridgeTransport
     /// 暂停控制串口连接，把该串口独占交给外围串口任务（固件刷写、板载日志转存等）。
     /// 调用方必须释放返回的租约，控制软件才会重新接管串口。
     /// </summary>
+    /// <summary>
+    /// 挂接对端板卡日志监听（2026-09-28），使其在独占任务期间一起让出串口。
+    /// </summary>
+    internal void AttachPeerLogMirror(DeviceLogMirror? mirror)
+    {
+        lock (_sync)
+        {
+            _peerLogMirror = mirror;
+        }
+    }
+
     internal ExclusivePortLease AcquireExclusivePort(string portName, string purpose)
     {
+        ExclusivePortLease lease;
+        DeviceLogMirror? mirrorToSuspend;
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -709,8 +761,19 @@ internal sealed class SerialBridge : IBridgeTransport
             _exclusivePortPurpose = purpose;
             ClosePort();
             Console.WriteLine($"已暂停控制串口连接，将 {selectedPort} 交给{purpose}独占使用。");
-            return new ExclusivePortLease(this, selectedPort, purpose);
+
+            /*
+             * 对端日志监听占的是**另一个**串口，而那个端口很可能正是这次要刷的板子；
+             * 让它一起让出，否则 esptool 打不开端口（2026-09-28 实测 P 板刷写失败）。
+             * Suspend 会关端口并 join 线程、可能阻塞，所以拿到引用后到锁外执行；
+             * 引用本身保留，释放租约时好让它 Resume 回来。
+             */
+            mirrorToSuspend = _peerLogMirror;
+            lease = new ExclusivePortLease(this, selectedPort, purpose);
         }
+
+        mirrorToSuspend?.Suspend();
+        return lease;
     }
 
     internal static string NormalizeFirmwarePortName(string? portName)
@@ -746,6 +809,7 @@ internal sealed class SerialBridge : IBridgeTransport
 
     private void ReleaseExclusivePort(string portName, string purpose)
     {
+        DeviceLogMirror? mirror;
         lock (_sync)
         {
             if (!_exclusivePortLeaseActive)
@@ -756,7 +820,15 @@ internal sealed class SerialBridge : IBridgeTransport
             _exclusivePortPurpose = null;
             _nextConnectAttemptUtc = DateTime.MinValue;
             Console.WriteLine($"{purpose}已释放 {portName}，控制软件开始恢复连接。");
+            mirror = _peerLogMirror;
         }
+
+        /*
+         * Resume 会重新探测端口、可能阻塞，放在锁外执行（2026-09-28）。
+         * 关键：必须让它**重新走让路等待**（内部会先等 4 秒），否则它会抢在控制通道
+         * 之前抓走端口——实测 15:52 就因此报"刷写成功，但控制软件未能在 15 秒内重新连接"。
+         */
+        mirror?.Resume(null);
     }
 
     public void Dispose()

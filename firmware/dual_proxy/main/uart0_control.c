@@ -485,6 +485,15 @@ static void on_control_frame(const dual_frame_t *frame, void *context)
         }
         return;
     }
+    if (frame->type == DUAL_MESSAGE_LOG_STATS_CONTROL_REQUEST) {
+        ++s_state.accepted;
+        if (frame->payload_length == 1U) {
+            dual_proxy_set_periodic_stats_enabled(frame->payload[0] != 0U);
+        }
+        const uint8_t enabled = dual_proxy_periodic_stats_enabled() ? 1U : 0U;
+        send_diag_frame(frame, DUAL_MESSAGE_LOG_READ_RESPONSE, &enabled, 1U);
+        return;
+    }
     if (frame->type == DUAL_MESSAGE_LOG_DUMP_REQUEST) {
         ++s_state.accepted;
         send_log_dump(frame);

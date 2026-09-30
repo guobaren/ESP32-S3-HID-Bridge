@@ -17,6 +17,15 @@ using HidBridge.Host.Transport;
 using HidBridge.Host.Ui;
 using HidBridge.Protocol;
 
+if (args.Any(argument => argument.Equals("--device-log-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckBufferedFullDeviceLogs();
+    CheckDeviceTraceRealtimePersistence();
+    CheckDeviceLogMirrorPerPortFile();
+    Console.WriteLine("完整设备日志、精简显示与后台写盘专项：PASS");
+    return 0;
+}
+
 if (args.Any(argument => argument.Equals("--raw-capture-hardware", StringComparison.OrdinalIgnoreCase)))
 {
     RunRawCaptureHardwareCheck(args);
@@ -27,6 +36,15 @@ if (args.Any(argument => argument.Equals("--layout-only", StringComparison.Ordin
 {
     CheckHotkeyChooserControl();
     CheckWindowLayout();
+    return 0;
+}
+
+if (args.Any(argument => argument.Equals("--serial-api-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckDeviceLogMirrorDiscoveryPolicy();
+    CheckDeviceLogMirrorPerPortFile();
+    CheckSerialForwardingApi();
+    Console.WriteLine("串口 loopback API 与镜像独立日志文件检查通过。");
     return 0;
 }
 
@@ -117,6 +135,9 @@ CheckRemoteInputUdpPath();
 CheckKmboxNetCompatibility();
 CheckFirmwareUpdateApiPolicy();
 CheckFirmwareUpdateApiLan();
+CheckDeviceLogMirrorDiscoveryPolicy();
+CheckDeviceLogMirrorPerPortFile();
+CheckSerialForwardingApi();
 CheckAutomationProfilesAndRuntime();
 CheckLuaRuntimeFeatures();
 CheckExternalProfileStorageAndLuaIndentation();
@@ -827,7 +848,7 @@ static void CheckDeviceLogPolicy()
         SerialBridge.ShouldPersistDeviceLog(false, "I (1) ESP_HID_GAP: BLE connection parameters: interval=10000 us"),
         "精简模式必须保留最终连接参数");
     Require(
-        !SerialBridge.ShouldPersistDeviceLog(false, "I (1) NIMBLE_HIDD: notify report=mouse"),
+        SerialBridge.ShouldPersistDeviceLog(false, "I (1) NIMBLE_HIDD: notify report=mouse"),
         "精简模式必须过滤高频普通通知日志");
     Require(
         SerialBridge.ShouldPersistDeviceLog(true, "I (1) NIMBLE_HIDD: notify report=mouse"),
@@ -871,6 +892,62 @@ static void CheckInputSuppressionPolicy()
     }
 }
 
+static void CheckBufferedFullDeviceLogs()
+{
+    const string detail = "I (1) dual_hid_host: 物理 SET_REPORT: interface=1 id=11 type=2 length=20";
+    Require(SerialBridge.ShouldPersistDeviceLog(false, detail), "精简显示仍须保存SET_REPORT明细");
+    Require(!SerialBridge.ShouldMirrorDeviceLog(false, detail), "精简窗口不应显示SET_REPORT洪峰");
+    Require(!SerialBridge.ShouldMirrorDeviceLog(false, "W (2) test: timeout"), "精简窗口不得新增设备原始警告");
+    Require(SerialBridge.ShouldMirrorDeviceLog(true, detail), "完整窗口须显示明细");
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-full-log-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
+    {
+        string path = Path.Combine(directory, "full.log");
+        using (BufferedDeviceLog sink = new(SerialBridge.CreateTraceWriter(path, false)))
+        {
+            Stopwatch timer = Stopwatch.StartNew();
+            for (int i = 0; i < 10000; ++i)
+            {
+                Require(sink.TryWrite($"{i:D5} {detail}"), "正常批量日志不得丢弃");
+            }
+            Console.WriteLine($"完整日志入队10000行：{timer.Elapsed.TotalMilliseconds:F2} ms（本机样本，非真机延迟验收）");
+            Require(SpinWait.SpinUntil(() => sink.Written == 10000, 3000), "后台未完成10000行写入");
+            Require(SpinWait.SpinUntil(() =>
+            {
+                using FileStream file = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using StreamReader reader = new(file, Encoding.UTF8);
+                return reader.ReadToEnd().Contains("09999 " + detail);
+            }, 3000),
+                "日志仍打开时必须周期刷新可读取");
+            Require(sink.Dropped == 0 && sink.WriteErrors == 0, "正常写盘出现缺口");
+        }
+        string[] lines = File.ReadAllLines(path).Where(line => !line.StartsWith("[日志写盘统计]")).ToArray();
+        Require(lines.Length == 10000, "磁盘实际行数与输入不符");
+        for (int i = 0; i < lines.Length; ++i)
+        {
+            Require(lines[i] == $"{i:D5} {detail}", "完整日志内容或顺序错误");
+        }
+        using GatedDeviceLogWriter blocked = new();
+        using (BufferedDeviceLog sink = new(blocked, 1024))
+        {
+            Require(sink.TryWrite("first"), "首行无法入队");
+            Require(blocked.Entered.Wait(2000), "慢磁盘测试没有进入写入");
+            try
+            {
+                Stopwatch timer = Stopwatch.StartNew();
+                for (int i = 0; i < 1000; ++i) { sink.TryWrite($"slow-{i}"); }
+                Require(timer.ElapsedMilliseconds < 1000, "队列满时接收线程被慢磁盘阻塞");
+                Require(sink.Dropped > 0 && sink.PeakBytes <= 1024, "有界队列未限流或未记录缺口");
+            }
+            finally { blocked.Release.Set(); }
+        }
+        Require(blocked.Content.ToString().Contains("dropped="), "丢弃统计没有实际写入日志");
+        Console.WriteLine("完整日志文件逐行比对10000/10000；慢磁盘背压与缺口统计：PASS");
+    }
+    finally { Directory.Delete(directory, recursive: true); }
+}
+
 static void CheckDeviceTraceRealtimePersistence()
 {
     string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-device-log-{Guid.NewGuid():N}");
@@ -880,6 +957,7 @@ static void CheckDeviceTraceRealtimePersistence()
     {
         using StreamWriter writer = SerialBridge.CreateTraceWriter(path, fullLogging: false);
         writer.WriteLine("实时落盘检查");
+        writer.Flush();
         using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         using StreamReader reader = new(stream, Encoding.UTF8);
         Require(
@@ -2331,6 +2409,226 @@ static void CheckFirmwareUpdateApiLan()
     Require(!server.Enabled, "设置关闭后固件刷写 API 必须停止监听");
 }
 
+static void CheckSerialForwardingApi()
+{
+    string[] heldPorts = ["COM12", "COM3"];
+    List<(string PortName, byte[] Bytes)> writes = [];
+    bool failWrite = false;
+    int refreshCalls = 0;
+
+    int? FakeWrite(string portName, byte[] bytes, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!heldPorts.Contains(portName, StringComparer.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        if (failWrite)
+        {
+            throw new IOException("fake serial write failure");
+        }
+        writes.Add((portName, bytes.ToArray()));
+        return bytes.Length;
+    }
+
+    FirmwareFlashSnapshot snapshot = new("serial-api-check", "idle", "test", null, null, null, null);
+    using FirmwareUpdateApiServer server = new(
+        0,
+        () => snapshot,
+        (string _, string _, out FirmwareFlashSnapshot current) =>
+        {
+            current = snapshot;
+            return false;
+        },
+        () => null,
+        () => heldPorts,
+        FakeWrite,
+        cancellationToken =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            refreshCalls++;
+            return new SerialPortRefreshSnapshot(["COM3", "COM12"], heldPorts);
+        });
+    server.SetEnabled(false);
+    Require(!server.Enabled && server.Port > 0, "关闭固件 API 时仍必须为串口 API 监听");
+    using HttpClient client = new() { BaseAddress = new Uri($"http://127.0.0.1:{server.Port}") };
+
+    HttpResponseMessage disabledFirmware = client.GetAsync("/api/v1/firmware/status").GetAwaiter().GetResult();
+    Require(disabledFirmware.StatusCode == System.Net.HttpStatusCode.NotFound, "固件 API 关闭时其路由必须不可用");
+
+    HttpResponseMessage portsResponse = client.GetAsync("/api/v1/serial/ports").GetAwaiter().GetResult();
+    Require(portsResponse.StatusCode == System.Net.HttpStatusCode.OK, "串口列表路由必须返回 200");
+    using (JsonDocument portsJson = JsonDocument.Parse(portsResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()))
+    {
+        string[] ports = portsJson.RootElement.GetProperty("ports").EnumerateArray()
+            .Select(value => value.GetString()!)
+            .ToArray();
+        Require(ports.SequenceEqual(heldPorts), "串口列表必须只返回 fake EXE 当前持有的两个端口");
+    }
+
+    HttpResponseMessage refreshResponse = client.PostAsync("/api/v1/serial/refresh", null).GetAwaiter().GetResult();
+    Require(refreshResponse.StatusCode == System.Net.HttpStatusCode.OK, "串口刷新路由必须返回 200");
+    using (JsonDocument refreshJson = JsonDocument.Parse(refreshResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()))
+    {
+        string[] available = refreshJson.RootElement.GetProperty("availablePorts").EnumerateArray()
+            .Select(value => value.GetString()!)
+            .ToArray();
+        string[] open = refreshJson.RootElement.GetProperty("openPorts").EnumerateArray()
+            .Select(value => value.GetString()!)
+            .ToArray();
+        Require(available.SequenceEqual(["COM3", "COM12"]) && open.SequenceEqual(heldPorts),
+            "刷新响应必须返回刷新后的可用端口与 EXE 持有端口");
+    }
+    Require(refreshCalls == 1, "POST 串口刷新必须执行一次注入的刷新流程");
+
+    HttpResponseMessage unknownRoute = client.GetAsync("/api/v1/serial/unknown").GetAwaiter().GetResult();
+    Require(unknownRoute.StatusCode == System.Net.HttpStatusCode.NotFound, "未注册路由必须返回 404");
+
+    HttpResponseMessage missingBody = client.PostAsync("/api/v1/serial/write", null).GetAwaiter().GetResult();
+    Require(missingBody.StatusCode == System.Net.HttpStatusCode.BadRequest, "缺少写入 JSON 时必须返回 400");
+
+    HttpResponseMessage invalidJson = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent("{", Encoding.UTF8, "application/json")).GetAwaiter().GetResult();
+    Require(invalidJson.StatusCode == System.Net.HttpStatusCode.BadRequest, "无效 JSON 必须返回 400");
+
+    HttpResponseMessage invalidPort = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent("{\"portName\":\"COMx\",\"hex\":\"00\"}", Encoding.UTF8, "application/json"))
+        .GetAwaiter().GetResult();
+    Require(invalidPort.StatusCode == System.Net.HttpStatusCode.BadRequest, "非法 COM 名必须返回 400");
+
+    HttpResponseMessage invalidHex = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent("{\"portName\":\"COM12\",\"hex\":\"0G\"}", Encoding.UTF8, "application/json"))
+        .GetAwaiter().GetResult();
+    Require(invalidHex.StatusCode == System.Net.HttpStatusCode.BadRequest, "非十六进制内容必须返回 400");
+
+    HttpResponseMessage oddHex = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent("{\"portName\":\"COM12\",\"hex\":\"ABC\"}", Encoding.UTF8, "application/json"))
+        .GetAwaiter().GetResult();
+    Require(oddHex.StatusCode == System.Net.HttpStatusCode.BadRequest, "奇数位十六进制必须返回 400");
+
+    HttpResponseMessage emptyHex = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent("{\"portName\":\"COM12\",\"hex\":\"\"}", Encoding.UTF8, "application/json"))
+        .GetAwaiter().GetResult();
+    Require(emptyHex.StatusCode == System.Net.HttpStatusCode.BadRequest, "空写入必须返回 400");
+
+    HttpResponseMessage tooLarge = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent(
+            JsonSerializer.Serialize(new { portName = "COM12", hex = new string('A', 8194) }),
+            Encoding.UTF8,
+            "application/json")).GetAwaiter().GetResult();
+    Require(tooLarge.StatusCode == System.Net.HttpStatusCode.RequestEntityTooLarge, "超过 4096 字节必须返回 413");
+
+    HttpResponseMessage notOpen = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent("{\"portName\":\"COM44\",\"hex\":\"00\"}", Encoding.UTF8, "application/json"))
+        .GetAwaiter().GetResult();
+    Require(notOpen.StatusCode == System.Net.HttpStatusCode.Conflict, "EXE 未持有的端口必须返回 409");
+    Require(writes.Count == 0, "参数错误或未连接端口不得调用 fake writer");
+
+    byte[] frame = new FrameCodec().Encode(MessageType.Ping, ReadOnlySpan<byte>.Empty);
+    string hex = Convert.ToHexString(frame);
+    HttpResponseMessage success = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent(
+            JsonSerializer.Serialize(new { portName = "COM12", hex }),
+            Encoding.UTF8,
+            "application/json")).GetAwaiter().GetResult();
+    Require(success.StatusCode == System.Net.HttpStatusCode.OK, "已连接端口成功写入必须返回 200");
+    using (JsonDocument successJson = JsonDocument.Parse(success.Content.ReadAsStringAsync().GetAwaiter().GetResult()))
+    {
+        JsonElement root = successJson.RootElement;
+        Require(root.GetProperty("portName").GetString() == "COM12", "成功响应的 portName 不正确");
+        Require(root.GetProperty("bytesWritten").GetInt32() == frame.Length, "成功响应的 bytesWritten 不正确");
+        Require(!root.GetProperty("queued").GetBoolean(), "同步写入响应必须 queued=false");
+    }
+    Require(
+        writes.Count == 1 && writes[0].PortName == "COM12" && writes[0].Bytes.SequenceEqual(frame),
+        "fake writer 必须收到完全相同的目标端口和帧字节");
+
+    failWrite = true;
+    HttpResponseMessage writeFailure = client.PostAsync(
+        "/api/v1/serial/write",
+        new StringContent(
+            JsonSerializer.Serialize(new { portName = "COM12", hex }),
+            Encoding.UTF8,
+            "application/json")).GetAwaiter().GetResult();
+    Require(writeFailure.StatusCode == System.Net.HttpStatusCode.InternalServerError, "写入异常必须返回 500");
+    string failureJson = writeFailure.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+    Require(failureJson.Contains("fake serial write failure", StringComparison.Ordinal), "写入失败响应必须保留明确原因");
+
+    Require(
+        FirmwareUpdateApiServer.IsLoopbackAddress(System.Net.IPAddress.Loopback) &&
+        !FirmwareUpdateApiServer.IsLoopbackAddress(System.Net.IPAddress.Parse("192.0.2.10")) &&
+        FirmwareUpdateApiServer.IsLoopbackAddress(System.Net.IPAddress.Parse("::ffff:127.0.0.1")),
+        "串口 API loopback 地址判定错误");
+    server.SetEnabled(false);
+}
+
+static void CheckDeviceLogMirrorPerPortFile()
+{
+    string root = Path.Combine(Path.GetTempPath(), $"hidbridge-mirror-log-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(root);
+    try
+    {
+        string hostLogPath = Path.Combine(root, "host-runtime-{timestamp}.log");
+        DateTime timestamp = new(2026, 9, 29, 4, 5, 6, 123);
+        string mirrorPath = DeviceLogMirror.BuildMirrorLogPath(hostLogPath, "COM3", timestamp, root);
+        Require(
+            Path.GetFileName(mirrorPath) == "host-serial-COM3-20260929-040506-123.log",
+            "镜像日志文件名必须包含独立 COM 口和毫秒时间戳");
+        using (StreamWriter writer = new(
+                   new FileStream(mirrorPath, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite),
+                   new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+               { AutoFlush = true })
+        {
+            DeviceLogMirror.WriteMirrorLogLine(writer, "COM3", "I (42) UART1统计 rx=7", timestamp);
+            using FileStream readStream = new(mirrorPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using StreamReader reader = new(readStream, Encoding.UTF8);
+            Require(reader.ReadToEnd().Contains("[COM3] I (42) UART1统计 rx=7", StringComparison.Ordinal),
+                "镜像日志必须在写入后可实时读取并保留端口标记");
+        }
+        Require(!File.Exists(Path.Combine(root, "host-runtime-20260929-040506.log")),
+            "镜像日志写入不得混入主串口 host-runtime 文件");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+}
+
+static void CheckDeviceLogMirrorDiscoveryPolicy()
+{
+    string[] startupPorts = DeviceLogMirror.SelectDiscoveryCandidates(["COM12"], "COM12", null, 0);
+    Require(startupPorts.Length == 0, "主串口尚未确认之外没有可用候选时不得尝试接管主串口");
+
+    string[] latePeerPorts = DeviceLogMirror.SelectDiscoveryCandidates(
+        ["COM12", "COM3"],
+        "COM12",
+        null,
+        0);
+    Require(latePeerPorts.SequenceEqual(["COM3"]), "后枚举的 COM3 应在下一轮被识别为对端候选");
+
+    string[] resumedPorts = DeviceLogMirror.SelectDiscoveryCandidates(
+        ["COM12", "COM3", "COM8", "COM9"],
+        "COM12",
+        "COM3",
+        1);
+    Require(resumedPorts[0] == "COM3" && !resumedPorts.Contains("COM12", StringComparer.OrdinalIgnoreCase),
+        "恢复监听时应优先回到历史对端口，并始终排除当前主串口");
+
+    Require(DeviceLogMirror.ShouldAttemptDiscovery(false, false, false, false), "缺少镜像端口时应继续周期重试");
+    Require(DeviceLogMirror.ShouldAttemptDiscovery(false, false, true, true), "读线程失效后应释放并重试镜像端口");
+    Require(!DeviceLogMirror.ShouldAttemptDiscovery(false, false, true, false), "健康镜像端口不应被周期重开");
+    Require(!DeviceLogMirror.ShouldAttemptDiscovery(false, true, false, false), "刷写独占期间必须暂停端口发现");
+    Require(!DeviceLogMirror.ShouldAttemptDiscovery(true, false, false, false), "Dispose 后不得继续端口发现");
+}
+
 static void CheckAutomationProfilesAndRuntime()
 {
     string root = Path.Combine(Path.GetTempPath(), $"hidbridge-automation-{Guid.NewGuid():N}");
@@ -3658,5 +3956,19 @@ internal static class EnumerableExtensions
             }
         }
         return false;
+    }
+}
+
+internal sealed class GatedDeviceLogWriter : TextWriter
+{
+    internal readonly ManualResetEventSlim Entered = new(false);
+    internal readonly ManualResetEventSlim Release = new(false);
+    internal readonly StringBuilder Content = new();
+    public override Encoding Encoding => Encoding.UTF8;
+    public override void WriteLine(string? value)
+    {
+        Entered.Set();
+        if (!Release.Wait(5000)) { throw new IOException("测试等待释放超时"); }
+        Content.AppendLine(value);
     }
 }
