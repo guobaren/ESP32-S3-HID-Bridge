@@ -1,7 +1,7 @@
 # 主机输入协议（UART / USB CDC）
 
 > **适用范围**：本文的「帧格式 / 消息类型 / 双板透明代理内部协议 / 有界重试与去重规则 / 双板内存统计快照」适用于当前双板主线 `firmware/`（工程名 `dual_s3_hid_proxy`，由原 `firmware/dual_proxy/` 提升而来）。
-> 主机局域网 UDP/kmboxNet 接口由 Windows Host 接收；Host 可运行于旧版单板或双板模式，实际输出条件和路由见本章对应说明。
+> 主机局域网 UDP/kmboxNet 接口由 Windows Host 接收；Host 可运行于双板模式或**单板兼容模式**（后者对应 `single-board` 分支的固件，本分支不构建单板固件），实际输出条件和路由见本章对应说明。
 > 标注为"早期单板"的段落（原生 USB CDC 探测窗口、BLE 节拍、Wi-Fi TCP）只适用于 `single-board` 分支的单板工程；双板克隆不开 CDC、无 Wi-Fi/BLE。
 >
 > **随机断连状态**：用户报告过的「鼠标随机断连 / 偶发无响应」在当前双板固件上**已解决，此后未复现**。本文「有界重试与去重规则」一节里 EP0 超时与枚举预热期参数是**当时的现场记录**，历史条目与风险项一律保留；证据边界（upstream USB Host 整体冻结的长期发生率、故障时按钮释放、完整无 reset 恢复、长时 1 kHz 高负载等仍未复测）见 [docs/交接.md](交接.md) 的「随机断连状态更新」。是「已解决、未再复现」，不是「已彻底排除」。
@@ -59,11 +59,11 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 
 主机在每次 UART、原生 USB CDC 或 Wi-Fi 连接建立后先发送 `SessionStart`，之后至少每 500 ms 发送一次 `Ping`。固件默认在 1500 ms 内未收到当前会话的有效帧时执行 `ReleaseAll`，避免断线卡键。
 
-`portName` 为 `auto` 时，主机依次打开当前可用 COM 口并发送 `DeviceProbe`。`dual_proxy` 正式拓扑只接受角色字节为 `MOUSE_HOST` 的响应，避免误连电脑侧板的开发串口；旧固件没有角色字节时只用于兼容诊断脚本。启动日志等非协议字节会被跳过。
+`portName` 为 `auto` 时，主机依次打开当前可用 COM 口并发送 `DeviceProbe`。双板主线（`dual_s3_hid_proxy`）的正式拓扑只接受角色字节为 `MOUSE_HOST` 的响应，避免误连电脑侧板的开发串口；不带角色字节的旧固件只用于兼容诊断脚本。启动日志等非协议字节会被跳过。
 
 ### 双板透明代理内部协议
 
-双板 `dual_proxy` 的 UART1 复用同一帧封装，并使用以下内部消息；它们不属于主机 CDC 控制 API：
+双板主线（`dual_s3_hid_proxy`）的 UART1 复用同一帧封装，并使用以下内部消息；它们不属于主机 CDC 控制 API：
 
 UART0 诊断另有 `0x1C DIAG_PROFILE_REFRESH_REQUEST`（可选 1 字节载荷），只由 M 角色受理：重新采集物理鼠标 Profile 并提议给 P，回现有 `DIAG_INJECT_RESULT`。这用于按需复现 Profile 流程，不会直接复位或重枚举物理鼠标。
 
@@ -120,7 +120,7 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 实体 raw Input 优先于软件输入；软件 move/release 使用独立有界队列；HID 厂商控制使用独立队列；Profile 只在安全/输入队列允许时分片发送。鼠标拔出、UART1 超时、鼠标侧掉电或 Profile 超时都先释放输入，再由电脑侧卸载 USB Device；重新插入后只有完整新 Profile 校验通过才重新枚举。
 **（主机 EXE / 早期单板）** 主机同步程序打开 UART 或原生 USB CDC 对应的 COM 口后，会由同一个 `SerialPort` 实例读取设备日志并缓冲写入 `deviceLogPath` 指定的文件（默认是 EXE 同目录 `log/device/host-serial-{timestamp}.log`），并按 `deviceLogRetentionCount` 清理最旧文件，因此不需要、也不能再同时运行 `idf.py monitor` 独占同一个 COM 口。为避免高频 BLE notify 日志重复触发主机日志落盘和 WinForms 重绘，`showDeviceLogInUi` 默认关闭；该选项只影响窗口镜像，不影响独立设备日志文件。
 
-**（早期单板）** UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流解析、设备发现和输入租约。Wi-Fi TCP 通道先用预共享密钥进行双向挑战认证，再使用 AES-256-GCM、单调包计数器和会话随机数保护每个完整帧；计数器不连续或认证标签错误时立即断开连接。双板 `dual_proxy` 不使用 Wi-Fi/BLE，也不开原生 USB CDC 控制口。
+**（单板兼容路径，固件在 `single-board` 分支）** UART 与原生 USB CDC 都直接承载上述帧；两者使用相同的字节流解析、设备发现和输入租约。Wi-Fi TCP 通道先用预共享密钥进行双向挑战认证，再使用 AES-256-GCM、单调包计数器和会话随机数保护每个完整帧；计数器不连续或认证标签错误时立即断开连接。双板主线不使用 Wi-Fi/BLE，也不开原生 USB CDC 控制口。
 
 **（早期单板）** 固件启动后的 1500 ms 为原生 USB profile 检测窗口：收到任何 CRC 正确的 UART 协议帧时选择键盘与相对触摸板 HID-only；未收到时先选择 CDC-only。若 CDC-only 启动后 UART 才收到首个有效协议帧，固件会执行 `ReleaseAll` 并自动重启一次；控制端持续探测会在新的启动窗口内命中，使原生 USB 重新枚举为 HID-only。已经处于 HID-only 时不会重复重启。选择只影响原生 USB 描述符，不改变本协议帧格式。
 

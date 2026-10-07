@@ -436,6 +436,7 @@ Host 在串口模式启动时会检查驱动状态：若找到随包 INF 且确�
 | [docs/protocol.md](docs/protocol.md) | UART/USB 协议、消息类型、统计快照、UDP/kmboxNet 与 Makcu V4 接口细节 |
 | [docs/连接流程.md](docs/连接流程.md) | 从上电初始化到克隆输入的完整时序、状态灯与控制通道加固 |
 | [docs/dependencies.md](docs/dependencies.md) | 开发环境、官方来源与安装步骤 |
+| [docs/发布.md](docs/发布.md) | 维护者发布入口与版本号同步规则 |
 | [docs/firmware-update-api.md](docs/firmware-update-api.md) | 远程固件刷写 API 的请求格式与边界 |
 | [docs/交接.md](docs/交接.md) | 当前状态快照、执行路线图与历史索引 |
 | [docs/审计.md](docs/审计.md) | 质量报告、Known Issues、技术债与未验证清单 |

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$SkipHostBuild,
     [switch]$BuildFirmware
@@ -122,7 +122,7 @@ try {
     $packageReadme = @(
         '# ESP32-S3 HID Bridge 发布件',
         '',
-        '启动 `HidBridge.Host.exe` 即可使用。程序会优先使用同目录的 `bridge.json`，并自动加载 `profiles/` 下的默认配置。每个配置的宏正文位于 `macros/`，Lua 正文位于 `lua/`，`profile.json` 只保存文件关联和运行元数据。鼠标捕获页提供 0.3–3.0 的统一输出灵敏度，只作用于 **Host 发往板端**的 X/Y 相对移动（网络 UDP、Lua/宏及软件输入），1 为原始值，滚轮和按键不变；**双板模式下 M→P 的实体鼠标是硬件直通，不经过该灵敏度**（旧单板模式的实体转发才受它影响）。“始终开启 UDP 输出”默认开启，HOME 关闭时仍可发送网络 UDP。设置页的“模拟 UDP 输入（测试）”默认关闭，仅用于测试聚合、平滑和输出链路。Lua 输入栏左侧显示行号；Lua 页“检查”会在不改变换行的前提下对齐缩进并规范常见行内空格；`delay(ms)`、`sleep(ms)` 和 `Sleep(ms)` 共用可取消延时实现，`move(x, y)` 支持小数累计移动，Lua 错误会显示行号。Host 不额外生成 `press arg=`/`release arg=` 摘要，脚本主动调用 `DebugLog(...)` 的内容仍会显示。',
+        '启动 `HidBridge.Host.exe` 即可使用。程序会优先使用同目录的 `bridge.json`，并自动加载 `profiles/` 下的默认配置。每个配置的宏正文位于 `macros/`，Lua 正文位于 `lua/`，`profile.json` 只保存文件关联和运行元数据。鼠标捕获页提供 0.3–3.0 的统一输出灵敏度，只作用于 **Host 发往板端**的 X/Y 相对移动（网络 UDP、Lua/宏及软件输入），1 为原始值，滚轮和按键不变；**双板模式下 M→P 的实体鼠标是硬件直通，不经过该灵敏度**（旧单板模式的实体转发才受它影响）。“始终开启 UDP 输出”默认开启，HOME 关闭时仍可发送网络 UDP。设置页的“UDP 模拟输入测试”默认关闭，仅在旧版单板通路且 HOME 同步开启时生效，用于验证软件输入聚合与旧单板 7 字节串口报告；它不是网络 UDP，也不用于双板 M 软件输入。Lua 输入栏左侧显示行号；Lua 页“检查”会在不改变换行的前提下对齐缩进并规范常见行内空格；`delay(ms)`、`sleep(ms)` 和 `Sleep(ms)` 共用可取消延时实现，`move(x, y)` 支持小数累计移动，Lua 错误会显示行号。Host 不额外生成 `press arg=`/`release arg=` 摘要，脚本主动调用 `DebugLog(...)` 的内容仍会显示。',
         '',
         '## 驱动',
         '',
@@ -135,10 +135,6 @@ try {
         '单板固件不在本发布件内，也不由本分支构建；如需旧单板方案，请在 `single-board` 分支获取源码与构建入口。',
         '',
         '固件按 **4 MB Flash** 目标构建，分区表为 `nvs`（24 KB）、`phy_init`（4 KB）与 `factory` 应用（1 MB），表尾 `0x110000`（约 1.06 MB），因此 **4 MB 及以上的 ESP32-S3 板卡都可用**，8 MB 板卡同样可用（更大的 Flash 不会被使用）。板卡不需要 PSRAM。若此前刷过含 4 MB `storage` 分区的旧版本，本次需要整片重刷（bootloader + partition table + app 三段）。',
-        '',
-        '## 移动分析图',
-        '',
-        '设置页中的“生成按键情况分析图片”默认关闭。启用后，左右键记录完成时打开 X/Y 分析窗口，并将 PNG 保存到程序同目录的 `log/`；该图只用于观察实际固件报告，不改变转发逻辑。',
         '',
         '## 校验',
         '',
