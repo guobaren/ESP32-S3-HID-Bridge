@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import serial  # noqa: E402
 
-from fetch_onboard_log import build_frame  # noqa: E402
+from uart_protocol import build_frame  # noqa: E402
 
 # Windows 控制台默认 GBK：串口日志里可能混入非 UTF-8 字节（多任务日志交错），
 # 统一改成 UTF-8 容错输出，否则 print 会直接抛 UnicodeEncodeError。

@@ -6,6 +6,7 @@
 
 #include "bridge_protocol.h"
 #include "esp_err.h"
+#include "stats_snapshot.h"
 
 #define DUAL_USB_STATE_WAITING 0
 #define DUAL_USB_STATE_MOUNTED 1
@@ -25,12 +26,15 @@ esp_err_t dual_uart1_start(
 esp_err_t dual_uart1_lock_role(uint8_t role);
 void dual_uart1_set_usb_state(uint8_t usb_state);
 bool dual_uart1_peer_online(void);
+bool dual_uart1_peer_hid_ready(void);
 uint32_t dual_uart1_generation(void);
 uint32_t dual_uart1_peer_generation(void);
 /* P侧只有在本地USB teardown完成后才能开放本会话的单次Profile申请。 */
 void dual_uart1_set_profile_request_ready(bool ready);
 /* Drop queued HID++/raw-HID traffic from the previous cloned device session. */
 void dual_uart1_cancel_vendor_hid_session(void);
+/* Drop only vendor control requests/responses; preserve queued physical input reports. */
+void dual_uart1_cancel_vendor_control_session(void);
 esp_err_t dual_uart1_send_mouse(
     uint8_t interface_number,
     uint8_t report_id,
@@ -102,6 +106,14 @@ esp_err_t dual_uart1_send_vendor_control_response(
     uint8_t status,
     const uint8_t *data,
     size_t data_length);
+esp_err_t dual_uart1_send_vendor_session_begin(
+    uint32_t p_generation,
+    uint32_t m_generation,
+    uint32_t epoch);
+esp_err_t dual_uart1_send_vendor_session_ack(
+    uint32_t p_generation,
+    uint32_t m_generation,
+    uint32_t epoch);
 /* Copy a complete serialized HID profile for bounded, fair UART1 streaming. */
 esp_err_t dual_uart1_queue_profile(
     const uint8_t *blob,
@@ -109,10 +121,12 @@ esp_err_t dual_uart1_queue_profile(
     uint32_t crc32);
 void dual_uart1_cancel_profile(void);
 void dual_uart1_deferred_refresh(void);
+void dual_uart1_collect_stats(dual_stats_snapshot_t *snapshot);
 
 /* Profile 传输（OFFER→最终 ACK）是否在途：在途期间移动报文应让路，
  * 保证鼠标侧板自己的枚举/采集与整份传输不被 1 kHz 转发干扰。 */
 bool dual_uart1_profile_transfer_in_flight(void);
+bool dual_uart1_profile_waiting_host(void);
 
 /* 克隆是否已完成（鼠标侧：收到成功 Profile ACK 之后为真）。 */
 bool dual_uart1_clone_ready(void);

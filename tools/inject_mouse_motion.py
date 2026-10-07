@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import serial  # noqa: E402
 
-from fetch_onboard_log import build_frame  # noqa: E402
+from uart_protocol import build_frame  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

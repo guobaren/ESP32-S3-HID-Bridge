@@ -21,7 +21,11 @@ $sources = @(
     'main\hid_clone_descriptor.c',
     'main\hid_report_layout.c',
     'main\dual_status_led_logic.c',
-    'main\usb_cdc_control_logic.c'
+    'main\usb_cdc_control_logic.c',
+    'main\makcu_ascii_logic.c',
+    'main\makcu_v4_logic.c',
+    'main\uart0_protocol_router.c',
+    'main\m_udp_smoothing.c'
 )
 # 共享的平滑器仍在旧单板工程里，逻辑测试复用同一份源码。
 $shared_sources = @('firmware\main\mouse_motion_smoother.c')

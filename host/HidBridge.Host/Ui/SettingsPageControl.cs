@@ -1,6 +1,5 @@
 using HidBridge.Host.Automation;
 using HidBridge.Host.FirmwareUpdate;
-using HidBridge.Host.Input;
 using HidBridge.Host.Transport;
 
 namespace HidBridge.Host.Ui;
@@ -21,11 +20,13 @@ internal sealed class SettingsPageControl : UserControl
     private readonly CheckBox _minimizeToTrayCheckBox;
     private readonly CheckBox _closeToTrayCheckBox;
     private readonly CheckBox _legacySingleBoardFirmwareCheckBox;
-    private readonly CheckBox _generateMovementAnalysisImageCheckBox;
+    private readonly Panel _legacySingleBoardOptionRow;
+    private readonly CheckBox _simulatedUdpInputCheckBox;
+    private readonly ComboBox _simulatedUdpInputFrequencyBox;
+    private readonly Panel _simulatedUdpInputOptionRow;
+    private readonly CheckBox _alwaysOutputUdpCheckBox;
+    private readonly Panel _alwaysOutputUdpOptionRow;
     private readonly CheckBox _firmwareUpdateApiCheckBox;
-    private readonly CheckBox _simulatedUdpCheckBox;
-    private readonly ComboBox _simulatedUdpFrequencyComboBox;
-    private readonly Action<bool, int>? _configureSimulatedUdp;
     private readonly Panel _cards;
     private TextBox _firmwareFileTextBox = null!;
     private ComboBox _firmwarePortComboBox = null!;
@@ -38,13 +39,11 @@ internal sealed class SettingsPageControl : UserControl
     internal SettingsPageControl(
         AutomationController controller,
         FirmwareUpdateApiServer? firmwareUpdateApi = null,
-        FirmwareFlashService? firmwareFlash = null,
-        Action<bool, int>? configureSimulatedUdp = null)
+        FirmwareFlashService? firmwareFlash = null)
     {
         _controller = controller;
         _firmwareUpdateApi = firmwareUpdateApi;
         _firmwareFlash = firmwareFlash;
-        _configureSimulatedUdp = configureSimulatedUdp;
         Dock = DockStyle.Fill;
         Padding = new Padding(18, 14, 18, 18);
         AutoScroll = false;
@@ -72,9 +71,28 @@ internal sealed class SettingsPageControl : UserControl
         _legacySingleBoardFirmwareCheckBox = CreateOption(
             "使用旧版单板通路",
             "开启后完全使用旧版单板串口通路：跳过新双板角色握手，发送旧版 7 字节鼠标报告。仅在连接旧版单板转发固件时开启。默认关闭。\n开启后无法确认串口设备身份。 ");
-        _generateMovementAnalysisImageCheckBox = CreateOption(
-            "生成按键情况分析图片",
-            "默认关闭。左右键同时按下开始记录，全部松开 3 秒后完成；启用后弹出 X/Y 实际固件报告分析窗口，并将 PNG 保存到程序目录 log。仅用于观察输出，不改变转发逻辑。");
+        _simulatedUdpInputCheckBox = CreateOption(
+            "UDP 模拟输入测试",
+            "仅旧版单板通路且 HOME 同步开启时生效：将实体鼠标移动按指定频率聚合并写入旧版单板 7 字节鼠标报告；此测试不发送网络 UDP 数据报。");
+        _simulatedUdpInputFrequencyBox = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 92,
+            Height = 28,
+            FormattingEnabled = true,
+            AccessibleName = "UDP 模拟输入测试频率",
+        };
+        _simulatedUdpInputFrequencyBox.Items.AddRange([30, 60, 100, 140, 200, 500, 0]);
+        _simulatedUdpInputFrequencyBox.Format += (_, eventArgs) =>
+        {
+            if (eventArgs.ListItem is int frequencyHz)
+            {
+                eventArgs.Value = frequencyHz == 0 ? "无上限" : $"{frequencyHz} Hz";
+            }
+        };
+        _alwaysOutputUdpCheckBox = CreateOption(
+            "始终开启 UDP 输出",
+            "仅旧版单板通路使用。开启后 HOME 关闭时仍允许 UDP 输入发送到开发板；关闭后 UDP 输入只在 HOME 同步开启时发送。");
         _firmwareUpdateApiCheckBox = CreateOption(
             "启用局域网固件刷写接口",
             firmwareUpdateApi is null
@@ -82,50 +100,29 @@ internal sealed class SettingsPageControl : UserControl
                 : $"监听局域网 TCP {firmwareUpdateApi.Port}；默认关闭，刷写时自动使用下方已选择的串口。仅限受信任局域网。");
         _firmwareUpdateApiCheckBox.Enabled = firmwareUpdateApi is not null;
 
-        _simulatedUdpCheckBox = new CheckBox
-        {
-            Text = "启用模拟 UDP 输入（测试）",
-            AutoSize = false,
-            Width = 320,
-            Height = 32,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(4, 0, 0, 0),
-            AccessibleName = "模拟 UDP 输入测试开关",
-        };
-        _simulatedUdpFrequencyComboBox = new ComboBox
-        {
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            Width = 150,
-            Height = 30,
-            FormattingEnabled = true,
-            AccessibleName = "模拟 UDP 输入测试频率",
-        };
-        _simulatedUdpFrequencyComboBox.Items.AddRange(
-            SimulatedUdpMouseInput.SupportedFrequencies.Cast<object>().ToArray());
-        _simulatedUdpFrequencyComboBox.Format += (_, eventArgs) =>
-        {
-            if (eventArgs.ListItem is int frequencyHz)
-            {
-                eventArgs.Value = FormatSimulatedUdpFrequency(frequencyHz);
-            }
-        };
-
         FlowLayoutPanel startupOptions = new()
         {
             Dock = DockStyle.Fill,
-            Height = 212,
+            Height = 362,
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
             Padding = new Padding(0, 8, 0, 0),
         };
+        _legacySingleBoardOptionRow = WrapOption(_legacySingleBoardFirmwareCheckBox);
+        _simulatedUdpInputOptionRow = WrapSimulatedUdpInputOption(
+            _simulatedUdpInputCheckBox,
+            _simulatedUdpInputFrequencyBox);
+        _alwaysOutputUdpOptionRow = WrapOption(_alwaysOutputUdpCheckBox);
         startupOptions.Controls.AddRange([
             WrapOption(_startOnBootCheckBox),
             WrapOption(_minimizeToTrayCheckBox),
             WrapOption(_closeToTrayCheckBox),
-            WrapOption(_legacySingleBoardFirmwareCheckBox),
+            _legacySingleBoardOptionRow,
+            _simulatedUdpInputOptionRow,
+            _alwaysOutputUdpOptionRow,
         ]);
 
-        Panel startupPanel = CreateCardPanel(276);
+        Panel startupPanel = CreateCardPanel(418);
         Label startupTitle = CreateSectionTitle("启动与托盘");
         startupTitle.Dock = DockStyle.None;
         startupTitle.Location = new Point(16, 10);
@@ -133,13 +130,12 @@ internal sealed class SettingsPageControl : UserControl
         startupTitle.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         startupOptions.Dock = DockStyle.None;
         startupOptions.Location = new Point(16, 44);
-        startupOptions.Size = new Size(900, 216);
+        startupOptions.Size = new Size(900, 362);
         startupOptions.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         startupPanel.Controls.Add(startupOptions);
         startupPanel.Controls.Add(startupTitle);
         startupPanel.Controls.SetChildIndex(startupTitle, 0);
         Panel flashPanel = BuildFlashPanel();
-        Panel simulatedUdpPanel = BuildSimulatedUdpPanel();
 
         _statusLabel = new Label
         {
@@ -190,7 +186,6 @@ internal sealed class SettingsPageControl : UserControl
             Padding = new Padding(0, 0, 0, 12),
         };
         _cards.Controls.Add(flashPanel);
-        _cards.Controls.Add(simulatedUdpPanel);
         _cards.Controls.Add(startupPanel);
         Controls.Add(_cards);
         Controls.Add(fixedHeader);
@@ -206,10 +201,10 @@ internal sealed class SettingsPageControl : UserControl
         _minimizeToTrayCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _closeToTrayCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _legacySingleBoardFirmwareCheckBox.CheckedChanged += (_, _) => SaveSettings();
-        _generateMovementAnalysisImageCheckBox.CheckedChanged += (_, _) => SaveSettings();
+        _simulatedUdpInputCheckBox.CheckedChanged += (_, _) => SaveSettings();
+        _simulatedUdpInputFrequencyBox.SelectedIndexChanged += (_, _) => SaveSettings();
+        _alwaysOutputUdpCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _firmwareUpdateApiCheckBox.CheckedChanged += (_, _) => SaveSettings();
-        _simulatedUdpCheckBox.CheckedChanged += (_, _) => SaveSettings();
-        _simulatedUdpFrequencyComboBox.SelectedIndexChanged += (_, _) => SaveSettings();
         LoadSettings();
     }
 
@@ -217,73 +212,16 @@ internal sealed class SettingsPageControl : UserControl
     internal CheckBox MinimizeToTrayCheckBox => _minimizeToTrayCheckBox;
     internal CheckBox CloseToTrayCheckBox => _closeToTrayCheckBox;
     internal CheckBox LegacySingleBoardFirmwareCheckBox => _legacySingleBoardFirmwareCheckBox;
-    internal CheckBox GenerateMovementAnalysisImageCheckBox => _generateMovementAnalysisImageCheckBox;
+    internal Panel LegacySingleBoardOptionRow => _legacySingleBoardOptionRow;
+    internal CheckBox SimulatedUdpInputCheckBox => _simulatedUdpInputCheckBox;
+    internal ComboBox SimulatedUdpInputFrequencyBox => _simulatedUdpInputFrequencyBox;
+    internal Panel SimulatedUdpInputOptionRow => _simulatedUdpInputOptionRow;
+    internal CheckBox AlwaysOutputUdpCheckBox => _alwaysOutputUdpCheckBox;
+    internal Panel AlwaysOutputUdpOptionRow => _alwaysOutputUdpOptionRow;
     internal CheckBox FirmwareUpdateApiCheckBox => _firmwareUpdateApiCheckBox;
-    internal CheckBox SimulatedUdpCheckBox => _simulatedUdpCheckBox;
-    internal ComboBox SimulatedUdpFrequencyComboBox => _simulatedUdpFrequencyComboBox;
     internal ComboBox FirmwarePortComboBox => _firmwarePortComboBox;
     internal Button RefreshFirmwarePortsButton => _refreshFirmwarePortsButton;
     internal void ResetScrollPosition() => _cards.AutoScrollPosition = Point.Empty;
-
-    private Panel BuildSimulatedUdpPanel()
-    {
-        Panel panel = new()
-        {
-            Dock = DockStyle.Top,
-            Height = 212,
-            Padding = new Padding(16),
-            BackColor = CardSurfaceColor,
-        };
-        StyleCard(panel);
-
-        Label title = CreateSectionTitle("分析与诊断");
-        FlowLayoutPanel row = new()
-        {
-            Dock = DockStyle.Top,
-            Width = 900,
-            Height = 88,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = true,
-            Padding = new Padding(0, 3, 0, 0),
-        };
-        row.Controls.Add(_simulatedUdpCheckBox);
-        row.Controls.Add(new Label
-        {
-            Text = "源频率",
-            AutoSize = true,
-            Padding = new Padding(8, 7, 4, 0),
-            ForeColor = MutedTextColor,
-        });
-        row.Controls.Add(_simulatedUdpFrequencyComboBox);
-        Label simulatedUdpDescription = new()
-        {
-            Text = "仅用于测试输入聚合、UDP 平滑和输出链路，不代表真实网络性能。",
-            AutoSize = false,
-            Width = 300,
-            Height = 56,
-            TextAlign = ContentAlignment.MiddleLeft,
-            ForeColor = MutedTextColor,
-            Margin = new Padding(8, 0, 0, 0),
-        };
-        row.Controls.Add(simulatedUdpDescription);
-        row.Resize += (_, _) =>
-        {
-            int reservedWidth = _simulatedUdpCheckBox.Width + _simulatedUdpFrequencyComboBox.Width + 112;
-            simulatedUdpDescription.Width = Math.Clamp(row.ClientSize.Width - reservedWidth, 180, 360);
-        };
-        FlowLayoutPanel rows = new()
-        {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.TopDown,
-            WrapContents = false,
-            Padding = new Padding(0, 4, 0, 0),
-        };
-        rows.Controls.Add(WrapOption(_generateMovementAnalysisImageCheckBox));
-        rows.Controls.Add(row);
-        panel.Controls.Add(rows);
-        panel.Controls.Add(title);
-        return panel;
-    }
 
     private Panel BuildFlashPanel()
     {
@@ -639,6 +577,60 @@ internal sealed class SettingsPageControl : UserControl
         return panel;
     }
 
+    private static Panel WrapSimulatedUdpInputOption(CheckBox option, ComboBox frequencyBox)
+    {
+        Panel panel = new()
+        {
+            Width = 900,
+            Height = 66,
+            Margin = new Padding(0),
+            BackColor = CardSurfaceColor,
+        };
+        TableLayoutPanel row = new()
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 2,
+            Padding = new Padding(0),
+        };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
+        row.RowStyles.Add(new RowStyle(SizeType.Percent, 58));
+        row.RowStyles.Add(new RowStyle(SizeType.Percent, 42));
+        option.Dock = DockStyle.Fill;
+        row.Controls.Add(option, 0, 0);
+        row.SetRowSpan(option, 2);
+        row.Controls.Add(new Label
+        {
+            Text = option.Tag as string ?? string.Empty,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = MutedTextColor,
+            AutoEllipsis = true,
+            AccessibleName = "UDP 模拟输入测试说明",
+        }, 1, 0);
+        FlowLayoutPanel frequencyOptions = new()
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0),
+            Padding = new Padding(0),
+        };
+        frequencyOptions.Controls.Add(new Label
+        {
+            Text = "频率：",
+            AutoSize = true,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = MutedTextColor,
+            Margin = new Padding(0, 5, 5, 0),
+        });
+        frequencyOptions.Controls.Add(frequencyBox);
+        row.Controls.Add(frequencyOptions, 1, 1);
+        panel.Controls.Add(row);
+        return panel;
+    }
+
     private static Label CreateSectionTitle(string text) => new()
     {
         Text = text,
@@ -671,25 +663,19 @@ internal sealed class SettingsPageControl : UserControl
         };
     }
 
-    private int GetSelectedSimulatedUdpFrequency() =>
-        _simulatedUdpFrequencyComboBox.SelectedItem is int frequencyHz
-            ? frequencyHz
-            : 100;
-
-    private void ApplySimulatedUdpSettings()
+    private void ApplyAlwaysOutputUdpSettings()
     {
-        int frequencyHz = GetSelectedSimulatedUdpFrequency();
-        bool enabled = _simulatedUdpCheckBox.Checked;
-        _simulatedUdpFrequencyComboBox.Enabled = enabled;
-        _controller.Settings.SimulatedUdpInputEnabled = enabled;
-        _controller.Settings.SimulatedUdpInputFrequencyHz = frequencyHz;
-        _configureSimulatedUdp?.Invoke(enabled, frequencyHz);
+        bool legacySingleBoard = _legacySingleBoardFirmwareCheckBox.Checked;
+        _alwaysOutputUdpOptionRow.Visible = legacySingleBoard;
+        _simulatedUdpInputOptionRow.Visible = legacySingleBoard;
+        _simulatedUdpInputCheckBox.Enabled = legacySingleBoard;
+        _simulatedUdpInputFrequencyBox.Enabled = legacySingleBoard && _simulatedUdpInputCheckBox.Checked;
+        _controller.ApplyOutputRoutingSettings(
+            legacySingleBoard,
+            _alwaysOutputUdpCheckBox.Checked,
+            _simulatedUdpInputCheckBox.Checked,
+            _simulatedUdpInputFrequencyBox.SelectedItem is int frequencyHz ? frequencyHz : 100);
     }
-
-    private static string FormatSimulatedUdpFrequency(int frequencyHz) =>
-        frequencyHz == SimulatedUdpMouseInput.UnlimitedFrequencyHz
-            ? "无上限"
-            : $"{frequencyHz} Hz";
 
     private void LoadSettings()
     {
@@ -700,13 +686,13 @@ internal sealed class SettingsPageControl : UserControl
         _closeToTrayCheckBox.Checked = _controller.Settings.CloseToTray;
         _legacySingleBoardFirmwareCheckBox.Checked =
             _controller.Settings.LegacySingleBoardFirmwareCompatibility;
-        _generateMovementAnalysisImageCheckBox.Checked = _controller.Settings.GenerateMovementAnalysisImage;
-        int simulatedFrequency = SimulatedUdpMouseInput.SupportedFrequencies.Contains(
-            _controller.Settings.SimulatedUdpInputFrequencyHz)
-            ? _controller.Settings.SimulatedUdpInputFrequencyHz
-            : 100;
-        _simulatedUdpCheckBox.Checked = _controller.Settings.SimulatedUdpInputEnabled;
-        _simulatedUdpFrequencyComboBox.SelectedItem = simulatedFrequency;
+        _simulatedUdpInputCheckBox.Checked = _controller.Settings.SimulatedUdpInputEnabled;
+        int frequencyIndex = _simulatedUdpInputFrequencyBox.Items.IndexOf(
+            _controller.Settings.SimulatedUdpInputFrequencyHz);
+        _simulatedUdpInputFrequencyBox.SelectedIndex = frequencyIndex >= 0
+            ? frequencyIndex
+            : _simulatedUdpInputFrequencyBox.Items.IndexOf(100);
+        _alwaysOutputUdpCheckBox.Checked = _controller.Settings.AlwaysOutputUdpEnabled;
         _firmwareUpdateApiCheckBox.Checked =
             _firmwareUpdateApi is not null && _controller.Settings.FirmwareUpdateApiEnabled;
         _firmwareFileTextBox.Text = _controller.Settings.FirmwareManifestPath;
@@ -714,7 +700,7 @@ internal sealed class SettingsPageControl : UserControl
         RefreshFirmwarePorts(showStatus: false);
         _confirmFlashButton.Enabled = CanStartFlash();
         _loading = false;
-        ApplySimulatedUdpSettings();
+        ApplyAlwaysOutputUdpSettings();
     }
 
     private void SaveSettings()
@@ -726,13 +712,10 @@ internal sealed class SettingsPageControl : UserControl
         _controller.Settings.StartOnBoot = _startOnBootCheckBox.Checked;
         _controller.Settings.MinimizeToTray = _minimizeToTrayCheckBox.Checked;
         _controller.Settings.CloseToTray = _closeToTrayCheckBox.Checked;
-        _controller.Settings.LegacySingleBoardFirmwareCompatibility =
-            _legacySingleBoardFirmwareCheckBox.Checked;
-        _controller.Settings.GenerateMovementAnalysisImage = _generateMovementAnalysisImageCheckBox.Checked;
+        ApplyAlwaysOutputUdpSettings();
         _controller.Settings.FirmwareUpdateApiEnabled =
             _firmwareUpdateApi is not null && _firmwareUpdateApiCheckBox.Checked;
         _controller.Settings.FirmwareFlashPortName = _firmwarePortComboBox.Text.Trim();
-        ApplySimulatedUdpSettings();
         try
         {
             _firmwareUpdateApi?.SetEnabled(_controller.Settings.FirmwareUpdateApiEnabled);

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Ports;
+using System.Buffers.Binary;
 using System.Text;
 using HidBridge.Protocol;
 
@@ -33,8 +34,11 @@ internal sealed class SerialBridge : IBridgeTransport
     private readonly RuntimeLogSettings _logSettings;
     private readonly Func<bool> _legacyFirmwareCompatibility;
     private readonly FrameCodec _codec = new();
+    private readonly FrameCodec _diagnosticCodec = new();
     private readonly object _sync = new();
     private readonly object _writeSync = new();
+    private readonly SemaphoreSlim _statsQueryGate = new(1, 1);
+    private readonly DeviceStatsPendingRequestRegistry _statsRequests = new();
     private readonly Queue<byte[]> _outboundFrames = [];
     private readonly AutoResetEvent _outboundSignal = new(false);
     private readonly Thread _writerThread;
@@ -138,9 +142,127 @@ internal sealed class SerialBridge : IBridgeTransport
         }
     }
 
-    internal void SetDevicePeriodicStats(bool enabled)
+    internal async Task<DeviceStatisticsQueryResult> ReadDeviceStatisticsAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
     {
-        Send(MessageType.LogStatsControlRequest, new[] { (byte)(enabled ? 1 : 0) });
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        using CancellationTokenSource deadline =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(timeout);
+        DeviceStatsQueryContext? query = null;
+        bool gateEntered = false;
+        try
+        {
+            try
+            {
+                await _statsQueryGate.WaitAsync(deadline.Token).ConfigureAwait(false);
+                gateEntered = true;
+            }
+            catch (OperationCanceledException) when (
+                !cancellationToken.IsCancellationRequested && deadline.IsCancellationRequested)
+            {
+                throw new TimeoutException($"统计请求在 {timeout.TotalSeconds:F1} 秒内未能取得查询通道。");
+            }
+
+            string[] ports = GetOpenPortNames();
+            if (ports.Length == 0)
+            {
+                throw new IOException("没有已打开的主串口或对端镜像串口可查询。");
+            }
+
+            byte[] request = _diagnosticCodec.Encode(MessageType.StatsSnapshotRequest, ReadOnlySpan<byte>.Empty);
+            ushort sequence = BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(4, 2));
+            query = _statsRequests.Register(ports, sequence);
+
+            try
+            {
+                foreach (string portName in ports)
+                {
+                    deadline.Token.ThrowIfCancellationRequested();
+                    int? written = WriteToOpenPort(portName, request, deadline.Token);
+                    if (written != request.Length)
+                    {
+                        throw new IOException($"端口 {portName} 当前不由本程序持有或请求帧未完整写入。");
+                    }
+                }
+
+                return await query.Completion.Task.WaitAsync(deadline.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (
+                !cancellationToken.IsCancellationRequested && deadline.IsCancellationRequested)
+            {
+                string pending = query?.DescribeIncomplete() ?? "尚未收到板端分页";
+                throw new TimeoutException(
+                    $"统计请求在 {timeout.TotalSeconds:F1} 秒内未收齐所有分页；{pending}");
+            }
+            catch
+            {
+                lock (query.Sync)
+                {
+                    query.Closed = true;
+                    query.Completion.TrySetCanceled(deadline.Token);
+                }
+                throw;
+            }
+        }
+        finally
+        {
+            if (query is not null)
+            {
+                _statsRequests.Clear(query);
+            }
+            if (gateEntered)
+            {
+                _statsQueryGate.Release();
+            }
+        }
+    }
+
+    internal void OnDiagnosticFrame(string portName, BridgeFrame frame)
+    {
+        if (!_statsRequests.TryGet(
+                portName,
+                frame,
+                out DeviceStatsQueryContext? query,
+                out DeviceStatsPageCollector? collector) ||
+            query is null || collector is null)
+        {
+            return;
+        }
+
+        lock (query.Sync)
+        {
+            if (query.Closed)
+            {
+                return;
+            }
+            try
+            {
+                collector.Add(frame);
+                if (query.Collectors.Values.All(item => item.IsComplete))
+                {
+                    DeviceStatisticsSnapshot[] boards = query.Collectors.Values
+                        .Select(item => item.Build())
+                        .OrderBy(item => item.Role)
+                        .ToArray();
+                    query.Closed = true;
+                    query.Completion.TrySetResult(new DeviceStatisticsQueryResult(
+                        DateTimeOffset.Now,
+                        boards));
+                }
+            }
+            catch (Exception exception) when (
+                exception is InvalidDataException or InvalidOperationException)
+            {
+                query.Closed = true;
+                query.Completion.TrySetException(exception);
+            }
+        }
     }
 
     private bool EnqueueFrameLocked(byte[] frame)
@@ -389,10 +511,11 @@ internal sealed class SerialBridge : IBridgeTransport
             }
 
             // 设置页模式变化后，不能继续复用旧握手和旧 payload 语义的连接。
-            // 关闭并立即重新探测，避免用户必须拔插串口或等待断线。
+            // 旧 Writer 队列可能还留有按下报告；先在旧串口写入 SessionStart + ReleaseAll，
+            // 再关闭旧口，避免关闭后新模式的重连把旧 ReleaseAll 丢进新队列。
             Console.WriteLine(
-                $"旧版单板兼容模式已{(requestedLegacyCompatibility ? "启用" : "停用")}，正在重新连接串口。");
-            ClosePort();
+                $"旧版单板兼容模式已{(requestedLegacyCompatibility ? "启用" : "停用")}，正在释放旧输入并重新连接串口。");
+            ClosePortForInputModeChange();
             _nextConnectAttemptUtc = DateTime.MinValue;
         }
 
@@ -426,7 +549,15 @@ internal sealed class SerialBridge : IBridgeTransport
                 bool legacyCompatibility = requestedLegacyCompatibility;
                 byte? expectedRole = legacyCompatibility ? null : SerialDeviceProbe.MouseHostRole;
                 bool probeMatched = legacyCompatibility ||
-                    !automatic || SerialDeviceProbe.Probe(candidate, _codec, expectedRole);
+                    SerialDeviceProbe.Probe(candidate, _codec, expectedRole);
+                if (!probeMatched && !legacyCompatibility && candidate.BaudRate != 115200)
+                {
+                    candidate.Dispose();
+                    candidate = CreatePort(portName);
+                    candidate.BaudRate = 115200;
+                    candidate.Open();
+                    probeMatched = SerialDeviceProbe.Probe(candidate, _codec, expectedRole);
+                }
                 if (!probeMatched)
                 {
                     Console.WriteLine($"{portName} 未返回 HID Bridge 握手，已忽略。");
@@ -461,39 +592,37 @@ internal sealed class SerialBridge : IBridgeTransport
 
     private void StartDeviceTrace(SerialPort port, string portName)
     {
-        if (string.IsNullOrWhiteSpace(_options.DeviceLogPath))
-        {
-            return;
-        }
-
+        BufferedDeviceLog? sink = null;
         try
         {
-            string template = _options.DeviceLogPath;
-            string relativePath = template.Replace("{timestamp}", DateTime.Now.ToString("yyyyMMdd-HHmmss"),
-                StringComparison.OrdinalIgnoreCase);
-            string path = Path.IsPathRooted(relativePath)
-                ? relativePath
-                : Path.Combine(AppContext.BaseDirectory, relativePath);
-            string? directory = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(directory))
+            if (!string.IsNullOrWhiteSpace(_options.DeviceLogPath))
             {
-                Directory.CreateDirectory(directory);
-            }
-            LogFileRetention.Enforce(template, path, _options.DeviceLogRetentionCount);
+                string template = _options.DeviceLogPath;
+                string relativePath = template.Replace("{timestamp}", DateTime.Now.ToString("yyyyMMdd-HHmmss"),
+                    StringComparison.OrdinalIgnoreCase);
+                string path = Path.IsPathRooted(relativePath)
+                    ? relativePath
+                    : Path.Combine(AppContext.BaseDirectory, relativePath);
+                string? directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                LogFileRetention.Enforce(template, path, _options.DeviceLogRetentionCount);
 
-            BufferedDeviceLog sink = new(CreateTraceWriter(path, fullLogging: true));
-            _traceWriter = sink;
-            _traceCancellation = new CancellationTokenSource();
-            CancellationToken cancellation = _traceCancellation.Token;
-            _traceTask = Task.Run(() => TraceDeviceOutput(port, portName, cancellation, sink), cancellation);
-            Console.WriteLine(
-                $"设备日志已启用（后台完整保存，界面={(_logSettings.FullLoggingEnabled ? "完整" : "精简")}）：{path}");
+                sink = new BufferedDeviceLog(CreateTraceWriter(path, fullLogging: true));
+                Console.WriteLine(
+                    $"设备日志已启用（后台完整保存，界面={(_logSettings.FullLoggingEnabled ? "完整" : "精简")}）：{path}");
+            }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
             Console.Error.WriteLine($"设备日志创建失败：{exception.Message}");
-            _traceWriter = null;
         }
+        _traceWriter = sink;
+        _traceCancellation = new CancellationTokenSource();
+        CancellationToken cancellation = _traceCancellation.Token;
+        _traceTask = Task.Run(() => TraceDeviceOutput(port, portName, cancellation, sink), cancellation);
     }
 
     internal static StreamWriter CreateTraceWriter(string path, bool fullLogging)
@@ -512,11 +641,16 @@ internal sealed class SerialBridge : IBridgeTransport
         };
     }
 
-    private void TraceDeviceOutput(SerialPort port, string portName, CancellationToken cancellation, BufferedDeviceLog sink)
+    private void TraceDeviceOutput(
+        SerialPort port,
+        string portName,
+        CancellationToken cancellation,
+        BufferedDeviceLog? sink)
     {
         byte[] buffer = new byte[1024];
         char[] textBuffer = new char[2048];
         Decoder decoder = Encoding.UTF8.GetDecoder();
+        DeviceOutputFrameScanner scanner = new();
         StringBuilder pending = new();
         try
         {
@@ -544,7 +678,15 @@ internal sealed class SerialBridge : IBridgeTransport
                     continue;
                 }
 
-                int charCount = decoder.GetChars(buffer, 0, read, textBuffer, 0, flush: false);
+                byte[] textBytes = scanner.Feed(
+                    buffer.AsSpan(0, read),
+                    frame => OnDiagnosticFrame(portName, frame));
+                if (textBytes.Length == 0)
+                {
+                    continue;
+                }
+
+                int charCount = decoder.GetChars(textBytes, 0, textBytes.Length, textBuffer, 0, flush: false);
                 pending.Append(textBuffer, 0, charCount);
                 while (true)
                 {
@@ -588,10 +730,10 @@ internal sealed class SerialBridge : IBridgeTransport
         }
     }
 
-    private void WriteDeviceTraceLine(BufferedDeviceLog sink, string portName, string line)
+    private void WriteDeviceTraceLine(BufferedDeviceLog? sink, string portName, string line)
     {
         string stamped = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{portName}] {line}";
-        sink.TryWrite(stamped);
+        sink?.TryWrite(stamped);
         if (ShouldMirrorDeviceLog(_logSettings.FullLoggingEnabled, line))
         {
             Console.WriteLine($"[设备] {line}");
@@ -717,7 +859,70 @@ internal sealed class SerialBridge : IBridgeTransport
         }
     }
 
+    private void ClosePortForInputModeChange()
+    {
+        _outboundFrames.Clear();
+        Monitor.PulseAll(_sync);
+        StopDeviceTrace();
+        lock (_writeSync)
+        {
+            SerialPort? oldPort = _port;
+            try
+            {
+                if (oldPort?.IsOpen == true)
+                {
+                    WriteInputModeChangeReleaseFrames(
+                        _codec,
+                        frame => oldPort.Write(frame, 0, frame.Length));
+                    Console.WriteLine("已在旧串口同步写入 SessionStart + ReleaseAll。");
+                }
+            }
+            catch (Exception exception) when (
+                exception is IOException or InvalidOperationException or UnauthorizedAccessException or
+                    TimeoutException)
+            {
+                Console.Error.WriteLine($"切换单板/双板通路时旧串口 ReleaseAll 写入失败：{exception.Message}");
+            }
+            finally
+            {
+                try
+                {
+                    oldPort?.Dispose();
+                }
+                catch
+                {
+                    // 旧端口已失效时，清理状态仍必须继续。
+                }
+                Volatile.Write(ref _connectedPortName, null);
+                _port = null;
+                _connectedLegacyCompatibility = false;
+                _sessionStarted = false;
+            }
+        }
+    }
+
+    internal static void WriteInputModeChangeReleaseFrames(FrameCodec codec, Action<byte[]> writeFrame)
+    {
+        ArgumentNullException.ThrowIfNull(codec);
+        ArgumentNullException.ThrowIfNull(writeFrame);
+        writeFrame(codec.Encode(MessageType.SessionStart, ReadOnlySpan<byte>.Empty));
+        writeFrame(codec.Encode(MessageType.ReleaseAll, ReadOnlySpan<byte>.Empty));
+    }
+
     internal string? GetConnectedPortName() => Volatile.Read(ref _connectedPortName);
+
+    internal bool IsMouseHostAvailable
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return !_disposed && !_writerStopping && !_exclusivePortLeaseActive &&
+                    !_legacyFirmwareCompatibility() && !_connectedLegacyCompatibility &&
+                    _port?.IsOpen == true;
+            }
+        }
+    }
 
     internal static string[] GetAvailablePortNames() =>
         SerialPort.GetPortNames()

@@ -18,7 +18,10 @@ public static class MouseReportCodec
     public const int Length = 7;
     public const int BridgeLength = 8;
     public const byte FirmwareSmoothingDisabled = 0;
+    // Default tier remains five slots for existing callers that opt in to smoothing.
     public const byte FirmwareSmoothingSlots = 5;
+    public const byte FirmwareSmoothingMaxSlots = 20;
+    public const byte FirmwareSmoothingSlotStep = 5;
 
     public static byte[] Encode(byte buttons, short x, short y, sbyte wheel, sbyte pan)
     {
@@ -84,8 +87,9 @@ public static class MouseReportCodec
         return true;
     }
 
-    private static bool IsValidFirmwareSmoothingSlots(byte value) =>
-        value is FirmwareSmoothingDisabled or FirmwareSmoothingSlots;
+    public static bool IsValidFirmwareSmoothingSlots(byte value) =>
+        value == FirmwareSmoothingDisabled ||
+        (value <= FirmwareSmoothingMaxSlots && value % FirmwareSmoothingSlotStep == 0);
 
     private static void ValidateFirmwareSmoothingSlots(byte value)
     {
@@ -94,7 +98,7 @@ public static class MouseReportCodec
             throw new ArgumentOutOfRangeException(
                 nameof(value),
                 value,
-                "固件平滑槽数只能是 0 或 5。");
+                "固件平滑槽数只能是 0、5、10、15 或 20。");
         }
     }
 }

@@ -1,6 +1,5 @@
 #include "uart1_link.h"
 
-#include "onboard_log.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -21,6 +20,8 @@
 #include "dual_status_led.h"
 #include "hid_device_profile.h"
 #include "link_recovery_logic.h"
+#include "mouse_motion_smoother.h"
+#include "uart1_vendor_queue_logic.h"
 
 #define LINK_UART UART_NUM_1
 #define LINK_TX_GPIO 17
@@ -109,6 +110,8 @@ static queue_metrics_t s_vendor_tx_queue_metrics;
 static volatile uint32_t s_uart_event_consumed;
 static volatile uint32_t s_uart_event_overflow;
 static volatile uint32_t s_uart_event_reset_dropped;
+static volatile uint32_t s_uart_fifo_overflow_events;
+static volatile uint32_t s_uart_buffer_full_events;
 static volatile uint32_t s_uart_event_peak;
 static volatile uint32_t s_uart_event_current;
 static volatile uint32_t s_uart_event_waiting;
@@ -413,7 +416,8 @@ static void log_queue_metrics(const char *name, const queue_metrics_t *metrics)
 typedef struct {
     uint8_t type;
     uint8_t length;
-    uint32_t vendor_session_generation;
+    uint32_t vendor_input_session_generation;
+    uint32_t vendor_control_session_generation;
     /* 入队时刻：测量"产生→发出"的发送侧停留时间（延迟定位）。 */
     int64_t enqueued_us;
     uint8_t payload[DUAL_PROXY_MAX_PAYLOAD];
@@ -497,6 +501,7 @@ static volatile uint32_t s_motion_queue_drops;
 static volatile uint32_t s_vendor_queue_overflows;
 static volatile uint32_t s_vendor_queue_drops;
 static uint32_t s_vendor_hid_session_generation = 1U;
+static uint32_t s_vendor_control_session_generation = 1U;
 static bool s_role_ack_logged;
 /* P：本会话唯一一次 PROFILE_REQUEST 的事务状态。 */
 static link_flow_t s_request_flow;
@@ -516,6 +521,8 @@ static link_flow_t s_offer_flow;
 /* M：COMMIT 已发出，等待 P 的数据接收确认与最终挂载结果。 */
 static link_flow_t s_commit_flow;
 static bool s_profile_commit_receipt_seen;
+static bool s_profile_waiting_host;
+static int64_t s_profile_wait_host_last_probe_us;
 static uint8_t s_profile_retransmit_attempts;
 /* M：鼠标拔出清理屏障（同一事件有界重发）。 */
 static link_flow_t s_gone_flow;
@@ -606,17 +613,6 @@ static void write_u32_le(uint8_t *output, uint32_t value)
     output[3] = (uint8_t)(value >> 24);
 }
 
-static bool is_vendor_hid_message(uint8_t type)
-{
-    return type == DUAL_MESSAGE_RAW_HID_INPUT ||
-        type == DUAL_MESSAGE_HID_SET_REPORT ||
-        type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST ||
-        type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE ||
-        /* 设备级 Vendor 控制请求/响应同属厂商会话：对端换会话时一并作废。 */
-        type == DUAL_MESSAGE_VENDOR_CONTROL_REQUEST ||
-        type == DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE;
-}
-
 static uint32_t vendor_hid_session_generation(void)
 {
     return __atomic_load_n(&s_vendor_hid_session_generation, __ATOMIC_ACQUIRE);
@@ -631,6 +627,24 @@ void dual_uart1_cancel_vendor_hid_session(void)
             next = 1U;
         }
         if (__atomic_compare_exchange_n(&s_vendor_hid_session_generation,
+                                        &current, next, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+    }
+    dual_uart1_cancel_vendor_control_session();
+}
+
+void dual_uart1_cancel_vendor_control_session(void)
+{
+    uint32_t current = __atomic_load_n(&s_vendor_control_session_generation,
+                                       __ATOMIC_ACQUIRE);
+    while (true) {
+        uint32_t next = current + 1U;
+        if (next == 0U) {
+            next = 1U;
+        }
+        if (__atomic_compare_exchange_n(&s_vendor_control_session_generation,
                                         &current, next, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             return;
@@ -650,8 +664,14 @@ static bool send_tx_item(const tx_item_t *item)
     if (item == NULL) {
         return false;
     }
-    if (is_vendor_hid_message(item->type) &&
-        item->vendor_session_generation != vendor_hid_session_generation()) {
+    if (uart1_uses_vendor_input_generation(item->type) &&
+        item->vendor_input_session_generation != vendor_hid_session_generation()) {
+        ++s_vendor_queue_drops;
+        return false;
+    }
+    if (uart1_uses_vendor_control_generation(item->type) &&
+        item->vendor_control_session_generation != __atomic_load_n(
+            &s_vendor_control_session_generation, __ATOMIC_ACQUIRE)) {
         ++s_vendor_queue_drops;
         return false;
     }
@@ -782,6 +802,8 @@ static bool accept_peer_frame(const dual_frame_t *frame)
         const uint8_t previous_peer_usb_state = s_peer_usb_state;
         s_peer_role = peer_role;
         s_peer_usb_state = frame->payload[1];
+        dual_status_led_set_peer_usb_ready(
+            frame->payload[1] == DUAL_USB_STATE_HID_CONNECTED);
         /*
          * 对端报告物理 HID 已连上：此前“在等鼠标”的等待可以结束，恢复常规的
          * OFFER 等待（重放申请由 M 的 OFFER 或下一次超时推进）。
@@ -820,6 +842,8 @@ static bool accept_peer_frame(const dual_frame_t *frame)
             s_profile_request_accepted_us = 0;
             s_request_offer_retries = 0;
             link_flow_reset(&s_commit_flow);
+            s_profile_waiting_host = false;
+            s_profile_wait_host_last_probe_us = 0;
             s_profile_commit_receipt_seen = false;
             s_profile_retransmit_attempts = 0;
             if (s_role == DUAL_ROLE_MOUSE_HOST) {
@@ -915,6 +939,8 @@ static bool accept_peer_frame(const dual_frame_t *frame)
         bool stale_session = false;
         bool repeated = false;
         bool success_after_failure = false;
+        bool waiting_host_accepted = false;
+        const bool wait_host = link_profile_ack_is_wait_host(status);
         const int64_t now_us = esp_timer_get_time();
         taskENTER_CRITICAL(&s_profile_mux);
         matched = link_profile_ack_is_for_session(
@@ -923,34 +949,54 @@ static bool accept_peer_frame(const dual_frame_t *frame)
             transfer_id, crc32, s_profile_transfer_id, s_profile_crc32);
         /* 重复到达的同一确认只刷新 LED，不再重复更新状态或打印。 */
         /* 同一事务晚到的 NACK 必须能撤销先前的成功状态；仅成功 ACK 去重。 */
-        repeated = matched && s_commit_flow.state == LINK_FLOW_ACCEPTED && status == 0U;
+        repeated = matched && s_commit_flow.state == LINK_FLOW_ACCEPTED &&
+            status == DUAL_PROFILE_ACK_STATUS_MOUNTED;
         /* 已收到终态 NACK 后，迟到的旧成功确认不能重新点亮 HID_CONNECTED。 */
-        success_after_failure = matched && s_commit_flow.state == LINK_FLOW_FAILED && status == 0U;
+        success_after_failure = matched && s_commit_flow.state == LINK_FLOW_FAILED &&
+            (status == DUAL_PROFILE_ACK_STATUS_MOUNTED || wait_host);
         stale_session = !matched && transfer_id == s_profile_transfer_id &&
             s_profile_transfer_id != 0U;
         if (matched && !repeated && !success_after_failure) {
-            accepted = status == 0U;
+            accepted = status == DUAL_PROFILE_ACK_STATUS_MOUNTED;
             if (accepted) {
                 (void)link_flow_ack(&s_commit_flow, true);
+                s_profile_waiting_host = false;
+                s_profile_wait_host_last_probe_us = 0;
                 s_profile_pending = false;
                 s_profile_commit_receipt_seen = false;
                 s_profile_phase = LINK_PROFILE_PHASE_IDLE;
                 s_profile_last_commit_us = now_us;
                 s_profile_retransmit_attempts = 0;
-            } else if (status == 1U) {
+            } else if (status == DUAL_PROFILE_ACK_STATUS_FAILED) {
                 /* 不可克隆/挂载失败属于终态：不重试，明确终止本轮。 */
                 s_commit_flow.state = LINK_FLOW_FAILED;
+                s_profile_waiting_host = false;
+                s_profile_wait_host_last_probe_us = 0;
                 s_profile_pending = false;
                 s_profile_commit_receipt_seen = false;
                 s_profile_phase = LINK_PROFILE_PHASE_IDLE;
                 s_profile_last_commit_us = 0;
+            } else if (wait_host && link_flow_pending(&s_commit_flow)) {
+                /* 已装好但电脑尚未枚举：暂停 COMMIT 重传预算，等真实挂载结果。 */
+                s_profile_waiting_host = true;
+                s_profile_wait_host_last_probe_us = now_us;
+                s_commit_flow.resend_requested = false;
+                waiting_host_accepted = true;
+            } else if (wait_host) {
+                /* 已终结或无活动 COMMIT 的迟到 WAIT_HOST 不得重开事务。 */
             } else {
                 /* 未知状态按可重试处理：重放同一 transfer 的 COMMIT。 */
                 link_flow_request_resend(&s_commit_flow);
             }
         }
         taskEXIT_CRITICAL(&s_profile_mux);
-        if (matched && !repeated && !success_after_failure) {
+        if (matched && !repeated && !success_after_failure && waiting_host_accepted) {
+            dual_status_led_set_flow_error(false);
+            dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
+            ESP_LOGI(TAG, "Profile已在P侧安装，等待电脑枚举：transfer=%" PRIu32
+                     " crc=%08" PRIX32, transfer_id, crc32);
+            log_recovery("profile_wait_host", NULL);
+        } else if (matched && !repeated && !success_after_failure && !wait_host) {
             dual_status_led_set_flow_error(!accepted);
             if (link_profile_ack_updates_hid_state(true, accepted)) {
                 /* M 侧只有绑定当前活动传输的成功确认才能推进 HID 状态。 */
@@ -1239,7 +1285,9 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
     const bool safety = type == DUAL_MESSAGE_PHYSICAL_RELEASE ||
         type == DUAL_MESSAGE_SOFTWARE_RELEASE ||
         type == DUAL_MESSAGE_DEVICE_GONE ||
-        type == DUAL_MESSAGE_FLOW_ACK;
+        type == DUAL_MESSAGE_FLOW_ACK ||
+        type == DUAL_MESSAGE_VENDOR_SESSION_BEGIN ||
+        type == DUAL_MESSAGE_VENDOR_SESSION_ACK;
     const bool software = type == DUAL_MESSAGE_SOFTWARE_MOUSE;
     /* 移动独占队列；厂商控制帧与 PROFILE_ACK/ROLE_ACK 共用另一条。
      * PHYSICAL_MOUSE（归一化实体报文，当前无活跃发送者）与 RAW_HID_INPUT 同属移动。 */
@@ -1274,15 +1322,23 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
         .type = type,
         .length = length,
         .enqueued_us = esp_timer_get_time(),
-        .vendor_session_generation = is_vendor_hid_message(type) ?
+        .vendor_input_session_generation = uart1_uses_vendor_input_generation(type) ?
             vendor_hid_session_generation() : 0U,
+        .vendor_control_session_generation = uart1_uses_vendor_control_generation(type) ?
+            __atomic_load_n(&s_vendor_control_session_generation, __ATOMIC_ACQUIRE) : 0U,
     };
     if (length > 0 && payload != NULL) {
         memcpy(item.payload, payload, length);
     }
     if (xQueueSend(target, &item, 0) != pdTRUE) {
         ++s_tx_queue_overflows;
-        if (safety) {
+        const bool session_barrier = uart1_is_retryable_vendor_session_barrier(type);
+        if (session_barrier) {
+            /* BEGIN/ACK 可重试；绝不能借用release兜底而清空物理输入队列。 */
+            queue_metric_increment(&s_safety_tx_queue_metrics.dropped);
+            ++s_tx_queue_drops;
+            return ESP_ERR_TIMEOUT;
+        } else if (safety) {
             /* Preserve the newest release even if stale releases accumulated. */
             const UBaseType_t discarded = uxQueueMessagesWaiting(s_tx_queue) +
                 uxQueueMessagesWaiting(s_safety_tx_queue);
@@ -1409,6 +1465,28 @@ static bool send_profile_commit_frame(void)
     return true;
 }
 
+/* WAIT_HOST期间的幂等状态探测：同一COMMIT只让P重放状态，不重建安装事务。 */
+static bool send_profile_commit_probe(void)
+{
+    uint32_t transfer_id;
+    uint32_t total_length;
+    uint32_t crc32;
+    taskENTER_CRITICAL(&s_profile_mux);
+    transfer_id = s_profile_transfer_id;
+    total_length = s_profile_length;
+    crc32 = s_profile_crc32;
+    const bool waiting = s_profile_waiting_host && link_flow_pending(&s_commit_flow);
+    taskEXIT_CRITICAL(&s_profile_mux);
+    if (!waiting || transfer_id == 0U || total_length == 0U) {
+        return false;
+    }
+    uint8_t payload[12];
+    write_u32_le(&payload[0], transfer_id);
+    write_u32_le(&payload[4], total_length);
+    write_u32_le(&payload[8], crc32);
+    return send_status_frame(DUAL_MESSAGE_PROFILE_COMMIT, payload, sizeof(payload));
+}
+
 static bool profile_stream_send_one(void)
 {
     uint32_t transfer_id;
@@ -1492,6 +1570,8 @@ static bool profile_stream_send_one(void)
                         commit_us, LINK_COMMIT_MAX_ATTEMPTS,
                         LINK_COMMIT_RETRY_INTERVAL_US,
                         recovery_stage_timeout(commit_us, LINK_COMMIT_STAGE_TIMEOUT_US));
+        s_profile_waiting_host = false;
+        s_profile_wait_host_last_probe_us = 0;
         s_commit_flow.peer_generation = s_peer_generation;
         s_profile_commit_receipt_seen = false;
         link_flow_mark_sent(&s_commit_flow, commit_us);
@@ -1879,7 +1959,9 @@ static void link_tx_task(void *argument)
         /* ---------- M 侧：COMMIT 确认与最终挂载结果（等价重放） ---------- */
         link_flow_action_t commit_action = LINK_FLOW_ACTION_NONE;
         taskENTER_CRITICAL(&s_profile_mux);
-        commit_action = link_flow_poll(&s_commit_flow, now_us);
+        if (link_commit_poll_enabled(s_profile_waiting_host)) {
+            commit_action = link_flow_poll(&s_commit_flow, now_us);
+        }
         taskEXIT_CRITICAL(&s_profile_mux);
         if (commit_action == LINK_FLOW_ACTION_RESEND) {
             if (send_profile_commit_frame()) {
@@ -1921,6 +2003,25 @@ static void link_tx_task(void *argument)
                 ESP_LOGE(TAG, "Profile最终确认预算耗尽，终止本轮克隆：transfer=%" PRIu32,
                          s_profile_transfer_id);
                 log_recovery("profile_give_up", "retry_exhausted");
+            }
+        }
+
+        bool host_probe_due = false;
+        taskENTER_CRITICAL(&s_profile_mux);
+        if (link_profile_host_probe_due(
+                s_profile_waiting_host, s_profile_wait_host_last_probe_us, now_us)) {
+            s_profile_wait_host_last_probe_us = now_us;
+            host_probe_due = true;
+        }
+        taskEXIT_CRITICAL(&s_profile_mux);
+        if (host_probe_due) {
+            if (send_profile_commit_probe()) {
+                ++s_commit_replays;
+                ESP_LOGI(TAG, "等待主机期间发送同事务状态探测：transfer=%" PRIu32,
+                         s_profile_transfer_id);
+            } else {
+                ESP_LOGW(TAG, "等待主机期间的状态探测暂未发送：transfer=%" PRIu32,
+                         s_profile_transfer_id);
             }
         }
 
@@ -2036,6 +2137,7 @@ static void link_tx_task(void *argument)
             }
             taskEXIT_CRITICAL(&s_profile_mux);
             dual_status_led_set_peer_connected(false);
+            dual_status_led_set_peer_usb_ready(false);
             ESP_LOGW(TAG, "UART1对端超时，清理实体输入");
             log_recovery("peer_timeout", NULL);
             queue_fault();
@@ -2059,8 +2161,7 @@ static void link_tx_task(void *argument)
                     s_rx_pending_peak = (uint32_t)rx_pending;
                 }
             }
-            if (DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG ||
-                dual_proxy_periodic_stats_enabled()) {
+            if (DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG) {
             ESP_LOGI(TAG, "UART1统计 tx=%" PRIu32 " rx=%" PRIu32
                      " rx_bytes=%" PRIu32 " frame_err=%" PRIu32
                      " peer_silence_ms=%" PRIu32
@@ -2211,8 +2312,6 @@ static void link_rx_task(void *argument)
                     break;
                 }
                 s_rx_bytes += (uint32_t)received;
-                /* 输入路径活跃：让板载写盘让路（flash 停顿会饿到接收任务）。 */
-                dual_onboard_log_note_input_activity();
                 if (s_raw_dump_budget > 0U) {
                     /* 只在对端刚被判离线时抓取少量字节，避免刷屏。 */
                     char hex[3 * LINK_RX_CHUNK_SIZE + 1];
@@ -2251,6 +2350,11 @@ static void link_rx_task(void *argument)
              */
             ++s_rx_overflows;
             queue_metric_increment(&s_uart_event_overflow);
+            if (event.type == UART_FIFO_OVF) {
+                queue_metric_increment(&s_uart_fifo_overflow_events);
+            } else {
+                queue_metric_increment(&s_uart_buffer_full_events);
+            }
             ESP_LOGW(TAG, "UART1接收缓冲溢出：丢弃并重同步（累计=%" PRIu32 "），不断开接收端",
                      s_rx_overflows);
             uart_flush_input(LINK_UART);
@@ -2304,6 +2408,7 @@ esp_err_t dual_uart1_start(
     s_peer_generation_initialized = false;
     s_peer_online = false;
     s_peer_usb_state = DUAL_USB_STATE_WAITING;
+    dual_status_led_set_peer_usb_ready(false);
     s_role_ack_logged = false;
     s_last_peer_rx_us = 0;
     s_tx_count = 0;
@@ -2334,6 +2439,8 @@ esp_err_t dual_uart1_start(
     s_uart_event_consumed = 0U;
     s_uart_event_overflow = 0U;
     s_uart_event_reset_dropped = 0U;
+    s_uart_fifo_overflow_events = 0U;
+    s_uart_buffer_full_events = 0U;
     s_uart_event_peak = 0U;
     s_uart_event_current = 0U;
     s_uart_event_waiting = 0U;
@@ -2364,6 +2471,8 @@ esp_err_t dual_uart1_start(
     s_next_flow_id = s_generation;
     link_flow_reset(&s_offer_flow);
     link_flow_reset(&s_commit_flow);
+    s_profile_waiting_host = false;
+    s_profile_wait_host_last_probe_us = 0;
     s_profile_commit_receipt_seen = false;
     s_profile_retransmit_attempts = 0;
     link_flow_reset(&s_gone_flow);
@@ -2482,6 +2591,8 @@ esp_err_t dual_uart1_lock_role(uint8_t role)
     }
     s_role = role;
     dual_status_led_set_peer_connected(s_peer_online);
+    dual_status_led_set_peer_usb_ready(
+        s_peer_usb_state == DUAL_USB_STATE_HID_CONNECTED);
     notify_tx_task();
     return ESP_OK;
 }
@@ -2498,6 +2609,11 @@ void dual_uart1_set_usb_state(uint8_t usb_state)
 bool dual_uart1_peer_online(void)
 {
     return s_peer_online;
+}
+
+bool dual_uart1_peer_hid_ready(void)
+{
+    return s_peer_usb_state == DUAL_USB_STATE_HID_CONNECTED;
 }
 
 uint32_t dual_uart1_generation(void)
@@ -2568,7 +2684,7 @@ esp_err_t dual_uart1_send_release(uint8_t reason)
 esp_err_t dual_uart1_send_software_mouse(const uint8_t *payload, size_t length)
 {
     if (payload == NULL || (length != 7U && length != 8U) ||
-        (length == 8U && payload[7] != 0U && payload[7] != 5U)) {
+        (length == 8U && !mouse_motion_smoother_valid_slot_count(payload[7]))) {
         return ESP_ERR_INVALID_ARG;
     }
     return enqueue_item(DUAL_MESSAGE_SOFTWARE_MOUSE, payload, (uint8_t)length);
@@ -2617,6 +2733,8 @@ esp_err_t dual_uart1_send_device_gone(uint8_t reason)
      * this event has been acknowledged by the same P generation. */
     link_flow_reset(&s_offer_flow);
     link_flow_reset(&s_commit_flow);
+    s_profile_waiting_host = false;
+    s_profile_wait_host_last_probe_us = 0;
     s_profile_commit_receipt_seen = false;
     s_profile_retransmit_attempts = 0;
     s_profile_pending = false;
@@ -2815,6 +2933,40 @@ esp_err_t dual_uart1_send_vendor_control_response(
     return enqueue_item(DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE, payload, payload_length);
 }
 
+esp_err_t dual_uart1_send_vendor_session_begin(
+    uint32_t p_generation,
+    uint32_t m_generation,
+    uint32_t epoch)
+{
+    if (s_role != DUAL_ROLE_PC_DEVICE || p_generation != s_generation ||
+        m_generation == 0U || m_generation != dual_uart1_peer_generation()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t payload[DUAL_LINK_VENDOR_SESSION_LENGTH];
+    if (!dual_vendor_session_encode(p_generation, m_generation, epoch,
+                                    payload, sizeof(payload))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return enqueue_item(DUAL_MESSAGE_VENDOR_SESSION_BEGIN, payload, sizeof(payload));
+}
+
+esp_err_t dual_uart1_send_vendor_session_ack(
+    uint32_t p_generation,
+    uint32_t m_generation,
+    uint32_t epoch)
+{
+    if (s_role != DUAL_ROLE_MOUSE_HOST || m_generation != s_generation ||
+        p_generation == 0U || p_generation != dual_uart1_peer_generation()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t payload[DUAL_LINK_VENDOR_SESSION_LENGTH];
+    if (!dual_vendor_session_encode(p_generation, m_generation, epoch,
+                                    payload, sizeof(payload))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return enqueue_item(DUAL_MESSAGE_VENDOR_SESSION_ACK, payload, sizeof(payload));
+}
+
 esp_err_t dual_uart1_queue_profile(
     const uint8_t *blob,
     size_t length,
@@ -2844,6 +2996,8 @@ esp_err_t dual_uart1_queue_profile(
     s_profile_motion_since_send = 0;
     s_profile_pending = false;
     link_flow_reset(&s_commit_flow);
+    s_profile_waiting_host = false;
+    s_profile_wait_host_last_probe_us = 0;
     s_profile_commit_receipt_seen = false;
     s_profile_retransmit_attempts = 0;
     /* 每采集到一份新 Profile 即进入新的物理鼠标连接周期。 */
@@ -2875,6 +3029,8 @@ void dual_uart1_cancel_profile(void)
     s_profile_pending = false;
     link_flow_reset(&s_offer_flow);
     link_flow_reset(&s_commit_flow);
+    s_profile_waiting_host = false;
+    s_profile_wait_host_last_probe_us = 0;
     s_profile_commit_receipt_seen = false;
     s_profile_retransmit_attempts = 0;
     s_profile_length = 0;
@@ -2892,10 +3048,83 @@ void dual_uart1_deferred_refresh(void)
     s_profile_pending = false;
     link_flow_reset(&s_offer_flow);
     link_flow_reset(&s_commit_flow);
+    s_profile_waiting_host = false;
+    s_profile_wait_host_last_probe_us = 0;
     s_profile_commit_receipt_seen = false;
     s_profile_retransmit_attempts = 0;
     s_profile_phase = LINK_PROFILE_PHASE_IDLE;
     taskEXIT_CRITICAL(&s_profile_mux);
+}
+
+void dual_uart1_collect_stats(dual_stats_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+#define ADD_LINK_STAT(id, field) \
+    dual_stats_snapshot_add_counter(snapshot, (uint8_t)(id), \
+        (uint64_t)__atomic_load_n(&(field), __ATOMIC_RELAXED))
+    ADD_LINK_STAT(DUAL_STAT_UART_TX, s_tx_count);
+    ADD_LINK_STAT(DUAL_STAT_UART_RX, s_rx_count);
+    ADD_LINK_STAT(DUAL_STAT_UART_RX_BYTES, s_rx_bytes);
+    ADD_LINK_STAT(DUAL_STAT_UART_FRAME_ERR, s_crc_or_frame_errors);
+    ADD_LINK_STAT(DUAL_STAT_UART_RX_OVERFLOW, s_rx_overflows);
+    ADD_LINK_STAT(DUAL_STAT_UART_RX_PENDING_PEAK, s_rx_pending_peak);
+    ADD_LINK_STAT(DUAL_STAT_UART_HEARTBEAT_GAP_PEAK_MS, s_heartbeat_gap_peak_ms);
+    ADD_LINK_STAT(DUAL_STAT_UART_RAW_TX_LATENCY_PEAK_US, s_raw_tx_latency_peak_us);
+    ADD_LINK_STAT(DUAL_STAT_UART_TX_WRITE_FAIL, s_tx_write_failures);
+    ADD_LINK_STAT(DUAL_STAT_UART_VENDOR_DROPPED, s_vendor_queue_drops);
+    ADD_LINK_STAT(DUAL_STAT_UART_MOTION_DROPPED, s_motion_queue_drops);
+    ADD_LINK_STAT(DUAL_STAT_UART_PROFILE_FAIL, s_profile_failures);
+    ADD_LINK_STAT(DUAL_STAT_UART_GONE_RETRY, s_gone_retries);
+    ADD_LINK_STAT(DUAL_STAT_UART_GONE_FAIL, s_gone_failures);
+    ADD_LINK_STAT(DUAL_STAT_UART_BUDGET_EXHAUSTED, s_budget_exhausted);
+    ADD_LINK_STAT(DUAL_STAT_UART_FIFO_OVF_EVENTS, s_uart_fifo_overflow_events);
+    ADD_LINK_STAT(DUAL_STAT_UART_BUFFER_FULL_EVENTS, s_uart_buffer_full_events);
+    ADD_LINK_STAT(DUAL_STAT_UART_EVENT_RESET_DROPPED, s_uart_event_reset_dropped);
+#undef ADD_LINK_STAT
+    const QueueHandle_t queues[] = {
+        s_tx_queue, s_motion_tx_queue, s_safety_tx_queue,
+        s_software_tx_queue, s_vendor_tx_queue, s_uart_event_queue
+    };
+    const queue_metrics_t *metrics[] = {
+        &s_tx_queue_metrics, &s_motion_tx_queue_metrics, &s_safety_tx_queue_metrics,
+        &s_software_tx_queue_metrics, &s_vendor_tx_queue_metrics, NULL
+    };
+    const uint16_t capacities[] = {
+        LINK_TX_QUEUE_LENGTH, LINK_MOTION_QUEUE_LENGTH, LINK_SAFETY_QUEUE_LENGTH,
+        LINK_SOFTWARE_QUEUE_LENGTH, LINK_VENDOR_QUEUE_LENGTH, LINK_EVENT_QUEUE_LENGTH
+    };
+    const uint8_t ids[] = {
+        DUAL_STATS_QUEUE_UART1_TX, DUAL_STATS_QUEUE_UART1_MOTION_TX,
+        DUAL_STATS_QUEUE_UART1_SAFETY_TX, DUAL_STATS_QUEUE_UART1_SOFTWARE_TX,
+        DUAL_STATS_QUEUE_UART1_VENDOR_TX, DUAL_STATS_QUEUE_UART1_EVENT
+    };
+    for (size_t index = 0; index < 5U; ++index) {
+        const uint16_t depth = queues[index] == NULL ? DUAL_STATS_UNKNOWN_U16 :
+            (uint16_t)uxQueueMessagesWaiting(queues[index]);
+        const uint16_t peak = (uint16_t)__atomic_load_n(&metrics[index]->peak,
+                                                        __ATOMIC_RELAXED);
+        dual_stats_snapshot_add_queue(snapshot, ids[index], capacities[index], depth, peak,
+            __atomic_load_n(&metrics[index]->received, __ATOMIC_RELAXED),
+            __atomic_load_n(&metrics[index]->rejected, __ATOMIC_RELAXED),
+            __atomic_load_n(&metrics[index]->dropped, __ATOMIC_RELAXED));
+    }
+    const uint16_t event_depth = s_uart_event_queue == NULL ? DUAL_STATS_UNKNOWN_U16 :
+        (uint16_t)uxQueueMessagesWaiting(s_uart_event_queue);
+    dual_stats_snapshot_add_queue(snapshot, DUAL_STATS_QUEUE_UART1_EVENT,
+        LINK_EVENT_QUEUE_LENGTH, event_depth,
+        (uint16_t)__atomic_load_n(&s_uart_event_peak, __ATOMIC_RELAXED),
+        DUAL_STATS_UNKNOWN_U32, DUAL_STATS_UNKNOWN_U32,
+        __atomic_load_n(&s_uart_event_reset_dropped, __ATOMIC_RELAXED));
+    size_t rx_ring_depth_bytes = 0U;
+    const uint16_t rx_ring_depth = uart_get_buffered_data_len(
+        LINK_UART, &rx_ring_depth_bytes) == ESP_OK && rx_ring_depth_bytes <= UINT16_MAX
+        ? (uint16_t)rx_ring_depth_bytes : DUAL_STATS_UNKNOWN_U16;
+    dual_stats_snapshot_add_queue_unit(snapshot, DUAL_STATS_QUEUE_UART1_RX_RING_BYTES,
+        DUAL_STATS_UNIT_BYTES, LINK_RX_BUFFER_SIZE, rx_ring_depth,
+        (uint16_t)__atomic_load_n(&s_rx_pending_peak, __ATOMIC_RELAXED),
+        DUAL_STATS_UNKNOWN_U32, DUAL_STATS_UNKNOWN_U32, DUAL_STATS_UNKNOWN_U32);
 }
 
 /*
@@ -2920,4 +3149,13 @@ bool dual_uart1_profile_transfer_in_flight(void)
         link_flow_incomplete(&s_commit_flow);
     taskEXIT_CRITICAL(&s_profile_mux);
     return in_flight;
+}
+
+bool dual_uart1_profile_waiting_host(void)
+{
+    bool waiting = false;
+    taskENTER_CRITICAL(&s_profile_mux);
+    waiting = s_profile_waiting_host && link_flow_pending(&s_commit_flow);
+    taskEXIT_CRITICAL(&s_profile_mux);
+    return waiting;
 }

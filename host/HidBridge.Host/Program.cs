@@ -65,7 +65,8 @@ internal static class Program
             }
             input = new InputForwarder(
                 transport,
-                () => automation?.Settings.LegacySingleBoardFirmwareCompatibility ?? false);
+                () => automation?.Settings.LegacySingleBoardFirmwareCompatibility ?? false,
+                () => serialBridge?.IsMouseHostAvailable ?? false);
             AutomationProfileStore profileStore = new();
             automation = new AutomationController(profileStore, input);
             automation.Log += automationLogWriter.WriteLine;
@@ -81,7 +82,8 @@ internal static class Program
                     options.BaudRate,
                     options.DeviceLogPath,
                     options.DeviceLogRetentionCount,
-                    serialBridge.GetConnectedPortName);
+                    serialBridge.GetConnectedPortName,
+                    serialBridge.OnDiagnosticFrame);
                 /* 让固件刷写等独占任务也能让对端监听让出串口（2026-09-28）。 */
                 serialBridge.AttachPeerLogMirror(logMirror);
                 logMirror.Start();
@@ -92,7 +94,8 @@ internal static class Program
                     () => automation.Settings.FirmwareFlashPortName,
                     serialBridge.GetOpenPortNames,
                     serialBridge.WriteToOpenPort,
-                    serialBridge.RefreshOpenSerialPorts);
+                    serialBridge.RefreshOpenSerialPorts,
+                    serialBridge.ReadDeviceStatisticsAsync);
                 try
                 {
                     firmwareUpdateApi.SetEnabled(automation.Settings.FirmwareUpdateApiEnabled);

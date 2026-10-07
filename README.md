@@ -1,439 +1,200 @@
 # ESP32-S3 HID Bridge
 
-> **仓库里有两条并存的产品线，先分清再读本文：**
-> 1. **当前主线（2026-09 起）：双板透明鼠标代理** —— `firmware/dual_proxy/`。鼠标侧板（M）用原生 USB 接真实罗技鼠标并采集其 USB 描述符，经板间 UART1 传给电脑侧板（P），P 用 TinyUSB **严格克隆**出同一只鼠标供被控电脑与 G HUB 使用。状态、路线图与风险见 [docs/交接.md](docs/交接.md)、[docs/审计.md](docs/审计.md)、[docs/连接流程.md](docs/连接流程.md)、[docs/故障排查总结.md](docs/故障排查总结.md)。**该主线不需要本文描述的 EXE 参与实体输入转发。**
-> 2. **本文其余章节描述的早期形态：单板固件 `firmware/` + 主机 EXE**（固定"键盘 + 相对触摸板"HID、BLE、Wi-Fi、UDP/kmboxNet 远程输入、Lua/宏、发布与驱动安装流程）。这些能力仍在仓库与发布件中并可用，但**不是当前故障排查与验收的对象**；相关历史结论已归档到上述文档的《历史索引》。
+本项目用两块 ESP32-S3 开发板把真实鼠标直通到目标电脑，也可按需运行 Windows Host 进行 Lua/宏控制、网络鼠标输入和设备维护。旧单板方案仍作为独立兼容路径保留，不能与双板操作混用。
 
-把 Windows 电脑的键盘和鼠标事件，经 ESP32-S3-DevKitC-1 转换成独立的键盘与相对触摸板 HID，输出到手机、平板、嵌入式设备或其他项目。当前原生 USB 固定枚举为键盘 + 相对触摸板 HID，不依赖 EXE 是否运行或 UART 握手；BLE HID 保持可用。Wi-Fi 输入、配网和 Target Agent 输出代码暂时保留但不启用。
-
-## 功能特性
-
-- Windows 全局键盘/鼠标捕获：低级钩子 + Raw Input，500 Hz / 2 ms 桥接报告聚合上限
-- 串口自动发现（COM 改变后自动重连）与随机数设备握手
-- 原生 USB：固定枚举「键盘 + 相对触摸板」HID-only，不依赖启动期 UART 帧
-- BLE HID 键盘/鼠标输出，NimBLE Just Works 配对 + 绑定密钥持久化
-- USB/BLE 双输出活动链路锁定与 100 ms 失活切换，切换前后自动 ReleaseAll
-- 局域网 UDP 模拟输入（默认 0.0.0.0:24814，兼容 JSON 与 kmboxNet，固件 5 个 1 ms 槽平滑）
-- 宏（多段脚本）与 Lua 脚本（OnEvent 事件模型）
-- 鼠标移动记录与分析图（左右键同按触发）
-- 固件刷写双入口：设置页本地刷写 + 局域网 HTTP 接口，均使用内置独立 esptool，无需 Python
-- 板载 RGB 状态灯（USB 绿 / BLE 蓝 / 无活动红灯闪烁）
-
-## 数据路径
-
-```text
-Windows 键盘/鼠标
-        │ 键鼠低级钩子 + 鼠标 Raw Input
-        ▼
-HidBridge.Host
-        │ USB-to-UART/CH340 控制输入，自动发现与二进制帧握手
-        ▼
-ESP32-S3-DevKitC-1
-        ├─ 原生 USB OTG，固定键盘 + 相对触摸板 HID
-        ├─ BLE HID ────────────────> 手机/电脑
-```
-
-开发板支持两种有线主机输入方式：
-
-- **USB-to-UART**：CH340 COM 口接收主机端生成的 HID 报告。
-- **ESP32-S3 USB**：当前始终枚举为 `USB Keyboard with Touchpad`（HID-only）。UART/CH340 是正式的主机控制输入；固件中保留的 CDC 输入代码不再参与当前 USB profile 选择，也不会因晚到 UART 帧重启切换。
-
-USB HID 与 BLE HID 同时可用时，先连接并成为活动输出的链路保持锁定，另一链路不得抢占；活动链路连续 100 ms 不可发送时切换到仍在线的另一链路，切换前后都执行 ReleaseAll。BLE 已活动时 USB 恢复不会抢占，BLE 断开后才按可用性回退到 USB。官方 DevKitC-1 支持两个 USB 端口同时供电；第三方兼容板需先核对原理图，确认两端口间没有 VBUS 回灌路径。
-
-## Windows CH340/CH341 驱动
-
-当前硬件枚举为 `USB\VID_1A86&PID_7523`。历史诊断中该设备曾为
-`CM_PROB_FAILED_INSTALL`、Problem Code `28`，表示 Windows 缺少可用的匹配驱动；
-本机历史上曾完成安装并枚举为 `USB-SERIAL CH340 (COM6)`、Status `OK`；当前驱动包已入库，
-但没有 CH340/CH341 设备节点或 COM 口。这不是 Code 43，也不是 ESP32-S3 原生 USB HID
-能够替代的串口链路。驱动离线包已保存于
-[`drivers/wch-ch341ser/CH341SER_v4.0_2026-06-26.zip`](drivers/wch-ch341ser/CH341SER_v4.0_2026-06-26.zip)，
-详细校验记录见 [`drivers/wch-ch341ser/README.md`](drivers/wch-ch341ser/README.md)。
-
-来源是 [WCH 官方页面](https://www.wch-ic.com/downloads/CH341SER_ZIP.html) 和
-[官方直链](https://www.wch-ic.com/download/file?id=5)，页面元数据为 v4.0、
-2026-06-26、696KB。离线安装步骤：
-
-1. 解压上述 ZIP；以管理员身份运行 `CH341SER\SETUP.EXE`，或在设备管理器中对
-   `USB\VID_1A86&PID_7523` 选择“更新驱动程序”，浏览到解压后的 `CH341SER` 目录/`CH341SER.INF`。
-2. 安装完成后在“端口 (COM 和 LPT)”确认出现 `USB-SERIAL CH340 (COMx)` 或同类 COM 设备。
-3. 用下面的 PowerShell 命令核对设备和 COM 名称，再让 Host 自动发现：
-
-   ```powershell
-   Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\VID_1A86&PID_7523*'
-   [System.IO.Ports.SerialPort]::GetPortNames()
-   ```
-
-发布件中的 Host 会在启动时检查该设备：检测到 Problem Code `28` 且找到随包 INF 时显示确认窗口；
-只有用户确认并通过 UAC 后才执行安装，完成后会重新检查 PnP 状态和 COM。其他 Problem Code
-只提示手动处理，不会自动覆盖现有驱动。
-
-仅在 `serial` 模式启动时执行这项检查。若设备节点暂时不可见，Host 还会只读执行
-`pnputil /enum-drivers`：Driver Store 缺少 `CH341SER.INF` 且随包 INF 存在时，即使卸载驱动后设备节点暂时消失，也会显示安装确认；
-Driver Store 已有驱动、设备已正常工作或 Driver Store 探测失败时不弹安装窗口。未插入设备但 Driver Store 确实缺少驱动时仍会提示，以便预先安装随包驱动。
-用户确认后仍必须通过 UAC。当前 Host 使用随包、签名有效的 WCH 官方 `SETUP.EXE /S` 安装，
-与手动点击官方安装器的 INSTALL 走同一安装器路径；后续可运行同一 `SETUP.EXE` 点击 UNINSTALL，
-或使用其内置参数 `/U` 卸载、`/D` 卸载并删除驱动。安装器成功仍不代表设备已经枚举或 COM 口可用；
-如果安装后的瞬时复检仍没有 CH340/CH341 设备或 COM 口，Host 不显示可能过时的阻塞弹窗，
-而是继续启动并由串口握手自动发现；只有握手成功才记录“已连接 COMx”。这既不会把“驱动包入库”误报成“串口可用”，
-也不会在 Windows 稍后完成 COM 初始化时错误要求重插 USB。WCH 自带卸载器在没有已绑定设备时可能提示“无驱动可卸载”，
-是否已入库应以 `pnputil /enum-drivers` 中的 `CH341SER.INF` 为准。
-
-## 架构与生命周期
-
-### 主机端职责
-
-- `HidBridge.Host` 使用 `WH_KEYBOARD_LL`、`WH_MOUSE_LL` 和鼠标 Raw Input 捕获实体输入；捕获线程只做快速入队，独立分发线程负责状态更新、Lua/宏事件和报告发送。
-- `MouseReportPump` 以 500 Hz / 2 ms 为桥接发送上限，连续相对移动在队列中合并，按钮、滚轮和键盘边沿保持顺序；原生 USB 固件每 1 ms 消费一个 5 槽平滑样本。
-- `SerialBridge` 通过 `DeviceProbe`/`DeviceHello` 自动发现串口并建立二进制会话；主机负责发送 `ReleaseAll`、维护输入租约和记录诊断日志。
-- 固件刷写设置页与局域网 API 共用校验和刷写服务；API 提供对端本机 JSON 清单路径，并自动使用设置页已保存的串口；EXE 不内嵌固件镜像。
-- 普通键鼠捕获转发路径不创建虚拟 HID 设备；UDP、Lua/宏等自动化路径属于主动输出路径，不能据此推断为“完全没有本机输入注入”。
-
-### 固件端职责
-
-- UART 接收主机报告和控制帧；原生 USB 固定提供 HID 输出；BLE 提供备用 HID 输出。
-- 输出选择器采用单一活动租约：USB 在线时禁止 BLE 抢占，活动链路断开或连续不可用约 100 ms 后才允许切换；切换、断线、复位和退出路径都释放键盘与鼠标状态。
-- Wi-Fi/SoftAP/Target Agent 代码保留但由 Kconfig 与 `HID_BRIDGE_WIFI_RUNTIME_ENABLED=0` 双重闸门禁用；当前正式链路不是未经认证的 Wi-Fi 输入。
-
-### HID 报告
-
-| Report ID | 当前用途 | 长度/内容 |
-|---|---|---|
-| `1` | Boot Keyboard | 8 字节键盘报告，含修饰键、保留字节和最多 6 个按键 |
-| `2` | 相对触摸板鼠标 | 7 字节报告，使用有符号 16 位相对 X/Y，另含按钮、滚轮和横滚轮 |
-
-报告路径中的累计位移使用更宽的内部整数，最终按 HID 字段范围分块；USB/BLE 端点完成只证明固件完成发送，不证明目标系统或目标应用已经消费报告。
-
-### 验证边界
-
-构建、策略测试和主机自检分别记录；它们不能替代真实 USB 枚举、BLE 配对/重连、插拔顺序、Raw Input 和被控端光标行为验收。真实链路测试必须保留设备日志、目标端结果和对应版本/镜像 SHA-256。
+命令中的仓库路径默认相对于项目根目录；Markdown 链接相对于当前文档。历史记录中的尖括号外部路径表示可选、不会随仓库分发的证据目录。开发环境与按需安装的依赖见 [依赖说明](docs/dependencies.md)。
 
 ## 快速开始
 
-### 1. 烧录固件
+### 只使用双板实体鼠标
 
-要求：ESP-IDF 6.0.2（位于 .esp-idf/，不提交 Git）、ESP32-S3-DevKitC-1。
+1. M、P 两块板都刷入同一版本的 `firmware/dual_proxy` 固件。已经刷好可跳过；尚未刷写时，先按[依赖说明](docs/dependencies.md)准备环境，再按[双板构建与刷写](#构建与刷写双板固件)操作。
+2. 板间连接 UART1：M GPIO17 TX→P GPIO18 RX、M GPIO18 RX←P GPIO17 TX，并共地；不要连接两板的 5V 或 3V3。M 需通过 USB-UART/CH340 维护口连接 Windows 电脑或合适的 USB 电源供电，真实鼠标接 M 原生 USB Host 口；P 原生 USB 接目标电脑供电并枚举。
+3. 实体鼠标由 M→P 硬件直通；这条路径不需要启动 Host EXE。板卡供电和兼容开发板的更多连接说明见 [M 板与 P 板](#m-板与-p-板)及[双板协议说明](docs/protocol.md)。
+
+### 需要 Lua/宏或网络 UDP 时再运行 Host
+
+1. 将 M 的 USB-UART/CH340 维护口连接到运行 Host 的 Windows 电脑；需要网络 UDP 时，确保发送端可以访问 Host 电脑。
+2. 已有 `HidBridge.Host.exe` 时安装 [.NET 8 Desktop Runtime x64](docs/dependencies.md) 后跳过构建。没有 EXE 时，按[Host 构建备注](#host-构建与配置实现备注)从源码生成。
+3. 在项目根目录启动 `.\HidBridge.Host.exe`，设置页保持“使用旧版单板通路”未勾选（默认关闭），让 Host 自动发现 M。
+4. 只有使用宏或 Lua 时，才在 Host 页面启用、编辑或选择相应自动化配置；默认活动配置是 `Global`。需要网络 UDP 输入时，将发送端指向 Host 电脑的地址和默认 UDP 端口 `24814`。
+
+更多细节：[Host 功能](#host-功能)、[Host 配置与日志](#host-配置与日志)、[宏](#宏)、[Lua](#lua-脚本)、[UDP/kmboxNet](#udp-与-kmboxnet-输入)、[Makcu 接口](#makcu-兼容接口)、[固件刷写](#固件刷写)、[驱动](#windows-ch340ch341-驱动)、[FAQ](#常见问题与安全边界)。
+
+## 当前主线：双板透明鼠标代理
+
+两块 ESP32-S3 开发板协作，让目标电脑看到由 P 板模拟的物理鼠标。M 板连接真实鼠标并读取其 USB 描述符和输入；P 板在目标电脑侧克隆鼠标并转发输入与厂商 HID 通信。
+
+```text
+真实鼠标/接收器 ─USB Host─> M 板 ──UART1──> P 板 ─USB Device─> 目标电脑
+                                ↑                       ↑
+                           UART0/CH340              UART0/开发口
+                       软件命令与维护工具             刷写与诊断
+```
+
+实体鼠标由 M→P 硬件直通，无需 Host EXE。Host 提供可选的软件鼠标输入、自动化和设备维护功能；实体鼠标路径不依赖这些功能。
+
+### M 板与 P 板
+
+| 板卡 | USB 角色 | 主要连接与职责 |
+|---|---|---|
+| M（鼠标侧） | USB Host | USB Host 口连接真实鼠标/接收器；采集描述符及输入；通过 UART1 向 P 发送设备信息和数据；UART0/CH340 用于软件命令与维护 |
+| P（电脑侧） | USB Device | 原生 USB 连接目标电脑；安装并呈现 M 提供的鼠标克隆；接收 M 转发的输入和厂商 HID 数据 |
+
+两板烧录同一个 `firmware/dual_proxy` 镜像，由运行时协商 M/P 角色。板间 UART1 交叉连接：M GPIO17 TX→P GPIO18 RX，M GPIO18 RX←P GPIO17 TX，并共地。不要把两板的 5V 或 3V3 相连。目标电脑接 P 的原生 USB；真实鼠标接 M 的 USB Host 口。
+
+当前双板协议、统计字段和运行边界见 [docs/protocol.md](docs/protocol.md)。执行状态、已知风险和硬件验收记录见 [docs/交接.md](docs/交接.md) 与 [docs/审计.md](docs/审计.md)。
+
+### 软件输入与平滑
+
+- M/P 转发真实鼠标输入和厂商 HID 通信；无法安全克隆的设备可能保持断开，不能保证所有鼠标型号都兼容。
+- Host 的网络 UDP 和 Lua/宏鼠标移动可发送给 M；Host 平滑设置统一作用于这些软件移动。实体鼠标 M→P 硬件直通不经过 Host 平滑或输出灵敏度。
+- Makcu/V4 输入与 Host 软件输入使用不同路径；Makcu 自身按 P 端配置平滑，不受 Host 平滑设置影响。不要同时用多个程序打开同一串口。
+- 双板构建选项和串口协议边界见[协议说明](docs/protocol.md)。历史串口或目标端检查结果见[审计记录](docs/审计.md)，记录只适用于其中明确注明的固件和测试环境。
+
+### 构建与刷写双板固件
+
+使用 ESP-IDF 6.0.2。双板工程必须从 `firmware/dual_proxy` 构建，不要从旧的 `firmware/` 单板工程生成双板镜像。
 
 ```powershell
-Set-Location D:/ESP32-S3-HID-Bridge/firmware
-. ../scripts/Enter-EspIdf.ps1
+Set-Location .\firmware\dual_proxy
+. ..\..\scripts\Enter-EspIdf.ps1
+
+# 仅全新且尚未设置 target 的构建目录执行
 idf.py set-target esp32s3
 idf.py build
-idf.py -p <实际串口> flash
+
+$port = 'COMx' # 替换成当前板卡串口
+idf.py -p $port flash
 ```
 
-激活脚本只修改当前 PowerShell 会话；重新打开终端后需要再次执行。
+<details>
+<summary>备注：双板接口构建选项</summary>
 
-### 2. 运行主机端
+默认 CMake 选项 `DUAL_PROXY_ENABLE_MAKCU_V4_API` 为 `ON`。仅需构建不含 V4 的旧 A5 双板镜像时，可显式执行 `idf.py -D DUAL_PROXY_ENABLE_MAKCU_V4_API=OFF build`；该选项不会改变已经刷入开发板的固件。旧 V3 风格 ASCII 选项与 V4 互斥。
 
-方式 A：直接运行根目录单文件 exe（Release 构建产物，自包含，仅需 .NET 8 Desktop Runtime）：
+</details>
 
-```powershell
-Set-Location D:/ESP32-S3-HID-Bridge
-./HidBridge.Host.exe
-```
+M/P 的 UART0 速率和可用维护接口取决于两板的固件构建配置。连接前应按[协议说明](docs/protocol.md)核对对应角色和速率；不要让多个程序同时打开同一串口。
 
-方式 B：源码运行 / 重新构建：
+只有全新且尚未设置 target 的构建目录，才首次执行 `idf.py set-target esp32s3`。日常构建沿用双板工程已有的 ESP32-S3 target 和 sdkconfig。
 
-```powershell
-Set-Location D:/ESP32-S3-HID-Bridge/host/HidBridge.Host
-dotnet run -c Release
-```
+生成的镜像与刷写清单位于 `firmware/dual_proxy/build/`。两块板需要使用同一版本，并分别选中各自正确的串口刷写。刷写会复位开发板；操作前确认 M/P 串口对应关系。项目刷写接口说明见 [docs/firmware-update-api.md](docs/firmware-update-api.md)。
 
-默认配置自动发现开发板串口，无需填写 COM 号。需要固定串口或调整参数时，复制本机配置再修改（该文件被 Git 忽略）：
+## 旧方案：单板固件
 
-```powershell
-Copy-Item bridge.json bridge.local.json
-```
+`firmware/` 根目录工程是早期单 ESP32-S3 方案，主机软件经 USB-UART/CH340 把软件输入交给单板，单板自行输出固定 HID 设备。它不采集真实鼠标 USB 描述符，也不提供 M/P 双板克隆链路；其串口协议、镜像和连接方法均与 `firmware/dual_proxy` 分开。
 
-### 3. 生成可直接交付的发布件
-
-发布脚本会先构建最新 Host，并把根目录最新 `HidBridge.Host.exe`、默认 `profiles/`、CH340/CH341
-驱动和三段可刷写固件复制到 `release/`；根目录仍保留同一份最新 EXE。固件默认使用最近一次
-ESP-IDF 构建结果，要求重新构建固件时加上 `-BuildFirmware`：
-
-```powershell
-.\scripts\Prepare-Release.ps1
-# 重新构建 ESP32-S3 后再生成发布件
-.\scripts\Prepare-Release.ps1 -BuildFirmware
-```
-
-发布目录结构：
-
-```text
-release/
-├─ HidBridge.Host.exe
-├─ bridge.json
-├─ profiles/                       默认 Global 与示例配置
-├─ drivers/wch-ch341ser/           WCH 官方驱动与 INF
-├─ firmware/                       flasher_args.json + 三段镜像
-├─ SHA256SUMS.txt
-└─ README.md
-```
-
-### 4. 创建 GitHub Release
-
-`Publish-GitHubRelease.ps1` 会先调用 `Prepare-Release.ps1` 重建 `release/`，校验根目录与
-`release/HidBridge.Host.exe` 大小和 SHA-256 一致，再把 `release/` 内容直接打入 ZIP 根目录，
-输出 `dist/ESP32-S3-HID-Bridge-<Tag>.zip` 及外部 `.zip.sha256`。打包后会用 .NET ZipArchive
-核对 ZIP 条目、`release/SHA256SUMS.txt` 和强制驱动 INF；默认发布命令最后才调用
-`gh release create <Tag> --target <SHA>` 上传，不会覆盖已有 tag/Release。
-
-正常发布前置条件：当前目录必须是 Git 仓库；tracked 工作树必须干净（确认风险后才使用
-`-AllowDirty`）；已安装并登录 GitHub CLI `gh`；当前本地/远端 tag 和 GitHub Release 不得存在；
-`Target` 默认为当前 HEAD SHA，也可显式传入分支或提交。默认会重建 Host，固件需要重建时加
-`-BuildFirmware`；只有明确确认已有根目录 EXE 时才使用 `-SkipHostBuild`。
-
-只打包、不联网、不登录 gh、也不要求工作树干净：
-
-```powershell
-.\scripts\Publish-GitHubRelease.ps1 -Tag v0.0.0-localtest -PackageOnly
-```
-
-创建新 Release（示例不会在本轮执行）：
-
-```powershell
-.\scripts\Publish-GitHubRelease.ps1 -Tag v1.2.3 -Title 'ESP32-S3 HID Bridge v1.2.3'
-.\scripts\Publish-GitHubRelease.ps1 -Tag v1.2.3 -Repo owner/repo -Target <commit-or-branch> `
-    -NotesFile .\docs\release-notes-v1.2.3.md -Prerelease
-```
-
-可用参数：`Tag`（必填，`vX.Y` 或 `vX.Y.Z`/预发布后缀）、`Title`、`NotesFile`（缺省使用
-`--generate-notes`）、`Repo`、`Target`、`Draft`、`Prerelease`、`BuildFirmware`、
-`SkipHostBuild`、`AllowDirty` 和 `PackageOnly`。脚本只会删除 `dist/` 下当前 Tag 对应的
-ZIP/哈希文件；不会递归清理其他发布产物，也不会自动创建或覆盖已有 GitHub Release。
-
-### 5. 快捷键
-
-- `HOME`：启用 / 停止向目标设备转发。
-- `END`：安全释放所有按键并退出。
-
-同步开启后，除 HOME/END 外的键盘、组合键和鼠标输入都会被主机拦截并转发到对端；同步关闭后恢复本机输入。
-
-## 固件刷写
-
-控制软件可以在不退出进程的情况下释放串口刷写固件，刷写完成后自动恢复连接。两个入口**最终都调用内置的独立版 esptool.exe**（构建时嵌入 exe，目标机无需安装 Python / ESP-IDF 环境；首次刷写时解压到 %LOCALAPPDATA%/HidBridge/embedded 缓存）。
-
-EXE 不内嵌固件。设置页和远程 API 各自指定运行控制软件电脑上的 JSON 清单与串口；两者只共用清单校验、esptool 调用和串口恢复逻辑。刷写串口不要求应用固件先完成 HID Bridge 握手，便于应用固件异常时恢复。
-
-### 方式一：设置页本地刷写（手动，推荐）
-
-1. 运行 HidBridge.Host.exe，打开「设置」页底部的「本地固件刷写」模块。
-2. 在模块内选择或输入刷写串口（例如 `COM3`）；点「刷新端口」可重新枚举。默认优先当前已连接串口，其次使用上次选择或端口列表首项。
-3. 点「选择 JSON」并选择三段完整刷写清单；清单里的相对镜像路径按 JSON 所在目录解析，可按标准子目录（bootloader/、partition_table/）或与清单同目录平铺放置。
-4. 点「确定」→ 弹窗确认 → 打开小日志窗口实时显示 esptool 进度。检测到多个串口时，确认窗口会列出全部串口和本次所选端口，确认后只刷写该端口。
-
-### 方式二：远端刷写接口（远程调用）
-
-接口监听所有 IPv4 网卡，默认端口 24815，可从受信任局域网直接请求，例如 `192.168.3.50:24815`。接口没有账号或令牌认证，不应暴露到公网或不可信网络。
-
-**启用**：主界面「设置」页先选择并保存刷写串口，再勾选「启用局域网固件刷写接口」（保存后立即生效）。远程请求自动使用该串口。
-
-**启动刷写**：
-
-```powershell
-$headers = @{ 'X-HidBridge-Action' = 'flash-firmware' }
-$body = @{
-    manifestPath = 'D:\ESP32-S3-HID-Bridge\firmware\build\flasher_args.json'
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri 'http://192.168.3.50:24815/api/v1/firmware/flash' -Headers $headers -ContentType 'application/json' -Body $body
-```
-
-**查询状态**：
-
-```powershell
-Invoke-RestMethod -Uri 'http://192.168.3.50:24815/api/v1/firmware/status'
-```
-
-状态 state 取值：`idle`（未执行）/ `running`（释放串口、刷写或恢复中）/ `succeeded`（三段哈希校验 + RTS 复位 + 串口恢复通过）/ `failed`（原因见 message，退出码见 exitCode）。重复提交时不会并发执行，返回 HTTP 409 和当前任务状态。
-
-**安全边界**：监听局域网且没有强认证，只能用于受信任网络；POST 必须携带确认头，并在 JSON 正文中指定对端本机 `manifestPath`；不接受固件上传或命令行参数。串口自动取设置页已保存且当前存在的 `COM`；清单必须且只能包含 0x0、0x8000、0x10000 三段且镜像位于 JSON 所在目录内；刷写期间独占所选串口并暂停同步，程序退出时等待 esptool 安全结束。成功后日志输出「固件刷写最终摘要」（三段 SHA-256、设备校验计数、RTS 复位结果）。
-
-### 内置 esptool 的重新构建
-
-内置 esptool 由 scripts/build-embedded-esptool.ps1 用 PyInstaller 生成（独立单文件，v5.3.1，约 14MB），产物放在 host/HidBridge.Host/EmbeddedAssets/（不提交 Git），构建时作为嵌入资源打进 exe：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build-embedded-esptool.ps1
-dotnet build host/HidBridge.Host/HidBridge.Host.csproj -c Release
-```
-
-固件更新只需替换本地 JSON 及其引用镜像，不需要重新构建 EXE。
-
-## 宏
-
-宏是主机端按键脚本，保存在 profiles/<配置名>/macros/ 下，每个宏一个 .txt；配置目录中的 profile.json 只记录触发键、模式、启用状态和文件关联。在设置页选择激活的配置（automation.settings.json 的 ActiveProfile）。触发键示例：`f13`、`ctrl+f1`、`mouse_side1`。仓库提供完整示例配置（含宏与 Lua），见 [profiles.example/](profiles.example/)，复制到 profiles/ 即可使用。
-
-### 语法
-
-每行一条命令，格式 `命令(参数)`，参数用逗号分隔，可用引号包裹，`#` 开头为注释：
-
-| 命令 | 参数 | 说明 |
+| 子系统 | 旧单板方案记录 | 与双板主线的关系 |
 |---|---|---|
-| `move` | dx, dy | 相对移动鼠标 |
-| `moveto` | x, y | 移动到绝对坐标 |
-| `mouse` | button, state | 鼠标键（1 左 / 2 右 / 3 中 / 4 / 5），state 1 按下 0 松开 |
-| `keydown` | key | 按住按键 |
-| `keyup` | key | 松开按键 |
-| `keypress` | key [, hold_ms] | 点按按键，可带按住时长 |
-| `wheel` | amount | 垂直滚轮增量 |
-| `delay` / `sleep` | ms | 可取消延时，底层共用同一实现 |
-| `randsleep` / `randdelay` | min, max | 随机延时（毫秒） |
+| USB 输出 | 固定键盘 + 相对触摸板 HID | 不是动态克隆物理鼠标；不用于双板镜像 |
+| 主机输入 | Host 经 CH340 串口转发软件键鼠输入 | 使用旧版单板模式，不使用 M/P 双板直通 |
+| 自动化与网络 | 旧版 Host 支持宏/Lua、UDP/kmboxNet，仅适配原单板固件 | 当前 Host 支持向 M 注入软件鼠标；自动化键盘使用 Win32；网络 UDP 由 Host 适配，双板固件没有软件 KeyboardReport 注入 |
+| BLE / Wi-Fi | 支持 BLE HID；Wi-Fi/SoftAP 未启用 | 双板透明代理不依赖这些路径 |
+| 构建与验收 | 使用根目录 `firmware/` 的独立配置和产物 | 与双板工程分开构建、刷写和验收，不要交叉使用清单或镜像 |
 
-示例：
 
-```text
-# 按住 F13 连点
-keydown(f13)
-delay(50)
-mouse(1, 1)
-randsleep(30, 60)
-mouse(1, 0)
-keyup(f13)
-```
 
-### 运行模式
+#### 旧单板接线、构建与 BLE
 
-| 模式 | 行为 |
-|---|---|
-| `once` | 触发一次执行一遍 |
-| `toggle` | 按一次开始循环，再按一次停止 |
-| `hold_loop` | 按住循环，松开停止 |
-| `staged` | 分段脚本：按下 / 按住 / 松开三段 |
+旧单板通过 USB-UART/CH340 接运行 Host 的电脑，Host 经该串口发送软件输入；开发板的原生 USB 口连接目标电脑，作为旧版固定 HID 输出。它不需要 M/P 两板之间的 UART1 交叉线。
 
-staged 模式用段标签分段：
-
-```text
-[on_press]
-mouse(1, 1)
-
-[while_hold]
-randsleep(40, 80)
-move(0, 5)
-
-[on_release]
-mouse(1, 0)
-```
-
-## Lua 脚本
-
-每个配置可携带一段 Lua 脚本，正文保存在 profiles/<配置名>/lua/ 下的 txt，profile.json 的 lua_script_file 记录关联文件，激活配置时自动运行。采用鼠标宏常见的 OnEvent 事件模型：按键/鼠标事件到达时调用 `OnEvent(event, arg)`，event 为 `pressed` / `released`，arg 为按键名（字符串，如 "a"、"f13"、"num0"）或鼠标键数字（1 左 / 2 右 / 3 中）。
-
-Lua 页的“检查”会先校验脚本，再自动调整已有行的 4 空格缩进，并规范运算符、逗号等行内空格；不会插入或重排换行，也不会修改字符串和注释。旧版本把 Lua 正文写在 profile.json 的 lua_script_text 时，打开配置会先读取旧字段并自动转换为 lua/、macros/ 目录下的 txt，再保存新版 JSON。
-
-Lua 语法检查、启动失败和运行时失败都会在状态或日志中显示脚本错误行号。
-
-Lua 输入栏左侧显示随滚动同步的行号。Host 不再为每次按键额外生成 `press arg=...` / `release arg=...` 日志；脚本主动调用 `DebugLog(...)` 的内容仍会照常显示。
-
-### 可用 API
-
-| API | 说明 |
-|---|---|
-| `move(x, y)` | 相对移动鼠标，支持小数并按累计结果输出整数 HID 位移 |
-| `moveto(x, y)` | 绝对坐标移动 |
-| `mouse(button, state)` | 鼠标键按下/松开（1 左 / 2 右 / 3 中） |
-| `wheel(amount)` | 垂直滚轮 |
-| `keydown(key)` / `keyup(key)` / `keypress(key, hold_ms)` | 按键控制 |
-| `delay(ms)` / `sleep(ms)` / `Sleep(ms)` | 可取消延时，底层共用同一实现，单位为毫秒 |
-| `randdelay(min, max)` / `randsleep(min, max)` | 随机延时 |
-| `IsPressed(key)` | 查询按键当前是否按住（可轮询） |
-| `DebugLog(...)` | 输出到 Lua 诊断日志 |
-| `ClearLog()` | 清空 Lua 日志 |
-| `VK_CODES` | 虚拟键码表 |
-
-示例：
-
-```lua
-function OnEvent(event, arg)
-    if event == "pressed" and arg == 1 then
-        while IsPressed(1) do
-            move(0, 2)
-            sleep(10)
-        end
-    end
-    DebugLog("event=%s arg=%s", tostring(event), tostring(arg))
-end
-```
-
-Lua 详细诊断日志写入 EXE 同目录的 `log/automation/automation-runtime-<时间戳>.log`；文件中保留 `LuaEvent`、`LuaOutput` 及开始/完成序号，便于分析长按、松开和连点问题。宏/Lua 页面只显示实际发布的状态日志和脚本 `DebugLog`，不会重复显示 Host 自动生成的按键摘要。
-
-## UDP 模拟鼠标接口
-
-主机 EXE 默认监听 UDP 0.0.0.0:24814，同一端口自动识别 UTF-8 JSON 和 kmboxNet 二进制协议。鼠标捕获页左上角会显示其他电脑实际可填写的局域网 IP 和端口。默认开启“始终开启 UDP 输出”时，即使 HOME 关闭也会发送到 ESP32；UDP 输入不会直接移动运行 EXE 电脑的光标。
-
-```json
-{"dx":12,"dy":-4,"wheel":0,"pan":0}
-```
-
-- dx/dy 范围 -32768..32767，wheel/pan 范围 -128..127，四项不能全零。
-- EXE 以最高 500 Hz 聚合发送完整位移；开启平滑时，原生 USB 固件把每条报告叠加到滚动的 5 个 1 ms 槽并以 1000 Hz 消费，停止输入后的计划尾部不超过 5 ms。
-- 无身份认证：仅应在受信任网络使用；只做本机测试可把 remoteInputBindAddress 改为 127.0.0.1。
-- 可选发送示例：tools/send-remote-mouse.ps1 -HostAddress 192.168.1.20 -Port 24814 -Dx 25 -Dy -10。
-- 主界面「UDP 平滑」开关可临时关闭分摊做 A/B；「始终开启 UDP 输出」默认开启，关闭 HOME 时仍允许网络 UDP 输入输出到 ESP32，关闭后网络 UDP 仅在 HOME 同步开启时输出。
-- 设置页的「模拟 UDP 输入（测试）」默认关闭；启用后可把实体鼠标按 30/60/100/140/200/500 Hz/无上限分桶成模拟 UDP 源，仅用于测试输入聚合、平滑和输出链路，不代表真实网络性能。
-
-### kmboxNet 兼容调用
-
-可以继续使用 `kmboxnet-main/python_pyd` 中与 Python 版本匹配的 `kmNet.cp*.pyd`，调用名称不变，只需把 IP 和端口指向主界面左上角显示的监听地址。UUID 仍按原来的 8 位十六进制字符串传入：
-
-```python
-import kmNet
-
-kmNet.init("192.168.1.20", "24814", "AF425414")
-kmNet.move(10, -5)
-kmNet.wheel(1)
-```
-
-兼容范围包括明文/加密鼠标与键盘输入、按钮、滚轮、`mouse_all`、`move_auto`、贝塞尔移动、`monitor/isdown_*`、`mask/unmask` 和 `trace`。其中：
-
-- 所有 move 类调用忽略原盒子的轨迹参数，统一提交到现有 UDP move 链路。
-- `trace(type, value)` 只映射为当前固件 5 槽 UDP 平滑开关：`value > 0` 开启，否则关闭。
-- `monitor(port)` 不改变 EXE 的捕获状态，只登记原版 pyd 接收 21 字节实体键鼠状态的回传端口；`isdown_*` 继续读取 pyd 的本地状态缓存。
-- `mask_*` 过滤实体键鼠到 ESP32 的转发，但 monitor 仍能看到被屏蔽的物理状态。
-- `reboot`、`setconfig`、`setvidpid` 和 LCD 接口没有主机端等价设备，本版不处理。
-
-### Python 调用示范
-
-项目在 `tools/esp32_move.py` 内提供自己的 `Esp32MouseSender` 调用库，
-`tools/send-remote-mouse-sample.py` 使用该库发送命令，不依赖外部项目路径。目标 IP、端口和
-正方形参数都直接写在 `send-remote-mouse-sample.py` 顶部，不读取命令行参数或其他外部输入。
-
-先编辑脚本顶部的 `TARGET_HOST`、`TARGET_PORT`、`SQUARE_SIDE_PIXELS`、
-`MOVE_STEP_PIXELS` 和 `MOVE_INTERVAL_SECONDS`，然后直接运行：
+旧单板固件从项目根目录下的 `firmware/` 构建，产物与双板工程分开：
 
 ```powershell
-python .\tools\send-remote-mouse-sample.py
+Set-Location .\firmware
+. ..\scripts\Enter-EspIdf.ps1
+# 仅全新且尚未设置 target 的构建目录执行
+idf.py set-target esp32s3
+idf.py build
+
+$port = 'COMx' # 替换成当前开发板的 USB-UART 串口
+idf.py -p $port flash
 ```
 
-当前默认示范会顺时针分四条边发送一个边长 `100`、步长 `100` 的正方形，每条边发送
-一次相对移动命令；每条边前暂停 `10 ms`，命令间隔为 `1 ms`。运行后可能导致目标鼠标移动。
+旧单板固件还保留 BLE HID。设备名默认是 `Keyboard with Touchpad`。USB HID 未连接或不可用且固件启用了 BLE 时，板卡会开始广播；在目标电脑的 Windows“蓝牙和设备”中选择添加设备，找到该设备并完成配对。该固件使用无需输入 PIN 的 Just Works 配对并保存 bond。USB HID 可用时 BLE 后端可能不广播；双板固件不提供此 BLE 输出路径。
 
-调用库的最小用法为：
+<details>
+<summary>备注：旧单板源码与本地打包</summary>
 
-```python
-from tools.esp32_move import Esp32MouseSender
+单板固件和 Host 的历史代码仍保留在仓库；这些功能的当前可构建性与设备可用性需针对旧工程单独验证，不能据此推断已接入双板主线。
 
-sender = Esp32MouseSender("192.168.1.20", 24814)
-try:
-    sender.move(10, 0)
-    sender.move(0, 10)
-finally:
-    sender.close()
+旧单板固件和 Host 可通过 `scripts/Prepare-Release.ps1` 生成本地交付目录。该脚本读取 `firmware/build/` 的旧单板 manifest 和镜像，不是双板发布工具；执行 Host Release 构建前应先退出正在运行的 Host，因为构建会更新项目根目录 EXE。
+
+</details>
+
+## Host 功能
+
+Host 是可选的 Windows 桌面工具，提供 Lua/宏自动化、网络鼠标输入、设备维护和本地固件刷写。双板实体鼠标由 M→P 硬件直通，单纯使用实体鼠标时无需运行 Host。
+
+- Host 会监听运行它的 Windows 电脑上的本地键盘和鼠标事件，Lua `IsPressed` 与本机触发可在两种模式下使用。
+- 旧版单板模式只适配原单板固件。实体键鼠仅在 HOME 开启时由 EXE 捕获并串口转发；HOME 关闭时 Lua/宏使用本机 Win32 输出。旧版“始终开启 UDP 输出”仅控制 HOME 关闭时网络 UDP 输入是否继续发送。
+- 双板模式下，实体鼠标由 M→P 硬件直通，EXE 不重复转发；HOME 不控制这条通路，也不锁定本机光标。Lua/宏鼠标输入优先发给可用的 M 串口，否则回退到运行 Host 的本机；自动化键盘使用本机输出，因为双板固件当前只支持鼠标软件输入。
+- 双板模式的网络 UDP 鼠标输入不受 HOME 或旧单板 UDP 开关限制；M 不可用时不会回退到本机光标。旧单板的“UDP 模拟输入测试”只在旧单板、HOME 和测试开关同时启用时生效，不会发送网络 UDP 数据报。
+
+### HOME / END 快捷键
+
+- `HOME`：切换旧单板模式的实体键鼠同步/转发状态。双板实体鼠标由 M→P 硬件直通，不受 HOME 控制。
+- `END`：释放 Host 跟踪的输出状态并结束程序。
+
+Host 软件输入与[Makcu 直接调用](#makcu-兼容接口)使用不同通路；直接调用时必须先退出 Host，避免多个程序同时占用 M 的 UART0。
+
+## Host 配置与日志
+
+开发环境依赖、官方来源和安装步骤见[依赖说明](docs/dependencies.md)。Host 使用 .NET 8 桌面应用运行时；运行已发布的单文件 EXE 需要安装 .NET 8 Desktop Runtime x64。
+
+### 运行 Host 与选择配置
+
+在项目根目录启动 `HidBridge.Host.exe`，在“设置”页选择活动配置，按需启用宏、Lua 或 UDP 输入。示例配置位于 `profiles.example/示例配置/`，复制到程序所在目录的 `profiles/` 后即可选择。
+
+日志默认保存在程序目录下的 `log/`，包括 Host、设备和自动化日志，默认各保留 10 个文件。需要手动修改网络监听、日志或本地配置时，展开下方备注。
+
+<details>
+<summary>备注：Host 构建与配置实现</summary>
+
+### Host 构建与配置实现备注
+
+从源码生成 Host 需要 .NET 8 SDK，安装位置与依赖见[依赖说明](docs/dependencies.md)。
+
+### 构建 Host
+
+在项目根目录执行：
+
+```powershell
+dotnet build .\host\HidBridge.Host\HidBridge.Host.csproj -c Release
 ```
 
-本轮只执行了源码检查和不连接网络的正方形纯逻辑检查，没有在本机执行正方形发送演示。
+Release 构建会更新项目根目录的 `HidBridge.Host.exe`。构建前先正常退出正在运行的 Host。
 
-## 统一输出灵敏度
+### 运行 Host 与加载配置
 
-鼠标捕获页底部的「输出灵敏度」是发送到固件前的最后一道 X/Y 相对移动处理。左侧滑块可在 `0.3` 到 `3.0` 之间拖动，右侧输入框也可直接输入数值；`1` 表示保持原始移动量，小于 `1` 会降低输出，大于 `1` 会放大输出。输入超出范围时会自动限制到边界，输入无效时恢复上一次有效值。
+可运行构建好的程序，也可从源码启动：
 
-该比例在主机统一的 500 Hz 鼠标报告泵中生效：实体鼠标、UDP 输入、Lua `move()` 和宏 `move()` 都会经过同一处理，再编码为发送给 ESP32 固件的报告。因此无论输入来源如何，最终 X/Y 输出都使用同一个灵敏度；小数比例会保留未满一个整数报告的余量，连续移动不会因为逐条取整而丢失。滚轮、水平滚动和鼠标按键不受该设置影响；未开启 HOME 同步时走本机 Win32 输出的 Lua/宏动作也不会被该固件输出比例改写。
+```powershell
+# 在项目根目录运行
+.\HidBridge.Host.exe
 
-## 鼠标移动记录与分析图
+# 或运行源码项目
+dotnet run --project .\host\HidBridge.Host\HidBridge.Host.csproj -c Release
+```
 
-该功能默认关闭，可在设置页开启。HOME 同步开启期间同时按住鼠标左键+右键开始记录；左右键松开 3 秒后自动停止并弹出分析图（X 有符号值时间序列 + Y 有符号值时间序列），同时保存到 EXE 同目录的 `log/mouse-movement-<时间戳>.png`。记录点位于 500 Hz 桥接报告实际提交边界；固件内的 1 ms 平滑样本不回传到该分析图。
+Host 从当前程序集/EXE 所在目录读取 `bridge.local.json` 和 `bridge.json`。若同目录存在 `bridge.local.json`，就完整使用它；不会与 `bridge.json` 按字段合并，未写入的字段使用代码默认值。默认模板位于 `host/HidBridge.Host/bridge.json`。
 
-## 主机配置参考（bridge.local.json）
+若从项目根目录运行根 EXE，可在不覆盖已有本地配置时复制模板：
+
+```powershell
+if (-not (Test-Path -LiteralPath '.\bridge.local.json')) {
+    Copy-Item -LiteralPath '.\host\HidBridge.Host\bridge.json' -Destination '.\bridge.local.json'
+}
+```
+
+`remoteInputEnabled` 开启或关闭 Host UDP 输入服务；`remoteInputBindAddress` 控制绑定网卡地址。日志文件名中的 `{timestamp}` 会替换为当前时间，默认日志位于程序目录下的 `log/`。自动化选项（例如活动配置、统一输出灵敏度和旧版 UDP 开关）保存在 `automation.settings.json`，不属于 `bridge.local.json`。
+
+从源码运行时，配置目录是项目根下 `host/HidBridge.Host/bin/.../` 中实际生成程序集所在目录，不是当前工作目录或项目根。`bridge.local.json` 是本机配置，不应提交。Host 自动化设置保存在程序集目录中的 `automation.settings.json`；自动化配置和日志也以该目录为基准。
+
+示例宏与 Lua 配置在 `profiles.example/示例配置/`。复制到程序所在目录的 `profiles/` 后，在 Host“设置”页选择配置。每个配置用 `profile.json` 保存触发键和文件关联；宏正文在 `macros/*.txt`，Lua 正文默认在 `lua/main.txt`。
+
+常用 `bridge.local.json` 字段如下，未列出的字段使用代码默认值：
 
 ```json
 {
@@ -447,93 +208,283 @@ finally:
   "hostLogRetentionCount": 10,
   "deviceLogPath": "log/device/host-serial-{timestamp}.log",
   "deviceLogRetentionCount": 10,
+  "showDeviceLogInUi": false,
   "automationLogPath": "log/automation/automation-runtime-{timestamp}.log",
   "automationLogRetentionCount": 10,
-  "showDeviceLogInUi": false,
-  "firmwareUpdateApiPort": 24815,
-  "firmwareFlashBaudRate": 460800,
-  "firmwareFlashTimeoutSeconds": 180
+  "firmwareUpdateApiPort": 24815
 }
 ```
 
-- transport 只能是 serial（wifi 实现保留但当前被功能闸门拒绝）。
-- portName 为 auto 时自动扫描 COM 并完成随机数握手；固定串口模式不自动扫描。
-- hostLogPath / deviceLogPath / automationLogPath 支持 `{timestamp}` 占位符；路径为相对路径时相对于 EXE 所在目录；deviceLogPath 置空可关闭设备日志。
-- hostLogRetentionCount / deviceLogRetentionCount / automationLogRetentionCount 分别限制三类日志目录中的文件数量，默认每类保留 10 个，范围为 1..1000；创建新日志时优先删除最旧文件。
-- showDeviceLogInUi 为启动默认值：false 精简模式 / true 完整日志模式；窗口内可随时切换。
-- EXE 只内嵌刷写工具，不内嵌固件；远程 API 在请求正文中指定对端本机 JSON 路径，并自动使用设置页已保存的刷写串口。
+三个 `*LogPath` 都相对于 Host 程序目录，文件名中的 `{timestamp}` 用于区分每次日志；对应 `*LogRetentionCount` 默认保留 10 个匹配文件，可设为 1..1000。`showDeviceLogInUi` 默认关闭串口设备日志在界面中的显示。完整默认值和可选字段见 `host/HidBridge.Host/bridge.json`。
 
-### 串口、日志与输入租约
 
-- `portName: "auto"` 会扫描串口并发送 `DeviceProbe`/`DeviceHello`；固定 COM 只适用于明确知道设备端口的环境。默认波特率为 `921600`。
-- 同一个 COM 口不能同时由 Host、`idf.py monitor` 或其他串口工具打开；刷写前必须释放串口，刷写结束后再恢复会话。
-- EXE 同目录的 `log/host` 保存主机运行日志，`log/device` 保存设备串口日志，`log/automation` 保存 Lua/宏详细事件和输出时间线；三类目录分别执行文件数量限制。
-- `showDeviceLogInUi` 默认关闭。完整设备日志只用于短时排障；文件写入、UI 投递和实时输入线程相互隔离，UI 采用批量刷新和有界文本。
-- 输入租约默认约 `1500 ms`；停止转发、COM 断开、USB/BLE 切换、HOME/END 和进程退出都必须执行 `ReleaseAll`。
+</details>
 
-### ESP-IDF 与 Wi-Fi/SoftAP
+## 宏
 
-- 固件构建前进入项目提供的 ESP-IDF 终端，执行 `idf.py set-target esp32s3` 和 `idf.py build`；默认 USB/BLE 拓扑不需要启用 Wi-Fi。
-- 设备配置使用仓库中的 `sdkconfig`/`sdkconfig.defaults`；BLE 绑定持久化依赖 `CONFIG_BT_NIMBLE_NVS_PERSIST`，板载 RGB 使用 GPIO48，当前约定为 USB 绿、BLE 蓝、无活动红灯闪烁。
-- Wi-Fi 输入、SoftAP 配网和 Target Agent 后端目前只保留代码，不作为可用功能发布。运行时还必须保持 `HID_BRIDGE_WIFI_RUNTIME_ENABLED=0`，不能仅凭编译产物存在就认为 Wi-Fi 已启用。
-- 未来恢复 SoftAP 前，需要重新设计认证、PSK/AES-256-GCM、计数器/时间窗防重放、心跳超时、重连和 `ReleaseAll`；不能直接开放当前无认证的 UDP 规则到 Wi-Fi。
-- 规划中的配网入口可使用临时 `HID-Bridge-Setup-XXXX` 热点和 `192.168.4.1`，但当前不应把该流程当作已实现或已验收功能。
+宏是按键触发脚本，保存在活动配置目录的 `macros/` 子目录中，每个宏一个 `.txt` 文件。触发键可使用键盘键、鼠标侧键或组合键，例如 `f13`、`ctrl+f1`、`mouse_side1`。
 
-### UDP 平滑与安全边界
+每行写一条 `命令(参数)`，参数用逗号分隔；`#` 及其后的内容作为注释。命令名不区分大小写。
 
-- 默认监听 `0.0.0.0:24814`，同端口接受 JSON 和 kmboxNet 二进制包；JSON 字段为 `dx`、`dy`、`wheel`、`pan`，范围分别为 `-32768..32767`、`-128..127`，四项全零的数据报拒绝并应由发送端在复用 socket 的前提下跳过。
-- Host 最高 500 Hz 发送；原生 USB 固件使用固定 5 个 1 ms 滚动槽，整数位移在槽间守恒，连续命令叠加而不串行积压；关闭“UDP 平滑”时固件排空既有尾部并在下一 USB 周期直接输出。
-- 真实延迟/平滑验收：`python tools/measure_udp_smoothing.py` 会向指定远端发送单次 20 px 和每 10 ms 连续三次 20 px，在本机按 1 ms 时间桶采样鼠标坐标；统计窗口从首条命令发送前 5 ms 开始，持续到最后位移结束后 5 ms，输出每次命令的开始延迟、50% 位移耗时、每步距离、总移动耗时，以及两张 SVG 图、CSV 和 JSON。测试结束会发送反向位移恢复鼠标起点；仅在明确授权时运行。
-- “模拟 UDP 输入（测试）”位于设置页且默认关闭，可按 30/60/100/140/200/500 Hz 或无上限生成测试源；模拟结果不能替代真实 USB/BLE 和目标端 Raw Input 验收。
-- 当前 UDP 入口没有身份认证、计数器或时间窗防重放，只适用于受信任局域网；本机测试应将 `remoteInputBindAddress` 改为 `127.0.0.1`。
+| 命令 | 参数 | 说明 |
+|---|---|---|
+| `move` | dx, dy | 相对移动鼠标；宏参数为整数 |
+| `moveto` | x, y | 请求绝对坐标；远端路径会用本机光标位置计算相对差值，不保证目标端精确到达 |
+| `mouse` | button, state | 1 左、2 中、3 右、4 后退、5 前进；state 为 1 按下、0 松开 |
+| `keydown` / `keyup` | key | 按下或松开键盘键，支持键名或 HID Usage |
+| `keypress` | key[, hold_ms] | 点按键；缺省按住 10 ms |
+| `wheel` | amount | 输出垂直滚轮增量 |
+| `delay` / `sleep` | ms | 可取消延时 |
+| `randsleep` / `randdelay` | base, variance | 在 max(0, base−variance) 到 base+variance 之间随机延时 |
 
-### BLE 维护
-
-- BLE 使用 NimBLE HID、Just Works 配对和绑定密钥持久化；升级固件或更换设备后若反复显示“已配对/已连接”，应在目标系统删除旧配对后重新配对。
-- BLE 鼠标路径按约 10 ms 节拍发送合并状态；API 调用率、空口报告率和目标端 Raw Input 频率是三个不同指标，必须分别测量。
-- 当前 USB/BLE 活动锁保证后连接链路不抢占；真实冷启动、插回 USB、BLE 断开回退和目标端输入仍需按版本单独验收。
-
-## 常见问题
-
-- **COM 被占用**：主机程序与 idf.py monitor、串口工具不能同时打开同一 COM 口；关闭占用程序后主机会自动重连。
-- **检测到 CH340/CH341 Code 28**：发布件中的 Host 会显示驱动路径和管理员权限提示；只有确认“安装驱动”并通过 UAC 后才执行随包 WCH 驱动，其他 Problem Code 请在设备管理器中处理。
-- **生成发布件**：在项目根目录执行 `scripts/Prepare-Release.ps1`；如果要把最新 ESP-IDF 构建也纳入发布件，使用 `-BuildFirmware`。
-- **手动刷写提示「刷写镜像不存在」**：JSON 引用的 bin 必须位于清单所在目录内（支持 bootloader/、partition_table/ 子目录或平铺）。
-- **BLE 配对后反复「已配对/已连接」**：旧固件无绑定持久化，升级后需在目标设备删除/忽略旧配对，重新配对一次。
-- **防火墙弹窗**：UDP 24814 与刷写接口 24815 首次监听可能触发 Windows 防火墙提示。
-- **exe 无法启动**：需要 .NET 8 Desktop Runtime（x64）。
-- **不要输入回路**：不要把开发板原生 USB 口接回同一台电脑测试转发并同时抑制本地输入。
-
-## 安全边界
-
-- UDP 模拟鼠标入口默认开启且无身份认证，默认监听 0.0.0.0:24814，仅限受信任网络。
-- 固件刷写接口默认关闭；启用后监听局域网 `0.0.0.0:24815`，不接受固件上传或串口参数，只接受对端本机 JSON 清单路径，并自动使用设置页已选择的串口。仅限受信任局域网。
-- 主机退出、串口断开或切换转发状态时发送 ReleaseAll，防止目标设备卡键。
-- 预共享密钥类配置只写入被 Git 忽略的本地文件（bridge.local.json、firmware/sdkconfig 等），不要写入仓库文件。
-
-## 仓库结构
+示例：
 
 ```text
-firmware/                 ESP-IDF 固件（build 产物不提交）
-host/HidBridge.Host/      主机控制程序（WinForms，.NET 8）
-shared/HidBridge.Protocol 主机与固件共享协议
-target/                   保留的 Target Agent 输出后端
-tests/                    主机/硬件自检程序与固件测试
-scripts/                  构建与工具脚本（含内置 esptool 构建）
-drivers/wch-ch341ser/    WCH CH340/CH341 官方驱动归档与可安装 INF
-release/                  可直接交付的 Host、默认 profiles、驱动和三段固件发布件
-profiles/                 宏/Lua 配置（每个配置含 profile.json、macros/*.txt、lua/*.txt）
-profiles.example/         示例配置（宏 + Lua，可复制到 profiles/）
-docs/                     项目文档（协议、刷写 API、交接与审计记录）
-log/                      EXE 运行日志、自动化日志、设备日志和可选分析图
-artifacts/                检查/调试临时产物（不提交）
-tools/                    辅助工具（如 UDP 发送示例）
+# 按住触发键时循环移动，松开触发键后停止
+move(0, 5)
+delay(10)
 ```
 
-主机检查程序（自检，无需连接开发板）：
+支持四种运行模式：
+
+| 模式 | 行为 |
+|---|---|
+| `once` | 每次触发执行一遍 |
+| `toggle` | 按一次开始循环，再按一次停止 |
+| `hold_loop` | 按住循环，松开停止 |
+| `staged` | 按下时运行按下段；按住循环运行按住段；松开时运行松开段 |
+
+`staged` 模式使用以下段标签：
+
+```text
+[on_press]
+mouse(1, 1)
+
+[while_hold]
+randsleep(40, 20)
+move(0, 5)
+
+[on_release]
+mouse(1, 0)
+```
+
+## Lua 脚本
+
+每个活动配置可运行一段 Lua 脚本，入口为 `function OnEvent(event, arg)`。`event` 为 `pressed` 或 `released`；键盘 `arg` 是小写友好键名，鼠标按钮参数为 1 左、2 中、3 右、4/5 侧键。
+
+`IsPressed(arg)` 查询运行 Host 的 Windows 电脑当前观测到的物理键盘或鼠标按键状态，不查询远端目标电脑或 M 板连接的真实鼠标。字符串可用 `"a"`、`"f13"`、`"mouse_left"` 等键名；数字 1..5 表示鼠标按钮，其他数字按 Win32 虚拟键码处理。`VK_CODES` 提供常见虚拟键名。
+
+| API | 说明 |
+|---|---|
+| `move(x, y)` | 相对移动，接受小数并累计余量后输出整数 HID 位移 |
+| `moveto(x, y)` | 本机 Win32 路径使用屏幕绝对坐标；远端 M 路径以本机光标为基准换算相对差值 |
+| `mouse(button, state)` / `wheel(delta)` | 输出鼠标按钮和垂直滚轮 |
+| `keydown(key)` / `keyup(key)` / `keypress(key[, ms])` | 输出键盘按键，支持友好键名或 HID Usage |
+| `delay(ms)` / `sleep(ms)` / `Sleep(ms)` | 可取消的毫秒延时 |
+| `randdelay(base[, range])` / `randsleep(base[, range])` | 在基准时间附近随机延时 |
+| `IsPressed(arg)` | 查询 Host 本机当前物理按键状态 |
+| `DebugLog(...)` / `ClearLog()` | 输出或清空 Lua 日志 |
+| `VK_CODES` | 常见 Win32 虚拟键码表 |
+
+远端 `moveto(x,y)` 没有目标屏幕坐标反馈，实际是读取本机光标坐标并发送相对增量，不能保证目标端落在给定位置。双板模式自动化鼠标优先注入 M，M 角色串口不可用时回退到本机 Win32；自动化键盘在双板模式下使用本机 Win32，因为当前双板不支持软件键盘输入。
+
+```lua
+function OnEvent(event, arg)
+    if event == "pressed" and arg == 1 then
+        while IsPressed(1) do
+            move(0.5, 2)
+            sleep(10)
+        end
+    end
+    DebugLog("event=%s arg=%s", tostring(event), tostring(arg))
+end
+```
+
+Lua 页的“检查”会校验脚本并整理缩进与常见行内空格；运行错误会显示脚本行号。脚本主动调用的 `DebugLog(...)` 内容会显示在 Lua 日志中。
+
+## UDP 与 kmboxNet 输入
+
+Host 默认监听 UDP `0.0.0.0:24814`，同一端口可接收 JSON 鼠标命令或兼容的 kmboxNet 数据报。该接口没有身份认证，仅应在受信网络使用；本机测试可把 `remoteInputBindAddress` 设为 `127.0.0.1`。JSON 只接受相对移动和滚轮，不包含按键：
+
+```json
+{"dx":12,"dy":-4,"wheel":0,"pan":0}
+```
+
+`dx`/`dy` 范围为 -32768..32767，`wheel`/`pan` 范围为 -128..127；四项全为零的数据报会被拒绝。可选 `smoothing_slots` 接受 0、5、10、15、20。JSON 与 kmboxNet 共用 `remoteInputPort`，默认 24814。
+
+双板模式下，UDP 鼠标移动和 kmboxNet 鼠标按键经 Host 软件鼠标通路发给 M，不会因 M 不可用而回退成本机光标输入。kmboxNet 键盘命令在双板模式下不会输出到目标电脑，也不会回退到本机；旧单板模式仍可使用旧版键盘转发路径。
+
+UDP 和串口是两种不同的调用方式：本节 Makcu 接口直接连接 M 板 UART0/CH340，不经过 UDP，也不通过 Host；开始直连前先退出 Host，避免串口占用。
+
+### Makcu 兼容接口
+
+双板固件默认在 M 板 UART0/CH340 提供 Makcu V4 鼠标接口，默认串口为 **115200、8N1**。直接从 Python 或其他串口程序调用前，先正常退出 Host 并关闭其他占用 M 串口的程序。当前只实现鼠标功能子集，不等同于完整原厂 Makcu 设备，也不提供键盘、手柄、flick 或设备管理接口。旧 V3 风格 ASCII 是另一套可选旧接口，不应与本节命令混用。
+
+ASCII 命令以 CR/LF 结束，必须使用 `km.` 前缀。常用调用如下：
+
+| 调用 | 用途 |
+|---|---|
+| `km.device()` / `km.version()` | 查询设备类型 `mouse` 与接口标识 `km.MAKCU` |
+| `km.move(dx,dy)` / `km.wheel(delta)` | 相对移动或滚轮 |
+| `km.left(1)` / `km.left(0)` | 按下/松开左键；也可用 `right`、`middle`、`side1`、`side2` |
+| `km.click(button[,count[,hold_ms]])` | button 为 1 左、2 右、3 中、4 后退、5 前进；count 为 1..255，hold_ms 为 1..5000；省略/为 0 时随机按住 35..75 ms |
+| `km.interpolate()` / `km.interpolate(value)` | 查询/设置 P 端的软件鼠标平滑；值为 0..100 或 `255`（AUTO） |
+
+查询响应以 `\r\n>>> ` 结束；参数或队列错误返回 `ERR\r\n>>> `。默认关闭 echo 时，成功的设置命令不会返回文本。可用 [pyserial](https://pyserial.readthedocs.io/en/latest/pyserial_api.html) 直接发送 ASCII 命令；以下示例先查询接口，再移动并按下左键，最后在 `finally` 中松开：
+
+```python
+import serial
+import time
+
+port = "COMx"  # 替换为 M 板的 UART0/CH340 端口
+ser = serial.Serial(port=None, baudrate=115200, timeout=1, write_timeout=1)
+ser.port = port
+ser.dtr = False
+ser.rts = False
+ser.open()
+try:
+    ser.reset_input_buffer()
+    ser.write(b"km.version()\r\n")
+    reply = ser.read_until(b">>> ")
+    if not reply.endswith(b">>> "):
+        raise TimeoutError("Makcu 查询超时")
+    if b"ERR\r\n" in reply:
+        raise RuntimeError(reply.decode("ascii", errors="replace"))
+    if b"km.MAKCU" not in reply:
+        raise RuntimeError("串口未返回预期的 Makcu 接口标识")
+    print(reply.decode("ascii", errors="replace"))
+
+    ser.write(b"km.move(20,-5)\r\n")
+    ser.write(b"km.left(1)\r\n")
+    time.sleep(0.05)
+finally:
+    try:
+        if ser.is_open:
+            ser.write(b"km.left(0)\r\n")
+    finally:
+        ser.close()
+```
+
+二进制接口使用 `DE AD LEN:u16le CMD PAYLOAD` 帧，`LEN` 是 payload 字节数且不包含命令字节。例如 `move(20,-5)` 使用 opcode `0x18`，payload 是两个有符号 16 位小端整数，完整帧为 `DE AD 04 00 18 14 00 FB FF`。更多 ASCII/二进制命令与返回格式见[Makcu V4 协议说明](docs/protocol.md#makcu-v4-鼠标-apim-板-uart0)。有效鼠标设置会续 1500 ms 输入租约；查询不会续租，停止发送后固件会释放注入按钮。`interpolate` 的 0/25/50/75/100 分别对应关闭/5/10/15/20 个平滑槽，其他 0..100 值就近选择；它不受 Host 平滑设置影响。建议使用 115200；本机 CH340 的 4 Mbaud 切换测试失败，不能按协议支持推断适配器可用。调用本接口不需要启动 Host。
+
+### kmboxNet 示例
+
+已有兼容版本 `kmNet.pyd` 的用户可将目标地址设为运行 Host 的电脑。以下 `192.0.2.10` 为文档保留地址，请替换为实际 Host 地址；UUID 使用原 API 所需的 8 位十六进制字符串：
+
+```python
+import kmNet
+
+kmNet.init("192.0.2.10", "24814", "AF425414")
+kmNet.move(10, -5)
+kmNet.wheel(1)
+```
+
+Host 兼容鼠标移动、按钮、滚轮和键盘命令。`move_auto` 和贝塞尔移动命令会被当作普通相对移动处理，自动步进和曲线轨迹参数不生效。`monitor` 上报的状态以及兼容客户端 `isdown_*` 查询所依据的按键缓存来自 Host 本机物理输入，不是目标电脑状态；`mask`/`unmask` 只影响 Host 捕获并转发的实体输入，不会屏蔽双板 M→P 硬件直通，也不改变软件输入。`trace` 用于切换 Host 软件鼠标移动的平滑开关，不指定固定槽数。设备专用的重启、配置、屏幕等命令没有对应的 Host 功能。双板目标端目前仅支持软件鼠标输入。
+
+### 项目内 Python 示例
+
+`tools/esp32_move.py` 提供 `Esp32MouseSender`；`tools/send-remote-mouse-sample.py` 提供正方形移动示例。发送动作会移动目标鼠标，先检查脚本中的 Host 地址和位移参数，再按需运行：
 
 ```powershell
-dotnet run --project tests/HidBridge.Host.Checks -c Release
+python .\tools\send-remote-mouse-sample.py
 ```
 
-协议细节（帧格式、消息类型、握手与 UDP 接口）见 [docs/protocol.md](docs/protocol.md)，固件刷写接口见 [docs/firmware-update-api.md](docs/firmware-update-api.md)；连接、配置和架构说明已整合在本 README。
+也可在自己的脚本中调用：
+
+```python
+from tools.esp32_move import Esp32MouseSender
+
+sender = Esp32MouseSender("192.0.2.10", 24814)
+try:
+    sender.move(10, 0)
+    sender.move(0, 10)
+finally:
+    sender.close()
+```
+
+将文档保留地址换成运行 Host 电脑在目标网络中的 IP。JSON UDP 只输入鼠标相对移动和滚轮，不会直接移动运行 Host 的本机光标。
+
+## 统一输出灵敏度
+
+主窗口鼠标捕获区域提供 `0.30` 到 `3.00` 的输出灵敏度，默认 `1.00`。`1.00` 保持原始 X/Y 移动量；低于 1 会缩小，高于 1 会放大，程序会保留小数余量。该比例只作用于 Host 发送到板端的 X/Y 相对移动，包括旧单板实体转发、网络 UDP、双板 M 软件注入，以及路由到板端的 Lua/宏移动。
+
+双板 M→P 的实体鼠标硬件直通和 Lua/宏回退到本机 Win32 的动作不经过 Host 输出灵敏度。滚轮、水平滚动和鼠标按钮不受该设置影响。
+
+## 固件刷写
+
+设置页“本地固件刷写”模块允许选择刷写串口和 JSON 清单，检查后确认即可开始；Host 会释放串口并在刷写完成后恢复连接。清单描述 bootloader、partition table 和 app 镜像；清单中的相对镜像路径按 JSON 所在目录解析。Host EXE 不嵌入固件镜像。
+
+<details>
+<summary>备注：刷写工具构建与查找</summary>
+
+Host 优先使用构建时嵌入的独立 esptool；若 EXE 没有嵌入 esptool，则尝试项目 ESP-IDF Python 环境中的 esptool。需要自行准备嵌入工具时，可运行 `scripts/build-embedded-esptool.ps1` 后再构建 Host，依赖见[依赖说明](docs/dependencies.md)。
+
+</details>
+
+远程刷写 API 默认关闭。设置页启用后监听局域网 TCP 24815，并使用设置页保存的串口；请求提供的是**运行 Host 的电脑上的** manifest 路径。远程请求电脑上的路径不会自动映射到 Host。manifest 相对路径按 Host 进程当前工作目录解析，镜像相对路径按 JSON 文件目录解析。接口没有账号认证，仅限受信网络；启用前请阅读[固件刷写 API 说明](docs/firmware-update-api.md)。
+
+```powershell
+# 先从项目根目录启动 Host；相对 manifestPath 按 Host 进程当前工作目录解析
+$manifestPath = 'firmware/dual_proxy/build/flasher_args.json'
+$headers = @{ 'X-HidBridge-Action' = 'flash-firmware' }
+$body = @{ manifestPath = $manifestPath } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri 'http://192.0.2.10:24815/api/v1/firmware/flash' -Headers $headers -ContentType 'application/json' -Body $body
+```
+
+## Windows CH340/CH341 驱动
+
+M 板 UART0/CH340 串口用于 Host 软件命令、维护和日志。若 Windows 没有出现 COM 端口，可从[WCH 官方驱动页面](https://www.wch-ic.com/downloads/CH341SER_ZIP.html)下载驱动，或查看仓库中的[驱动来源和安装说明](drivers/wch-ch341ser/README.md)。
+
+Host 在串口模式启动时会检查驱动状态。若找到随包 INF 且确认缺少匹配驱动，程序会先显示安装确认；安装仍需用户确认并通过 UAC。驱动安装完成不代表串口已可用：双板模式还需完成 M/P 角色握手；旧单板兼容模式跳过新的角色握手。手动安装时可解压 WCH 驱动包，在设备管理器中选择更新驱动并指向 `CH341SER.INF`，或运行驱动包自带安装器。
+
+常见排查方式：
+
+- 在设备管理器“端口 (COM 和 LPT)”查看 CH340/CH341 对应端口。
+- 若设备显示 Problem Code 28，通常表示 Windows 没有匹配驱动；按官方驱动说明安装后再检查 COM 端口。
+- 同一串口不能同时由 Host、ESP-IDF monitor、刷写器或其他串口工具打开；关闭占用程序后让 Host 重新发现设备。
+- 安装驱动后仍无 COM 端口时，检查 USB 数据线、板卡的 USB-UART 接口和设备管理器状态。P 板原生 USB HID 口与 UART/CH340 是不同接口。
+
+## 常见问题与安全边界
+
+- **Host 找不到串口：** 检查 CH340/CH341 驱动、USB 数据线和设备管理器；关闭占用串口的 monitor、刷写器或其他程序。双板自动发现依赖 M/P 角色握手；旧单板兼容模式跳过新的角色握手。
+- **COM 号改变：** `portName` 使用 `auto` 时 Host 会自动发现；固定串口配置只适用于明确知道端口的环境。
+- **双板实体鼠标没有经过 Host：** 这是预期路径。真实鼠标由 M→P 硬件直通，Host 的 HOME 和灵敏度设置不改变这条路径。
+- **双板 Lua/宏键盘输出没有到目标电脑：** 双板模式自动化键盘使用运行 Host 的本机 Win32；当前双板不支持软件键盘输入。kmboxNet 键盘不会回退成本机输入。
+- **Host EXE 无法启动：** 安装[依赖说明](docs/dependencies.md)中列出的 .NET 8 Desktop Runtime x64。
+- **BLE 配对：** BLE HID 是旧单板固件路径；设备名默认是 `Keyboard with Touchpad`。USB HID 可用时 BLE 可能不广播。若 Windows 配对失败，先在 Windows 蓝牙设置中删除已保存的旧设备，再让旧单板重新广播并配对；不能据此推断双板透明鼠标代理支持 BLE。
+- **刷写提示清单或镜像不存在：** 检查 JSON 路径及其引用的镜像；相对镜像路径以 JSON 所在目录解析。
+- **网络输入无输出：** 核对 Host 地址、UDP 端口、防火墙及 M 端串口角色握手。UDP 输入只适用于受信网络，不要暴露到公网。
+- **避免输入回路：** 不要把目标电脑的鼠标输出经 USB 接回同一台正在捕获并转发输入的电脑。
+
+停止转发、串口断开、刷写切换和程序退出时，Host 会释放自己跟踪的按键与鼠标按钮，避免目标设备卡键。不同鼠标的克隆兼容性及目标端是否消费报告，请以[审计记录](docs/审计.md)中对应版本的验证边界为准。
+
+## 备注
+
+<details>
+<summary>备注：源码目录与检查入口</summary>
+
+### 仓库目录
+
+```text
+firmware/                 旧单板固件工程
+firmware/dual_proxy/      当前双板透明鼠标代理固件
+host/HidBridge.Host/      Windows Host 与设备维护工具
+shared/                   主机与固件共享协议代码
+tests/                    Host 检查及固件逻辑测试
+tools/                    串口、统计、注入和探针工具
+docs/                     协议、刷写、交接和审计记录
+artifacts/                本地测试证据（通常不提交）
+log/                      本地运行日志
+```
+
+Host 检查程序入口为 `tests/HidBridge.Host.Checks/`，可在项目根目录运行：
+
+```powershell
+dotnet run --project .\tests\HidBridge.Host.Checks -c Release
+```
+
+完整 Host 检查包含依赖旧单板构建 manifest 的项目；若该构建产物不存在，相关检查会失败。双板纯逻辑检查入口为 `scripts/Test-DualProxyLogic.ps1`，需要 clang 和按[依赖说明](docs/dependencies.md)准备的双板构建环境。源码检查、模拟逻辑检查和真实开发板验收是不同层级，测试目录或命令本身不代表设备验证通过。
+
+BLE 设备名可通过旧单板的 `CONFIG_HID_BRIDGE_BLE_DEVICE_NAME` 修改；双板不提供 BLE。Host 使用 A5 帧编码软件鼠标输入，Makcu 使用独立 V4 ASCII/二进制命令；具体实现及完整协议见 [协议文档](docs/protocol.md)。
+
+</details>

@@ -3,7 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MOUSE_MOTION_SMOOTHING_SLOTS 5U
+#define MOUSE_MOTION_SMOOTHING_MAX_SLOTS 20U
+#define MOUSE_MOTION_SMOOTHING_SLOT_STEP 5U
 
 typedef struct {
     int64_t x;
@@ -13,7 +14,7 @@ typedef struct {
 } mouse_motion_delta_t;
 
 typedef struct {
-    mouse_motion_delta_t slots[MOUSE_MOTION_SMOOTHING_SLOTS];
+    mouse_motion_delta_t slots[MOUSE_MOTION_SMOOTHING_MAX_SLOTS];
     uint8_t next_slot;
     uint8_t distribution_phase;
 } mouse_motion_smoother_t;

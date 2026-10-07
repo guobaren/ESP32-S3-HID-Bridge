@@ -19,9 +19,11 @@
 #include "diag_stream.h"
 #include "hid_device_profile.h"
 #include "hid_report_layout.h"
+#include "link_recovery_logic.h"
 #include "vendor_urb.h"
 #include "usb_stall_recovery_logic.h"
 #include "dual_proxy_runtime_config.h"
+#include "uart0_control.h"
 
 /*
  * 厂商控制传输走直连通道（每请求独立 URB + 自定超时 + 孤儿等待回调回收）还是走
@@ -131,6 +133,7 @@ typedef struct {
     uint8_t report_id;
     uint8_t length;
     bool mouse_report;
+    bool injected;
     bool has_report_id;
     uint8_t mouse_report_id;
     hid_mouse_report_layout_t mouse_layout;
@@ -153,6 +156,8 @@ typedef struct {
 
 typedef struct {
     bool get_report;
+    uint32_t vendor_session_epoch;
+    uint32_t vendor_session_peer_generation;
     uint16_t transaction_id;
     uint8_t interface_number;
     uint8_t report_id;
@@ -254,6 +259,7 @@ static volatile uint32_t s_profile_revision;
 static volatile bool s_profile_refresh_requested;
 static TaskHandle_t s_profile_task;
 static SemaphoreHandle_t s_profile_mutex;
+static SemaphoreHandle_t s_vendor_session_state_mutex;
 static usb_host_client_handle_t s_descriptor_client;
 static TaskHandle_t s_usb_host_task;
 static TaskHandle_t s_descriptor_task;
@@ -783,6 +789,28 @@ static void log_report_descriptor(
 
 /* 上一次鼠标报文首字节（按键位）：仅用于按键边沿打点。 */
 static uint8_t s_last_button_byte;
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API || DUAL_PROXY_ENABLE_MAKCU_V4_API
+static volatile uint8_t s_makcu_physical_buttons;
+
+uint8_t dual_hid_host_makcu_physical_buttons(void)
+{
+    return __atomic_load_n(&s_makcu_physical_buttons, __ATOMIC_ACQUIRE);
+}
+#endif
+
+static void notify_release_callback(bool device_gone)
+{
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API || DUAL_PROXY_ENABLE_MAKCU_V4_API
+    __atomic_store_n(&s_makcu_physical_buttons, 0U, __ATOMIC_RELEASE);
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
+    dual_uart0_control_v4_physical_buttons(0U);
+    dual_uart0_control_v4_cancel_input();
+#endif
+#endif
+    if (s_release_callback != NULL) {
+        s_release_callback(device_gone);
+    }
+}
 /* 滚轮字节偏移（相对报表正文，不含 report ID）；0xFF 表示未知。 */
 static volatile uint8_t s_wheel_byte_offset = 0xFFU;
 static volatile uint32_t s_wheel_reports;
@@ -795,17 +823,12 @@ static volatile uint32_t s_vendor_control_retries;
 static volatile uint32_t s_ctrl_fail_streak;
 /* 直连通道连续失败计数（与组件路径分开统计）。 */
 static volatile uint32_t s_vendor_urb_fail_streak;
-/* 控制连续失败时核对物理鼠标输入；停滞只释放按钮，不断电。 */
-#define STALL_REPORT_FREEZE_US     (1 * 1000 * 1000LL)   /* 多久没报告算"数据冻结" */
-#define STALL_CTRL_FAIL_FRESH_US   (3 * 1000 * 1000LL)   /* 控制失败的新鲜度窗口 */
-#define STALL_RECOVERY_COOLDOWN_US (30 * 1000 * 1000LL)  /* 两次冻结恢复的最小间隔 */
 /* 自动恢复只记录故障并释放卡住的按钮；不重挂接口或切断物理鼠标供电。 */
 #define USB_HOST_AUTOMATIC_DESTRUCTIVE_RECOVERY 0
-/* 两次心跳失败只标记控制通道异常，不能据此推断输入端点已停。 */
-#define STALL_PROBE_FAIL_LIMIT     2U
+/* 心跳失败数供诊断；恢复判据使用未完成心跳 URB，不用失败次数代替。 */
 static volatile uint32_t s_probe_fail_streak;
 /*
- * USB 心跳探测（2026-09-28，用户要求 0.5 秒一次）：主动向设备发一笔最轻量的标准请求，
+ * USB 心跳探测：约每 100 ms 主动向设备发一笔最轻量的标准请求，
  * 成败直接喂给 s_last_ctrl_ok_us / s_last_ctrl_fail_us，于是上面这套"数据冻结判据"
  * 不必再等外部软件碰巧发控制请求。
  * 起因：现场实测 13:58 那次冻结期间**没有任何控制请求发出**，判据白等了 42 秒才成立。
@@ -839,6 +862,9 @@ static volatile int64_t s_last_ctrl_fail_us;   /* 最近一次控制传输失败
 static volatile int64_t s_stall_recovery_us;   /* 最近一次因数据冻结触发的恢复 */
 /* 鼠标接口就绪时刻：用于判定枚举后的预热期。 */
 static volatile int64_t s_mouse_ready_us;
+static volatile uint32_t s_vendor_session_epoch;
+static volatile uint32_t s_vendor_session_peer_generation;
+static volatile int64_t s_vendor_session_first_request_us;
 #define VENDOR_URB_RECOVER_STREAK 3U
 /*
  * 枚举后预热期：实测同一场景下超时次数随等待时间单调下降（600 ms→8~13 次、
@@ -848,6 +874,56 @@ static volatile int64_t s_mouse_ready_us;
 #define VENDOR_URB_WARMUP_US 10000000LL
 #define VENDOR_URB_WARMUP_TIMEOUT_MS 2500U
 #define VENDOR_URB_TIMEOUT_MS 800U
+
+static bool vendor_control_event_session_is_current(const hid_control_event_t *event)
+{
+    return event != NULL && event->vendor_session_epoch != 0U &&
+        event->vendor_session_epoch == __atomic_load_n(
+            &s_vendor_session_epoch, __ATOMIC_ACQUIRE) &&
+        event->vendor_session_peer_generation == __atomic_load_n(
+            &s_vendor_session_peer_generation, __ATOMIC_ACQUIRE);
+}
+
+/* 在 URB 结束后短暂持锁校验并入队，BEGIN不能夹在校验与旧响应入队之间。 */
+static bool vendor_control_event_lock_if_current(const hid_control_event_t *event)
+{
+    if (s_vendor_session_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_vendor_session_state_mutex, portMAX_DELAY);
+    if (!vendor_control_event_session_is_current(event)) {
+        xSemaphoreGive(s_vendor_session_state_mutex);
+        return false;
+    }
+    return true;
+}
+
+static int64_t vendor_session_note_first_request(uint32_t epoch)
+{
+    if (epoch == 0U || s_vendor_session_state_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_vendor_session_state_mutex, portMAX_DELAY);
+    if (epoch != __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_ACQUIRE)) {
+        xSemaphoreGive(s_vendor_session_state_mutex);
+        return 0;
+    }
+    int64_t first = __atomic_load_n(&s_vendor_session_first_request_us, __ATOMIC_RELAXED);
+    if (first == 0) {
+        const int64_t now = esp_timer_get_time();
+        first = now;
+        __atomic_store_n(&s_vendor_session_first_request_us, first, __ATOMIC_RELEASE);
+    }
+    xSemaphoreGive(s_vendor_session_state_mutex);
+    return first;
+}
+
+static bool vendor_session_request_is_warmup(uint32_t epoch, int64_t now_us)
+{
+    const int64_t first = vendor_session_note_first_request(epoch);
+    return first != 0 && now_us >= first && now_us - first < VENDOR_URB_WARMUP_US;
+}
+
 static volatile uint32_t s_hid_recoveries;
 static volatile bool s_hid_recover_requested;
 /* 二级恢复：根端口断电再上电（等价于拔插一次 USB）。一级重挂若被"在飞传输"挡住
@@ -894,24 +970,40 @@ static void raw_report_task(void *argument)
                 int32_t axis_x = 0, axis_y = 0, axis_wheel = 0, axis_pan = 0;
                 if (axis_length != event.mouse_layout.report_bytes) {
                     __atomic_add_fetch(&s_motion_rx_bad_length, 1U, __ATOMIC_RELAXED);
-                } else if (hid_mouse_report_read_axes(axis_report, axis_length,
-                                                       &event.mouse_layout, &axis_x, &axis_y,
-                                                       &axis_wheel, &axis_pan)) {
-                    __atomic_add_fetch(&s_motion_rx_dx, axis_x, __ATOMIC_RELAXED);
-                    __atomic_add_fetch(&s_motion_rx_dy, axis_y, __ATOMIC_RELAXED);
-                    const uint32_t sample_index = __atomic_add_fetch(
-                        &s_motion_rx_ok, 1U, __ATOMIC_RELAXED);
-                    if (sample_index <= 10U || (sample_index % 1000U) == 0U) {
-                        ESP_LOGI(TAG,
-                                 "M样本#%u 原始=%u字节 剥离后=%u字节 布局=%u字节 dx=%d dy=%d",
-                                 (unsigned)sample_index, (unsigned)event.length,
-                                 (unsigned)axis_length,
-                                 (unsigned)event.mouse_layout.report_bytes,
-                                 (int)axis_x, (int)axis_y);
-                        ESP_LOG_BUFFER_HEX_LEVEL(TAG, axis_report, axis_length, ESP_LOG_INFO);
-                    }
                 } else {
-                    __atomic_add_fetch(&s_motion_rx_bad_parse, 1U, __ATOMIC_RELAXED);
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API || DUAL_PROXY_ENABLE_MAKCU_V4_API
+                    uint8_t physical_buttons = 0U;
+                    if (hid_mouse_report_read_buttons(
+                            axis_report, axis_length, &event.mouse_layout,
+                            &physical_buttons)) {
+                        __atomic_store_n(&s_makcu_physical_buttons,
+                                         physical_buttons, __ATOMIC_RELEASE);
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
+                        if (!event.injected) {
+                            dual_uart0_control_v4_physical_buttons(physical_buttons);
+                        }
+#endif
+                    }
+#endif
+                    if (hid_mouse_report_read_axes(axis_report, axis_length,
+                                                   &event.mouse_layout, &axis_x, &axis_y,
+                                                   &axis_wheel, &axis_pan)) {
+                        __atomic_add_fetch(&s_motion_rx_dx, axis_x, __ATOMIC_RELAXED);
+                        __atomic_add_fetch(&s_motion_rx_dy, axis_y, __ATOMIC_RELAXED);
+                        const uint32_t sample_index = __atomic_add_fetch(
+                            &s_motion_rx_ok, 1U, __ATOMIC_RELAXED);
+                        if (sample_index <= 10U || (sample_index % 1000U) == 0U) {
+                            ESP_LOGI(TAG,
+                                     "M样本#%u 原始=%u字节 剥离后=%u字节 布局=%u字节 dx=%d dy=%d",
+                                     (unsigned)sample_index, (unsigned)event.length,
+                                     (unsigned)axis_length,
+                                     (unsigned)event.mouse_layout.report_bytes,
+                                     (int)axis_x, (int)axis_y);
+                            ESP_LOG_BUFFER_HEX_LEVEL(TAG, axis_report, axis_length, ESP_LOG_INFO);
+                        }
+                    } else {
+                        __atomic_add_fetch(&s_motion_rx_bad_parse, 1U, __ATOMIC_RELAXED);
+                    }
                 }
             }
         }
@@ -927,6 +1019,22 @@ static void raw_report_task(void *argument)
         }
         event.mouse_report = event.mouse_report &&
             event.report_id == event.mouse_report_id;
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
+        if (event.mouse_report) {
+            uint8_t button_mask = 0U;
+            uint8_t move_mask = 0U;
+            uint8_t wheel_mask = 0U;
+            dual_uart0_control_v4_get_physical_masks(
+                &button_mask, &move_mask, &wheel_mask);
+            if (!hid_mouse_report_apply_physical_masks(
+                    &event.mouse_layout, event.data, event.length,
+                    button_mask, move_mask, wheel_mask)) {
+                ++s_errors;
+                ++s_vendor_input_failures;
+                continue;
+            }
+        }
+#endif
         if (event.length > DUAL_HID_RAW_INPUT_MAX_DATA) {
             ++s_errors;
             ++s_vendor_input_failures;
@@ -960,13 +1068,23 @@ static void raw_report_task(void *argument)
          * 注意：本模块的 `on_mouse_report` 回调在物理路径上不会被调用，这里的判定才是
          * 生效路径——历史教训是"只改那边等于没生效"。
          */
-        if (event.length == 0U ||
-            dual_uart1_send_raw_hid_input(
-                event.interface_number, event.report_id, event.data,
-                event.length) != ESP_OK) {
+        const esp_err_t forward_result = event.length == 0U
+            ? ESP_ERR_INVALID_SIZE
+            : dual_uart1_send_raw_hid_input(
+                  event.interface_number, event.report_id, event.data,
+                  event.length);
+        if (forward_result != ESP_OK) {
             ++s_errors;
             ++s_vendor_input_failures;
         } else if (event.mouse_report) {
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
+            int32_t x = 0, y = 0, wheel = 0, pan = 0;
+            if (hid_mouse_report_read_axes(
+                    event.data, event.length, &event.mouse_layout,
+                    &x, &y, &wheel, &pan)) {
+                dual_uart0_control_v4_track_physical_move(x, y);
+            }
+#endif
             ++s_reports;
         } else {
             ++s_vendor_reports;
@@ -999,18 +1117,19 @@ static void hid_control_task(void *argument)
         if (xQueueReceive(s_control_queue, &request, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        /*
-         * 标记“厂商事务在途”：G HUB 的初始化是一连串 SET/GET 往返，期间移动报文
-         * 必须让路。实测现场：接线上电期间持续移动时，G HUB 的初始化序列在第
-         * ~76 条 SET 就中断（正常 171 条），随后显示灰卡「恢复设备」。
-         */
-        host_vendor_note_request();
         if (request.stop) {
             break;
         }
         if (stopping_requested()) {
             continue;
         }
+        if (!vendor_control_event_session_is_current(&request)) {
+            /* BEGIN 已使旧请求失效；旧响应不得进入新的 PC Vendor 会话。 */
+            continue;
+        }
+        (void)vendor_session_note_first_request(request.vendor_session_epoch);
+        /* G HUB 的初始化是成组 SET/GET，期间移动报文让路。 */
+        host_vendor_note_request();
         if (request.vendor_control) {
             /*
              * 设备级 Vendor 控制请求：与具体 HID 接口无关（wIndex 由主机任意指定），
@@ -1032,15 +1151,18 @@ static void hid_control_task(void *argument)
             if (vendor_handle == NULL ||
                 hid_host_device_get_params(vendor_handle, &vendor_params) != ESP_OK) {
                 ++s_vendor_control_failures;
-                (void)dual_uart1_send_vendor_control_response(
-                    request.transaction_id, DUAL_HID_REPORT_STATUS_INVALID, NULL, 0);
+                if (vendor_control_event_lock_if_current(&request)) {
+                    (void)dual_uart1_send_vendor_control_response(
+                        request.transaction_id, DUAL_HID_REPORT_STATUS_INVALID, NULL, 0);
+                    xSemaphoreGive(s_vendor_session_state_mutex);
+                }
                 continue;
             }
             uint8_t vendor_response[DUAL_VENDOR_CONTROL_MAX_DATA];
             size_t vendor_response_length = 0;
             const int64_t vendor_now_us = esp_timer_get_time();
-            const bool vendor_warmup = s_mouse_ready_us != 0 &&
-                vendor_now_us - s_mouse_ready_us < VENDOR_URB_WARMUP_US;
+            const bool vendor_warmup = vendor_session_request_is_warmup(
+                request.vendor_session_epoch, vendor_now_us);
             const bool vendor_is_in = (request.bm_request_type & 0x80U) != 0U;
             const esp_err_t vendor_result = dual_vendor_urb_control(
                 vendor_params.addr, request.bm_request_type, request.b_request,
@@ -1066,19 +1188,23 @@ static void hid_control_task(void *argument)
                      "Vendor 控制请求：bm=%02X req=%02X value=%04X index=%04X len=%u result=%s",
                      request.bm_request_type, request.b_request, request.w_value,
                      request.w_index, request.length, esp_err_to_name(vendor_result));
-            (void)dual_uart1_send_vendor_control_response(
-                request.transaction_id, vendor_status,
-                vendor_status == DUAL_HID_REPORT_STATUS_OK ? vendor_response : NULL,
-                vendor_status == DUAL_HID_REPORT_STATUS_OK ? vendor_response_length : 0U);
+            if (vendor_control_event_lock_if_current(&request)) {
+                (void)dual_uart1_send_vendor_control_response(
+                    request.transaction_id, vendor_status,
+                    vendor_status == DUAL_HID_REPORT_STATUS_OK ? vendor_response : NULL,
+                    vendor_status == DUAL_HID_REPORT_STATUS_OK ? vendor_response_length : 0U);
+                xSemaphoreGive(s_vendor_session_state_mutex);
+            }
             continue;
         }
         hid_interface_slot_t *slot = find_interface_slot(request.interface_number);
         if (slot == NULL || !slot->active || slot->handle == NULL) {
             ++s_vendor_control_failures;
-            if (request.get_report) {
+            if (request.get_report && vendor_control_event_lock_if_current(&request)) {
                 (void)dual_uart1_send_hid_get_response(
                     request.transaction_id, DUAL_HID_REPORT_STATUS_INVALID,
                     request.interface_number, request.report_id, NULL, 0);
+                xSemaphoreGive(s_vendor_session_state_mutex);
             }
             continue;
         }
@@ -1141,12 +1267,15 @@ static void hid_control_task(void *argument)
                 ++response_data;
                 --response_length;
             }
-            if (dual_uart1_send_hid_get_response(
-                    request.transaction_id, status, request.interface_number,
-                    request.report_id,
-                    status == DUAL_HID_REPORT_STATUS_OK ? response_data : NULL,
-                    status == DUAL_HID_REPORT_STATUS_OK ? response_length : 0) != ESP_OK) {
-                ++s_vendor_control_failures;
+            if (vendor_control_event_lock_if_current(&request)) {
+                if (dual_uart1_send_hid_get_response(
+                        request.transaction_id, status, request.interface_number,
+                        request.report_id,
+                        status == DUAL_HID_REPORT_STATUS_OK ? response_data : NULL,
+                        status == DUAL_HID_REPORT_STATUS_OK ? response_length : 0) != ESP_OK) {
+                    ++s_vendor_control_failures;
+                }
+                xSemaphoreGive(s_vendor_session_state_mutex);
             }
         } else {
             uint8_t mutable_data[DUAL_HID_CONTROL_MAX_DATA];
@@ -1179,8 +1308,8 @@ static void hid_control_task(void *argument)
              */
             hid_host_dev_params_t direct_params;
             const int64_t now_us = esp_timer_get_time();
-            const bool warmup = s_mouse_ready_us != 0 &&
-                now_us - s_mouse_ready_us < VENDOR_URB_WARMUP_US;
+            const bool warmup = vendor_session_request_is_warmup(
+                request.vendor_session_epoch, now_us);
             if (hid_host_device_get_params(slot->handle, &direct_params) == ESP_OK) {
                 result = dual_vendor_urb_set_report(
                     direct_params.addr, request.interface_number, request.report_type,
@@ -1266,8 +1395,7 @@ static void hid_stats_task(void *argument)
         if (stopping_requested()) {
             break;
         }
-        if (!DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG &&
-            !dual_proxy_periodic_stats_enabled()) {
+        if (!DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG) {
             continue;
         }
         uint32_t urb_submitted = 0;
@@ -1316,6 +1444,121 @@ static void hid_stats_task(void *argument)
         log_queue_metrics("host_hid_control", &s_control_queue_metrics);
     }
     finish_owned_task(TASK_EXIT_STATS);
+}
+
+void dual_hid_host_collect_stats(dual_stats_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+#define ADD_HOST_STAT(id, field) \
+    dual_stats_snapshot_add_counter(snapshot, (uint8_t)(id), \
+        (uint64_t)__atomic_load_n(&(field), __ATOMIC_RELAXED))
+    ADD_HOST_STAT(DUAL_STAT_REPORTS, s_reports);
+    ADD_HOST_STAT(DUAL_STAT_VENDOR_REPORTS, s_vendor_reports);
+    ADD_HOST_STAT(DUAL_STAT_INPUT_FAIL, s_vendor_input_failures);
+    ADD_HOST_STAT(DUAL_STAT_CONTROL, s_vendor_control_requests);
+    ADD_HOST_STAT(DUAL_STAT_CONTROL_FAIL, s_vendor_control_failures);
+    ADD_HOST_STAT(DUAL_STAT_CTRL_RETRY, s_vendor_control_retries);
+    ADD_HOST_STAT(DUAL_STAT_RECOVER, s_hid_recoveries);
+    ADD_HOST_STAT(DUAL_STAT_PORT_CYCLE, s_root_port_cycles);
+    ADD_HOST_STAT(DUAL_STAT_WHEEL, s_wheel_reports);
+    ADD_HOST_STAT(DUAL_STAT_ERRORS, s_errors);
+    dual_stats_snapshot_add_signed_counter(snapshot, DUAL_STAT_MOTION_RX_DX,
+        __atomic_load_n(&s_motion_rx_dx, __ATOMIC_RELAXED));
+    dual_stats_snapshot_add_signed_counter(snapshot, DUAL_STAT_MOTION_RX_DY,
+        __atomic_load_n(&s_motion_rx_dy, __ATOMIC_RELAXED));
+    ADD_HOST_STAT(DUAL_STAT_MOTION_RX_OK, s_motion_rx_ok);
+    ADD_HOST_STAT(DUAL_STAT_MOTION_RX_BADLEN, s_motion_rx_bad_length);
+    ADD_HOST_STAT(DUAL_STAT_MOTION_RX_BADPARSE, s_motion_rx_bad_parse);
+    ADD_HOST_STAT(DUAL_STAT_HB_OK, s_heartbeat_ok_count);
+    ADD_HOST_STAT(DUAL_STAT_HB_FAIL, s_heartbeat_fail_count);
+    ADD_HOST_STAT(DUAL_STAT_CYCLE_REQ, s_cycle_requests);
+    ADD_HOST_STAT(DUAL_STAT_CYCLE_ATTEMPT, s_root_port_cycles);
+    ADD_HOST_STAT(DUAL_STAT_CYCLE_OK, s_cycle_ok);
+    ADD_HOST_STAT(DUAL_STAT_CYCLE_FAIL, s_cycle_failed);
+    ADD_HOST_STAT(DUAL_STAT_CYCLE_OFF_FAIL, s_cycle_off_fail);
+    ADD_HOST_STAT(DUAL_STAT_CYCLE_ON_FAIL, s_cycle_on_fail);
+    ADD_HOST_STAT(DUAL_STAT_CYCLE_SUPPRESSED, s_cycle_suppressed);
+    ADD_HOST_STAT(DUAL_STAT_INPUT_RESTORED, s_cycle_input_restored);
+    ADD_HOST_STAT(DUAL_STAT_INPUT_MISSING, s_cycle_input_missing);
+    ADD_HOST_STAT(DUAL_STAT_LATE500, s_cycle_slow);
+#undef ADD_HOST_STAT
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_VMIN_GAP_US,
+        (uint64_t)__atomic_load_n(&s_vendor_arrival_min_gap_us, __ATOMIC_RELAXED));
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_DETECT_MAX_US,
+        (uint64_t)__atomic_load_n(&s_cycle_delay_max_us, __ATOMIC_ACQUIRE));
+    uint32_t urb_submitted = 0U;
+    uint32_t urb_completed = 0U;
+    uint32_t urb_timeouts = 0U;
+    uint32_t urb_aborted = 0U;
+    uint32_t urb_reopens = 0U;
+    uint32_t urb_retries = 0U;
+    int64_t urb_latency_max_us = 0;
+    uint32_t urb_over_10ms = 0U;
+    uint32_t urb_over_100ms = 0U;
+    dual_vendor_urb_stats(&urb_submitted, &urb_completed, &urb_timeouts,
+                          &urb_aborted, &urb_reopens, &urb_retries,
+                          &urb_latency_max_us, &urb_over_10ms, &urb_over_100ms);
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_URB_SUB, urb_submitted);
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_URB_OK, urb_completed);
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_URB_TO, urb_timeouts);
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_URB_RETRY, urb_retries);
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_SLOW10, urb_over_10ms);
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_SLOW100, urb_over_100ms);
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_CTRL_LAT_MAX_US,
+                                     (uint64_t)urb_latency_max_us);
+    uint64_t vendor_session_state = 0U;
+    uint32_t vendor_epoch = 0U;
+    uint32_t vendor_peer_generation = 0U;
+    int64_t first_vendor_request_us = 0;
+    if (s_vendor_session_state_mutex != NULL) {
+        xSemaphoreTake(s_vendor_session_state_mutex, portMAX_DELAY);
+        vendor_epoch = __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_RELAXED);
+        vendor_peer_generation = __atomic_load_n(
+            &s_vendor_session_peer_generation, __ATOMIC_RELAXED);
+        first_vendor_request_us = __atomic_load_n(
+            &s_vendor_session_first_request_us, __ATOMIC_RELAXED);
+        xSemaphoreGive(s_vendor_session_state_mutex);
+    }
+    if (vendor_epoch != 0U && vendor_peer_generation != 0U) {
+        vendor_session_state |= DUAL_M_VENDOR_SESSION_ACTIVE;
+    }
+    if (first_vendor_request_us != 0) {
+        vendor_session_state |= DUAL_M_VENDOR_SESSION_FIRST_REQUEST;
+    }
+    if (vendor_peer_generation != 0U &&
+        vendor_peer_generation == dual_uart1_peer_generation()) {
+        vendor_session_state |= DUAL_M_VENDOR_SESSION_PEER_CURRENT;
+    }
+    if (dual_uart1_profile_waiting_host()) {
+        vendor_session_state |= DUAL_M_VENDOR_SESSION_WAITING_HOST;
+    }
+    vendor_session_state |= (uint64_t)vendor_epoch <<
+        DUAL_M_VENDOR_SESSION_EPOCH_SHIFT;
+    dual_stats_snapshot_add_counter(snapshot,
+        DUAL_STAT_M_VENDOR_SESSION_STATE, vendor_session_state);
+    const QueueHandle_t queues[] = { s_hid_event_queue, s_report_queue, s_control_queue };
+    const queue_metrics_t *metrics[] = {
+        &s_hid_event_queue_metrics, &s_report_queue_metrics, &s_control_queue_metrics
+    };
+    const uint16_t capacities[] = {
+        HID_EVENT_QUEUE_LENGTH, HID_REPORT_QUEUE_LENGTH, HID_CONTROL_QUEUE_LENGTH
+    };
+    const uint8_t ids[] = {
+        DUAL_STATS_QUEUE_HOST_HID_EVENT, DUAL_STATS_QUEUE_HOST_HID_REPORT,
+        DUAL_STATS_QUEUE_HOST_HID_CONTROL
+    };
+    for (size_t index = 0; index < sizeof(queues) / sizeof(queues[0]); ++index) {
+        const uint16_t depth = queues[index] == NULL ? DUAL_STATS_UNKNOWN_U16 :
+            (uint16_t)uxQueueMessagesWaiting(queues[index]);
+        const uint16_t peak = (uint16_t)__atomic_load_n(&metrics[index]->peak,
+                                                        __ATOMIC_RELAXED);
+        dual_stats_snapshot_add_queue(snapshot, ids[index], capacities[index], depth, peak,
+            __atomic_load_n(&metrics[index]->received, __ATOMIC_RELAXED),
+            __atomic_load_n(&metrics[index]->rejected, __ATOMIC_RELAXED),
+            __atomic_load_n(&metrics[index]->dropped, __ATOMIC_RELAXED));
+    }
 }
 
 static void hid_interface_callback(
@@ -1370,6 +1613,7 @@ static void hid_interface_callback(
             .interface_number = slot->interface_number,
             .length = (uint8_t)length,
             .mouse_report = slot->mouse_interface,
+            .injected = injected,
             .has_report_id = slot->has_report_id,
             .mouse_report_id = slot->mouse_report_id,
             .mouse_layout = slot->mouse_layout,
@@ -1378,15 +1622,11 @@ static void hid_interface_callback(
         if (s_report_queue == NULL) {
             queue_metric_increment(&s_report_queue_metrics.rejected);
             ++s_errors;
-            if (s_release_callback != NULL) {
-                s_release_callback(false);
-            }
+            notify_release_callback(false);
         } else if (xQueueSend(s_report_queue, &queued, 0) != pdTRUE) {
             queue_metric_increment(&s_report_queue_metrics.dropped);
             ++s_errors;
-            if (s_release_callback != NULL) {
-                s_release_callback(false);
-            }
+            notify_release_callback(false);
         } else {
             queue_metric_observe_depth(&s_report_queue_metrics, s_report_queue);
         }
@@ -1443,9 +1683,7 @@ static void hid_interface_callback(
     if (event == HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR) {
         ++s_errors;
         ESP_LOGW(TAG, "标准鼠标接口传输错误：interface=%u", params.iface_num);
-        if (s_release_callback != NULL) {
-            s_release_callback(false);
-        }
+        notify_release_callback(false);
         queue_metric_increment(&s_hid_event_queue_metrics.received);
         const hid_event_t retry = {.handle = handle, .type = HID_EVENT_TRANSFER_ERROR};
         if (s_hid_event_queue == NULL ||
@@ -1475,9 +1713,7 @@ static void hid_driver_callback(
     if (xQueueSend(s_hid_event_queue, &queued, 0) != pdTRUE) {
         queue_metric_increment(&s_hid_event_queue_metrics.dropped);
         ++s_errors;
-        if (s_release_callback != NULL) {
-            s_release_callback(false);
-        }
+        notify_release_callback(false);
     } else {
         queue_metric_observe_depth(&s_hid_event_queue_metrics, s_hid_event_queue);
     }
@@ -1505,9 +1741,7 @@ static void maybe_report_mouse_gone(void)
     ESP_LOGW(TAG, "确认真拔出：防抖 %u ms 后仍无设备，上报 DEVICE_GONE",
              (unsigned)(MOUSE_GONE_DEBOUNCE_US / 1000));
     profile_reset_collector();
-    if (s_release_callback != NULL) {
-        s_release_callback(true);
-    }
+    notify_release_callback(true);
 }
 
 /* 历史重挂路径由显式开关保留；默认只报告控制异常。 */
@@ -1553,7 +1787,7 @@ static void maybe_run_hid_recovery(void)
 #endif
 }
 
-/* 每 0.5 秒主动发 GET_DESCRIPTOR(Device)；其失败只代表 EP0 未完成。 */
+/* 每约 100 ms 主动发 GET_DESCRIPTOR(Device)；其失败只代表 EP0 未完成。 */
 static void maybe_run_usb_heartbeat(void)
 {
     const int64_t now = esp_timer_get_time();
@@ -1585,8 +1819,8 @@ static void maybe_run_usb_heartbeat(void)
 
     uint8_t descriptor[18];
     size_t out_length = 0;
-    const esp_err_t result = dual_vendor_urb_control(
-        params.addr, 0x80U, 0x06U, (uint16_t)((1U << 8) | 0U), 0U, NULL,
+    const esp_err_t result = dual_vendor_urb_heartbeat_control(
+        params.addr, 0x80U, 0x06U, (uint16_t)((1U << 8) | 0U), 0U,
         (uint16_t)sizeof(descriptor), USB_HEARTBEAT_TIMEOUT_MS,
         descriptor, sizeof(descriptor), &out_length);
     const int64_t done = esp_timer_get_time();
@@ -1601,15 +1835,15 @@ static void maybe_run_usb_heartbeat(void)
     }
 }
 
-/* 独立检查任务：不等待控制线程的800ms超时。 */
-static void run_stall_port_cycle(int64_t last_input, int64_t oldest_ep0)
+/* 独立检查任务：冻结判定只看标准心跳 URB，不等待普通控制请求超时。 */
+static void run_stall_port_cycle(int64_t oldest_heartbeat)
 {
     ++s_root_port_cycles;
-    if (s_release_callback != NULL) { s_release_callback(false); }
+    notify_release_callback(false);
     ESP_LOGW(TAG, "USB诊断：根端口循环开始 attempt=%" PRIu32, s_root_port_cycles);
     /* 包含释放按钮和日志耗时，测量到实际调用关端口前；不是硬件故障时间。 */
     const int64_t observed_delay_us = usb_stall_observed_delay(
-        esp_timer_get_time(), last_input, oldest_ep0);
+        esp_timer_get_time(), oldest_heartbeat);
     if (observed_delay_us > s_cycle_delay_max_us) {
         __atomic_store_n(&s_cycle_delay_max_us, observed_delay_us, __ATOMIC_RELEASE);
     }
@@ -1622,7 +1856,6 @@ static void run_stall_port_cycle(int64_t last_input, int64_t oldest_ep0)
         return;
     }
     __atomic_store_n(&s_root_port_powered, false, __ATOMIC_RELEASE);
-    vTaskDelay(pdMS_TO_TICKS(300));
     esp_err_t on = ESP_FAIL;
     /* 设备句柄失效后仍执行有界开端口补救，不依赖mouse_present。 */
     for (unsigned attempt = 0; attempt < 3; ++attempt) {
@@ -1663,11 +1896,11 @@ static void stall_watch_task(void *argument)
                 s_cycle_input_wait_us = 0;
             }
         }
-        int64_t oldest = 0;
-        uint32_t pending = 0;
-        (void)dual_vendor_urb_pending_snapshot(&oldest, &pending);
+        int64_t oldest_heartbeat = 0;
+        (void)dual_vendor_urb_heartbeat_pending_snapshot(&oldest_heartbeat, NULL);
         const int64_t ready = __atomic_load_n(&s_mouse_ready_us, __ATOMIC_ACQUIRE);
-        const bool evidence = usb_stall_evidence_ready(now, ready, input, oldest,
+        const bool evidence = usb_stall_evidence_ready(
+            now, ready, oldest_heartbeat,
             __atomic_load_n(&s_mouse_present, __ATOMIC_ACQUIRE), stopping_requested());
         if (evidence) {
             if (!usb_stall_cooldown_ready(now, s_stall_recovery_us) ||
@@ -1676,16 +1909,16 @@ static void stall_watch_task(void *argument)
                 suppressed_latched = true;
             } else {
                 /* 获取生命周期锁后重新采样，避免依据已经恢复的旧快照切端口。 */
-                (void)dual_vendor_urb_pending_snapshot(&oldest, &pending);
+                (void)dual_vendor_urb_heartbeat_pending_snapshot(
+                    &oldest_heartbeat, NULL);
                 const int64_t check_now = esp_timer_get_time();
-                const int64_t check_input = __atomic_load_n(&s_last_report_us, __ATOMIC_ACQUIRE);
                 if (usb_stall_evidence_ready(check_now,
                         __atomic_load_n(&s_mouse_ready_us, __ATOMIC_ACQUIRE),
-                        check_input, oldest,
+                        oldest_heartbeat,
                         __atomic_load_n(&s_mouse_present, __ATOMIC_ACQUIRE), stopping_requested())) {
                     ++s_cycle_requests;
                     s_stall_recovery_us = check_now;
-                    run_stall_port_cycle(check_input, oldest);
+                    run_stall_port_cycle(oldest_heartbeat);
                 }
                 release_lifecycle_lock();
                 suppressed_latched = false;
@@ -1843,9 +2076,7 @@ static void hid_event_task(void *argument)
             }
             portEXIT_CRITICAL(&s_interface_state_mux);
             (void)hid_host_device_close(event.handle);
-            if (s_release_callback != NULL) {
-                s_release_callback(false);
-            }
+            notify_release_callback(false);
         } else {
             bool slot_started = false;
             bool started_mouse_interface = false;
@@ -2151,6 +2382,10 @@ static void delete_runtime_storage(void)
         vSemaphoreDelete(s_profile_mutex);
         s_profile_mutex = NULL;
     }
+    if (s_vendor_session_state_mutex != NULL) {
+        vSemaphoreDelete(s_vendor_session_state_mutex);
+        s_vendor_session_state_mutex = NULL;
+    }
     if (s_task_events != NULL) {
         vEventGroupDelete(s_task_events);
         s_task_events = NULL;
@@ -2162,6 +2397,9 @@ static void delete_runtime_storage(void)
     s_profile_device_addr = UINT8_MAX;
     s_report_callback = NULL;
     s_release_callback = NULL;
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+    __atomic_store_n(&s_makcu_physical_buttons, 0U, __ATOMIC_RELEASE);
+#endif
     s_profile_task = NULL;
     s_usb_host_task = NULL;
     s_descriptor_task = NULL;
@@ -2346,9 +2584,13 @@ esp_err_t dual_hid_host_start(
     s_errors = 0;
     s_logged_device_addr = UINT8_MAX;
     s_profile_mutex = xSemaphoreCreateMutex();
-    if (s_profile_mutex == NULL) {
+    s_vendor_session_state_mutex = xSemaphoreCreateMutex();
+    if (s_profile_mutex == NULL || s_vendor_session_state_mutex == NULL) {
         goto no_memory;
     }
+    __atomic_store_n(&s_vendor_session_epoch, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_peer_generation, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_first_request_us, 0, __ATOMIC_RELEASE);
     s_profile_revision = 0;
     s_profile_refresh_requested = false;
     s_vendor_reports = 0;
@@ -2524,6 +2766,57 @@ size_t dual_hid_host_copy_profile_blob(uint32_t offset, uint8_t *output, size_t 
 
 void dual_hid_host_handle_control_frame(const dual_frame_t *frame)
 {
+    if (frame != NULL && frame->type == DUAL_MESSAGE_VENDOR_SESSION_BEGIN) {
+        uint32_t p_generation = 0U;
+        uint32_t m_generation = 0U;
+        uint32_t epoch = 0U;
+        if (!dual_vendor_session_decode(frame->payload, frame->payload_length,
+                                        &p_generation, &m_generation, &epoch) ||
+            !link_vendor_session_identity_matches(
+                p_generation, m_generation, dual_uart1_peer_generation(),
+                dual_uart1_generation(), epoch) ||
+            s_vendor_session_state_mutex == NULL) {
+            ++s_vendor_control_failures;
+            return;
+        }
+
+        bool accepted = false;
+        xSemaphoreTake(s_vendor_session_state_mutex, portMAX_DELAY);
+        const uint32_t current_peer = __atomic_load_n(
+            &s_vendor_session_peer_generation, __ATOMIC_ACQUIRE);
+        const uint32_t current_epoch = __atomic_load_n(
+            &s_vendor_session_epoch, __ATOMIC_ACQUIRE);
+        const bool duplicate = current_peer == p_generation && current_epoch == epoch;
+        const bool newer = current_peer != p_generation ||
+            link_vendor_session_epoch_is_newer(epoch, current_epoch);
+        if (duplicate || newer) {
+            if (!duplicate) {
+                __atomic_store_n(&s_vendor_session_peer_generation,
+                                 p_generation, __ATOMIC_RELEASE);
+                __atomic_store_n(&s_vendor_session_epoch, epoch, __ATOMIC_RELEASE);
+                __atomic_store_n(&s_vendor_session_first_request_us, 0,
+                                 __ATOMIC_RELEASE);
+                if (s_control_queue != NULL) {
+                    queue_reset_count_dropped(s_control_queue,
+                                              &s_control_queue_metrics);
+                }
+                /* 只使旧控制帧失效；队列中的物理输入/button edge仍按到达顺序发送。 */
+                dual_uart1_cancel_vendor_control_session();
+            }
+            accepted = true;
+        }
+        xSemaphoreGive(s_vendor_session_state_mutex);
+        if (accepted) {
+            (void)dual_uart1_send_vendor_session_ack(
+                p_generation, m_generation, epoch);
+        } else {
+            ESP_LOGW(TAG, "丢弃过期Vendor会话BEGIN：peer=%" PRIu32
+                     " epoch=%" PRIu32 " current=%" PRIu32,
+                     p_generation, epoch, current_epoch);
+        }
+        return;
+    }
+
     __atomic_add_fetch(&s_control_api_users, 1U, __ATOMIC_ACQUIRE);
     const bool queue_candidate = frame != NULL &&
         (frame->type == DUAL_MESSAGE_HID_SET_REPORT ||
@@ -2595,6 +2888,11 @@ void dual_hid_host_handle_control_frame(const dual_frame_t *frame)
         __atomic_sub_fetch(&s_control_api_users, 1U, __ATOMIC_RELEASE);
         return;
     }
+    request.vendor_session_epoch = __atomic_load_n(
+        &s_vendor_session_epoch, __ATOMIC_ACQUIRE);
+    request.vendor_session_peer_generation = __atomic_load_n(
+        &s_vendor_session_peer_generation, __ATOMIC_ACQUIRE);
+    (void)vendor_session_note_first_request(request.vendor_session_epoch);
     ++s_vendor_control_requests;
     if (xQueueSend(s_control_queue, &request, 0) != pdTRUE) {
         queue_metric_increment(&s_control_queue_metrics.dropped);

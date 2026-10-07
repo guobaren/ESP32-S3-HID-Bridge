@@ -5,6 +5,7 @@ namespace HidBridge.Host.Ui;
 internal sealed class MouseCaptureSurface : Panel
 {
     private bool _forwarding;
+    private bool _legacySingleBoardMode;
 
     internal bool Forwarding
     {
@@ -17,6 +18,21 @@ internal sealed class MouseCaptureSurface : Panel
             }
 
             _forwarding = value;
+            Invalidate();
+        }
+    }
+
+    internal bool LegacySingleBoardMode
+    {
+        get => _legacySingleBoardMode;
+        set
+        {
+            if (_legacySingleBoardMode == value)
+            {
+                return;
+            }
+
+            _legacySingleBoardMode = value;
             Invalidate();
         }
     }
@@ -47,8 +63,10 @@ internal sealed class MouseCaptureSurface : Panel
         using Font detailFont = new(Font.FontFamily, 10, FontStyle.Regular);
         using Brush detailBrush = new SolidBrush(Color.FromArgb(82, 106, 139));
         string detail = _forwarding
-            ? "鼠标已锁定在此处，移动和按钮只发送到对端"
-            : "按 HOME 开启同步后，鼠标将停放在中心";
+            ? "旧版单板同步已开启，实体鼠标由 EXE 转发"
+            : _legacySingleBoardMode
+                ? "旧版单板：按 HOME 开启实体鼠标转发；关闭时输入留在本机"
+                : "双板实体鼠标由 M→P 硬件直通；EXE 不重复转发，本机光标不锁定";
         SizeF detailSize = e.Graphics.MeasureString(detail, detailFont);
         float centerX = Width / 2f;
         float centerY = Height / 2f;

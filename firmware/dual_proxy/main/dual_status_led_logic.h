@@ -26,6 +26,7 @@ typedef struct {
     bool pc_mounted;
     bool host_mouse_ready;
     bool peer_connected;
+    bool peer_usb_ready;
     bool flow_error;
     uint32_t flash_until_ms;
     uint32_t next_flash_allowed_ms;
@@ -44,6 +45,9 @@ void dual_status_led_logic_set_host_mouse_ready(
 void dual_status_led_logic_set_peer_connected(
     dual_status_led_state_t *state,
     bool connected);
+void dual_status_led_logic_set_peer_usb_ready(
+    dual_status_led_state_t *state,
+    bool ready);
 void dual_status_led_logic_set_flow_error(
     dual_status_led_state_t *state,
     bool failed);

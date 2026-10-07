@@ -35,12 +35,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 三项共同验证，不能用脚本退出码单独替代真实 HID 输入验证。
 
-按已知地址连接（地址来自同一设备会话的扫描日志，可能因随机地址变化而失效）：
+按已知地址连接（下面是示例占位地址，需替换为同一设备会话的扫描地址；地址可能因随机变化而失效）：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\tools\connect-ble-hid.ps1 `
-  -Address 'E88485461D82' `
+  -Address 'AABBCCDDEEFF' `
   -DurationSeconds 20
 ```
 
@@ -103,24 +103,16 @@ Get-Content "$env:TEMP\usb-cycle.txt"     # 每步真实结果都在这里
 - 完全不能：**插在鼠标侧板 Host 口上的物理鼠标**。那一侧是板子在当 USB 主机，PC 看不到也管不到它的端口——只能手动拔插，或给固件加测试钩子。
 - 非管理员时 `Disable-PnpDevice` 直接失败（本机实测报「常规故障」），所以必须提权；提权脚本把结果写文件，主流程读文件判定，不依赖提权子进程的标准输出。
 
-## 板载日志下载（任意一块板）
+## 双板统计快照读取
 
-每块板把日志写进自己的 SPIFFS 分区：**4×128 KB 轮转、跨复位续写**，开机第一件事就开始记录（早于身份探测），因此调试串口没插、目标电脑看不到控制台时也能事后取回完整历史。
+`dual_proxy` 固件保留 RAM 中的累计计数与实时队列快照，通过 UART0 `0x1D` 请求、`0x1E` 分页返回。快照包括恢复事务、输入处理、UART1 与各队列状态，不清零计数、不暂停输入。EXE 的“读取设备统计”入口复用已打开的两块板串口；单板 Python 工具仅用于 EXE 未占用的端口：
 
 ```powershell
-# 鼠标侧板（主机控制口）或电脑侧板（调试口，只跑日志服务）
-python .\tools\fetch_onboard_log.py --port COM3 --out artifacts\tests\onboard-COM3.log
-
-# 先清空再取；取完清空
-python .\tools\fetch_onboard_log.py --port COM14 --clear-before --out board.log
-python .\tools\fetch_onboard_log.py --port COM14 --clear-after  --out board.log
+python .\tools\read_device_stats.py --port COM14
+python .\tools\read_device_stats.py --port COM14 --baud 921600 --timeout 4
 ```
 
-命令走 `LOG_DUMP_REQUEST`（流式回帧），实测 480 KB 约 **10 秒**。打开串口时显式放开 DTR/RTS，取日志不会复位被测板。EXE 侧另有「转存板载日志」按钮，走同一套协议。
-
-容量与速率：512 KB 上限下，统计行（1 Hz）只保留每 10 秒一条，事件行（角色锁定、Profile、恢复事务、错误）全部保留，因此历史长度是小时级而不是十几分钟；`total_bytes` 达到 524288 说明已经写满并在覆盖最旧内容。
-
-协议细节见 [docs/protocol.md](../docs/protocol.md) 的「板载日志下载命令」。
+工具在打开串口前把 DTR/RTS 设为低电平，并要求收到计数器页和队列页的完整快照。未知队列指标输出为 `null`。共享帧编码、CRC 与流式解析实现位于 `tools/uart_protocol.py`；`inject_mouse_motion.py`、`vendor_control_probe.py` 等诊断脚本复用此模块。统计协议字段和实际 C 编码 fixture 见 [docs/protocol.md](../docs/protocol.md) 的「双板内存统计快照」及 `tests/fixtures/stats_snapshot_c_frames.txt`。
 
 ## 软件鼠标移动延迟测试
 `measure_udp_smoothing.py` 测量 UDP 软件输入到本机光标的延迟、5 槽平滑和连续命令重叠效果：向运行 `HidBridge.Host.exe` 的地址发送相对位移，在运行脚本的机器上每 1 ms 采样一次 `GetCursorPos`，输出 CSV、JSON 和两个无依赖 SVG。
@@ -132,7 +124,7 @@ python .\tools\fetch_onboard_log.py --port COM14 --clear-after  --out board.log
 python .\tools\measure_udp_smoothing.py --output-dir .\artifacts\tests\move-latency
 
 # EXE 在另一台机器时：--host 指向那台机器
-python .\tools\measure_udp_smoothing.py --host 192.168.3.50 --output-dir .\artifacts\tests\move-latency
+python .\tools\measure_udp_smoothing.py --host 192.0.2.10 --output-dir .\artifacts\tests\move-latency
 ```
 
 判定标准（不符合时退出码 1，通过时退出码 0）：

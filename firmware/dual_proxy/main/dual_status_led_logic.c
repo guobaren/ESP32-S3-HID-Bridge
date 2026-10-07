@@ -64,6 +64,15 @@ void dual_status_led_logic_set_peer_connected(
     }
 }
 
+void dual_status_led_logic_set_peer_usb_ready(
+    dual_status_led_state_t *state,
+    bool ready)
+{
+    if (state != NULL) {
+        state->peer_usb_ready = ready;
+    }
+}
+
 void dual_status_led_logic_set_flow_error(
     dual_status_led_state_t *state,
     bool failed)
@@ -108,7 +117,9 @@ dual_status_led_color_t dual_status_led_logic_color(
             : DUAL_STATUS_LED_COLOR_OFF;
     }
     if (state->role == DUAL_STATUS_LED_ROLE_MOUSE_HOST) {
-        return DUAL_STATUS_LED_COLOR_GREEN;
+        return state->host_mouse_ready && state->peer_usb_ready
+            ? DUAL_STATUS_LED_COLOR_GREEN
+            : DUAL_STATUS_LED_COLOR_BLUE;
     }
     if (state->role == DUAL_STATUS_LED_ROLE_PC_DEVICE) {
         return state->pc_mounted && deadline_is_after(now_ms, state->flash_until_ms)

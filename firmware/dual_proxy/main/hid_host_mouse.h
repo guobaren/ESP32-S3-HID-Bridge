@@ -4,8 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "dual_proxy_runtime_config.h"
+
 #include "bridge_protocol.h"
 #include "esp_err.h"
+#include "stats_snapshot.h"
 
 typedef void (*dual_physical_mouse_callback_t)(
     uint8_t interface_number,
@@ -23,6 +26,9 @@ esp_err_t dual_hid_host_start(
 esp_err_t dual_hid_host_stop(void);
 bool dual_hid_host_device_present(void);
 bool dual_hid_host_mouse_present(void);
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+uint8_t dual_hid_host_makcu_physical_buttons(void);
+#endif
 /* 复制当前已序列化的物理设备 Profile；没有完整快照时返回 0。 */
 size_t dual_hid_host_copy_profile_blob(uint32_t offset, uint8_t *output, size_t capacity,
                                        uint32_t *total_length);
@@ -52,5 +58,6 @@ esp_err_t dual_hid_host_vendor_selftest(
     size_t out_capacity,
     size_t *out_length);
 esp_err_t dual_hid_host_request_profile_refresh(void);
+void dual_hid_host_collect_stats(dual_stats_snapshot_t *snapshot);
 void dual_hid_host_handle_control_frame(const dual_frame_t *frame);
 void dual_hid_host_clear_control_queue(void);

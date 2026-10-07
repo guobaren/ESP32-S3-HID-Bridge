@@ -1,6 +1,6 @@
-# dual_proxy：双板单鼠标第一阶段固件
+# dual_proxy：双 ESP32-S3 透明鼠标代理
 
-这是独立于 `firmware/main` 的双 ESP32-S3 透明鼠标代理工程。两块板刷同一个镜像，启动时先通过 UART1 广播 `UNRESOLVED`，再在 USB Device 与 USB Host 间轮换探测，每个探测窗口为 3 秒：
+这是当前双板主线固件工程，与根目录 `firmware/` 中的旧单板工程相互独立。两块板使用同一镜像，通过 UART1 与 USB 状态协商 M（鼠标侧）和 P（电脑侧）角色：
 
 - USB Device 检测到电脑 attach 或完成配置（`tud_mounted()`）：本机锁定为 `PC_DEVICE`；收到完整物理 Profile 后严格克隆真实鼠标 Device/Configuration/String/Report descriptor，并代理 raw Input/Output/Feature；
 - USB Host 成功启动至少一个物理 HID 接口：本机锁定为 `MOUSE_HOST`，以 USB Host 接真实鼠标/接收器，同时从 UART0/CH340 接收电脑 A 的软件输入。此角色确认不要求先解析出标准鼠标布局，避免复合设备枚举期间按周期切断重试；实体移动只由已识别的鼠标 Report layout 转换和转发；
@@ -10,7 +10,7 @@
 
 ## 运行连接
 
-正式拓扑中，电脑 B 只连接 PC 侧板原生 USB-C；电脑 A 通过鼠标侧板 UART0/CH340 USB-C 给板卡供电并发送软件命令，鼠标侧板原生 USB Host 口连接并给真实鼠标供电。PC 侧板 UART0 只在刷写/开发时连接。两板通过 UART1 连接：
+正式拓扑中，目标电脑连接 P 板原生 USB-C；真实鼠标/接收器连接 M 板原生 USB Host 口。电脑 A 可通过 M 板 UART0/CH340 发送软件输入并为板卡供电，P 板 UART0 用于 Host 协议、统计和维护。两板通过 UART1 交叉连接：
 
 ```text
 PC板 GPIO17 (TX)  ->  鼠标板 GPIO18 (RX)
@@ -18,11 +18,31 @@ PC板 GPIO18 (RX)  <-  鼠标板 GPIO17 (TX)
 两板 GND 共地
 ```
 
-不要连接两板的 5V 或 3V3。鼠标侧板由电脑 A 的 UART USB-C 供电，板载 5V 路径再给 Host 口鼠标供电；当前硬件已实际让测试鼠标正常上电。需要区分：固件轮换的是 ESP32-S3 USB 控制器软件栈，不会切换板上的 CC 电阻或 VBUS 电源路径。现有硬件记录显示 USB-C CC1/CC2 固定下拉且没有可控的标准 Host VBUS/CC 角色电路；反复切换时的 VBUS/反灌表现仍须实测，固件构建通过不能替代该验证。
+不要连接两板的 5V 或 3V3。M 侧 UART0/CH340 USB-C 可给板卡供电，板载 5V 路径再给 Host 口鼠标供电。固件改变 USB 控制器角色不会切换开发板上的 CC 电阻或 VBUS 电源路径；现有硬件记录没有可控的标准 Host VBUS/CC 角色电路，供电与反灌行为须按实际接线验证。
 
-## 协议和功能边界
+## 新版固件：独立平滑（已部署）
 
-鼠标侧 UART0/CH340 使用现有 A5 5A、版本 2 协议：`SessionStart`、`MouseReport`、`Ping`、`ReleaseAll`、`DeviceProbe/DeviceHello`。DeviceHello 追加运行角色，主机自动探测只接受 `MOUSE_HOST`。SessionStart 后软件租约为 1500 ms；关闭串口、租约超时和 ReleaseAll 经板间高优先级消息只释放软件输入，不清除实体输入。Host 以 500 Hz 合并软件位移，PC 侧板将每条命令叠加分摊到 5 个滚动 1 ms 槽，以 1000 Hz USB HID 节拍消费；新命令不会排在旧命令尾部，位移代数和保持不变。PC 侧按动态 Report layout 将软件按钮与实体按钮合并，将移动、滚轮和水平滚动相加；实体报告仍直接转发，不进入软件平滑器。
+EXE UDP 仅在 M 使用 0/5/10/15/20 个 1 ms 槽，转发给 P 时槽数置 0。Makcu 接口仍在 M UART0，M 仅解析与转发，由 P 平滑；V4 interpolate 的 0/25/50/75/100% 对应上述槽数，其他 0..100 整数就近选择。两路参数独立，发送端同时只使用一路。
+
+新版 M UART0 默认 115200，隔离解析 A5 与 V4 完整帧，按有效命令切换输入所有者，清空待发软件输入并释放按钮。V4 所有者抑制 A5 日志；P 维护口仍 921600。2026-10-06 已刷入双板，V4 查询 46/0，五档及阈值 13 项 SET/GET 通过，结束恢复 0%。真实移动未验收；以下旧版部署记录保留。
+
+## 接口功能与历史部署记录
+
+默认构建在 M 板锁定 `MOUSE_HOST` 角色后，将 UART0/CH340 切换为 MAKCU V4 鼠标 API：ASCII 命令和 `DE AD` 二进制 `MAK_API` 鼠标命令可用，运行时默认 115200 baud。P 板保持 A5/5A v2、921600 baud。V4 与旧 V3 ASCII 选项在同一 UART0 上互斥；键盘、手柄和设备管理命令不支持。
+
+**历史部署快照（2026-10-06 的早期接口构建）：**同版默认 V4 固件已刷入两板，M=COM12、P=COM3；P/M 刷写各三段均通过哈希校验。M UART0 默认 115200，P UART0 为 A5/5A v2、921600。Host EXE 已正常关闭并保持关闭，避免占用 V4 独占的 M 串口。M UART0 不再承载 A5 控制、分页统计和实时 ESP_LOG；P 仍可提供 A5 统计。这条记录仅代表该次检查时的状态。当前固件已共存解析 A5 与 V4：M 收到有效 A5 请求可切换所有者并返回统计；切换时释放按钮、清空待发移动。V4 所有者抑制 A5 诊断流，每次只让一个客户端使用 M 串口。串口号会变化，操作前重新核对角色。
+
+V4 接口允许 `baud(4000000)`，但本次本机 Windows CH340 在配置 4,000,000 baud 时返回 Win32 `PermissionError(31)`；本机 4M 测试 `Failed`，4M 接口响应未验证，建议使用默认 115200。ASCII `version()` 返回 `km.MAKCU` 仅用于协议握手；本项目实现的是限定鼠标子集的仿兼容接口，不代表原厂设备或完整原厂行为。
+
+本实现支持相对移动、立即移动、滚轮、五个按钮查询/注入、物理按钮订阅、物理输入屏蔽、移动/滚轮屏蔽、14 个 lock 目标、插值设置、屏幕与指针查询/移动、点击、silent 移动及 baud 查询/设置。插值由固件 1 ms 调度器分片实现，8 个串行任务槽中排队，动作曲线和时序不保证与原厂完全一致；物理按钮订阅队列溢出会退订并通知客户端。`snapshot()` 仅支持二进制接口。`flick`、键盘、手柄、设备管理和其余未列命令会明确拒绝，不会伪造成功。
+
+完成刷写并确认 M 端串口未被 Host 占用后，可从仓库根目录运行只读查询工具检查接口。工具不会发送复位命令或鼠标输入，并会在打开串口前将 DTR/RTS 设为低电平：
+
+```powershell
+python .\tools\test_makcu_v4.py --port COMx
+```
+
+本次 115200 查询实测 46 PASS、0 FAIL。检查期间不能让 Host 或其他串口工具同时占用该端口。4 Mbaud 在本机 CH340 上配置失败，暂不建议使用 `--baud 4000000`。只读查询不替代目标电脑光标消费、G HUB、物理鼠标、按钮释放或长时运行验收。
 
 PC 侧正式运行时不追加 CDC、自定义 HID 或隐藏控制 Report；它只呈现物理鼠标原有的 VID/PID、字符串、接口、端点和 HID collections。无法满足 ESP32-S3 Full-Speed、端点/FIFO 或描述符安全预算的设备保持断开，不回退为 `303A:4005` 通用鼠标。
 
@@ -67,7 +87,7 @@ UART1 会拒绝相同 node ID 或相同角色的对端；**超过 `LINK_TIMEOUT_
 
 重试间隔/次数是**待实测定标的保守初值**，全部集中在 `link_recovery_logic.h`，现场按日志调整即可。事务日志只在状态转移时打印：`恢复事务[stage] role=… gen=… peer_gen=… conn=… event=… flow=… transfer=… budget_left_ms=…`，不记录高频鼠标帧。
 
-## 多型号动态 Profile（运行时观察阶段）
+## 动态 USB Profile 与严格克隆
 
 `hid_device_profile` 提供与具体鼠标无关的有界二进制模型，保存原始 Device/Configuration 描述符、UTF-8 字符串以及按物理 interface number 索引的 HID Report 描述符。Profile 最大 4096 字节；接口数、字符串和单份描述符都有独立上限。UART1 分片接收器只接受严格连续 offset，并且只有在 BEGIN/COMMIT 字段一致、总 CRC32 正确、反序列化恰好消费全部数据后才发布新 Profile。错误或中断的替换传输不会清除上一份已发布 Profile。
 
@@ -81,20 +101,17 @@ C092 的 VID/PID、字符串、67/151 字节报告描述符仅是首个测试向
 
 软件键盘注入只在物理 Profile 本来就包含可安全解析的键盘 collection 时允许；为保持厂商驱动兼容，不给纯鼠标 Profile 追加键盘接口。
 
-## 控制通道加固与自愈（2026-09-25）
+## USB Host 冻结检测与恢复
 
-针对"设备偶发不完成一笔控制传输"导致整条厂商通道瘫痪（第三方组件整设备共用**一个** `usb_transfer_t`，超时后不取消、后续提交被 `ESP_ERR_NOT_FINISHED` 拒绝）：
+- 每约 100 ms 通过专用 `dual_vendor_urb_heartbeat_control()` 提交标准 GET_DESCRIPTOR(Device) 心跳，单次软件等待 200 ms。该入口给 URB 明确标记 `heartbeat`；冻结检测只读取这些心跳 URB 的 pending 快照。普通 SET/GET_REPORT、板间转发的 Vendor 控制请求及其它 EP0 请求不参与判定。100 ms 是检查/尝试节奏，设备 mutex 和同步重试可能延长实际提交间隔；250 ms 从提交后开始计时，不保证物理冻结到恢复的总时限。
+- pending 指已成功提交且尚未收到完成回调的心跳 URB。软件等待超时后 URB 保留为 orphan，仍留在快照中，直到完成回调清除；因此判据观测的是未完成 URB 的实际生命周期，不是只看同步等待是否超时。
+- watcher 每 20 ms 检查：鼠标仍 active、未停止、接口已就绪至少 10 s，且最老心跳 URB 持续未完成达到 250 ms。判定不依赖输入报告基线，静止或尚无输入报告也不阻挡；30 s 冷却及生命周期锁后复采样仍保留。500 ms 仅用于记录慢恢复，不是触发门槛。
+- 触发后释放按钮并调用 root-port power off；off 成功后立即调用 power on，不再等待固定 300 ms；开端口最多重试 3 次、失败间隔 100 ms，不重启整板。`cycle_ok` 只表示端口 API 调用成功；循环后的 `input_restored` 仍需真实输入报告，15 s 未观察到则记 `input_missing`（静止鼠标可能没有报告）。
+- 心跳专用判据及取消 300 ms 间隔尚未在真机验证；构建或纯逻辑测试不代表设备恢复成功。
 
-- **独立 URB 直连通道**：`vendor_urb.{c,h}`，SET 路径经 `VENDOR_USE_DIRECT_URB`（`hid_host_mouse.c:27`，默认 1）切换，每个请求独立分配 URB、完成即释放；本版本无 `usb_host_transfer_abort` 且 EP0 不支持 flush，超时 URB 标记 `orphan` 由回调回收。
-- **参数**：单次等待 `VENDOR_URB_TIMEOUT_MS=800`、每请求最多 `VENDOR_URB_ATTEMPTS=2` 次尝试、连续 `VENDOR_URB_RECOVER_STREAK=3` 次请求失败升级。
-- **两级恢复**：① 重挂各活动 HID 接口（`recover`）；② 一级被在飞传输挡住时根端口断电 300 ms 重枚举（`port_cycle`）。第三级（重启 USB 主机栈）未实现。
-- **预热期豁免**：枚举后 `VENDOR_URB_WARMUP_US=10 s` 内用 2500 ms 等待且**只重试、不升级**，避免"端口断电 → 重新枚举 → 再进慢阶段"的恢复风暴。
-- **其它已生效机制**：上电/复位后克隆 USB 操作无条件延迟 1000 ms（`CLONE_USB_START_DELAY_MS`）；鼠标瞬断 800 ms 防抖（`MOUSE_GONE_DEBOUNCE_US`）；UART1 接收缓冲 16 KB 且**溢出不再判链路故障**（只 flush + 重同步 + `rx_ovf`）；三条发送队列各 128 槽；P 侧握手保护窗 2.5 s / 厂商在途 400 ms 内纯移动让路、移动配额 96/128 槽。
-- **已知缺口**：GET_REPORT 仍走组件单例 URB（`hid_host_mouse.c:852`）；P 侧任务优先级仍是 `sender > vendor_input > vendor_control`；`s_mouse_motion_yielded` 未接入日志行。
+## 运行期日志与统计
 
-## 板载滚动日志
-
-每板把控制台日志写入 SPIFFS（`partitions.csv` 的 `storage` 4 MB；4×512 KB 文件轮转＝上限 2 MB；跨复位续写；每行前缀 `[b<boot> mm:ss.mmm]`）。协议命令 `0x08/0x0A/0x0B` 走 UART0 或原生 CDC，取用入口为 `tools/fetch_onboard_log.py` 与主机 EXE 的「转存板载日志」按钮。注意 `LOG_LINE_MAX=512`：统计行加了字段后会在板载副本里被截断，读计数请走控制台。
+ESP-IDF 文本日志仍通过 UART0 实时输出，并与二进制协议帧由同一输出锁串行化；固件不再把日志钩入 SPIFFS，也不再提供历史日志下载或清空命令。恢复计数保存在 RAM 中，启动后通过 UART0 主动请求 `0x1D` 读取一次性分页快照，`0x1E` 返回计数器与队列记录。主机 EXE 的“读取设备统计”会复用已打开的 M/P 串口；独立读取入口为 `tools/read_device_stats.py`，需在 EXE 未占用的串口上运行。详细字段见 `docs/protocol.md`。
 
 ## 构建和刷写
 
@@ -103,15 +120,16 @@ C092 的 VID/PID、字符串、67/151 字节报告描述符仅是首个测试向
 ```powershell
 Set-Location .\firmware\dual_proxy
 . ..\..\scripts\Enter-EspIdf.ps1
-idf.py set-target esp32s3
 idf.py build
 ```
+
+只有全新且尚未设置 target 的构建目录，才首次运行 `idf.py set-target esp32s3`。已有 `sdkconfig` 时直接 build，不要重复设置 target 或清理配置。
 
 刷写使用本工程 `build/flasher_args.json`（**不是**早期单板 `firmware/build/flasher_args.json`）。注意事项：
 
 - **两板必须刷同一版本固件**：`PROFILE_ACK` 长度（17 bytes）本身就是新旧判别条件，混刷会出现长度不匹配并判失败。
 - 分区表含 `storage`（SPIFFS 4 MB）：改动分区表必须**整片重刷**（bootloader + partition + app 三段）。
-- 刷写**不会清除 SPIFFS**，板载日志跨刷写保留；需要清空请用 `0x0A` 或 `tools/fetch_onboard_log.py --clear-*`。
+- 当前分区表仍包含 `storage`（SPIFFS 4 MB），本改动保留分区和已有数据但双板固件不再读写板载日志；恢复计数仅在 RAM 中，板卡重启后重新累计。
 
 ## 纯逻辑回归
 
@@ -133,4 +151,4 @@ python .\tools\test_dual_proxy_serial.py --port COMx --cursor
 
 脚本默认先发送 `DeviceProbe`，只有收到签名 `HIDBRDG2`、nonce 匹配且角色为 `MOUSE_HOST` 的 `DeviceHello` 才继续；随后发送 `SessionStart`、小幅 `+4`、等待、等量 `-4`、`Ping`，不发送点击、键盘或 `SendInput`。UART0 会与 ESP_LOG 混流，解析器会跳过非协议字节；同一 COM 不能同时被主机 EXE 或其他工具打开。
 
-真实鼠标报告、单一 HID 设备、实体移动与软件移动叠加仍必须在实际刷写和受控输入下验收；本工程构建通过不等于硬件通过。
+官方 MAKCU SDK 固定版本的 `Mouse.move(+20,0)` 与 `Mouse.move(-20,0)` 已经由 M 注入；P 诊断记录到匹配的 USB report submit/complete，提交到完成分别为 645 μs、484 μs。这只证明本次板端报告路径完成，不证明接收电脑的应用或光标已消费。真实鼠标输入、G HUB、按钮释放、实体与软件输入叠加和长时稳定性仍需另行验收。

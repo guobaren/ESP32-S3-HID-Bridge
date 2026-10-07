@@ -116,6 +116,7 @@ static volatile uint32_t s_vendor_motion_skipped;
 #define VENDOR_INPUT_TASK_STACK 3072
 #define VENDOR_CONTROL_TASK_STACK 3072
 #define VENDOR_GET_REPORT_TIMEOUT_MS 250
+#define VENDOR_SESSION_BARRIER_WAIT_MS 180U
 #define USB_RECONFIGURE_EVENT_GUARD_MS 500U
 
 static const char *TAG = "dual_pc_hid";
@@ -287,8 +288,11 @@ static volatile bool s_sender_stop_requested;
 static volatile bool s_reconfigure_enabled;
 static volatile bool s_reconfigure_disconnect_requested;
 static volatile bool s_reconfigure_profile_pending;
+static volatile bool s_reconfigure_waiting_host;
+static volatile bool s_reconfigure_waiting_final_ack;
 static uint32_t s_reconfigure_epoch = 1U;
 static uint32_t s_reconfigure_profile_epoch;
+static uint32_t s_reconfigure_installed_operation_epoch;
 static uint32_t s_reconfigure_disconnect_peer_generation;
 static uint32_t s_reconfigure_disconnect_event_id;
 static uint8_t s_reconfigure_disconnect_ack_type;
@@ -437,6 +441,7 @@ typedef struct {
 
 typedef struct {
     uint32_t session_generation;
+    int64_t deadline_us;
     bool get_report;
     uint16_t transaction_id;
     uint8_t interface_number;
@@ -484,8 +489,16 @@ static volatile uint32_t s_vendor_get_requests;
 static volatile uint32_t s_vendor_get_timeouts;
 static volatile uint32_t s_vendor_get_mismatches;
 static volatile bool s_usb_reconfigure_in_progress;
+static volatile bool s_profile_final_ack_failed;
+static volatile uint8_t s_profile_last_result;
 static volatile int64_t s_usb_reconfigure_guard_until_us;
 static uint32_t s_vendor_session_generation = 1U;
+static volatile uint32_t s_vendor_session_epoch;
+static volatile uint32_t s_vendor_session_p_generation;
+static volatile uint32_t s_vendor_session_m_generation;
+static volatile uint32_t s_vendor_session_begin_attempts;
+static volatile int64_t s_vendor_session_begin_last_us;
+static volatile bool s_vendor_peer_session_ready;
 
 _Static_assert(CONFIG_FREERTOS_HZ == DUAL_PROXY_REQUIRED_FREERTOS_HZ,
                "dual_proxy要求CONFIG_FREERTOS_HZ=1000");
@@ -496,6 +509,8 @@ static uint32_t vendor_session_generation(void)
 {
     return __atomic_load_n(&s_vendor_session_generation, __ATOMIC_ACQUIRE);
 }
+
+static void clear_pending_get(bool wake_waiter, uint8_t status);
 
 static uint32_t advance_vendor_session_generation(void)
 {
@@ -536,6 +551,197 @@ static bool vendor_session_lock_if_current(uint32_t item_generation)
     return true;
 }
 
+static void vendor_session_state_take(void)
+{
+    if (s_vendor_session_mutex != NULL) {
+        xSemaphoreTake(s_vendor_session_mutex, portMAX_DELAY);
+    }
+}
+
+static void vendor_session_state_give(void)
+{
+    if (s_vendor_session_mutex != NULL) {
+        xSemaphoreGive(s_vendor_session_mutex);
+    }
+}
+
+static void update_pc_ready_led(void)
+{
+    const bool ready = s_pc_usb_attached && s_installed && s_clone_active &&
+        tud_mounted() && !s_usb_reconfigure_in_progress &&
+        !s_reconfigure_disconnect_requested && !s_profile_final_ack_failed;
+    dual_status_led_set_pc_mounted(ready);
+}
+
+static bool vendor_control_entry_ready(void)
+{
+    bool reconfiguring = s_usb_reconfigure_in_progress;
+    bool waiting_host = s_reconfigure_waiting_host;
+    bool waiting_final_ack = s_reconfigure_waiting_final_ack;
+    bool disconnect_requested = s_reconfigure_disconnect_requested;
+    uint32_t operation_epoch = 0U;
+    uint32_t installed_operation_epoch = 0U;
+    if (s_reconfigure_mutex != NULL) {
+        xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+        reconfiguring = s_usb_reconfigure_in_progress;
+        waiting_host = s_reconfigure_waiting_host;
+        waiting_final_ack = s_reconfigure_waiting_final_ack;
+        disconnect_requested = s_reconfigure_disconnect_requested;
+        operation_epoch = s_reconfigure_epoch;
+        installed_operation_epoch = s_reconfigure_installed_operation_epoch;
+        xSemaphoreGive(s_reconfigure_mutex);
+    }
+    return hid_vendor_session_control_entry_ready(
+        s_installed, s_clone_active, tud_mounted(), reconfiguring,
+        waiting_host, waiting_final_ack, disconnect_requested,
+        operation_epoch, installed_operation_epoch);
+}
+
+static bool vendor_session_barrier_ready(void)
+{
+    vendor_session_state_take();
+    const uint32_t p_generation = dual_uart1_generation();
+    const uint32_t m_generation = dual_uart1_peer_generation();
+    const uint32_t epoch = __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_ACQUIRE);
+    const bool ready = __atomic_load_n(&s_vendor_peer_session_ready, __ATOMIC_ACQUIRE) &&
+        hid_vendor_session_ack_matches(
+            p_generation,
+            m_generation,
+            epoch,
+            __atomic_load_n(&s_vendor_session_p_generation, __ATOMIC_ACQUIRE),
+            __atomic_load_n(&s_vendor_session_m_generation, __ATOMIC_ACQUIRE),
+            epoch);
+    vendor_session_state_give();
+    return ready;
+}
+
+static void vendor_session_retry_begin_if_due(void)
+{
+    if (!__atomic_load_n(&s_pc_usb_attached, __ATOMIC_ACQUIRE) ||
+        !vendor_control_entry_ready()) {
+        return;
+    }
+    uint32_t p_generation = dual_uart1_generation();
+    uint32_t m_generation = dual_uart1_peer_generation();
+    const uint32_t target_p_generation = __atomic_load_n(
+        &s_vendor_session_p_generation, __ATOMIC_ACQUIRE);
+    const uint32_t target_m_generation = __atomic_load_n(
+        &s_vendor_session_m_generation, __ATOMIC_ACQUIRE);
+    if ((target_p_generation != 0U || target_m_generation != 0U) &&
+        (target_p_generation != p_generation || target_m_generation != m_generation)) {
+        /* UART peer重建后，先使旧请求/GET关联失效，再对新generation重新握手。 */
+        dual_pc_hid_vendor_link_fault();
+    }
+    bool send_begin = false;
+    uint32_t attempts = 0U;
+    uint32_t epoch = 0U;
+    int64_t now_us = 0;
+    vendor_session_state_take();
+    p_generation = dual_uart1_generation();
+    m_generation = dual_uart1_peer_generation();
+    epoch = __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_ACQUIRE);
+    const uint32_t locked_target_p = __atomic_load_n(
+        &s_vendor_session_p_generation, __ATOMIC_RELAXED);
+    const uint32_t locked_target_m = __atomic_load_n(
+        &s_vendor_session_m_generation, __ATOMIC_RELAXED);
+    if (p_generation == 0U || m_generation == 0U || epoch == 0U) {
+        vendor_session_state_give();
+        return;
+    }
+    if ((locked_target_p != 0U || locked_target_m != 0U) &&
+        (locked_target_p != p_generation || locked_target_m != m_generation)) {
+        vendor_session_state_give();
+        dual_pc_hid_vendor_link_fault();
+        return;
+    }
+    now_us = esp_timer_get_time();
+    if (locked_target_p != p_generation || locked_target_m != m_generation) {
+        __atomic_store_n(&s_vendor_session_p_generation, p_generation, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_vendor_session_m_generation, m_generation, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_vendor_session_begin_attempts, 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_vendor_session_begin_last_us, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_vendor_peer_session_ready, false, __ATOMIC_RELEASE);
+    }
+    attempts = __atomic_load_n(&s_vendor_session_begin_attempts, __ATOMIC_RELAXED);
+    const int64_t last_us = __atomic_load_n(&s_vendor_session_begin_last_us,
+                                            __ATOMIC_RELAXED);
+    const bool ready = __atomic_load_n(&s_vendor_peer_session_ready, __ATOMIC_RELAXED);
+    if (hid_vendor_session_begin_retry_due(true, ready, attempts,
+            HID_VENDOR_SESSION_BEGIN_MAX_ATTEMPTS, last_us, now_us)) {
+        __atomic_store_n(&s_vendor_session_begin_attempts, attempts + 1U, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_vendor_session_begin_last_us, now_us, __ATOMIC_RELEASE);
+        send_begin = true;
+    }
+    vendor_session_state_give();
+
+    if (send_begin) {
+        const esp_err_t result = dual_uart1_send_vendor_session_begin(
+            p_generation, m_generation, epoch);
+        ESP_LOGI(TAG, "发送PC Vendor会话BEGIN：epoch=%" PRIu32 " attempt=%" PRIu32
+                      " result=%s", epoch, attempts + 1U, esp_err_to_name(result));
+    }
+}
+
+static bool vendor_session_wait_ready(uint32_t item_generation, uint32_t timeout_ms)
+{
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (vendor_session_item_is_current(item_generation)) {
+        vendor_session_retry_begin_if_due();
+        if (vendor_session_barrier_ready()) {
+            return true;
+        }
+        if ((int32_t)(deadline - xTaskGetTickCount()) <= 0) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return false;
+}
+
+static uint32_t vendor_control_barrier_budget_ms(const vendor_control_item_t *item)
+{
+    if (item == NULL || item->deadline_us == 0) {
+        return VENDOR_SESSION_BARRIER_WAIT_MS;
+    }
+    const int64_t remaining_us = item->deadline_us - esp_timer_get_time();
+    if (remaining_us <= 0) {
+        return 0U;
+    }
+    /* HID GET 保留约220ms给既有M端100ms控制尝试和UART往返。 */
+    const int64_t reserve_us = item->get_report ? 220000LL : 0LL;
+    if (remaining_us <= reserve_us) {
+        return 0U;
+    }
+    int64_t budget_ms = (remaining_us - reserve_us) / 1000LL;
+    if (budget_ms > (int64_t)VENDOR_SESSION_BARRIER_WAIT_MS) {
+        budget_ms = VENDOR_SESSION_BARRIER_WAIT_MS;
+    }
+    return (uint32_t)budget_ms;
+}
+
+static void vendor_session_attached(void)
+{
+    /* 新attach只失效旧控制事务，保留独立物理输入/button队列。 */
+    vendor_session_state_take();
+    (void)advance_vendor_session_generation();
+    dual_uart1_cancel_vendor_control_session();
+    if (s_vendor_control_queue != NULL) {
+        queue_reset_count_dropped(s_vendor_control_queue,
+                                  &s_vendor_control_queue_metrics);
+    }
+    clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+    const uint32_t next_epoch = hid_vendor_session_advance(
+        __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_RELAXED));
+    __atomic_store_n(&s_vendor_session_epoch, next_epoch, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_p_generation, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_m_generation, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_begin_attempts, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_begin_last_us, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_peer_session_ready, false, __ATOMIC_RELEASE);
+    vendor_session_state_give();
+    vendor_session_retry_begin_if_due();
+}
+
 static uint32_t next_reconfigure_epoch_locked(void)
 {
     ++s_reconfigure_epoch;
@@ -555,9 +761,33 @@ static bool reconfigure_epoch_is_current(uint32_t epoch)
     return current;
 }
 
+static bool profile_reconfigure_session_is_current(
+    uint32_t operation_epoch, uint32_t transfer_id, uint32_t peer_generation)
+{
+    return reconfigure_epoch_is_current(operation_epoch) &&
+        (transfer_id == 0U ||
+         (peer_generation != 0U &&
+          dual_uart1_peer_generation() == peer_generation));
+}
+
 static void clear_clone_session_state(void)
 {
     s_clone_active = false;
+    if (s_reconfigure_mutex != NULL) {
+        xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+        s_reconfigure_waiting_host = false;
+        s_reconfigure_waiting_final_ack = false;
+        s_reconfigure_installed_operation_epoch = 0U;
+        s_profile_final_ack_failed = false;
+        s_profile_last_result = DUAL_P_USB_RESULT_CANCELED;
+        xSemaphoreGive(s_reconfigure_mutex);
+    } else {
+        s_reconfigure_waiting_host = false;
+        s_reconfigure_waiting_final_ack = false;
+        s_reconfigure_installed_operation_epoch = 0U;
+        s_profile_final_ack_failed = false;
+        s_profile_last_result = DUAL_P_USB_RESULT_CANCELED;
+    }
     s_clone_mouse_template_valid = false;
     s_clone_mouse_template_length = 0;
     memset(s_clone_mouse_template, 0, sizeof(s_clone_mouse_template));
@@ -794,6 +1024,29 @@ static void clear_pending_get(bool wake_waiter, uint8_t status)
     xSemaphoreGive(s_get_state_mutex);
 }
 
+static bool clear_pending_get_for_item(
+    const vendor_control_item_t *item, bool wake_waiter, uint8_t status)
+{
+    if (item == NULL || s_get_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
+    const bool matches = s_get_inflight && hid_vendor_session_pending_matches(
+        s_get_transaction_id, s_get_session_generation,
+        item->transaction_id, item->session_generation);
+    if (matches) {
+        s_get_status = status;
+        s_get_response_length = 0U;
+        s_get_response_ready = wake_waiter;
+        if (wake_waiter && s_get_response_sem != NULL) {
+            xSemaphoreGive(s_get_response_sem);
+        }
+        s_get_inflight = false;
+    }
+    xSemaphoreGive(s_get_state_mutex);
+    return matches;
+}
+
 static void vendor_input_task(void *argument)
 {
     (void)argument;
@@ -929,11 +1182,39 @@ static void vendor_control_task(void *argument)
     (void)argument;
     vendor_control_item_t item;
     while (true) {
-        if (xQueueReceive(s_vendor_control_queue, &item, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_vendor_control_queue, &item, pdMS_TO_TICKS(20)) != pdTRUE) {
+            vendor_session_retry_begin_if_due();
+            continue;
+        }
+        if (!vendor_session_item_is_current(item.session_generation)) {
+            ++s_vendor_set_dropped;
+            continue;
+        }
+        const uint32_t barrier_budget_ms = vendor_control_barrier_budget_ms(&item);
+        if ((item.deadline_us != 0 && esp_timer_get_time() >= item.deadline_us) ||
+            !vendor_session_wait_ready(item.session_generation, barrier_budget_ms) ||
+            (item.deadline_us != 0 && esp_timer_get_time() >= item.deadline_us)) {
+            ++s_vendor_set_dropped;
+            if (vendor_session_item_is_current(item.session_generation)) {
+                if (item.get_report || item.is_vendor_control) {
+                    (void)clear_pending_get_for_item(
+                        &item, true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+                }
+                ESP_LOGW(TAG, "Vendor会话BEGIN未确认，丢弃控制请求：epoch=%" PRIu32,
+                         __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_ACQUIRE));
+            }
             continue;
         }
         if (!vendor_session_lock_if_current(item.session_generation)) {
             ++s_vendor_set_dropped;
+            continue;
+        }
+        if (!vendor_control_entry_ready() ||
+            (item.deadline_us != 0 && esp_timer_get_time() >= item.deadline_us)) {
+            xSemaphoreGive(s_vendor_session_mutex);
+            ++s_vendor_set_dropped;
+            (void)clear_pending_get_for_item(
+                &item, true, DUAL_HID_REPORT_STATUS_TIMEOUT);
             continue;
         }
         if (item.is_vendor_control) {
@@ -947,18 +1228,19 @@ static void vendor_control_task(void *argument)
                     item.w_value, item.w_index, item.w_length, item.data,
                     item.length) != ESP_OK) {
                 ++s_vendor_set_dropped;
-                clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+                (void)clear_pending_get_for_item(
+                    &item, true, DUAL_HID_REPORT_STATUS_TIMEOUT);
             }
             xSemaphoreGive(s_vendor_session_mutex);
             continue;
         }
         uint8_t instance = 0;
-        if (s_usb_reconfigure_in_progress || !s_clone_active ||
-            !s_installed || !tud_mounted() ||
+        if (!s_clone_active || !s_installed || !tud_mounted() ||
             !clone_instance_for_interface(item.interface_number, &instance)) {
             xSemaphoreGive(s_vendor_session_mutex);
             if (item.get_report) {
-                clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+                (void)clear_pending_get_for_item(
+                    &item, true, DUAL_HID_REPORT_STATUS_TIMEOUT);
             }
             ++s_vendor_set_dropped;
             continue;
@@ -968,7 +1250,8 @@ static void vendor_control_task(void *argument)
                     item.transaction_id, item.interface_number, item.report_id,
                     item.report_type, item.requested_length) != ESP_OK) {
                 ++s_vendor_get_timeouts;
-                clear_pending_get(true, DUAL_HID_REPORT_STATUS_TIMEOUT);
+                (void)clear_pending_get_for_item(
+                    &item, true, DUAL_HID_REPORT_STATUS_TIMEOUT);
             }
         } else if (dual_uart1_send_hid_set_report(
                        item.transaction_id, item.interface_number, item.report_id,
@@ -1199,6 +1482,8 @@ bool tud_vendor_control_xfer_cb(
     }
     const uint16_t transaction_id = next_vendor_transaction_id();
     const uint32_t request_generation = vendor_session_generation();
+    const int64_t deadline_us = esp_timer_get_time() +
+        (int64_t)VENDOR_GET_REPORT_TIMEOUT_MS * 1000LL;
     xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
     s_get_inflight = true;
     s_get_response_ready = false;
@@ -1212,6 +1497,7 @@ bool tud_vendor_control_xfer_cb(
 
     vendor_control_item_t item = {
         .session_generation = request_generation,
+        .deadline_us = deadline_us,
         .get_report = false,
         .transaction_id = transaction_id,
         .is_vendor_control = true,
@@ -1288,7 +1574,7 @@ uint16_t tud_hid_get_report_cb(
         (uint8_t)report_type > DUAL_HID_REPORT_TYPE_FEATURE ||
         s_vendor_control_queue == NULL || s_get_gate == NULL ||
         s_get_state_mutex == NULL ||
-         s_usb_reconfigure_in_progress ||
+        !vendor_control_entry_ready() ||
          !clone_interface_for_instance(instance, &interface_number)) {
         queue_metric_increment(&s_vendor_control_queue_metrics.rejected);
         diag_capture_get_result(instance, UINT8_MAX, report_id,
@@ -1314,6 +1600,8 @@ uint16_t tud_hid_get_report_cb(
     }
     const uint16_t transaction_id = next_vendor_transaction_id();
     const uint32_t request_session_generation = vendor_session_generation();
+    const int64_t deadline_us = esp_timer_get_time() +
+        (int64_t)VENDOR_GET_REPORT_TIMEOUT_MS * 1000LL;
     xSemaphoreTake(s_get_state_mutex, portMAX_DELAY);
     s_get_inflight = true;
     s_get_response_ready = false;
@@ -1327,6 +1615,7 @@ uint16_t tud_hid_get_report_cb(
 
     const vendor_control_item_t item = {
         .session_generation = request_session_generation,
+        .deadline_us = deadline_us,
         .get_report = true,
         .transaction_id = transaction_id,
         .interface_number = interface_number,
@@ -1395,7 +1684,7 @@ void tud_hid_set_report_cb(
     queue_metric_increment(&s_vendor_control_queue_metrics.received);
     uint8_t interface_number = UINT8_MAX;
     if (s_vendor_control_queue == NULL ||
-        s_usb_reconfigure_in_progress ||
+        !vendor_control_entry_ready() ||
         !clone_interface_for_instance(instance, &interface_number) ||
         buffer_size > DUAL_HID_CONTROL_MAX_DATA ||
         (buffer == NULL && buffer_size != 0U) ||
@@ -1445,6 +1734,37 @@ void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame)
     if (frame == NULL) {
         return;
     }
+    if (frame->type == DUAL_MESSAGE_VENDOR_SESSION_ACK) {
+        uint32_t p_generation = 0U;
+        uint32_t m_generation = 0U;
+        uint32_t epoch = 0U;
+        if (!dual_vendor_session_decode(frame->payload, frame->payload_length,
+                                        &p_generation, &m_generation, &epoch)) {
+            return;
+        }
+        vendor_session_state_take();
+        const bool matches = __atomic_load_n(&s_pc_usb_attached, __ATOMIC_ACQUIRE) &&
+            hid_vendor_session_ack_matches(
+                dual_uart1_generation(), dual_uart1_peer_generation(),
+                __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_ACQUIRE),
+                p_generation, m_generation, epoch) &&
+            hid_vendor_session_ack_matches(
+                __atomic_load_n(&s_vendor_session_p_generation, __ATOMIC_ACQUIRE),
+                __atomic_load_n(&s_vendor_session_m_generation, __ATOMIC_ACQUIRE),
+                __atomic_load_n(&s_vendor_session_epoch, __ATOMIC_ACQUIRE),
+                p_generation, m_generation, epoch);
+        if (matches) {
+            __atomic_store_n(&s_vendor_peer_session_ready, true, __ATOMIC_RELEASE);
+        } else {
+            ++s_vendor_get_mismatches;
+        }
+        vendor_session_state_give();
+        if (matches) {
+            ESP_LOGI(TAG, "PC Vendor会话屏障已确认：epoch=%" PRIu32,
+                     epoch);
+        }
+        return;
+    }
     if (frame->type == DUAL_MESSAGE_RAW_HID_INPUT) {
         const uint8_t *data = NULL;
         size_t data_length = 0;
@@ -1458,8 +1778,7 @@ void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame)
             ++s_vendor_input_dropped;
             return;
         }
-        if (s_usb_reconfigure_in_progress || !s_clone_active ||
-            !s_installed || !tud_mounted()) {
+        if (!vendor_control_entry_ready()) {
             queue_metric_increment(&s_vendor_input_queue_metrics.received);
             queue_metric_increment(&s_vendor_input_queue_metrics.rejected);
             ++s_vendor_input_dropped;
@@ -1612,6 +1931,11 @@ void dual_pc_hid_vendor_link_fault(void)
         xSemaphoreTake(s_vendor_session_mutex, portMAX_DELAY);
     }
     (void)advance_vendor_session_generation();
+    __atomic_store_n(&s_vendor_peer_session_ready, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_p_generation, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_m_generation, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_begin_attempts, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vendor_session_begin_last_us, 0, __ATOMIC_RELEASE);
     dual_uart1_cancel_vendor_hid_session();
     if (s_vendor_input_queue != NULL) {
         queue_reset_count_dropped(s_vendor_input_queue,
@@ -1639,7 +1963,8 @@ static void usb_event_callback(tinyusb_event_t *event, void *argument)
     if (event->id == TINYUSB_EVENT_ATTACHED) {
         s_pc_usb_attached = true;
         ESP_LOGI(TAG, "PC侧USB HID已连接");
-        dual_status_led_set_pc_mounted(true);
+        update_pc_ready_led();
+        vendor_session_attached();
     } else if (event->id == TINYUSB_EVENT_DETACHED) {
         const int64_t now_us = esp_timer_get_time();
         if (s_usb_reconfigure_in_progress ||
@@ -1649,7 +1974,7 @@ static void usb_event_callback(tinyusb_event_t *event, void *argument)
         }
         s_pc_usb_attached = false;
         ESP_LOGW(TAG, "PC侧USB HID已断开，清理所有输入");
-        dual_status_led_set_pc_mounted(false);
+        update_pc_ready_led();
         dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
         dual_usb_cdc_control_on_detached();
         if (!s_usb_reconfigure_in_progress) {
@@ -1706,8 +2031,7 @@ static int64_t add_stat_axis(int64_t first, int64_t second)
 
 static void log_hid_statistics_if_due(void)
 {
-    if (!DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG &&
-        !dual_proxy_periodic_stats_enabled()) {
+    if (!DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG) {
         return;
     }
     const int64_t now_us = esp_timer_get_time();
@@ -1799,6 +2123,75 @@ static void log_hid_statistics_if_due(void)
         s_last_stats_submitted = s_hid_submitted;
         s_last_stats_completions = s_hid_completions;
         s_last_stats_us = now_us;
+    }
+}
+
+void dual_pc_hid_collect_stats(dual_stats_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+#define ADD_PC_STAT(id, field) \
+    dual_stats_snapshot_add_counter(snapshot, (uint8_t)(id), \
+        (uint64_t)__atomic_load_n(&(field), __ATOMIC_RELAXED))
+    ADD_PC_STAT(DUAL_STAT_NOT_MOUNTED, s_hid_not_mounted);
+    ADD_PC_STAT(DUAL_STAT_NOT_READY, s_hid_not_ready);
+    ADD_PC_STAT(DUAL_STAT_ATTEMPT, s_hid_attempts);
+    ADD_PC_STAT(DUAL_STAT_SUBMITTED, s_hid_submitted);
+    ADD_PC_STAT(DUAL_STAT_FAILED, s_hid_submit_failures);
+    ADD_PC_STAT(DUAL_STAT_COMPLETE, s_hid_completions);
+    ADD_PC_STAT(DUAL_STAT_TRANSFER_FAIL, s_hid_transfer_failures);
+    ADD_PC_STAT(DUAL_STAT_PHYSICAL_RX, s_physical_received);
+    ADD_PC_STAT(DUAL_STAT_VENDOR_RX, s_vendor_input_received);
+    ADD_PC_STAT(DUAL_STAT_VENDOR_SUBMITTED, s_vendor_input_submitted);
+    ADD_PC_STAT(DUAL_STAT_VENDOR_DROPPED, s_vendor_input_dropped);
+    ADD_PC_STAT(DUAL_STAT_GET_TIMEOUTS, s_vendor_get_timeouts);
+#undef ADD_PC_STAT
+    uint64_t usb_state = 0U;
+    uint32_t operation_epoch = 0U;
+    if (s_reconfigure_mutex != NULL) {
+        xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+        if (s_pc_usb_attached) usb_state |= DUAL_P_USB_STATE_ATTACHED;
+        if (s_installed) usb_state |= DUAL_P_USB_STATE_INSTALLED;
+        if (s_clone_active) usb_state |= DUAL_P_USB_STATE_CLONE_ACTIVE;
+        if (tud_mounted()) usb_state |= DUAL_P_USB_STATE_MOUNTED;
+        if (s_usb_reconfigure_in_progress) usb_state |= DUAL_P_USB_STATE_RECONFIGURING;
+        if (s_reconfigure_waiting_host) usb_state |= DUAL_P_USB_STATE_WAITING_HOST;
+        if (s_profile_final_ack_failed) usb_state |= DUAL_P_USB_STATE_FINAL_ACK_FAILED;
+        if (s_reconfigure_disconnect_requested) usb_state |= DUAL_P_USB_STATE_DISCONNECT_PENDING;
+        if (s_reconfigure_waiting_final_ack) usb_state |= DUAL_P_USB_STATE_FINAL_ACK_PENDING;
+        operation_epoch = s_reconfigure_epoch;
+        const uint8_t result = s_profile_last_result;
+        usb_state |= ((uint64_t)result << DUAL_P_USB_STATE_RESULT_SHIFT) &
+            DUAL_P_USB_STATE_RESULT_MASK;
+        xSemaphoreGive(s_reconfigure_mutex);
+    }
+    usb_state |= (uint64_t)operation_epoch << DUAL_P_USB_STATE_EPOCH_SHIFT;
+    dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_P_USB_STATE, usb_state);
+    const QueueHandle_t queues[] = {
+        s_vendor_input_queue, s_motion_input_queue, s_vendor_control_queue
+    };
+    const queue_metrics_t *metrics[] = {
+        &s_vendor_input_queue_metrics, &s_motion_input_queue_metrics,
+        &s_vendor_control_queue_metrics
+    };
+    const uint16_t capacities[] = {
+        VENDOR_INPUT_QUEUE_LENGTH, MOTION_INPUT_QUEUE_LENGTH,
+        VENDOR_CONTROL_QUEUE_LENGTH
+    };
+    const uint8_t ids[] = {
+        DUAL_STATS_QUEUE_PC_VENDOR_INPUT, DUAL_STATS_QUEUE_PC_MOTION_INPUT,
+        DUAL_STATS_QUEUE_PC_VENDOR_CONTROL
+    };
+    for (size_t index = 0; index < sizeof(queues) / sizeof(queues[0]); ++index) {
+        const uint16_t depth = queues[index] == NULL ? DUAL_STATS_UNKNOWN_U16 :
+            (uint16_t)uxQueueMessagesWaiting(queues[index]);
+        const uint16_t peak = (uint16_t)__atomic_load_n(&metrics[index]->peak,
+                                                        __ATOMIC_RELAXED);
+        dual_stats_snapshot_add_queue(snapshot, ids[index], capacities[index], depth, peak,
+            __atomic_load_n(&metrics[index]->received, __ATOMIC_RELAXED),
+            __atomic_load_n(&metrics[index]->rejected, __ATOMIC_RELAXED),
+            __atomic_load_n(&metrics[index]->dropped, __ATOMIC_RELAXED));
     }
 }
 
@@ -2016,7 +2409,7 @@ static esp_err_t stop_installed_usb(void)
     if (!s_installed) {
         clear_clone_session_state();
         s_pc_usb_attached = false;
-        dual_status_led_set_pc_mounted(false);
+        update_pc_ready_led();
         return ESP_OK;
     }
     esp_err_t result = dual_usb_cdc_control_stop();
@@ -2043,8 +2436,8 @@ static esp_err_t stop_installed_usb(void)
     if (uninstall == ESP_OK) {
         s_installed = false;
         s_pc_usb_attached = false;
-        dual_status_led_set_pc_mounted(false);
         clear_clone_session_state();
+        update_pc_ready_led();
         s_usb_reconfigure_guard_until_us = esp_timer_get_time() +
             (int64_t)USB_RECONFIGURE_EVENT_GUARD_MS * 1000LL;
     } else {
@@ -2080,6 +2473,23 @@ static esp_err_t install_profile_attempt(uint32_t operation_epoch, uint8_t attem
         }
     }
     if (result == ESP_OK && reconfigure_epoch_is_current(operation_epoch)) {
+        xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+        const bool current = dual_profile_operation_is_current(
+            operation_epoch, s_reconfigure_epoch,
+            s_reconfigure_disconnect_requested);
+        if (current) {
+            /* TinyUSB可在worker下次轮询前收到首个GET；预先绑定epoch，
+             * 但control gate仍要求clone已安装且tud_mounted为真。 */
+            s_reconfigure_installed_operation_epoch = operation_epoch;
+            s_reconfigure_waiting_host = true;
+            s_reconfigure_waiting_final_ack = false;
+            s_profile_final_ack_failed = false;
+            s_profile_last_result = DUAL_P_USB_RESULT_WAIT_HOST;
+        }
+        xSemaphoreGive(s_reconfigure_mutex);
+        if (!current) {
+            return ESP_ERR_INVALID_STATE;
+        }
         memcpy(&s_active_profile, &s_reconfigure_work_profile,
                sizeof(s_active_profile));
         s_clone_active = true;
@@ -2089,24 +2499,10 @@ static esp_err_t install_profile_attempt(uint32_t operation_epoch, uint8_t attem
             result = restart_runtime_after_install();
         }
     }
-    int64_t wait_ms = 0;
-    if (result == ESP_OK) {
-        const int64_t wait_start_us = esp_timer_get_time();
-        const TickType_t mount_deadline =
-            xTaskGetTickCount() + pdMS_TO_TICKS(3000);
-        while (!tud_mounted() && xTaskGetTickCount() < mount_deadline &&
-               reconfigure_epoch_is_current(operation_epoch)) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        wait_ms = (esp_timer_get_time() - wait_start_us) / 1000;
-        if (!tud_mounted()) {
-            result = ESP_ERR_TIMEOUT;
-        }
-    }
     ESP_LOGW(TAG, "USB克隆安装尝试：transfer=%" PRIu32 " epoch=%" PRIu32
-             " attempt=%u result=%s wait_ms=%" PRId64 " attached=%u mounted=%u",
+             " attempt=%u result=%s attached=%u mounted=%u",
              s_work_transfer_id, operation_epoch, (unsigned)attempt,
-             esp_err_to_name(result), wait_ms,
+             esp_err_to_name(result),
              (unsigned)s_pc_usb_attached, (unsigned)tud_mounted());
     if (!reconfigure_epoch_is_current(operation_epoch)) {
         return ESP_ERR_INVALID_STATE;
@@ -2123,6 +2519,7 @@ static void reconfigure_task(void *argument)
             bool disconnect_requested = false;
             bool profile_pending = false;
             uint32_t operation_epoch = 0;
+            uint32_t profile_peer_generation = 0U;
             uint32_t disconnect_peer_generation = 0;
             uint32_t disconnect_event_id = 0;
             uint8_t disconnect_ack_type = 0;
@@ -2146,6 +2543,7 @@ static void reconfigure_task(void *argument)
                        sizeof(s_reconfigure_work_profile));
                 s_work_transfer_id = s_reconfigure_transfer_id;
                 s_work_crc32 = s_reconfigure_crc32;
+                profile_peer_generation = s_reconfigure_peer_generation;
                 s_reconfigure_profile_pending = false;
             }
             xSemaphoreGive(s_reconfigure_mutex);
@@ -2302,7 +2700,65 @@ static void reconfigure_task(void *argument)
                          s_work_transfer_id, operation_epoch, (unsigned)(attempt + 1U));
                 vTaskDelay(pdMS_TO_TICKS(200));
             }
-            if (!reconfigure_epoch_is_current(operation_epoch)) {
+
+            if (result == ESP_OK) {
+                xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+                const bool current = dual_profile_operation_is_current(
+                    operation_epoch, s_reconfigure_epoch,
+                    s_reconfigure_disconnect_requested);
+                const bool mounted = tud_mounted();
+                if (current) {
+                    s_reconfigure_waiting_host = !mounted;
+                    s_reconfigure_waiting_final_ack = mounted;
+                    s_reconfigure_installed_transfer_id = s_work_transfer_id;
+                    s_reconfigure_installed_crc32 = s_work_crc32;
+                    s_reconfigure_installed_operation_epoch = operation_epoch;
+                    s_profile_final_ack_failed = false;
+                    s_profile_last_result = mounted ?
+                        DUAL_P_USB_RESULT_FINAL_ACK_PENDING :
+                        DUAL_P_USB_RESULT_WAIT_HOST;
+                    s_reconfigure_failed_transfer_id = 0U;
+                    s_reconfigure_failed_crc32 = 0U;
+                }
+                xSemaphoreGive(s_reconfigure_mutex);
+                if (!current) {
+                    result = ESP_ERR_INVALID_STATE;
+                } else if (!mounted && s_work_transfer_id != 0U) {
+                    const esp_err_t wait_ack =
+                        dual_uart1_send_profile_ack_for_generation(
+                            s_work_transfer_id, s_work_crc32,
+                            DUAL_PROFILE_ACK_STATUS_WAIT_HOST,
+                            profile_peer_generation);
+                    if (wait_ack != ESP_OK) {
+                        /* 已安装状态仍保留；重复 COMMIT 可幂等补发 WAIT_HOST。 */
+                        ESP_LOGW(TAG, "Profile已安装，等待主机枚举；WAIT_HOST暂未排队：%s"
+                                 " transfer=%" PRIu32,
+                                 esp_err_to_name(wait_ack), s_work_transfer_id);
+                    } else {
+                        ESP_LOGI(TAG, "Profile已安装并保留，等待主机配置后再确认：transfer=%"
+                                 PRIu32 " epoch=%" PRIu32,
+                                 s_work_transfer_id, operation_epoch);
+                    }
+                }
+            }
+
+            while (result == ESP_OK) {
+                const bool epoch_current = profile_reconfigure_session_is_current(
+                    operation_epoch, s_work_transfer_id, profile_peer_generation);
+                const link_profile_host_wait_action_t wait_action =
+                    link_profile_host_wait_action(s_installed, tud_mounted(), epoch_current);
+                if (wait_action == LINK_PROFILE_HOST_MOUNTED) {
+                    break;
+                }
+                if (wait_action == LINK_PROFILE_HOST_WAIT_CANCEL) {
+                    result = ESP_ERR_INVALID_STATE;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+
+            if (!profile_reconfigure_session_is_current(
+                    operation_epoch, s_work_transfer_id, profile_peer_generation)) {
                 /* DEVICE_GONE 或新会话取消了旧安装；只清理，不回旧事务 ACK。 */
                 const esp_err_t stale_cleanup = stop_installed_usb();
                 if (stale_cleanup != ESP_OK) {
@@ -2318,33 +2774,72 @@ static void reconfigure_task(void *argument)
                 const bool current = dual_profile_operation_is_current(
                     operation_epoch, s_reconfigure_epoch,
                     s_reconfigure_disconnect_requested);
-                /* transfer=0 保留给 UART0 离线注入；没有 M 时无需板间 ACK。 */
-                const esp_err_t ack_result = !current ? ESP_ERR_INVALID_STATE :
-                    s_work_transfer_id == 0U ? ESP_OK :
-                    dual_uart1_send_profile_ack(s_work_transfer_id,
-                                                s_work_crc32, 0U);
-                if (ack_result == ESP_OK) {
-                    s_reconfigure_installed_transfer_id = s_work_transfer_id;
-                    s_reconfigure_installed_crc32 = s_work_crc32;
+                if (current && tud_mounted()) {
+                    s_reconfigure_waiting_host = false;
+                    s_reconfigure_waiting_final_ack = true;
                 }
                 xSemaphoreGive(s_reconfigure_mutex);
-                if (ack_result != ESP_OK) {
-                    result = ack_result;
+                if (!current || !tud_mounted() ||
+                    (s_work_transfer_id != 0U &&
+                     dual_uart1_peer_generation() != profile_peer_generation)) {
+                    result = ESP_ERR_INVALID_STATE;
                 } else {
-                    dual_uart1_set_usb_state(DUAL_USB_STATE_HID_CONNECTED);
-                    ESP_LOGI(TAG, "%s：transfer=%" PRIu32 " crc=%08" PRIX32,
-                             s_work_transfer_id == 0U ?
-                                 "手动Profile已配置并挂载" :
-                                 "Profile已配置并挂载，最终ACK已排队",
-                             s_work_transfer_id, s_work_crc32);
-                    dual_status_led_set_flow_error(false);
+                    esp_err_t ack_result = ESP_OK;
+                    if (s_work_transfer_id != 0U) {
+                        for (uint8_t ack_try = 0U;
+                             ack_try < LINK_ACK_ENQUEUE_MAX_ATTEMPTS;
+                             ++ack_try) {
+                            ack_result = dual_uart1_send_profile_ack_for_generation(
+                                s_work_transfer_id, s_work_crc32,
+                                DUAL_PROFILE_ACK_STATUS_MOUNTED,
+                                profile_peer_generation);
+                            if (ack_result == ESP_OK ||
+                                !reconfigure_epoch_is_current(operation_epoch)) {
+                                break;
+                            }
+                            if (ack_try + 1U < LINK_ACK_ENQUEUE_MAX_ATTEMPTS) {
+                                vTaskDelay(pdMS_TO_TICKS(50));
+                            }
+                        }
+                    }
+                    if (s_work_transfer_id != 0U) {
+                        dual_pc_hid_note_profile_ack_result(
+                            s_work_transfer_id, s_work_crc32,
+                            DUAL_PROFILE_ACK_STATUS_MOUNTED, ack_result);
+                    } else {
+                        s_profile_final_ack_failed = false;
+                        s_profile_last_result = DUAL_P_USB_RESULT_MOUNTED_ACKED;
+                        dual_uart1_set_usb_state(DUAL_USB_STATE_HID_CONNECTED);
+                        dual_status_led_set_flow_error(false);
+                        update_pc_ready_led();
+                    }
+                    if (ack_result == ESP_OK) {
+                        ESP_LOGI(TAG, "%s：transfer=%" PRIu32 " crc=%08" PRIX32,
+                                 s_work_transfer_id == 0U ?
+                                     "手动Profile已配置并挂载" :
+                                     "Profile已配置并挂载，最终ACK已排队",
+                                 s_work_transfer_id, s_work_crc32);
+                    } else {
+                        /* 克隆仍然已挂载；M 的 COMMIT 重放可补发最终确认。 */
+                        ESP_LOGW(TAG, "Profile已挂载但最终ACK暂未排队，保留克隆等待重放："
+                                 "transfer=%" PRIu32 " error=%s",
+                                 s_work_transfer_id, esp_err_to_name(ack_result));
+                    }
                     s_usb_reconfigure_guard_until_us = esp_timer_get_time() +
                         (int64_t)USB_RECONFIGURE_EVENT_GUARD_MS * 1000LL;
                 }
             }
 
             if (result == ESP_OK) {
-                s_usb_reconfigure_in_progress = false;
+                xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+                if (operation_epoch == s_reconfigure_epoch &&
+                    !s_reconfigure_disconnect_requested) {
+                    s_usb_reconfigure_in_progress = false;
+                    s_reconfigure_waiting_host = false;
+                    s_reconfigure_waiting_final_ack = false;
+                }
+                xSemaphoreGive(s_reconfigure_mutex);
+                update_pc_ready_led();
                 ESP_LOGI(TAG,
                          "动态USB严格克隆已启用：VID:PID=%04X:%04X HID=%u mouse_instance=%u CDC=disabled",
                          s_clone_device_descriptor.idVendor,
@@ -2367,16 +2862,28 @@ static void reconfigure_task(void *argument)
                          esp_err_to_name(failure_cleanup));
             }
             xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+            s_reconfigure_waiting_host = false;
+            s_reconfigure_waiting_final_ack = false;
+            s_reconfigure_installed_operation_epoch = 0U;
+            s_profile_final_ack_failed = false;
+            s_profile_last_result = DUAL_P_USB_RESULT_INSTALL_FAILED;
+            xSemaphoreGive(s_reconfigure_mutex);
+            update_pc_ready_led();
+            xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
             const bool failure_current = dual_profile_operation_is_current(
                 operation_epoch, s_reconfigure_epoch,
-                s_reconfigure_disconnect_requested);
+                s_reconfigure_disconnect_requested) &&
+                (s_work_transfer_id == 0U ||
+                 dual_uart1_peer_generation() == profile_peer_generation);
             if (failure_current) {
                 s_reconfigure_failed_transfer_id = s_work_transfer_id;
                 s_reconfigure_failed_crc32 = s_work_crc32;
             }
             xSemaphoreGive(s_reconfigure_mutex);
             if (failure_current && s_work_transfer_id != 0U) {
-                (void)dual_uart1_send_profile_ack(s_work_transfer_id, s_work_crc32, 1U);
+                (void)dual_uart1_send_profile_ack_for_generation(
+                    s_work_transfer_id, s_work_crc32,
+                    DUAL_PROFILE_ACK_STATUS_FAILED, profile_peer_generation);
             }
         }
     }
@@ -2501,6 +3008,11 @@ void dual_pc_hid_enable_reconfigure(void)
     s_reconfigure_enabled = true;
     s_reconfigure_disconnect_requested = false;
     s_reconfigure_profile_pending = false;
+    s_reconfigure_waiting_host = false;
+    s_reconfigure_waiting_final_ack = false;
+    s_reconfigure_installed_operation_epoch = 0U;
+    s_profile_final_ack_failed = false;
+    s_profile_last_result = DUAL_P_USB_RESULT_UNKNOWN;
     s_reconfigure_disconnect_failed = false;
     s_reconfigure_cleanup_done = false;
     s_reconfigure_cleanup_attempts = 0;
@@ -2537,9 +3049,41 @@ link_profile_replay_result_t dual_pc_hid_profile_result(uint32_t transfer_id, ui
         s_reconfigure_installed_transfer_id, s_reconfigure_installed_crc32,
         s_reconfigure_failed_transfer_id, s_reconfigure_failed_crc32,
         s_clone_active, s_installed, tud_mounted(),
-        s_usb_reconfigure_in_progress || s_reconfigure_disconnect_requested);
+        s_usb_reconfigure_in_progress || s_reconfigure_disconnect_requested,
+        s_reconfigure_waiting_host);
     xSemaphoreGive(s_reconfigure_mutex);
     return result;
+}
+
+void dual_pc_hid_note_profile_ack_result(
+    uint32_t transfer_id, uint32_t crc32, uint8_t status, esp_err_t result)
+{
+    if (transfer_id == 0U || s_reconfigure_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    const bool same_installed_profile =
+        s_reconfigure_installed_transfer_id == transfer_id &&
+        s_reconfigure_installed_crc32 == crc32 &&
+        s_clone_active && s_installed && tud_mounted() &&
+        s_reconfigure_installed_operation_epoch != 0U &&
+        s_reconfigure_installed_operation_epoch == s_reconfigure_epoch &&
+        !s_reconfigure_disconnect_requested;
+    if (same_installed_profile && status == DUAL_PROFILE_ACK_STATUS_MOUNTED) {
+        s_profile_final_ack_failed = result != ESP_OK;
+        s_profile_last_result = result == ESP_OK ?
+            DUAL_P_USB_RESULT_MOUNTED_ACKED :
+            DUAL_P_USB_RESULT_FINAL_ACK_FAILED;
+    }
+    xSemaphoreGive(s_reconfigure_mutex);
+
+    if (!same_installed_profile || status != DUAL_PROFILE_ACK_STATUS_MOUNTED) {
+        return;
+    }
+    dual_uart1_set_usb_state(result == ESP_OK ?
+        DUAL_USB_STATE_HID_CONNECTED : DUAL_USB_STATE_WAITING);
+    dual_status_led_set_flow_error(result != ESP_OK);
+    update_pc_ready_led();
 }
 
 bool dual_pc_hid_installed_profile_matches(uint32_t crc32)
@@ -2589,11 +3133,20 @@ esp_err_t dual_pc_hid_reuse_installed_profile(uint32_t transfer_id, uint32_t crc
      */
     dual_pc_hid_vendor_link_fault();
     dual_pc_hid_release_all();
-    dual_uart1_set_usb_state(DUAL_USB_STATE_HID_CONNECTED);
 
     /* transfer=0 保留给 UART0 离线注入；没有 M 时无需板间 ACK。 */
     const esp_err_t ack_result = transfer_id == 0U ? ESP_OK :
         dual_uart1_send_profile_ack(transfer_id, crc32, 0U);
+    if (transfer_id != 0U) {
+        dual_pc_hid_note_profile_ack_result(
+            transfer_id, crc32, DUAL_PROFILE_ACK_STATUS_MOUNTED, ack_result);
+    } else {
+        s_profile_final_ack_failed = false;
+        s_profile_last_result = DUAL_P_USB_RESULT_MOUNTED_ACKED;
+        dual_uart1_set_usb_state(DUAL_USB_STATE_HID_CONNECTED);
+        dual_status_led_set_flow_error(false);
+        update_pc_ready_led();
+    }
     if (ack_result != ESP_OK) {
         /*
          * 最终确认没排上队不改动克隆：M 侧的 COMMIT 重放（1 秒后）会走
@@ -2610,6 +3163,7 @@ esp_err_t dual_pc_hid_reuse_installed_profile(uint32_t transfer_id, uint32_t crc
              "transfer=%" PRIu32 " crc=%08" PRIX32 " reused=%" PRIu32,
              transfer_id, crc32, s_profile_reused);
     dual_status_led_set_flow_error(false);
+    update_pc_ready_led();
     return ESP_OK;
 }
 
@@ -2633,6 +3187,11 @@ esp_err_t dual_pc_hid_schedule_reconfigure(
     s_reconfigure_failed_transfer_id = 0U;
     s_reconfigure_failed_crc32 = 0U;
     s_reconfigure_profile_epoch = operation_epoch;
+    s_reconfigure_waiting_host = false;
+    s_reconfigure_waiting_final_ack = false;
+    s_reconfigure_installed_operation_epoch = 0U;
+    s_profile_final_ack_failed = false;
+    s_profile_last_result = DUAL_P_USB_RESULT_UNKNOWN;
     s_reconfigure_profile_pending = true;
     xSemaphoreGive(s_reconfigure_mutex);
     /* 使队列及已 dequeue 的旧厂商事务失效；物理报告热路径不等待此锁。 */
@@ -2773,6 +3332,8 @@ esp_err_t dual_pc_hid_schedule_disconnect(
     const uint32_t operation_epoch = next_reconfigure_epoch_locked();
     s_usb_reconfigure_in_progress = true;
     s_reconfigure_disconnect_requested = true;
+    s_reconfigure_waiting_host = false;
+    s_reconfigure_waiting_final_ack = false;
     s_reconfigure_disconnect_failed = false;
     s_reconfigure_cleanup_done = false;
     s_reconfigure_disconnect_peer_generation = sender_generation;

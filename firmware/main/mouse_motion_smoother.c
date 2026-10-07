@@ -3,12 +3,16 @@
 #include <stddef.h>
 #include <string.h>
 
-static int64_t split_component(int64_t total, uint8_t index, uint8_t phase)
+static int64_t split_component(
+    int64_t total,
+    uint8_t index,
+    uint8_t phase,
+    uint8_t slot_count)
 {
-    const int64_t quotient = total / (int64_t)MOUSE_MOTION_SMOOTHING_SLOTS;
-    const int64_t remainder = total % (int64_t)MOUSE_MOTION_SMOOTHING_SLOTS;
+    const int64_t quotient = total / (int64_t)slot_count;
+    const int64_t remainder = total % (int64_t)slot_count;
     const uint8_t phased_index =
-        (uint8_t)((index + MOUSE_MOTION_SMOOTHING_SLOTS - phase) % MOUSE_MOTION_SMOOTHING_SLOTS);
+        (uint8_t)((index + slot_count - phase) % slot_count);
     const uint64_t remainder_magnitude = (uint64_t)(remainder < 0 ? -remainder : remainder);
     const int64_t remainder_part = phased_index < remainder_magnitude
         ? (remainder < 0 ? -1 : 1)
@@ -26,7 +30,9 @@ static void add_delta(mouse_motion_delta_t *target, mouse_motion_delta_t delta)
 
 bool mouse_motion_smoother_valid_slot_count(uint8_t slot_count)
 {
-    return slot_count == 0U || slot_count == MOUSE_MOTION_SMOOTHING_SLOTS;
+    return slot_count == 0U ||
+        (slot_count <= MOUSE_MOTION_SMOOTHING_MAX_SLOTS &&
+         slot_count % MOUSE_MOTION_SMOOTHING_SLOT_STEP == 0U);
 }
 
 void mouse_motion_smoother_enqueue(
@@ -45,19 +51,19 @@ void mouse_motion_smoother_enqueue(
         return;
     }
 
-    for (uint8_t offset = 0; offset < MOUSE_MOTION_SMOOTHING_SLOTS; ++offset) {
+    const uint8_t phase = (uint8_t)(state->distribution_phase % slot_count);
+    for (uint8_t offset = 0; offset < slot_count; ++offset) {
         const uint8_t slot =
-            (uint8_t)((state->next_slot + offset) % MOUSE_MOTION_SMOOTHING_SLOTS);
+            (uint8_t)((state->next_slot + offset) % MOUSE_MOTION_SMOOTHING_MAX_SLOTS);
         mouse_motion_delta_t part = {
-            .x = split_component(delta.x, offset, state->distribution_phase),
-            .y = split_component(delta.y, offset, state->distribution_phase),
-            .wheel = split_component(delta.wheel, offset, state->distribution_phase),
-            .pan = split_component(delta.pan, offset, state->distribution_phase),
+            .x = split_component(delta.x, offset, phase, slot_count),
+            .y = split_component(delta.y, offset, phase, slot_count),
+            .wheel = split_component(delta.wheel, offset, phase, slot_count),
+            .pan = split_component(delta.pan, offset, phase, slot_count),
         };
         add_delta(&state->slots[slot], part);
     }
-    state->distribution_phase =
-        (uint8_t)((state->distribution_phase + 1U) % MOUSE_MOTION_SMOOTHING_SLOTS);
+    state->distribution_phase = (uint8_t)((phase + 1U) % slot_count);
 }
 
 mouse_motion_delta_t mouse_motion_smoother_take_next(mouse_motion_smoother_t *state)
@@ -67,7 +73,7 @@ mouse_motion_delta_t mouse_motion_smoother_take_next(mouse_motion_smoother_t *st
     }
     mouse_motion_delta_t result = state->slots[state->next_slot];
     state->slots[state->next_slot] = (mouse_motion_delta_t){0};
-    state->next_slot = (uint8_t)((state->next_slot + 1U) % MOUSE_MOTION_SMOOTHING_SLOTS);
+    state->next_slot = (uint8_t)((state->next_slot + 1U) % MOUSE_MOTION_SMOOTHING_MAX_SLOTS);
     return result;
 }
 
@@ -77,7 +83,7 @@ mouse_motion_delta_t mouse_motion_smoother_pending(const mouse_motion_smoother_t
     if (state == NULL) {
         return result;
     }
-    for (uint8_t index = 0; index < MOUSE_MOTION_SMOOTHING_SLOTS; ++index) {
+    for (uint8_t index = 0; index < MOUSE_MOTION_SMOOTHING_MAX_SLOTS; ++index) {
         add_delta(&result, state->slots[index]);
     }
     return result;

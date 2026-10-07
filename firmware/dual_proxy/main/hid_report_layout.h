@@ -64,6 +64,19 @@ bool hid_mouse_report_read_axes(
     int32_t *y,
     int32_t *wheel,
     int32_t *pan);
+bool hid_mouse_report_read_buttons(
+    const uint8_t *report,
+    size_t report_length,
+    const hid_mouse_report_layout_t *layout,
+    uint8_t *buttons);
+/* Apply masks to a physical report only; the caller should read queries/stream state first. */
+bool hid_mouse_report_apply_physical_masks(
+    const hid_mouse_report_layout_t *layout,
+    uint8_t *report,
+    size_t report_length,
+    uint8_t button_mask,
+    uint8_t move_mask,
+    uint8_t wheel_mask);
 bool hid_mouse_report_add_axes(
     uint8_t *report,
     size_t report_length,

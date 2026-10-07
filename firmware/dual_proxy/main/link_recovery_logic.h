@@ -38,6 +38,7 @@
 #define LINK_COMMIT_MAX_ATTEMPTS 10U
 #define LINK_COMMIT_RETRY_INTERVAL_US 1000000LL
 #define LINK_COMMIT_STAGE_TIMEOUT_US 8000000LL
+#define LINK_COMMIT_HOST_PROBE_INTERVAL_US 3000000LL
 #define LINK_PROFILE_MOUNT_MAX_ATTEMPTS 2U
 
 static inline bool link_profile_mount_should_retry(
@@ -55,6 +56,7 @@ typedef enum {
     LINK_PROFILE_REPLAY_PENDING = 0,
     LINK_PROFILE_REPLAY_MOUNTED,
     LINK_PROFILE_REPLAY_FAILED,
+    LINK_PROFILE_REPLAY_WAIT_HOST,
 } link_profile_replay_result_t;
 
 /* COMMIT 的数据发布不是 USB 挂载；重复帧只可回放真实的最终结果。 */
@@ -62,7 +64,8 @@ static inline link_profile_replay_result_t link_profile_replay_result(
     uint32_t transfer_id, uint32_t crc32,
     uint32_t installed_transfer_id, uint32_t installed_crc32,
     uint32_t failed_transfer_id, uint32_t failed_crc32,
-    bool clone_active, bool installed, bool mounted, bool reconfiguring)
+    bool clone_active, bool installed, bool mounted, bool reconfiguring,
+    bool waiting_host)
 {
     if (transfer_id == 0U) {
         return LINK_PROFILE_REPLAY_PENDING;
@@ -71,10 +74,64 @@ static inline link_profile_replay_result_t link_profile_replay_result(
         clone_active && installed && mounted && !reconfiguring) {
         return LINK_PROFILE_REPLAY_MOUNTED;
     }
+    if (installed_transfer_id == transfer_id && installed_crc32 == crc32 &&
+        clone_active && installed && !mounted && reconfiguring && waiting_host) {
+        return LINK_PROFILE_REPLAY_WAIT_HOST;
+    }
     if (failed_transfer_id == transfer_id && failed_crc32 == crc32) {
         return LINK_PROFILE_REPLAY_FAILED;
     }
     return LINK_PROFILE_REPLAY_PENDING;
+}
+
+static inline bool link_profile_ack_is_wait_host(uint8_t status)
+{
+    return status == DUAL_PROFILE_ACK_STATUS_WAIT_HOST;
+}
+
+/* WAIT_HOST 是非终态；COMMIT 的常规重试时钟必须暂停到最终结果或取消。 */
+static inline bool link_commit_poll_enabled(bool waiting_host)
+{
+    return !waiting_host;
+}
+
+static inline bool link_profile_host_probe_due(
+    bool waiting_host, int64_t last_probe_us, int64_t now_us)
+{
+    return waiting_host && now_us >= last_probe_us &&
+        now_us - last_probe_us >= LINK_COMMIT_HOST_PROBE_INTERVAL_US;
+}
+
+static inline bool link_vendor_session_epoch_is_newer(
+    uint32_t candidate, uint32_t current)
+{
+    return candidate != 0U &&
+        (current == 0U || (int32_t)(candidate - current) > 0);
+}
+
+static inline bool link_vendor_session_identity_matches(
+    uint32_t payload_p_generation, uint32_t payload_m_generation,
+    uint32_t local_p_generation, uint32_t local_m_generation,
+    uint32_t epoch)
+{
+    return epoch != 0U && local_p_generation != 0U && local_m_generation != 0U &&
+        payload_p_generation == local_p_generation &&
+        payload_m_generation == local_m_generation;
+}
+
+typedef enum {
+    LINK_PROFILE_HOST_WAIT_CANCEL = 0,
+    LINK_PROFILE_HOST_WAIT,
+    LINK_PROFILE_HOST_MOUNTED,
+} link_profile_host_wait_action_t;
+
+static inline link_profile_host_wait_action_t link_profile_host_wait_action(
+    bool installed, bool mounted, bool operation_current)
+{
+    if (!installed || !operation_current) {
+        return LINK_PROFILE_HOST_WAIT_CANCEL;
+    }
+    return mounted ? LINK_PROFILE_HOST_MOUNTED : LINK_PROFILE_HOST_WAIT;
 }
 
 typedef enum {

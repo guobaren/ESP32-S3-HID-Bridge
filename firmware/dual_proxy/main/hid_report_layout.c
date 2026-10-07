@@ -427,7 +427,85 @@ bool hid_mouse_report_read_axes(
     return read_axis(report, report_length, &layout->x, x) &&
         read_axis(report, report_length, &layout->y, y) &&
         read_axis(report, report_length, &layout->wheel, wheel) &&
-        read_axis(report, report_length, &layout->pan, pan);
+           read_axis(report, report_length, &layout->pan, pan);
+}
+
+bool hid_mouse_report_read_buttons(
+    const uint8_t *report,
+    size_t report_length,
+    const hid_mouse_report_layout_t *layout,
+    uint8_t *buttons)
+{
+    if (report == NULL || layout == NULL || buttons == NULL || !layout->valid ||
+        report_length != layout->report_bytes || layout->button_count == 0U ||
+        layout->buttons_bit_offset == HID_MOUSE_FIELD_INVALID_OFFSET ||
+        (uint32_t)layout->buttons_bit_offset + layout->button_count >
+            report_length * 8U) {
+        return false;
+    }
+    const uint8_t count = layout->button_count < 5U ? layout->button_count : 5U;
+    uint8_t result = 0U;
+    for (uint8_t index = 0U; index < count; ++index) {
+        const uint32_t source_bit = (uint32_t)layout->buttons_bit_offset + index;
+        if ((report[source_bit >> 3U] & (uint8_t)(1U << (source_bit & 7U))) != 0U) {
+            result |= (uint8_t)(1U << index);
+        }
+    }
+    *buttons = result;
+    return true;
+}
+
+bool hid_mouse_report_apply_physical_masks(
+    const hid_mouse_report_layout_t *layout,
+    uint8_t *report,
+    size_t report_length,
+    uint8_t button_mask,
+    uint8_t move_mask,
+    uint8_t wheel_mask)
+{
+    if (report == NULL || layout == NULL || !layout->valid ||
+        report_length != layout->report_bytes) {
+        return false;
+    }
+    if (layout->buttons_bit_offset != HID_MOUSE_FIELD_INVALID_OFFSET) {
+        const uint8_t count = layout->button_count < 5U
+            ? layout->button_count : 5U;
+        if ((uint32_t)layout->buttons_bit_offset + count > report_length * 8U) {
+            return false;
+        }
+        for (uint8_t button = 0U; button < count; ++button) {
+            if ((button_mask & (uint8_t)(1U << button)) == 0U) {
+                continue;
+            }
+            const uint32_t bit = (uint32_t)layout->buttons_bit_offset + button;
+            report[bit >> 3U] &= (uint8_t)~(1U << (bit & 7U));
+        }
+    }
+
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t wheel = 0;
+    int32_t pan = 0;
+    if (!hid_mouse_report_read_axes(report, report_length, layout,
+                                    &x, &y, &wheel, &pan)) {
+        return false;
+    }
+    if ((x < 0 && (move_mask & 0x01U) != 0U) ||
+        (x > 0 && (move_mask & 0x02U) != 0U)) {
+        x = 0;
+    }
+    if ((y > 0 && (move_mask & 0x04U) != 0U) ||
+        (y < 0 && (move_mask & 0x08U) != 0U)) {
+        y = 0;
+    }
+    if ((wheel < 0 && (wheel_mask & 0x01U) != 0U) ||
+        (wheel > 0 && (wheel_mask & 0x02U) != 0U)) {
+        wheel = 0;
+    }
+    return write_axis(report, report_length, &layout->x, x) &&
+        write_axis(report, report_length, &layout->y, y) &&
+        write_axis(report, report_length, &layout->wheel, wheel) &&
+        write_axis(report, report_length, &layout->pan, pan);
 }
 
 bool hid_mouse_report_add_axes(

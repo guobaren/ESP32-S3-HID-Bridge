@@ -4,10 +4,12 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text.Json;
 using HidBridge.Host.Input;
+using HidBridge.Protocol;
+using System.Text.Json.Serialization;
 
 namespace HidBridge.Host.RemoteInput;
 
-internal readonly record struct RemoteMouseCommand(int DeltaX, int DeltaY, int Wheel, int Pan);
+internal readonly record struct RemoteMouseCommand(int DeltaX, int DeltaY, int Wheel, int Pan, int? SmoothingSlots = null);
 
 internal readonly record struct DisplayAddressCandidate(
     IPAddress Address,
@@ -84,6 +86,8 @@ internal sealed class RemoteInputServer : IDisposable
                         result.Buffer,
                         out RemoteMouseCommand command,
                         out error);
+                    if (parsed && command.SmoothingSlots is int slots)
+                        _input.ConfigureUdpSmoothingSlots(slots, fromRemote: true);
                     accepted = parsed && _input.TryInjectMouseMovement(
                             command.DeltaX,
                             command.DeltaY,
@@ -462,6 +466,8 @@ internal static class RemoteMouseCommandParser
         public int Dy { get; init; }
         public int Wheel { get; init; }
         public int Pan { get; init; }
+        [JsonPropertyName("smoothing_slots")]
+        public int? SmoothingSlots { get; init; }
     }
 
     internal static bool TryParse(
@@ -479,6 +485,12 @@ internal static class RemoteMouseCommandParser
             if (dto is null)
             {
                 error = "JSON 内容为空";
+                return false;
+            }
+            if (dto.SmoothingSlots is int slots &&
+                (slots < 0 || slots > 20 || !MouseReportCodec.IsValidFirmwareSmoothingSlots((byte)slots)))
+            {
+                error = "smoothing_slots 只能是 0、5、10、15 或 20";
                 return false;
             }
             if (dto.Dx is < short.MinValue or > short.MaxValue ||
@@ -499,7 +511,7 @@ internal static class RemoteMouseCommandParser
                 return false;
             }
 
-            command = new RemoteMouseCommand(dto.Dx, dto.Dy, dto.Wheel, dto.Pan);
+            command = new RemoteMouseCommand(dto.Dx, dto.Dy, dto.Wheel, dto.Pan, dto.SmoothingSlots);
             return true;
         }
         catch (JsonException exception)

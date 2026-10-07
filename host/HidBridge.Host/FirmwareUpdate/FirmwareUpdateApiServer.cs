@@ -57,6 +57,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
     private readonly Func<IReadOnlyList<string>>? _getOpenSerialPorts;
     private readonly Func<string, byte[], CancellationToken, int?>? _writeSerialPort;
     private readonly Func<CancellationToken, SerialPortRefreshSnapshot>? _refreshSerialPorts;
+    private readonly Func<TimeSpan, CancellationToken, Task<DeviceStatisticsQueryResult>>? _readDeviceStatistics;
     private readonly bool _serialApiConfigured;
     private readonly object _sync = new();
     private TcpListener? _listener;
@@ -71,7 +72,8 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         Func<string?> selectedPortProvider,
         Func<IReadOnlyList<string>>? getOpenSerialPorts = null,
         Func<string, byte[], CancellationToken, int?>? writeSerialPort = null,
-        Func<CancellationToken, SerialPortRefreshSnapshot>? refreshSerialPorts = null)
+        Func<CancellationToken, SerialPortRefreshSnapshot>? refreshSerialPorts = null,
+        Func<TimeSpan, CancellationToken, Task<DeviceStatisticsQueryResult>>? readDeviceStatistics = null)
         : this(
             port,
             service.GetSnapshot,
@@ -79,7 +81,8 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
             selectedPortProvider,
             getOpenSerialPorts,
             writeSerialPort,
-            refreshSerialPorts)
+            refreshSerialPorts,
+            readDeviceStatistics)
     {
     }
 
@@ -90,7 +93,8 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         Func<string?> selectedPortProvider,
         Func<IReadOnlyList<string>>? getOpenSerialPorts = null,
         Func<string, byte[], CancellationToken, int?>? writeSerialPort = null,
-        Func<CancellationToken, SerialPortRefreshSnapshot>? refreshSerialPorts = null)
+        Func<CancellationToken, SerialPortRefreshSnapshot>? refreshSerialPorts = null,
+        Func<TimeSpan, CancellationToken, Task<DeviceStatisticsQueryResult>>? readDeviceStatistics = null)
     {
         _port = port;
         _getSnapshot = getSnapshot;
@@ -99,6 +103,7 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
         _getOpenSerialPorts = getOpenSerialPorts;
         _writeSerialPort = writeSerialPort;
         _refreshSerialPorts = refreshSerialPorts;
+        _readDeviceStatistics = readDeviceStatistics;
         _serialApiConfigured = getOpenSerialPorts is not null && writeSerialPort is not null &&
                                refreshSerialPorts is not null;
     }
@@ -246,10 +251,15 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                 {
                     requestTimeout.CancelAfter(TimeSpan.FromSeconds(15));
                 }
+                else if (path == "/api/v1/serial/stats")
+                {
+                    requestTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+                }
                 bool serialRoute = path is
                     "/api/v1/serial/ports" or
                     "/api/v1/serial/write" or
-                    "/api/v1/serial/refresh";
+                    "/api/v1/serial/refresh" or
+                    "/api/v1/serial/stats";
                 if (serialRoute && !IsLoopbackClient(client))
                 {
                     await WriteJsonAsync(stream, 403, new { error = "loopback_only" }, requestTimeout.Token)
@@ -362,6 +372,44 @@ internal sealed class FirmwareUpdateApiServer : IDisposable
                                 stream,
                                 500,
                                 new { error = "serial_port_list_failed", message = exception.Message },
+                                requestTimeout.Token)
+                            .ConfigureAwait(false);
+                    }
+                    return;
+                }
+
+                if (method == "GET" && path == "/api/v1/serial/stats")
+                {
+                    if (contentLength != 0)
+                    {
+                        await WriteJsonAsync(stream, 400, new { error = "request_body_not_allowed" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    if (_readDeviceStatistics is null)
+                    {
+                        await WriteJsonAsync(stream, 503, new { error = "serial_stats_unavailable" }, requestTimeout.Token)
+                            .ConfigureAwait(false);
+                        return;
+                    }
+                    try
+                    {
+                        DeviceStatisticsQueryResult result = await _readDeviceStatistics(
+                            TimeSpan.FromSeconds(4),
+                            requestTimeout.Token).ConfigureAwait(false);
+                        await WriteJsonAsync(stream, 200, result, requestTimeout.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception exception)
+                    {
+                        Console.Error.WriteLine($"设备统计查询失败：{exception.Message}");
+                        await WriteJsonAsync(
+                                stream,
+                                exception is TimeoutException ? 504 : 500,
+                                new { error = "serial_stats_failed", message = exception.Message },
                                 requestTimeout.Token)
                             .ConfigureAwait(false);
                     }

@@ -18,8 +18,6 @@ internal sealed class BridgeMainForm : Form
     private static readonly Color SuccessTextOnDeepSurface = Color.FromArgb(19, 128, 88);
     private static readonly Color DangerTextOnDeepSurface = Color.FromArgb(157, 91, 35);
     private static readonly Color SecondaryButtonColor = Color.FromArgb(237, 243, 250);
-    private const int OnboardLogReconnectTimeoutSeconds = 10;
-    private const int OnboardLogReleaseDelayMilliseconds = 100;
 
     private readonly InputForwarder _input;
     private readonly AutomationController _automation;
@@ -32,11 +30,13 @@ internal sealed class BridgeMainForm : Form
     private readonly MouseCaptureSurface _captureSurface;
     private readonly Label _statusLabel;
     private readonly Label _lanEndpointLabel;
+    private readonly Label _homeShortcutLabel;
     private readonly TextBox _logTextBox;
     private readonly ComboBox _logModeComboBox;
-    private readonly Button _onboardLogButton;
+    private readonly Button _statisticsButton;
     private readonly CheckBox _udpSmoothingCheckBox;
-    private readonly CheckBox _alwaysOutputUdpCheckBox;
+    private readonly ComboBox _udpSmoothingSlotsBox;
+    private bool _refreshingSmoothing;
     private readonly TrackBar _outputSensitivityTrackBar;
     private readonly TextBox _outputSensitivityTextBox;
     private readonly Label _outputSensitivityDescriptionLabel;
@@ -49,8 +49,7 @@ internal sealed class BridgeMainForm : Form
     private readonly NotifyIcon _notifyIcon;
     private readonly List<string> _pendingLogs = [];
     private bool _updatingOutputSensitivity;
-    private CancellationTokenSource? _onboardLogCancellation;
-    private bool _onboardLogDownloadActive;
+    private bool _statisticsReadActive;
     private const int MaxVisibleLogCharacters = 500_000;
 
     private bool _closing;
@@ -74,7 +73,6 @@ internal sealed class BridgeMainForm : Form
         double configuredOutputSensitivity = MouseOutputSensitivity.Clamp(automation.Settings.OutputSensitivity);
         _automation.Settings.OutputSensitivity = configuredOutputSensitivity;
         _input.ConfigureOutputSensitivity(configuredOutputSensitivity);
-        _input.ConfigureAlwaysOutputUdp(automation.Settings.AlwaysOutputUdpEnabled);
         _logSettings = logSettings ?? new RuntimeLogSettings(RuntimeLogMode.Reduced);
         _firmwareUpdateApi = firmwareUpdateApi;
         _firmwareFlash = firmwareFlash;
@@ -138,44 +136,29 @@ internal sealed class BridgeMainForm : Form
             ForeColor = PrimaryTextOnDeepSurface,
             UseVisualStyleBackColor = true,
         };
-        _alwaysOutputUdpCheckBox = new CheckBox
+        _udpSmoothingSlotsBox = new ComboBox
         {
-            AutoSize = true,
-            Height = 34,
-            Margin = new Padding(0),
-            TextAlign = ContentAlignment.MiddleLeft,
-            Text = "始终开启 UDP 输出",
-            AccessibleName = "始终开启 UDP 输出",
-            AccessibleDescription = "开启后，即使 HOME 关闭实体鼠标捕获，局域网 UDP 输入仍可发送到 ESP32；不会开启本机鼠标或键盘捕获。",
-            Checked = automation.Settings.AlwaysOutputUdpEnabled,
-            BackColor = CardSurfaceColor,
-            ForeColor = PrimaryTextOnDeepSurface,
-            UseVisualStyleBackColor = true,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 85,
+            AccessibleName = "UDP 平滑槽数",
+            Margin = new Padding(0, 0, 8, 0),
+        };
+        _udpSmoothingSlotsBox.Items.AddRange(new object[] { "5 槽", "10 槽", "15 槽", "20 槽" });
+        _udpSmoothingSlotsBox.SelectedIndex = 0;
+        _udpSmoothingSlotsBox.SelectedIndexChanged += (_, _) =>
+        {
+            if (!_refreshingSmoothing)
+                _input.SelectUdpSmoothingSlots((_udpSmoothingSlotsBox.SelectedIndex + 1) * 5);
         };
         _udpSmoothingCheckBox.CheckedChanged += (_, _) =>
         {
-            _input.ConfigureUdpSmoothing(_udpSmoothingCheckBox.Checked);
+            if (_refreshingSmoothing) return;
+            _input.ConfigureUdpSmoothingSlots(_udpSmoothingCheckBox.Checked
+                ? (_udpSmoothingSlotsBox.SelectedIndex + 1) * 5 : 0);
             AppendLog(_udpSmoothingCheckBox.Checked
-                ? "UDP 平滑已开启：EXE 以 500 Hz 聚合发送，开发板按 5 个 1 ms 槽输出。"
+                ? $"UDP 平滑已开启：M 板按 {(_udpSmoothingSlotsBox.SelectedIndex + 1) * 5} 个 1 ms 槽输出，P 不再平滑。"
                 : "UDP 平滑已关闭：EXE 以 500 Hz 聚合发送，开发板在下一 USB 周期直接输出。");
         };
-        _alwaysOutputUdpCheckBox.CheckedChanged += (_, _) =>
-        {
-            _automation.Settings.AlwaysOutputUdpEnabled = _alwaysOutputUdpCheckBox.Checked;
-            _input.ConfigureAlwaysOutputUdp(_alwaysOutputUdpCheckBox.Checked);
-            try
-            {
-                _automation.SaveSettings();
-                AppendLog(_alwaysOutputUdpCheckBox.Checked
-                    ? "始终开启 UDP 输出已开启：HOME 关闭时仍允许局域网 UDP 输入发送到 ESP32。"
-                    : "始终开启 UDP 输出已关闭：局域网 UDP 输入仅在 HOME 同步开启时发送。");
-            }
-            catch (Exception exception)
-            {
-                AppendLog($"始终开启 UDP 输出设置保存失败：{exception.Message}");
-            }
-        };
-
         _outputSensitivityTrackBar = new TrackBar
         {
             Dock = DockStyle.Fill,
@@ -275,7 +258,7 @@ internal sealed class BridgeMainForm : Form
         statusBar.Controls.Add(_statusLabel, 0, 0);
         statusBar.Controls.Add(_lanEndpointLabel, 1, 0);
         shortcutBar.Controls.Add(statusBar, 0, 0);
-        // FlowDirection=RightToLeft 让两个开关在中间列整体靠右，同时保留平滑在左、始终输出在右。
+        // FlowDirection=RightToLeft 让平滑控件在中间列整体靠右。
         // 与原先“百分比空白列 + AutoSize 列”的嵌套 TableLayoutPanel 不同，FlowLayoutPanel 会按
         // 控件首选宽度布局，避免 DPI 或端点文本变化时把 CheckBox 的文字挤成不可见区域。
         FlowLayoutPanel udpOptionsBar = new()
@@ -288,8 +271,7 @@ internal sealed class BridgeMainForm : Form
             Padding = new Padding(0),
         };
         _udpSmoothingCheckBox.Anchor = AnchorStyles.None;
-        _alwaysOutputUdpCheckBox.Anchor = AnchorStyles.None;
-        udpOptionsBar.Controls.Add(_alwaysOutputUdpCheckBox);
+        udpOptionsBar.Controls.Add(_udpSmoothingSlotsBox);
         udpOptionsBar.Controls.Add(_udpSmoothingCheckBox);
         shortcutBar.Controls.Add(udpOptionsBar, 1, 0);
         shortcutBar.Controls.Add(endpointLabel, 2, 0);
@@ -310,15 +292,17 @@ internal sealed class BridgeMainForm : Form
         endingBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         endingBar.Controls.Add(sensitivityControls, 0, 0);
         endingBar.Controls.Add(_outputSensitivityDescriptionLabel, 0, 1);
-        Label endingShortcutLabel = new()
+        _homeShortcutLabel = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleRight,
-            Text = "HOME：开启 / 关闭同步    END：结束程序",
+            AutoEllipsis = true,
+            AccessibleName = "HOME 和 END 快捷键说明",
+            Text = "HOME：切换 Host 同步状态    END：结束程序",
             ForeColor = DangerTextOnDeepSurface,
         };
-        endingBar.Controls.Add(endingShortcutLabel, 1, 0);
-        endingBar.SetRowSpan(endingShortcutLabel, 2);
+        endingBar.Controls.Add(_homeShortcutLabel, 1, 0);
+        endingBar.SetRowSpan(_homeShortcutLabel, 2);
 
         Panel capturePanel = new()
         {
@@ -377,27 +361,26 @@ internal sealed class BridgeMainForm : Form
                 : RuntimeLogMode.Reduced;
             if (_logSettings.SetMode(mode))
             {
-                _serialBridge?.SetDevicePeriodicStats(mode == RuntimeLogMode.Full);
                 AppendLog(mode == RuntimeLogMode.Full
-                    ? "日志窗口显示完整诊断；文件始终后台完整保存，大量界面刷新可能增加开销。"
-                    : "日志窗口仅显示连接、统计、警告和错误；文件仍后台完整保存全部设备日志。");
+                    ? "日志窗口显示完整实时串口日志；大量界面刷新可能增加开销。"
+                    : "日志窗口仅显示连接、统计、警告和错误；实时串口日志仍按设置保存到主机文件。");
             }
         };
-        _onboardLogButton = new Button
+        _statisticsButton = new Button
         {
             Dock = DockStyle.Fill,
-            Text = "转存板载日志",
+            Text = "读取设备统计",
             Enabled = serialBridge is not null,
             BackColor = SecondaryButtonColor,
             ForeColor = PrimaryTextOnDeepSurface,
             UseVisualStyleBackColor = false,
-            AccessibleName = "转存板载日志",
+            AccessibleName = "读取设备统计",
             AccessibleDescription = serialBridge is null
-                ? "当前不是串口传输模式，无法读取板载日志。"
-                : "按协议从当前已连接的串口下载板载滚动日志；转存期间会暂停串口连接和键鼠同步。",
+                ? "当前不是串口传输模式，无法读取设备统计。"
+                : "通过当前已打开的主串口和对端镜像串口查询板卡内存统计与队列快照。",
             Margin = new Padding(8, 0, 0, 0),
         };
-        _onboardLogButton.Click += OnOnboardLogDownloadClicked;
+        _statisticsButton.Click += OnReadDeviceStatisticsClicked;
         TableLayoutPanel logPanel = new()
         {
             Dock = DockStyle.Fill,
@@ -413,7 +396,7 @@ internal sealed class BridgeMainForm : Form
         logPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         logPanel.Controls.Add(logLabel, 0, 0);
         logPanel.Controls.Add(_logModeComboBox, 1, 0);
-        logPanel.Controls.Add(_onboardLogButton, 2, 0);
+        logPanel.Controls.Add(_statisticsButton, 2, 0);
         logPanel.Controls.Add(_logTextBox, 0, 1);
         logPanel.SetColumnSpan(_logTextBox, 3);
         logPanel.Paint += (_, eventArgs) =>
@@ -440,14 +423,7 @@ internal sealed class BridgeMainForm : Form
         _settingsPage = new SettingsPageControl(
             _automation,
             firmwareUpdateApi,
-            firmwareFlash,
-            (enabled, frequencyHz) =>
-            {
-                _input.ConfigureSimulatedUdpInput(enabled, frequencyHz);
-                AppendLog(enabled
-                    ? $"模拟 UDP 输入已开启：源频率={FormatSimulatedUdpFrequency(frequencyHz)}；仅用于测试，移动和滚轮进入 UDP 公共后续链路。"
-                    : "模拟 UDP 输入已关闭：测试源停止，实体鼠标恢复直接进入 500 Hz 聚合链路。");
-            });
+            firmwareFlash);
         _tabs = new TabControl
         {
             Dock = DockStyle.Fill,
@@ -524,17 +500,26 @@ internal sealed class BridgeMainForm : Form
         _notifyIcon.DoubleClick += (_, _) => RestoreFromTray();
 
         _logFlushTimer = new System.Windows.Forms.Timer { Interval = 50 };
-        _logFlushTimer.Tick += (_, _) => FlushPendingLogs();
+        _logFlushTimer.Tick += (_, _) =>
+        {
+            FlushPendingLogs();
+            _refreshingSmoothing = true;
+            _udpSmoothingCheckBox.Checked = _input.UdpSmoothingEnabled;
+            _udpSmoothingSlotsBox.SelectedIndex = _input.UdpSmoothingSlots / 5 - 1;
+            _refreshingSmoothing = false;
+        };
         _logFlushTimer.Start();
 
         _input.ForwardingChanged += InputOnForwardingChanged;
+        _input.PhysicalRoutingChanged += InputOnPhysicalRoutingChanged;
         _input.ExitRequested += InputOnExitRequested;
-        _input.MovementRecordingStarted += InputOnMovementRecordingStarted;
-        _input.MovementRecordingCompleted += InputOnMovementRecordingCompleted;
+        _captureSurface.LegacySingleBoardMode = _automation.Settings.LegacySingleBoardFirmwareCompatibility;
+        _captureSurface.Forwarding = _input.PhysicalForwardingEnabled;
+        UpdateHomeShortcutLabel();
         Resize += (_, _) =>
         {
             ApplySplitLayout();
-            if (_enableCursorLock && _input.ForwardingEnabled)
+            if (_enableCursorLock && _input.PhysicalForwardingEnabled)
             {
                 ApplyCursorLock();
             }
@@ -549,11 +534,9 @@ internal sealed class BridgeMainForm : Form
 
     internal TextBox LogTextBox => _logTextBox;
     internal ComboBox LogModeComboBox => _logModeComboBox;
-    internal Button OnboardLogButton => _onboardLogButton;
-    internal CheckBox SimulatedUdpCheckBox => _settingsPage.SimulatedUdpCheckBox;
-    internal ComboBox SimulatedUdpFrequencyComboBox => _settingsPage.SimulatedUdpFrequencyComboBox;
+    internal Button StatisticsButton => _statisticsButton;
     internal CheckBox UdpSmoothingCheckBox => _udpSmoothingCheckBox;
-    internal CheckBox AlwaysOutputUdpCheckBox => _alwaysOutputUdpCheckBox;
+    internal CheckBox AlwaysOutputUdpCheckBox => _settingsPage.AlwaysOutputUdpCheckBox;
     internal Label SyncStatusLabel => _statusLabel;
     internal Label LanEndpointLabel => _lanEndpointLabel;
     internal TrackBar OutputSensitivityTrackBar => _outputSensitivityTrackBar;
@@ -567,8 +550,6 @@ internal sealed class BridgeMainForm : Form
     internal SettingsPageControl SettingsPage => _settingsPage;
     internal NotifyIcon TrayIcon => _notifyIcon;
     internal void ForceCloseForChecks() => ForceClose();
-    internal void ProcessMovementRecordingForChecks(MouseMovementRecording recording) =>
-        InputOnMovementRecordingCompleted(recording);
 
     internal void AppendLog(string message)
     {
@@ -656,16 +637,25 @@ internal sealed class BridgeMainForm : Form
             return;
         }
 
-        _captureSurface.Forwarding = enabled;
+        bool physicalForwarding = _input.PhysicalForwardingEnabled;
+        bool legacySingleBoard = _automation.Settings.LegacySingleBoardFirmwareCompatibility;
+        _captureSurface.LegacySingleBoardMode = legacySingleBoard;
+        _captureSurface.Forwarding = physicalForwarding;
         _udpSmoothingCheckBox.Enabled = !enabled;
+        _udpSmoothingSlotsBox.Enabled = !enabled;
         _statusLabel.Text = enabled ? "同步已开启" : "同步已关闭";
         _statusLabel.ForeColor = enabled ? SuccessTextOnDeepSurface : SecondaryTextOnDeepSurface;
         Text = enabled ? "ESP32-S3 HID Bridge - 同步已开启" : "ESP32-S3 HID Bridge - 同步已关闭";
-        AppendLog(enabled
-            ? $"键鼠同步已开启，鼠标已锁定到上半区中心；UDP 平滑={(_input.UdpSmoothingEnabled ? "开启" : "关闭")}，始终 UDP 输出={(_input.AlwaysOutputUdpEnabled ? "开启" : "关闭")}。"
-            : $"键鼠同步已关闭，本机输入已恢复；UDP 平滑可切换，始终 UDP 输出={(_input.AlwaysOutputUdpEnabled ? "开启" : "关闭")}。");
+        UpdateHomeShortcutLabel();
+        AppendLog(legacySingleBoard
+            ? enabled
+                ? $"旧版单板实体键鼠同步已开启，实体鼠标已锁定并由 EXE 转发；UDP 平滑={(_input.UdpSmoothingEnabled ? "开启" : "关闭")}，始终 UDP 输出={(_input.AlwaysOutputUdpEnabled ? "开启" : "关闭")}。"
+                : $"旧版单板实体键鼠同步已关闭，本机输入已恢复；UDP 平滑可切换，始终 UDP 输出={(_input.AlwaysOutputUdpEnabled ? "开启" : "关闭")}。"
+            : enabled
+                ? "HOME 同步状态已开启；双板实体鼠标由 M→P 硬件直通，EXE 不重复转发也不锁定本机光标；本机键盘继续监听。"
+                : "HOME 同步状态已关闭；双板实体鼠标由 M→P 硬件直通，EXE 不重复转发也不锁定本机光标；本机键盘继续监听。");
 
-        if (enabled && _enableCursorLock)
+        if (physicalForwarding && _enableCursorLock)
         {
             ApplyCursorLock();
         }
@@ -675,174 +665,73 @@ internal sealed class BridgeMainForm : Form
         }
     }
 
-    /// <summary>
-    /// 转存板载日志：借走当前已连接的串口，按协议下载板载滚动日志并写入 UTF-8 文件。
-    /// 串口以独占租约方式借出，转存期间控制软件暂停连接与键鼠同步，结束后自动恢复。
-    /// </summary>
-    private async void OnOnboardLogDownloadClicked(object? sender, EventArgs e)
+    private void InputOnPhysicalRoutingChanged(object? sender, EventArgs eventArgs) =>
+        InputOnForwardingChanged(sender, _input.ForwardingEnabled);
+
+    private async void OnReadDeviceStatisticsClicked(object? sender, EventArgs e)
     {
         SerialBridge? serialBridge = _serialBridge;
-        if (serialBridge is null || _onboardLogDownloadActive)
+        if (serialBridge is null || _statisticsReadActive)
         {
             return;
         }
 
-        string? portName = serialBridge.GetConnectedPortName();
-        if (string.IsNullOrWhiteSpace(portName))
-        {
-            string[] availablePorts = SerialBridge.GetAvailablePortNames();
-            string hint = availablePorts.Length == 0
-                ? "当前系统没有可用串口。"
-                : $"当前可选串口：{string.Join("、", availablePorts)}；请等控制软件连上目标板后重试。";
-            AppendLog($"转存板载日志已取消：当前未连接串口。{hint}");
-            ShowOnboardLogMessage($"当前未连接串口，无法转存板载日志。{hint}", MessageBoxIcon.Information);
-            return;
-        }
-
-        string? outputPath = ChooseOnboardLogOutputPath();
-        if (string.IsNullOrWhiteSpace(outputPath))
-        {
-            AppendLog("转存板载日志已取消：未选择保存路径。");
-            return;
-        }
-
-        bool restoreForwarding = _input.ForwardingEnabled;
-        CancellationTokenSource cancellation = new();
-        _onboardLogCancellation = cancellation;
-        _onboardLogDownloadActive = true;
-        _onboardLogButton.Enabled = false;
-        SerialBridge.ExclusivePortLease? lease = null;
+        _statisticsReadActive = true;
+        _statisticsButton.Enabled = false;
         try
         {
-            AppendLog(
-                $"开始转存板载日志：端口={portName}，输出={outputPath}；" +
-                "转存期间暂停串口连接与键鼠同步（先释放所有按键），结束或失败后自动恢复。");
-            // 先发 ReleaseAll 再交出串口：转存期间释放事件无法送达，不能让目标端留下按住不放的键。
-            _input.DisableForwarding();
-            await Task.Delay(OnboardLogReleaseDelayMilliseconds).ConfigureAwait(true);
-            lease = serialBridge.AcquireExclusivePort(portName, "板载日志转存任务");
-            OnboardLogDownloadResult result = await OnboardLogDownloader.DownloadAsync(
-                portName,
-                outputPath,
-                new Progress<OnboardLogDownloadProgress>(ReportOnboardLogProgress),
-                cancellationToken: cancellation.Token).ConfigureAwait(true);
-            string summary = DescribeOnboardLogResult(result, portName, outputPath);
-            AppendLog(summary);
-            ShowOnboardLogMessage(
-                summary,
-                result.Completed ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
-        }
-        catch (OperationCanceledException)
-        {
-            AppendLog($"转存板载日志已取消：{outputPath}");
+            AppendLog("正在通过当前已打开的主串口和对端镜像串口读取板端统计快照；键鼠输入保持运行。");
+            DeviceStatisticsQueryResult result = await serialBridge.ReadDeviceStatisticsAsync(
+                TimeSpan.FromSeconds(4)).ConfigureAwait(true);
+            string formatted = DeviceStatisticsFormatter.Format(result);
+            AppendLog($"已读取 {result.Boards.Count} 块板的统计快照。");
+            ShowDeviceStatistics(formatted);
         }
         catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or InvalidOperationException or
-                TimeoutException or ArgumentException or ObjectDisposedException)
+            exception is IOException or InvalidOperationException or TimeoutException or
+                InvalidDataException or OperationCanceledException or ObjectDisposedException)
         {
-            string message = $"转存板载日志失败：{exception.Message}";
-            AppendLog(message);
-            ShowOnboardLogMessage(message, MessageBoxIcon.Warning);
+            AppendLog($"读取设备统计失败：{exception.Message}");
+            if (!_closing && !IsDisposed)
+            {
+                MessageBox.Show(this, exception.Message, "读取设备统计失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
         finally
         {
-            if (lease is not null)
-            {
-                lease.Dispose();
-                // 恢复连接会在 UI 线程上做串口握手探测，放到后台线程避免窗口假死。
-                bool reconnected = await Task.Run(() => serialBridge.WaitForConnectionAsync(
-                    TimeSpan.FromSeconds(OnboardLogReconnectTimeoutSeconds),
-                    CancellationToken.None)).ConfigureAwait(true);
-                AppendLog(reconnected
-                    ? $"串口 {portName} 已恢复控制连接。"
-                    : $"串口 {portName} 未在 {OnboardLogReconnectTimeoutSeconds} 秒内恢复控制连接，" +
-                      "控制软件会继续自动重试。");
-            }
-            if (restoreForwarding)
-            {
-                _input.SetForwardingEnabled(true);
-            }
-            cancellation.Dispose();
-            _onboardLogCancellation = null;
-            _onboardLogDownloadActive = false;
+            _statisticsReadActive = false;
             if (!IsDisposed && !_closing)
             {
-                _onboardLogButton.Enabled = true;
+                _statisticsButton.Enabled = true;
             }
         }
     }
 
-    /// <summary>选择板载日志保存路径；默认落在 EXE 同目录的 log\device 下。</summary>
-    private string? ChooseOnboardLogOutputPath()
+    private void ShowDeviceStatistics(string text)
     {
-        string directory = Path.Combine(AppContext.BaseDirectory, "log", "device");
-        try
+        if (_closing || IsDisposed)
         {
-            Directory.CreateDirectory(directory);
+            return;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        using Form viewer = new()
         {
-            Console.Error.WriteLine($"板载日志默认目录不可用，改用程序目录：{exception.Message}");
-            directory = AppContext.BaseDirectory;
-        }
-
-        using SaveFileDialog dialog = new()
-        {
-            Title = "保存板载日志",
-            Filter = "日志文件 (*.log)|*.log|文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
-            DefaultExt = "log",
-            AddExtension = true,
-            OverwritePrompt = true,
-            InitialDirectory = directory,
-            FileName = $"onboard-log-{DateTime.Now:yyyyMMdd-HHmmss}.log",
+            Text = "设备内存统计快照",
+            StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(980, 720),
+            MinimumSize = new Size(700, 480),
         };
-        return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
-    }
-
-    /// <summary>把转存结果拼成可诊断的一行结论：完成 / 截断 / 无响应 / 超时。</summary>
-    internal static string DescribeOnboardLogResult(
-        OnboardLogDownloadResult result,
-        string portName,
-        string outputPath)
-    {
-        string detail =
-            $"端口={portName}，已下载={result.BytesReceived} 字节，板端上报={result.DeviceTotalBytes} 字节，" +
-            $"分片={result.ChunkCount}，耗时={result.Elapsed.TotalSeconds:F1} 秒，文件={outputPath}";
-        if (result.Completed && !result.Truncated)
+        TextBox content = new()
         {
-            return $"板载日志转存完成：{detail}。";
-        }
-        if (result.Completed)
-        {
-            return $"板载日志转存结束：未覆盖板端上报总量，尾部仍在板上，可再转存一次；{detail}。";
-        }
-        if (result.NoResponse)
-        {
-            return "板载日志转存失败：板端没有任何 LOG_READ_RESPONSE 响应（端口选错、板子未运行日志服务，" +
-                   $"或该串口只有控制台文本）；{detail}。";
-        }
-        return $"板载日志转存失败：等待窗口内没有收到后续分片，已保存部分内容；{detail}。";
-    }
-
-    private void ReportOnboardLogProgress(OnboardLogDownloadProgress progress)
-    {
-        if (_closing || IsDisposed)
-        {
-            return;
-        }
-        string total = progress.DeviceTotalBytes == 0 ? "未知" : $"{progress.DeviceTotalBytes} 字节";
-        AppendLog(
-            $"板载日志转存进度：已收 {progress.BytesReceived} 字节，" +
-            $"板端上报 {total}，分片 {progress.ChunkCount}。");
-    }
-
-    private void ShowOnboardLogMessage(string message, MessageBoxIcon icon)
-    {
-        if (_closing || IsDisposed)
-        {
-            return;
-        }
-        MessageBox.Show(this, message, "转存板载日志", MessageBoxButtons.OK, icon);
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Font = new Font("Cascadia Mono", 9, FontStyle.Regular),
+            Text = text,
+        };
+        viewer.Controls.Add(content);
+        viewer.ShowDialog(this);
     }
 
     private void InputOnExitRequested(object? sender, EventArgs e)
@@ -891,7 +780,6 @@ internal sealed class BridgeMainForm : Form
             Console.Error.WriteLine($"退出时保存窗口尺寸失败，将继续关闭：{exception.Message}");
         }
         _closing = true;
-        _onboardLogCancellation?.Cancel();
         _notifyIcon.Visible = false;
         _logFlushTimer.Stop();
         FlushPendingLogs();
@@ -912,8 +800,6 @@ internal sealed class BridgeMainForm : Form
                 ownedForm.Dispose();
             }
         }
-        _input.MovementRecordingStarted -= InputOnMovementRecordingStarted;
-        _input.MovementRecordingCompleted -= InputOnMovementRecordingCompleted;
         try
         {
             _input.Stop();
@@ -1052,53 +938,6 @@ internal sealed class BridgeMainForm : Form
         }
     }
 
-    private static string FormatSimulatedUdpFrequency(int frequencyHz) =>
-        frequencyHz == SimulatedUdpMouseInput.UnlimitedFrequencyHz
-            ? "无上限"
-            : $"{frequencyHz} Hz";
-
-    private void InputOnMovementRecordingStarted()
-    {
-        if (_closing || IsDisposed)
-        {
-            return;
-        }
-        if (InvokeRequired)
-        {
-            BeginInvoke((Action)InputOnMovementRecordingStarted);
-            return;
-        }
-
-        AppendLog("检测到鼠标左右键同时按下，开始记录实际发出的有符号 X/Y 移动命令。");
-    }
-
-    private void InputOnMovementRecordingCompleted(MouseMovementRecording recording)
-    {
-        if (_closing || IsDisposed)
-        {
-            return;
-        }
-        if (InvokeRequired)
-        {
-            BeginInvoke((Action)(() => InputOnMovementRecordingCompleted(recording)));
-            return;
-        }
-
-        if (!_automation.Settings.GenerateMovementAnalysisImage)
-        {
-            AppendLog($"左右键移动记录完成：样本={recording.SampleCount}；设置已关闭，不生成按键情况分析图片。");
-            return;
-        }
-
-        MouseMovementAnalysisForm analysisForm = new(recording);
-        analysisForm.Show(this);
-        AppendLog(
-            $"左右键已松开超过 3 秒，鼠标移动记录完成：样本={recording.SampleCount}，" +
-            (analysisForm.SavedImagePath is null
-                ? "分析图已显示但保存失败。"
-                : $"分析图={analysisForm.SavedImagePath}"));
-    }
-
     private void ApplyCursorLock()
     {
         if (!_enableCursorLock)
@@ -1117,5 +956,12 @@ internal sealed class BridgeMainForm : Form
             AppendLog($"鼠标锁定失败：{exception.Message}");
             _input.DisableForwarding();
         }
+    }
+
+    private void UpdateHomeShortcutLabel()
+    {
+        _homeShortcutLabel.Text = _automation.Settings.LegacySingleBoardFirmwareCompatibility
+            ? "HOME：开启 / 关闭旧版实体键鼠转发    END：结束程序"
+            : "HOME：切换 Host 状态（双板实体鼠标由 M→P 直通）    END：结束程序";
     }
 }

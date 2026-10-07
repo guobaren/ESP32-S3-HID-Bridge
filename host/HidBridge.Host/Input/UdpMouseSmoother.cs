@@ -1,3 +1,5 @@
+using HidBridge.Protocol;
+
 namespace HidBridge.Host.Input;
 
 internal readonly record struct MouseDelta(long X, long Y, long Wheel, long Pan)
@@ -13,12 +15,24 @@ internal readonly record struct UdpMouseSmootherStatistics(
 
 internal sealed class UdpMouseSmoother
 {
-    // UDP 不再在 Host 侧展开为多个发送槽；这里仅保留诊断计数，
-    // 实际 5 槽分摊由 ESP32 USB HID 输出任务完成。
-    internal const int FirmwareSmoothingSlots = 5;
+    // UDP 不在 Host 展开多个报告；选择的槽数由桥接报告传到固件侧执行。
+    internal const int DefaultFirmwareSmoothingSlots = MouseReportCodec.FirmwareSmoothingSlots;
     internal const int MaximumScheduledDelayMilliseconds = 0;
 
     private long _enqueuedCommands;
+    private int _smoothingSlots = DefaultFirmwareSmoothingSlots;
+
+    internal int SmoothingSlots => _smoothingSlots;
+
+    internal void Configure(int smoothingSlots)
+    {
+        if (smoothingSlots < 0 || smoothingSlots > byte.MaxValue ||
+            !MouseReportCodec.IsValidFirmwareSmoothingSlots((byte)smoothingSlots))
+        {
+            throw new ArgumentOutOfRangeException(nameof(smoothingSlots));
+        }
+        _smoothingSlots = smoothingSlots;
+    }
 
     internal void Record(MouseDelta delta)
     {
@@ -31,7 +45,7 @@ internal sealed class UdpMouseSmoother
     }
 
     internal UdpMouseSmootherStatistics GetStatistics() => new(
-        FirmwareSmoothingSlots,
+        _smoothingSlots,
         0,
         _enqueuedCommands,
         0);

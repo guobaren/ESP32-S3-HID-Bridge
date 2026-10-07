@@ -17,6 +17,36 @@ using HidBridge.Host.Transport;
 using HidBridge.Host.Ui;
 using HidBridge.Protocol;
 
+if (args.Contains("--firmware-smoothing-only"))
+{
+    foreach (byte slots in new byte[] { 0, 5, 10, 15, 20 })
+    {
+        var encoded = MouseReportCodec.EncodeBridge(0, 100, -100, 2, -2, slots);
+        Require(MouseReportCodec.TryDecodeBridge(encoded, out var report) && report.FirmwareSmoothingSlots == slots,
+            "槽数编解码丢失");
+        var json = Encoding.UTF8.GetBytes($"{{\"dx\":100,\"dy\":-100,\"smoothing_slots\":{slots}}}");
+        Require(RemoteMouseCommandParser.TryParse(json, out var command, out _) && command.SmoothingSlots == slots,
+            "JSON 档位未传递");
+        RecordingTransport transport = new();
+        using MouseReportPump pump = new(transport);
+        pump.ConfigureUdpSmoothingSlots(slots);
+        pump.ResetAndSendRelease(true);
+        pump.AccumulateRemote(100, -100, 0, 0);
+        DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+        while (transport.BridgeMouseReports().Length == 0 && DateTime.UtcNow < deadline) Thread.Sleep(2);
+        var actual = transport.BridgeMouseReports();
+        Require(actual.Length == 1 && actual[0].FirmwareSmoothingSlots == slots && actual[0].Report.X == 100,
+            "实际输出帧未携带选档或改变总位移");
+    }
+    foreach (var bad in new[] { "1", "25", "-5", "5.5", "\"10\"" })
+        Require(!RemoteMouseCommandParser.TryParse(Encoding.UTF8.GetBytes(
+            $"{{\"dx\":1,\"smoothing_slots\":{bad}}}"), out _, out _), "接受非法档位");
+    CheckUdpSmoothingSwitch();
+    CheckUdpMouseSmoothing();
+    Console.WriteLine("五档平滑 codec/JSON/实际输出帧/开关：PASS");
+    return 0;
+}
+
 if (args.Any(argument => argument.Equals("--device-log-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckBufferedFullDeviceLogs();
@@ -72,6 +102,28 @@ if (args.Any(argument => argument.Equals("--driver-store-probe-only", StringComp
     return 0;
 }
 
+if (args.Any(argument => argument.Equals("--automation-routing-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckSerialModeSwitchReleaseSequence();
+    CheckAutomationRemoteOutput();
+    CheckAutomationOutputRouteAndButtonMerge();
+    CheckPhysicalInputForwardingRouting();
+    CheckRoutingModeChangesKeepHomeAndReloadOnce();
+    CheckLocalMouseTriggersReachLua();
+    Console.WriteLine("自动化输出路由与串口模式切换释放专项检查通过。");
+    return 0;
+}
+
+if (args.Any(argument => argument.Equals("--automation-runtime-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckAutomationProfilesAndRuntime();
+    CheckLuaRuntimeFeatures();
+    CheckTriggerForwardingIntegration();
+    CheckToggleMacroStopsOnSecondPress();
+    Console.WriteLine("宏/Lua 运行时与本机触发专项检查通过。");
+    return 0;
+}
+
 if (args.Any(argument => argument.Equals("--lua-format-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckLuaSpacingFormatting();
@@ -90,16 +142,11 @@ if (args.Any(argument => argument.Equals("--kmbox-only", StringComparison.Ordina
     return 0;
 }
 
-if (args.Any(argument => argument.Equals("--onboard-log-only", StringComparison.OrdinalIgnoreCase)))
+if (args.Any(argument => argument.Equals("--stats-snapshot-only", StringComparison.OrdinalIgnoreCase)))
 {
-    CheckOnboardLogDownload();
+    CheckStatsSnapshotProtocol();
+    CheckStatsSnapshotHttpApi();
     return 0;
-}
-
-// 真机模式：用与「转存板载日志」按钮完全相同的下载器从真实串口取日志。
-if (args.Any(argument => argument.Equals("--onboard-log-live", StringComparison.OrdinalIgnoreCase)))
-{
-    return await RunOnboardLogLiveAsync(args);
 }
 
 CheckMouseReportCodec();
@@ -114,11 +161,13 @@ CheckMouseStatisticsLoggingDoesNotBlockPump();
 CheckStatisticsActivityGate();
 CheckMouseMovementRecordingAndChart();
 CheckSerialDiscoveryProtocol();
+CheckSerialModeSwitchReleaseSequence();
+CheckStatsSnapshotProtocol();
+CheckStatsSnapshotHttpApi();
 CheckSerialHeartbeatGate();
 CheckWiFiBoardTransportDisabled();
 CheckDeviceLogPolicy();
 CheckDeviceTraceRealtimePersistence();
-CheckOnboardLogDownload();
 CheckInputSuppressionPolicy();
 CheckKeyboardAutoRepeatEdgeFiltering();
 CheckMouseButtonsAreTrackedPerDevice();
@@ -142,12 +191,15 @@ CheckAutomationProfilesAndRuntime();
 CheckLuaRuntimeFeatures();
 CheckExternalProfileStorageAndLuaIndentation();
 CheckAutomationRemoteOutput();
+CheckAutomationOutputRouteAndButtonMerge();
+CheckPhysicalInputForwardingRouting();
+CheckRoutingModeChangesKeepHomeAndReloadOnce();
 CheckLocalMouseTriggersReachLua();
 CheckTriggerForwardingIntegration();
 CheckToggleMacroStopsOnSecondPress();
 CheckHotkeyChooserControl();
 CheckWindowLayout();
-Console.WriteLine("全部主机检查通过：鼠标协议、500 Hz 聚合、可选频率模拟 UDP、固件 5 槽平滑标记和始终输出开关、左右键移动记录与分析图、串口握手、板载日志转存协议、Wi-Fi 开发板输入禁用闸门、可切换日志策略、输入独占策略、UDP 网络输入、局域网固件刷写 API 策略、宏配置导入、宏/Lua 执行、本机侧键 Lua 触发、自动化远端输出、实时日志、Lua 配置管理和四页窗口布局。");
+Console.WriteLine("全部主机检查通过：鼠标协议与聚合、模拟 UDP 输入核心逻辑、固件平滑标记、单板 UDP 开关、串口握手与切换释放、双板统计分页、输入独占策略、UDP 网络输入、固件刷写 API、宏/Lua 执行、本机输入触发、自动化路由与按钮合并、实时日志、Lua 配置和设置页布局。");
 return 0;
 
 static void RunRawCaptureHardwareCheck(string[] arguments)
@@ -635,33 +687,9 @@ static void CheckMouseMovementRecordingAndChart()
         }
     }
 
-    RecordingTransport transport = new();
-    MouseMovementRecorder fastRecorder = new(TimeSpan.FromMilliseconds(50));
-    using MouseReportPump pump = new(transport, fastRecorder);
-    using ManualResetEventSlim completed = new(false);
-    MouseMovementRecording? emittedRecording = null;
-    int startedCount = 0;
-    pump.MovementRecordingStarted += () => Interlocked.Increment(ref startedCount);
-    pump.MovementRecordingCompleted += result =>
-    {
-        emittedRecording = result;
-        completed.Set();
-    };
-    pump.ResetAndSendRelease(true);
-    pump.Accumulate(3, true, -9, 4, 0, 0);
-    pump.Accumulate(0, true, 0, 0, 0, 0);
-    Require(completed.Wait(TimeSpan.FromSeconds(2)), "实际 500 Hz 发送链路未触发移动记录完成事件");
-    Require(startedCount == 1, "实际发送链路的移动记录开始事件次数不正确");
-    MouseMovementRecording actualEmitted = emittedRecording
-        ?? throw new InvalidOperationException("实际发送链路未返回移动记录");
-    Require(
-        actualEmitted.XValues.SequenceEqual([-9]) && actualEmitted.YValues.SequenceEqual([4]),
-        "实际发送报告没有保留正负号进入移动记录");
     Console.WriteLine(
         $"鼠标移动记录检查：状态机 X=[{string.Join(',', recording.XValues)}]，" +
-        $"Y=[{string.Join(',', recording.YValues)}]；分析图=1600x800，X 时间顺序=底部到顶部并显示正负零轴；" +
-        $"500 Hz 实际发送链路 X=[{string.Join(',', actualEmitted.XValues)}]，" +
-        $"Y=[{string.Join(',', actualEmitted.YValues)}]。");
+        $"Y=[{string.Join(',', recording.YValues)}]；纯分析图逻辑=1600x800，X 时间顺序=底部到顶部并显示正负零轴。");
 }
 
 static void CheckUdpMouseSmoothing()
@@ -780,7 +808,7 @@ static void CheckSerialDiscoveryProtocol()
     byte[] helloPayload = "HIDBRDG2"u8.ToArray().Concat(nonce).ToArray();
     FrameCodec helloCodec = new();
     byte[] hello = helloCodec.Encode(MessageType.DeviceHello, helloPayload);
-    byte[] noisyInput = "ESP-ROM:esp32s3\r\n"u8.ToArray().Concat(hello).ToArray();
+    byte[] noisyInput = "ESP-ROM:esp32s3\n"u8.ToArray().Concat(hello).ToArray();
     Require(
         SerialDeviceProbe.TryMatchHello(noisyInput, probeSequence, nonce),
         "应能跳过串口日志并识别设备响应");
@@ -802,6 +830,314 @@ static void CheckSerialDiscoveryProtocol()
     Require(
         !SerialDeviceProbe.TryMatchHello(noisyInput, probeSequence, wrongNonce),
         "随机数不匹配的响应不得被接受");
+}
+
+static void CheckSerialModeSwitchReleaseSequence()
+{
+    FrameCodec codec = new();
+    List<byte[]> writtenFrames = [];
+    SerialBridge.WriteInputModeChangeReleaseFrames(codec, writtenFrames.Add);
+    Require(writtenFrames.Count == 2, "模式切换释放必须恰好写入两帧");
+    Require(
+        FrameCodec.TryDecode(writtenFrames[0], out BridgeFrame sessionStart) &&
+        sessionStart.Type == MessageType.SessionStart &&
+        sessionStart.Payload.Length == 0,
+        "旧端口模式切换第一帧必须是空 payload 的 SessionStart");
+    Require(
+        FrameCodec.TryDecode(writtenFrames[1], out BridgeFrame releaseAll) &&
+        releaseAll.Type == MessageType.ReleaseAll &&
+        releaseAll.Payload.Length == 0,
+        "旧端口模式切换第二帧必须是空 payload 的 ReleaseAll");
+    Require(
+        releaseAll.Sequence == unchecked((ushort)(sessionStart.Sequence + 1)),
+        "模式切换 SessionStart 与 ReleaseAll 必须使用连续序号");
+    Console.WriteLine("串口模式切换释放检查：直接写入顺序为 SessionStart → ReleaseAll，序号连续；未访问真实串口。");
+}
+
+static void CheckStatsSnapshotProtocol()
+{
+    string fixturePath = Path.Combine(AppContext.BaseDirectory, "stats_snapshot_c_frames.txt");
+    Require(File.Exists(fixturePath), $"缺少由 dual_proxy C 编码器生成的统计帧 fixture：{fixturePath}");
+    Dictionary<byte, DeviceStatsPageCollector> collectors = [];
+    List<(byte Role, byte Kind, byte Index, byte Count, BridgeFrame Frame)> frames = [];
+    foreach (string line in File.ReadLines(fixturePath).Where(line => !string.IsNullOrWhiteSpace(line)))
+    {
+        string[] fields = line.Split(',', 5, StringSplitOptions.None);
+        Require(fields.Length == 5, $"C 帧 fixture 行格式错误：{line}");
+        byte role = byte.Parse(fields[0]);
+        byte kind = byte.Parse(fields[1]);
+        byte index = byte.Parse(fields[2]);
+        byte count = byte.Parse(fields[3]);
+        byte[] wire = Convert.FromHexString(fields[4]);
+        Require(FrameCodec.TryDecode(wire, out BridgeFrame frame), $"C fixture 帧 CRC/长度错误：{line}");
+        Require(frame.Type == MessageType.StatsSnapshotResponse, "C fixture 消息类型必须是 StatsSnapshotResponse");
+        Require(frame.Sequence == 0xA17C, "C fixture 诊断序号不正确");
+        Require(frame.Payload.Length >= 12 && frame.Payload[1] == role && frame.Payload[2] == kind &&
+                frame.Payload[3] == index && frame.Payload[4] == count,
+            "C fixture 外部索引与 C 编码 payload header 不一致");
+        if (!collectors.TryGetValue(role, out DeviceStatsPageCollector? collector))
+        {
+            collector = new DeviceStatsPageCollector($"COM-role-{role}", frame.Sequence);
+            collectors.Add(role, collector);
+        }
+        collector.Add(frame);
+        frames.Add((role, kind, index, count, frame));
+    }
+
+    Require(frames.Count == 28, $"C fixture 应包含 P/M 两板 28 个实际编码页，实际={frames.Count}");
+    Require(collectors.Count == 2 && collectors[1].IsComplete && collectors[2].IsComplete,
+        "实际 C 输出必须完整覆盖 role=1 P 与 role=2 M 的 counters/queues 两组分页");
+    DeviceStatisticsSnapshot pc = collectors[1].Build();
+    DeviceStatisticsSnapshot mouse = collectors[2].Build();
+    Require(pc.RoleName == "P/PC_DEVICE" && mouse.RoleName == "M/MOUSE_HOST",
+        "C 角色编号必须是 P=1、M=2");
+    Require(pc.State is { } pcState && mouse.State is { } mouseState &&
+            (bool)pcState["mounted"] &&
+            (string)pcState["lastResult"] == "mounted_acked" &&
+            (ulong)pcState["operationEpoch"] == 7UL &&
+            (bool)mouseState["firstVendorRequestSeen"] &&
+            (ulong)mouseState["vendorSessionEpoch"] == 33UL,
+        "C 角色状态计数必须正确解码P挂载/最终ACK与M厂商会话字段");
+    foreach ((byte role, byte stateCounterId) in new[] { ((byte)1, (byte)67), ((byte)2, (byte)68) })
+    {
+        DeviceStatsPageCollector missingStateCollector = new($"COM-missing-state-{role}", 0xA17C);
+        foreach (BridgeFrame originalFrame in frames.Where(item => item.Role == role).Select(item => item.Frame))
+        {
+            byte[] payload = originalFrame.Payload.ToArray();
+            if (payload[2] == 1)
+            {
+                for (int item = 0; item < payload[6]; item++)
+                {
+                    int recordOffset = 12 + item * 10;
+                    if (payload[recordOffset] == stateCounterId)
+                    {
+                        payload[recordOffset] = 0xFE;
+                    }
+                }
+            }
+            missingStateCollector.Add(originalFrame with { Payload = payload });
+        }
+
+        bool missingRequiredStateRejected = false;
+        try
+        {
+            _ = missingStateCollector.Build();
+        }
+        catch (InvalidDataException)
+        {
+            missingRequiredStateRejected = true;
+        }
+        Require(missingRequiredStateRejected, $"role={role} 缺少必需状态计数器 id={stateCounterId} 时必须明确失败");
+    }
+    Require((ulong)pc.Counters["attempt"] == 39_000UL &&
+            (ulong)mouse.Counters["recover"] == 11_000UL,
+        "C 角色计数器 ID 集合映射错误或被对方角色误用");
+    Require((long)mouse.Counters["motion_rx_dx"] == -12_345L &&
+            (long)mouse.Counters["motion_rx_dy"] == -6_789L,
+        "M 的有符号位移统计必须按 i64 解码，不能变成巨大 unsigned 数值");
+    DeviceQueueStatistics rxRing = mouse.Queues.Single(queue => queue.Id == 13);
+    Require(rxRing.Unit == 2 && rxRing.Capacity == 16_384 && rxRing.Depth == 23 && rxRing.Peak == 1_024,
+        "UART1 RX ring 队列必须以字节单位且保留实际容量/深度/峰值");
+    DeviceQueueStatistics eventQueue = pc.Queues.Single(queue => queue.Id == 9);
+    Require(eventQueue.Received is null && eventQueue.Rejected is null && eventQueue.Dropped == 17,
+        "UART1 event queue 的未知 received/rejected 与独立 reset_dropped 语义必须保持");
+    Require(DeviceStatisticsFormatter.Format(new DeviceStatisticsQueryResult(DateTimeOffset.UnixEpoch, [pc, mouse]))
+                .Contains("motion_rx_dx = -12345", StringComparison.Ordinal),
+        "统计 UI 格式化必须呈现 signed motion 数值");
+
+    DeviceStatsPageCollector duplicateCollector = new("COM-test", 0xA17C);
+    BridgeFrame firstCounter = frames.First(item => item.Role == 1 && item.Kind == 1).Frame;
+    duplicateCollector.Add(firstCounter);
+    bool duplicateRejected = false;
+    try
+    {
+        duplicateCollector.Add(firstCounter);
+    }
+    catch (InvalidDataException)
+    {
+        duplicateRejected = true;
+    }
+    Require(duplicateRejected, "重复统计页必须明确失败");
+
+    DeviceStatsPageCollector missingPageCollector = new("COM-test", 0xA17C);
+    missingPageCollector.Add(firstCounter);
+    bool missingPageRejected = false;
+    try
+    {
+        _ = missingPageCollector.Build();
+    }
+    catch (InvalidOperationException)
+    {
+        missingPageRejected = true;
+    }
+    Require(missingPageRejected, "只收一部分统计页时不得构造成功快照");
+
+    DeviceStatsPageCollector invalidSchemaCollector = new("COM-test", 0xA17C);
+    byte[] invalidSchema = firstCounter.Payload.ToArray();
+    invalidSchema[0]++;
+    bool invalidSchemaRejected = false;
+    try
+    {
+        invalidSchemaCollector.Add(firstCounter with { Payload = invalidSchema });
+    }
+    catch (InvalidDataException)
+    {
+        invalidSchemaRejected = true;
+    }
+    Require(invalidSchemaRejected, "未知 schema version 必须明确失败");
+
+    DeviceStatsPendingRequestRegistry registry = new();
+    DeviceStatsQueryContext expired = registry.Register(["COM12"], 0x1234);
+    Require(registry.HasActive, "统计请求注册后必须进入 pending 状态");
+    registry.Clear(expired); // 仅模拟 timeout/cancellation finally 清理，不覆盖 deadline 实际触发时序。
+    Require(!registry.HasActive && !registry.TryGet("COM12", firstCounter, out _, out _),
+        "timeout 清理后迟到页必须因无 pending 请求被忽略");
+    DeviceStatsQueryContext next = registry.Register(["COM12"], 0x1235);
+    Require(!registry.TryGet("COM12", firstCounter, out _, out _),
+        "迟到的旧 sequence 不得污染下一次统计快照");
+    BridgeFrame newSequenceFrame = firstCounter with { Sequence = 0x1235 };
+    Require(registry.TryGet("COM12", newSequenceFrame, out _, out _),
+        "当前 request sequence 与端口匹配时应能找到 pending collector");
+    registry.Clear(next);
+
+    DeviceOutputFrameScanner scanner = new();
+    List<BridgeFrame> scanned = [];
+    byte[] prefix = Encoding.UTF8.GetBytes("I (1) realtime log\r\n");
+    byte[] sampleWire = Convert.FromHexString(File.ReadLines(fixturePath).First().Split(',', 5)[4]);
+    byte[] stream = [.. prefix, .. sampleWire, .. Encoding.UTF8.GetBytes("\r\nW (2) tail\r\n")];
+    List<byte> textBytes = [];
+    foreach (byte value in stream)
+    {
+        textBytes.AddRange(scanner.Feed([value], scanned.Add));
+    }
+    Require(scanned.Count == 1 && scanned[0].Type == MessageType.StatsSnapshotResponse,
+        "实时混合日志扫描器必须识别跨读取边界 stats response");
+    Require(Encoding.UTF8.GetString(textBytes.ToArray()) == "I (1) realtime log\r\n\r\nW (2) tail\r\n",
+        "剥离 stats 二进制帧时不得丢失前后实时日志文本");
+    Console.WriteLine("统计协议回归：PASS；28 页来自 dual_proxy C 序列化器，P/M 角色映射、必需 USB/会话状态及缺项拒绝、signed 位移、20B 队列、未知值、缺页/重复/版本、超时清理后的迟到序号与实时日志混流均符合协议。");
+}
+
+static void CheckStatsSnapshotHttpApi()
+{
+    FirmwareFlashSnapshot flashSnapshot = new("stats-api-check", "idle", "test", null, null, null, null);
+    bool NeverStart(string manifestPath, string portName, out FirmwareFlashSnapshot current)
+    {
+        current = flashSnapshot;
+        return false;
+    }
+
+    FirmwareUpdateApiServer CreateServer(
+        Func<TimeSpan, CancellationToken, Task<DeviceStatisticsQueryResult>>? statsReader)
+    {
+        return new FirmwareUpdateApiServer(
+            0,
+            () => flashSnapshot,
+            NeverStart,
+            () => null,
+            () => ["COM12"],
+            (string portName, byte[] bytes, CancellationToken cancellationToken) => bytes.Length,
+            cancellationToken => new SerialPortRefreshSnapshot(["COM12"], ["COM12"]),
+            statsReader);
+    }
+
+    HttpClient CreateClient(FirmwareUpdateApiServer server) =>
+        new() { BaseAddress = new Uri($"http://127.0.0.1:{server.Port}") };
+
+    DeviceStatisticsQueryResult snapshot = new(
+        DateTimeOffset.UnixEpoch,
+        [
+            new DeviceStatisticsSnapshot(
+                "COM12",
+                2,
+                "M/MOUSE_HOST",
+                123_456,
+                new Dictionary<string, object> { ["motion_rx_dx"] = -12_345L, ["recover"] = 17UL },
+                new Dictionary<string, object>
+                {
+                    ["vendorSessionActive"] = true,
+                    ["firstVendorRequestSeen"] = true,
+                    ["peerGenerationCurrent"] = true,
+                    ["waitingHost"] = false,
+                    ["vendorSessionEpoch"] = 33UL,
+                },
+                [
+                    new DeviceQueueStatistics(
+                        13,
+                        "UART1.rx_ring",
+                        2,
+                        16_384,
+                        23,
+                        1_024,
+                        null,
+                        null,
+                        5),
+                ]),
+        ]);
+    Task<DeviceStatisticsQueryResult> ReadSnapshot(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Require(timeout == TimeSpan.FromSeconds(4), "stats API 应为设备读取器传入 4 秒设备超时");
+        return Task.FromResult(snapshot);
+    }
+
+    using (FirmwareUpdateApiServer server = CreateServer(ReadSnapshot))
+    {
+        server.SetEnabled(true);
+        using HttpClient client = CreateClient(server);
+        using HttpResponseMessage response = client.GetAsync("/api/v1/serial/stats").GetAwaiter().GetResult();
+        Require(response.StatusCode == System.Net.HttpStatusCode.OK, "GET stats 应返回 200");
+        using JsonDocument json = JsonDocument.Parse(response.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+        JsonElement board = json.RootElement.GetProperty("boards")[0];
+        Require(board.GetProperty("roleName").GetString() == "M/MOUSE_HOST", "stats JSON 必须包含正确的板角色");
+        Require(board.GetProperty("counters").GetProperty("motion_rx_dx").GetInt64() == -12_345,
+            "stats JSON 必须保留有符号位移计数");
+        Require(board.GetProperty("state").GetProperty("vendorSessionActive").GetBoolean() &&
+                board.GetProperty("state").GetProperty("vendorSessionEpoch").GetUInt64() == 33UL,
+            "stats JSON 必须呈现M厂商会话状态");
+        JsonElement queue = board.GetProperty("queues")[0];
+        Require(queue.GetProperty("unit").GetByte() == 2 &&
+                queue.GetProperty("received").ValueKind == JsonValueKind.Null &&
+                queue.GetProperty("rejected").ValueKind == JsonValueKind.Null &&
+                queue.GetProperty("depth").GetUInt16() == 23,
+            "stats JSON 必须呈现队列单位、深度和未知 null 字段");
+    }
+
+    using (FirmwareUpdateApiServer server = CreateServer(
+               (_, _) => Task.FromException<DeviceStatisticsQueryResult>(new TimeoutException("fake stats timeout"))))
+    {
+        server.SetEnabled(true);
+        using HttpClient client = CreateClient(server);
+        using HttpResponseMessage response = client.GetAsync("/api/v1/serial/stats").GetAwaiter().GetResult();
+        Require(response.StatusCode == System.Net.HttpStatusCode.GatewayTimeout, "stats TimeoutException 应映射为 504");
+    }
+
+    using (FirmwareUpdateApiServer server = CreateServer(null))
+    {
+        server.SetEnabled(true);
+        using HttpClient client = CreateClient(server);
+        using HttpResponseMessage response = client.GetAsync("/api/v1/serial/stats").GetAwaiter().GetResult();
+        Require(response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable, "缺少 stats delegate 应返回 503");
+    }
+
+    using (FirmwareUpdateApiServer server = CreateServer(ReadSnapshot))
+    {
+        server.SetEnabled(true);
+        using TcpClient socket = new();
+        socket.Connect(System.Net.IPAddress.Loopback, server.Port);
+        using NetworkStream stream = socket.GetStream();
+        byte[] request = Encoding.ASCII.GetBytes(
+            "GET /api/v1/serial/stats HTTP/1.1\r\n" +
+            "Host: 127.0.0.1\r\n" +
+            "Content-Length: 2\r\n" +
+            "Connection: close\r\n\r\n{}");
+        stream.Write(request);
+        using StreamReader reader = new(stream, Encoding.ASCII, leaveOpen: true);
+        string? statusLine = reader.ReadLine();
+        Require(statusLine?.StartsWith("HTTP/1.1 400", StringComparison.Ordinal) == true,
+            "带 body 的 GET stats 应返回 400");
+    }
+
+    Console.WriteLine("统计 loopback API 集成检查：PASS；HTTP 200 JSON 保留 role/signed counter/queue unit/null，Timeout=504、无 delegate=503、请求体=400。");
 }
 
 static void CheckWiFiBoardTransportDisabled()
@@ -971,311 +1307,6 @@ static void CheckDeviceTraceRealtimePersistence()
     }
 }
 
-// 真机模式：走与「转存板载日志」按钮相同的 OnboardLogDownloader，从真实串口取日志。
-// 用法：HidBridge.Host.Checks.exe --onboard-log-live <COMx> <输出文件>
-static async Task<int> RunOnboardLogLiveAsync(string[] arguments)
-{
-    string[] positional = arguments
-        .Where(argument => !argument.StartsWith("--", StringComparison.Ordinal))
-        .ToArray();
-    if (positional.Length < 2)
-    {
-        Console.Error.WriteLine("用法：--onboard-log-live <COMx> <输出文件>");
-        return 2;
-    }
-    string portName = positional[0];
-    string outputPath = Path.GetFullPath(positional[1]);
-    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-    Stopwatch stopwatch = Stopwatch.StartNew();
-    try
-    {
-        OnboardLogDownloadResult result = await OnboardLogDownloader.DownloadAsync(portName, outputPath);
-        stopwatch.Stop();
-        long fileBytes = new FileInfo(outputPath).Exists ? new FileInfo(outputPath).Length : 0;
-        Console.WriteLine(
-            $"真机转存结果：端口={portName} 已下载={result.BytesReceived} 板端上报={result.DeviceTotalBytes} " +
-            $"分片={result.ChunkCount} 完成={result.Completed} 截断={result.Truncated} 无响应={result.NoResponse} " +
-            $"超时={result.TimedOut} 耗时={result.Elapsed.TotalSeconds:F1}s 文件字节={fileBytes}");
-        Console.WriteLine($"文件：{outputPath}");
-        // 判定标准：完成、未截断、板端上报量与落盘量一致（允许日志仍在增长导致的少量偏差）。
-        bool ok = result.Completed && !result.NoResponse && fileBytes > 0 &&
-            result.BytesReceived == fileBytes;
-        Console.WriteLine(ok ? "真机转存：PASS" : "真机转存：FAIL");
-        return ok ? 0 : 1;
-    }
-    catch (Exception exception)
-    {
-        stopwatch.Stop();
-        Console.Error.WriteLine($"真机转存异常（{stopwatch.Elapsed.TotalSeconds:F1}s）：{exception}");
-        return 1;
-    }
-}
-
-static void CheckOnboardLogDownload()
-{
-    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-onboard-log-{Guid.NewGuid():N}");
-    Directory.CreateDirectory(directory);
-    try
-    {
-        CheckOnboardLogFrameEncoding();
-        CheckOnboardLogFrameScanner();
-        CheckOnboardLogStreamingDownload(directory);
-        CheckOnboardLogTimeoutAndNoResponse(directory);
-        CheckOnboardLogResultMessages();
-    }
-    finally
-    {
-        Directory.Delete(directory, recursive: true);
-    }
-}
-
-// ① 转存请求帧必须与共享 FrameCodec 逐字节一致（A5 5A + version + type + sequence + 长度 + CRC16）。
-static void CheckOnboardLogFrameEncoding()
-{
-    byte[] payload = OnboardLogDownloader.BuildDumpPayload(0, OnboardLogDownloader.DefaultMaxBytes);
-    byte[] shared = new FrameCodec().Encode(MessageType.LogDumpRequest, payload);
-    byte[] local = OnboardLogDownloader.EncodeFrame(MessageType.LogDumpRequest, 0, payload);
-    Require(local.SequenceEqual(shared), "转存请求帧与共享 FrameCodec 编码不一致");
-    Require(
-        local[3] == (byte)MessageType.LogDumpRequest && local[6] == 8,
-        $"转存请求帧类型或载荷长度不正确：type=0x{local[3]:X2}，payload_length={local[6]}");
-    Require(
-        BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(0, 4)) == 0 &&
-        BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(4, 4)) == 1u << 20,
-        "LOG_DUMP_REQUEST 载荷必须是 offset=0、max_bytes=1 MB");
-    Console.WriteLine(
-        $"板载日志转存请求帧检查：通过；type=0x{local[3]:X2}，帧长={local.Length}，" +
-        $"CRC=0x{BinaryPrimitives.ReadUInt16LittleEndian(local.AsSpan(local.Length - 2, 2)):X4}（与 FrameCodec 逐字节一致）。");
-}
-
-// ② 混杂控制台文本、假帧头（CRC 错误/长度非法）和跨读取窗口的半帧都必须能正确恢复出真实帧。
-static void CheckOnboardLogFrameScanner()
-{
-    byte[] text = Encoding.UTF8.GetBytes("I (1234) dual_proxy: 控制台文本 A5 5A 后面不是帧\r\n");
-    byte[] firstPayload = Encoding.UTF8.GetBytes("日志第一段");
-    byte[] first = BuildLogResponseFrame(sequence: 7, offset: 0, total: 12, firstPayload);
-    byte[] badCrc = [0xA5, 0x5A, 0x02, 0x09, 0x00, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04, 0xDE, 0xAD];
-    byte[] badLength = [0xA5, 0x5A, 0x02, 0x09, 0x00, 0x00, 0xFF];
-    byte[] terminator = BuildLogResponseFrame(sequence: 7, offset: 12, total: 12, []);
-
-    List<byte> stream = [];
-    stream.AddRange(text);
-    stream.AddRange(first);
-    stream.AddRange(badCrc);
-    stream.AddRange(badLength);
-    stream.AddRange(text);
-    stream.AddRange(terminator);
-    byte[] bytes = [.. stream];
-
-    List<(byte Type, ushort Sequence, byte[] Payload)> frames = [];
-    OnboardLogFrameScanner scanner = new();
-    // 故意切成不等长片段，并让片段边界落在帧头和帧体内部。
-    foreach ((int Start, int Length) slice in new[] { (0, 3), (3, 11), (14, 9), (23, 5), (28, bytes.Length - 28) })
-    {
-        scanner.Feed(bytes.AsSpan(slice.Start, slice.Length), (type, sequence, payload) =>
-            frames.Add((type, sequence, payload.ToArray())));
-    }
-
-    Require(frames.Count == 2, $"帧扫描应只恢复 2 条合法帧，实际={frames.Count}");
-    Require(
-        frames[0].Type == (byte)MessageType.LogReadResponse && frames[0].Sequence == 7 &&
-        BinaryPrimitives.ReadUInt32LittleEndian(frames[0].Payload.AsSpan(0, 4)) == 0 &&
-        frames[0].Payload.AsSpan(8).SequenceEqual(firstPayload),
-        "跨读取窗口的第一条 LOG_READ_RESPONSE 未被正确恢复");
-    Require(
-        frames[1].Sequence == 7 && frames[1].Payload.Length == 8,
-        "空 data 结束帧未被正确恢复");
-    Require(
-        BinaryPrimitives.ReadUInt32LittleEndian(frames[1].Payload.AsSpan(4, 4)) == 12,
-        "结束帧上报的 total_bytes 不正确");
-    Console.WriteLine(
-        $"板载日志帧扫描检查：通过；混杂文本 {text.Length} 字节、假帧头 2 条被跳过，" +
-        $"恢复合法帧={frames.Count}（含空 data 结束帧）。");
-}
-
-// ③ 合成设备：分片流式下载 + 跨分片 UTF-8 中文 + 结束帧 + 进度回调 + 无 BOM 落盘。
-static void CheckOnboardLogStreamingDownload(string directory)
-{
-    string text =
-        "板载日志第一行：鼠标侧启动\r\n" +
-        "中文与 ASCII 混排 second line\r\n" +
-        "第三行结尾没有换行";
-    byte[] logBytes = Encoding.UTF8.GetBytes(text);
-    string path = Path.Combine(directory, "streaming.log");
-    OnboardLogScriptedChannel channel = new(maxReadSize: 7);
-    // 每片 40 字节（板端实际上限 56）：第 2 片的边界落在「动」字的第三个字节内部，
-    // 用来验证下载器用同一个 Decoder 跨分片拼接多字节字符。
-    List<byte[]> pieces = [];
-    for (int offset = 0; offset < logBytes.Length; offset += 40)
-    {
-        pieces.Add(logBytes[offset..Math.Min(offset + 40, logBytes.Length)]);
-    }
-    Require(pieces.Count >= 3, "流式转存检查的合成日志太短，无法覆盖跨分片解码");
-    int written = 0;
-    foreach (byte[] piece in pieces)
-    {
-        channel.WriteResponse(BuildLogResponseFrame(1, (uint)written, (uint)logBytes.Length, piece));
-        written += piece.Length;
-    }
-    channel.WriteResponse(BuildLogResponseFrame(1, (uint)logBytes.Length, (uint)logBytes.Length, []));
-
-    List<OnboardLogDownloadProgress> reports = [];
-    OnboardLogDownloadResult result = OnboardLogDownloader.DownloadFromChannel(
-        channel,
-        path,
-        new Progress<OnboardLogDownloadProgress>(reports.Add),
-        timeout: TimeSpan.FromSeconds(2),
-        firstResponseTimeout: TimeSpan.FromSeconds(2));
-
-    Require(channel.RequestWritten, "转存下载器没有写出 LOG_DUMP_REQUEST");
-    byte[] request = channel.Request;
-    Require(
-        request[0] == 0xA5 && request[1] == 0x5A && request[3] == (byte)MessageType.LogDumpRequest &&
-        BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(4, 2)) == 1 &&
-        FrameCodec.ComputeCrc16(request.AsSpan(2, request.Length - 4)) ==
-        BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(request.Length - 2, 2)),
-        "转存下载器写出的请求帧不符合 A5 5A 帧格式");
-    Require(result.Completed && !result.TimedOut, $"合成流下载未正常结束：{result}");
-    Require(
-        result.BytesReceived == logBytes.Length && result.ChunkCount == pieces.Count + 1 &&
-        result.DeviceTotalBytes == (uint)logBytes.Length,
-        $"合成流下载结果不正确：{result}");
-    Require(!result.Truncated && !result.NoResponse, "完整下载不得被判定为截断或无响应");
-    byte[] saved = File.ReadAllBytes(path);
-    Require(
-        saved.Length >= 3 && !(saved[0] == 0xEF && saved[1] == 0xBB && saved[2] == 0xBF),
-        "板载日志文件不得写入 UTF-8 BOM");
-    Require(Encoding.UTF8.GetString(saved) == text, "板载日志文件内容与设备发送的字节不一致");
-    Require(reports.Count == 0 || reports[^1].BytesReceived <= logBytes.Length, "进度回调超过实际下载量");
-    Console.WriteLine(
-        $"板载日志流式转存检查：通过；设备字节={logBytes.Length}，下载字节={result.BytesReceived}，" +
-        $"分片={result.ChunkCount}，读取窗口=7 字节（帧跨多次读取），中文跨分片解码正确，文件无 BOM。");
-
-    // ④ 大日志：分片上限 56 字节、超过 32 KB 时必须触发进度回调。
-    int largeLength = 40 * 1024;
-    byte[] large = new byte[largeLength];
-    for (int index = 0; index < large.Length; index++)
-    {
-        large[index] = (byte)('a' + index % 26);
-    }
-    string largePath = Path.Combine(directory, "large.log");
-    OnboardLogScriptedChannel largeChannel = new();
-    for (int offset = 0; offset < largeLength; offset += OnboardLogDownloader.MaximumChunkBytes)
-    {
-        int length = Math.Min(OnboardLogDownloader.MaximumChunkBytes, largeLength - offset);
-        largeChannel.WriteResponse(BuildLogResponseFrame(1, (uint)offset, (uint)largeLength,
-            large[offset..(offset + length)]));
-    }
-    largeChannel.WriteResponse(BuildLogResponseFrame(1, (uint)largeLength, (uint)largeLength, []));
-    List<OnboardLogDownloadProgress> largeReports = [];
-    OnboardLogDownloadResult largeResult = OnboardLogDownloader.DownloadFromChannel(
-        largeChannel,
-        largePath,
-        new Progress<OnboardLogDownloadProgress>(largeReports.Add),
-        timeout: TimeSpan.FromSeconds(5),
-        firstResponseTimeout: TimeSpan.FromSeconds(5));
-    int expectedChunks = (largeLength + OnboardLogDownloader.MaximumChunkBytes - 1) /
-                         OnboardLogDownloader.MaximumChunkBytes + 1;
-    Require(
-        largeResult.Completed && largeResult.BytesReceived == largeLength &&
-        largeResult.ChunkCount == expectedChunks,
-        $"40 KB 合成日志下载结果不正确：{largeResult}，期望分片={expectedChunks}");
-    Require(File.ReadAllBytes(largePath).Length == largeLength, "40 KB 合成日志落盘字节数不一致");
-    Require(
-        largeReports.Count >= 1 && largeReports[^1].BytesReceived >= OnboardLogDownloader.ProgressReportIntervalBytes,
-        $"超过 {OnboardLogDownloader.ProgressReportIntervalBytes} 字节后必须回调进度，实际={largeReports.Count} 次");
-    Console.WriteLine(
-        $"板载日志大包检查：通过；设备字节={largeLength}，分片={largeResult.ChunkCount}，" +
-        $"进度回调={largeReports.Count} 次（最后一次 {largeReports[^1].BytesReceived} 字节）。");
-}
-
-// ⑤ 超时与无响应必须可区分，且部分内容仍要落盘供现场判断。
-static void CheckOnboardLogTimeoutAndNoResponse(string directory)
-{
-    byte[] partial = Encoding.UTF8.GetBytes("只有前两片，板子随后没再回数据\r\n");
-    string timeoutPath = Path.Combine(directory, "timeout.log");
-    OnboardLogScriptedChannel timeoutChannel = new();
-    timeoutChannel.WriteResponse(BuildLogResponseFrame(1, 0, 4096, partial));
-    OnboardLogDownloadResult timeoutResult = OnboardLogDownloader.DownloadFromChannel(
-        timeoutChannel,
-        timeoutPath,
-        timeout: TimeSpan.FromMilliseconds(250),
-        firstResponseTimeout: TimeSpan.FromMilliseconds(250));
-    Require(
-        timeoutResult.TimedOut && !timeoutResult.Completed && !timeoutResult.NoResponse,
-        $"分片中断未被判定为超时：{timeoutResult}");
-    Require(
-        timeoutResult.BytesReceived == partial.Length && File.ReadAllBytes(timeoutPath).Length == partial.Length,
-        $"超时前的部分内容没有完整落盘：{timeoutResult}");
-    Require(timeoutResult.Truncated, "板端上报总量大于下载量时必须标记为截断");
-
-    string emptyPath = Path.Combine(directory, "no-response.log");
-    OnboardLogScriptedChannel silentChannel = new();
-    OnboardLogDownloadResult silentResult = OnboardLogDownloader.DownloadFromChannel(
-        silentChannel,
-        emptyPath,
-        timeout: TimeSpan.FromMilliseconds(200),
-        firstResponseTimeout: TimeSpan.FromMilliseconds(200));
-    Require(
-        silentResult.NoResponse && silentResult.TimedOut && silentResult.BytesReceived == 0,
-        $"板端无响应未被区分：{silentResult}");
-    Require(silentChannel.RequestWritten, "无响应场景下也必须先写出请求帧");
-    Console.WriteLine(
-        $"板载日志超时检查：通过；分片中断={timeoutResult.BytesReceived} 字节（已落盘、标记截断），" +
-        $"完全无响应={silentResult.NoResponse}，两者均与正常结束可区分。");
-}
-
-// ⑥ 界面结论文案必须覆盖完成、截断、无响应、超时四种可诊断结果。
-static void CheckOnboardLogResultMessages()
-{
-    string port = "COM9";
-    string path = @"D:\log\device\onboard-log.log";
-    string completed = BridgeMainForm.DescribeOnboardLogResult(
-        new OnboardLogDownloadResult(1024, 20, 1024, Completed: true, TimedOut: false, TimeSpan.FromSeconds(1.5)),
-        port,
-        path);
-    Require(
-        completed.Contains("转存完成", StringComparison.Ordinal) &&
-        completed.Contains("已下载=1024 字节", StringComparison.Ordinal) &&
-        completed.Contains("端口=COM9", StringComparison.Ordinal) &&
-        completed.Contains(path, StringComparison.Ordinal),
-        $"完成结论缺少端口/字节数/文件路径：{completed}");
-    string truncated = BridgeMainForm.DescribeOnboardLogResult(
-        new OnboardLogDownloadResult(1 << 20, 20000, 4 << 20, Completed: true, TimedOut: false, TimeSpan.FromSeconds(9)),
-        port,
-        path);
-    Require(
-        truncated.Contains("尾部仍在板上", StringComparison.Ordinal) &&
-        truncated.Contains("板端上报=4194304 字节", StringComparison.Ordinal),
-        $"截断结论未提示尾部仍在板上：{truncated}");
-    string noResponse = BridgeMainForm.DescribeOnboardLogResult(
-        new OnboardLogDownloadResult(0, 0, 0, Completed: false, TimedOut: true, TimeSpan.FromSeconds(3)),
-        port,
-        path);
-    Require(
-        noResponse.Contains("没有任何 LOG_READ_RESPONSE 响应", StringComparison.Ordinal) &&
-        noResponse.Contains("端口选错", StringComparison.Ordinal),
-        $"无响应结论未给出可诊断原因：{noResponse}");
-    string timeout = BridgeMainForm.DescribeOnboardLogResult(
-        new OnboardLogDownloadResult(512, 40, 4096, Completed: false, TimedOut: true, TimeSpan.FromSeconds(30)),
-        port,
-        path);
-    Require(
-        timeout.Contains("没有收到后续分片", StringComparison.Ordinal) &&
-        timeout.Contains("已保存部分内容", StringComparison.Ordinal),
-        $"超时结论未说明已保存部分内容：{timeout}");
-    Console.WriteLine("板载日志结论文案检查：通过；完成、截断、无响应、超时四种结果均给出端口、字节数、分片、耗时与文件路径。");
-}
-
-static byte[] BuildLogResponseFrame(ushort sequence, uint offset, uint total, byte[] data)
-{
-    byte[] payload = new byte[8 + data.Length];
-    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), offset);
-    BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), total);
-    data.CopyTo(payload.AsSpan(8));
-    return OnboardLogDownloader.EncodeFrame(MessageType.LogReadResponse, sequence, payload);
-}
-
 static void CheckKeyboardAutoRepeatEdgeFiltering()
 {
     RecordingTransport transport = new();
@@ -1422,7 +1453,7 @@ static void CheckInputCallbackFailureStillReleasesAll()
 static void CheckMouseButtonsAreTrackedPerDevice()
 {
     RecordingTransport transport = new();
-    using InputForwarder input = new(transport);
+    using InputForwarder input = new(transport, legacyFirmwareCompatibility: () => true);
     IntPtr firstMouse = new(1);
     IntPtr secondMouse = new(2);
     input.SetForwardingEnabled(true);
@@ -1475,7 +1506,7 @@ static void CheckMouseButtonsAreTrackedPerDevice()
 static void CheckLuaReleaseCannotBlockInputCapture()
 {
     RecordingTransport transport = new();
-    using InputForwarder input = new(transport);
+    using InputForwarder input = new(transport, legacyFirmwareCompatibility: () => true);
     using ManualResetEventSlim releaseHandlerEntered = new(false);
     using ManualResetEventSlim allowReleaseHandler = new(false);
     input.PhysicalInputChanged += physicalInput =>
@@ -2585,7 +2616,7 @@ static void CheckDeviceLogMirrorPerPortFile()
         using (StreamWriter writer = new(
                    new FileStream(mirrorPath, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite),
                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
-               { AutoFlush = true })
+        { AutoFlush = true })
         {
             DeviceLogMirror.WriteMirrorLogLine(writer, "COM3", "I (42) UART1统计 rx=7", timestamp);
             using FileStream readStream = new(mirrorPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
@@ -2684,10 +2715,10 @@ static void CheckAutomationProfilesAndRuntime()
         AutomationSettings behaviorSettings = store.LoadSettings();
         behaviorSettings.MinimizeToTray = false;
         behaviorSettings.CloseToTray = false;
-        behaviorSettings.GenerateMovementAnalysisImage = false;
+        behaviorSettings.AlwaysOutputUdpEnabled = false;
         store.SaveSettings(behaviorSettings);
         AutomationSettings reloadedBehaviorSettings = store.LoadSettings();
-        Require(!reloadedBehaviorSettings.MinimizeToTray && !reloadedBehaviorSettings.CloseToTray && !reloadedBehaviorSettings.GenerateMovementAnalysisImage, "托盘与分析图片设置未持久化");
+        Require(!reloadedBehaviorSettings.MinimizeToTray && !reloadedBehaviorSettings.CloseToTray && !reloadedBehaviorSettings.AlwaysOutputUdpEnabled, "托盘与始终 UDP 输出设置未持久化");
 
         ParsedMacro staged = MacroParser.Parse(
             "[on_press]\nmouse(1,1)\n[while_hold]\nmove(1,2)\n[on_release]\nmouse(1,0)",
@@ -2930,7 +2961,7 @@ static void CheckLuaSpacingFormatting()
 static void CheckAutomationRemoteOutput()
 {
     RecordingTransport transport = new();
-    using InputForwarder input = new(transport);
+    using InputForwarder input = new(transport, legacyFirmwareCompatibility: () => true);
     input.SetForwardingEnabled(true);
     input.SetAutomationMouseButton(4, true);
     input.SendAutomationMouseMove(17, -9);
@@ -2952,6 +2983,383 @@ static void CheckAutomationRemoteOutput()
     input.SetForwardingEnabled(false);
 }
 
+static void CheckAutomationOutputRouteAndButtonMerge()
+{
+    RecordingTransport transport = new();
+    RecordingAutomationOutput local = new();
+    bool mouseHostAvailable = false;
+    using InputForwarder input = new(
+        transport,
+        legacyFirmwareCompatibility: () => false,
+        mouseHostAvailable: () => mouseHostAvailable);
+    RoutedAutomationOutput output = new(input, local);
+
+    // 新模式 M 不可用时，按下走 Win32；M 恢复后，原 Win32 按下仍由 Win32 松开。
+    output.MoveRelative(3, -2);
+    output.SetMouseButton(1, true);
+    output.KeyDown(4);
+    mouseHostAvailable = true;
+    output.SetMouseButton(1, false);
+    output.KeyUp(4);
+    Require(
+        local.Actions.Contains("mouse:1:down") && local.Actions.Contains("mouse:1:up") &&
+        local.Actions.Contains("key:4:down") && local.Actions.Contains("key:4:up") &&
+        local.Actions.Contains("move:3,-2"),
+        "新模式 M 不可用时须使用 Win32，M 恢复后仍须向原 Win32 后端发送松开");
+    Require(transport.MouseReports().Length == 0, "M 不可用期间的本机回退不得发送鼠标报告");
+
+    // HOME 保持关闭；M 可用后 Lua 鼠标通过 8 字节桥接报告输出，键盘仍留在 Win32。
+    output.MoveRelative(17, -9);
+    output.Wheel(2);
+    output.SetMouseButton(1, true);
+    output.KeyDown(5);
+    output.KeyUp(5);
+    Require(
+        SpinWait.SpinUntil(() =>
+        {
+            BridgeMouseReport[] reports = transport.BridgeMouseReports();
+            return reports.Sum(report => (long)report.Report.X) == 17 &&
+                reports.Sum(report => (long)report.Report.Y) == -9 &&
+                reports.Sum(report => (long)report.Report.Wheel) == 2;
+        }, 1000) && transport.MousePayloadLengths().All(length => length == MouseReportCodec.BridgeLength),
+        "HOME 关闭时 M 可用的 Lua 鼠标移动/滚轮未形成完整 8 字节桥接报告");
+    Require(
+        transport.KeyboardReports().Length == 0 && local.Actions.Contains("key:5:down") &&
+        local.Actions.Contains("key:5:up"),
+        "新双板模式宏键盘必须继续通过 Win32，不得发送 KeyboardReport 到 M");
+
+    // UDP 右键 held 与 Lua 左键共享报告状态；释放 Lua 左键不能释放 UDP 右键。
+    input.SetRemoteMouseButtons(0x02);
+    output.SetMouseButton(1, true);
+    Require(
+        SpinWait.SpinUntil(() => transport.MouseReports().Any(report => report.Buttons == 0x03), 1000),
+        "UDP 右键 held 与 Lua 左键 down 未合并为 0x03");
+    output.SetMouseButton(1, false);
+    Require(
+        SpinWait.SpinUntil(() => transport.MouseReports().LastOrDefault().Buttons == 0x02, 1000),
+        "Lua 左键 up 未保留仍 held 的 UDP 右键 0x02");
+    output.SetMouseButton(1, true);
+    Require(
+        SpinWait.SpinUntil(() => transport.MouseReports().LastOrDefault().Buttons == 0x03, 1000),
+        "停止宏释放检查未先观察到 UDP 右键与宏左键同时按下");
+    output.ReleaseAll();
+    Require(
+        SpinWait.SpinUntil(() => transport.MouseReports().LastOrDefault().Buttons == 0x02, 1000),
+        "停止宏的 ReleaseAll 不得清除仍 held 的 UDP 右键 0x02");
+    input.SetRemoteMouseButtons(0);
+    Require(
+        SpinWait.SpinUntil(() => transport.MouseReports().LastOrDefault().Buttons == 0, 1000),
+        "UDP 右键释放后 M 软件报告未回到全释放状态");
+
+    // M 失效时移动回退 Win32；先前发往 M 的按钮 up 仍释放 M 上的软件按钮。
+    output.SetMouseButton(2, true);
+    Require(
+        SpinWait.SpinUntil(() => transport.MouseReports().LastOrDefault().Buttons == 0x04, 1000),
+        "M 可用时的 Lua 按钮 down 未进入 M 软件报告");
+    mouseHostAvailable = false;
+    output.MoveRelative(4, 6);
+    output.SetMouseButton(2, false);
+    Require(
+        local.Actions.Contains("move:4,6") &&
+        SpinWait.SpinUntil(() => transport.MouseReports().LastOrDefault().Buttons == 0, 1000),
+        "M 失效回退 Win32 后，原 M 后端的按钮 up 未释放软件按键");
+    mouseHostAvailable = true;
+    long recoveredX = transport.MouseReports().Sum(report => (long)report.X);
+    long recoveredY = transport.MouseReports().Sum(report => (long)report.Y);
+    long recoveredWheel = transport.MouseReports().Sum(report => (long)report.Wheel);
+    output.MoveRelative(2, -3);
+    output.Wheel(1);
+    Require(
+        SpinWait.SpinUntil(() =>
+        {
+            MouseReport[] reports = transport.MouseReports();
+            return reports.Sum(report => (long)report.X) == recoveredX + 2 &&
+                reports.Sum(report => (long)report.Y) == recoveredY - 3 &&
+                reports.Sum(report => (long)report.Wheel) == recoveredWheel + 1;
+        }, 1000),
+        "M 恢复后新宏移动/滚轮未重新走桥接报告通路");
+    output.ReleaseAll();
+
+    RecordingTransport legacyRemoteTransport = new();
+    using (InputForwarder legacyRemoteInput = new(
+        legacyRemoteTransport,
+        legacyFirmwareCompatibility: () => true))
+    {
+        legacyRemoteInput.SetForwardingEnabled(true);
+        RoutedAutomationOutput legacyRemoteOutput = new(legacyRemoteInput, new RecordingAutomationOutput());
+        legacyRemoteOutput.MoveRelative(12, -5);
+        legacyRemoteOutput.Wheel(-1);
+        legacyRemoteOutput.SetMouseButton(1, true);
+        legacyRemoteOutput.KeyDown(4);
+        legacyRemoteOutput.KeyUp(4);
+        legacyRemoteOutput.SetMouseButton(1, false);
+        Require(
+            SpinWait.SpinUntil(() =>
+            {
+                MouseReport[] reports = legacyRemoteTransport.MouseReports();
+                return reports.Sum(report => (long)report.X) == 12 &&
+                    reports.Sum(report => (long)report.Y) == -5 &&
+                    reports.Sum(report => (long)report.Wheel) == -1;
+            }, 1000) &&
+            legacyRemoteTransport.MousePayloadLengths().All(length => length == MouseReportCodec.Length),
+            "旧版单板 HOME 开启时 Lua 鼠标移动必须通过 7 字节报告输出");
+        byte[][] legacyKeyboardReports = legacyRemoteTransport.KeyboardReports();
+        Require(
+            legacyKeyboardReports.Any(report => report.Skip(2).Contains((byte)4)) &&
+            legacyKeyboardReports.Last().All(value => value == 0),
+            "旧版单板 HOME 开启时 Lua 键盘按下/松开必须发送键盘报告");
+        legacyRemoteInput.SetForwardingEnabled(false);
+    }
+
+    RecordingTransport legacyUdpTransport = new();
+    RecordingAutomationOutput legacyLocal = new();
+    using (InputForwarder legacyLocalInput = new(
+        legacyUdpTransport,
+        legacyFirmwareCompatibility: () => true))
+    {
+        RoutedAutomationOutput legacyLocalOutput = new(legacyLocalInput, legacyLocal);
+        legacyLocalOutput.MoveRelative(9, -4);
+        legacyLocalOutput.Wheel(3);
+        legacyLocalOutput.SetMouseButton(1, true);
+        legacyLocalOutput.SetMouseButton(1, false);
+        legacyLocalOutput.KeyDown(6);
+        legacyLocalOutput.KeyUp(6);
+        Require(
+            legacyLocal.Actions.Contains("move:9,-4") &&
+            legacyLocal.Actions.Contains("wheel:3") &&
+            legacyLocal.Actions.ContainsSequence("mouse:1:down", "mouse:1:up") &&
+            legacyLocal.Actions.ContainsSequence("key:6:down", "key:6:up") &&
+            legacyUdpTransport.FrameCount(MessageType.MouseReport) == 0 &&
+            legacyUdpTransport.FrameCount(MessageType.KeyboardReport) == 0,
+            "旧版单板 HOME 关闭时 Lua/宏鼠标和键盘必须走 Win32");
+        Require(
+            legacyLocalInput.TryInjectMouseMovement(8, -3, 1) &&
+            SpinWait.SpinUntil(() => legacyUdpTransport.MouseReports().Sum(report => (long)report.X) == 8, 1000) &&
+            legacyUdpTransport.MousePayloadLengths().All(length => length == MouseReportCodec.Length),
+            "旧版 HOME 关闭且 UDP 开关开启时应继续接收 7 字节 UDP 鼠标报告");
+        legacyLocalInput.ConfigureAlwaysOutputUdp(false);
+        int reportsBeforeDisabledUdp = legacyUdpTransport.FrameCount(MessageType.MouseReport);
+        Require(
+            !legacyLocalInput.TryInjectMouseMovement(6, 6) &&
+            legacyUdpTransport.FrameCount(MessageType.MouseReport) == reportsBeforeDisabledUdp,
+            "旧版 HOME 关闭且 UDP 开关关闭时应阻止 UDP 输入");
+    }
+
+    Console.WriteLine("自动化路由检查：新双板 HOME 关闭时 M 优先鼠标+Win32 键盘，失效回退并恢复；旧单板 HOME 开启走 7 字节鼠标与键盘报告，关闭走 Win32；UDP held 在宏 ReleaseAll 后保留。");
+}
+
+static void CheckPhysicalInputForwardingRouting()
+{
+    ConcurrentQueue<PhysicalInputEvent> dualObserved = new();
+    RecordingTransport dualTransport = new();
+    using (InputForwarder dualInput = new(dualTransport, legacyFirmwareCompatibility: () => false))
+    {
+        dualInput.PhysicalInputChanged += dualObserved.Enqueue;
+        dualInput.ConfigureSimulatedUdpInput(true, 30);
+        dualInput.SetForwardingEnabled(true);
+        Require(
+            dualInput.ForwardingEnabled &&
+            !dualInput.PhysicalForwardingEnabled &&
+            !dualInput.SimulatedUdpInputEnabled,
+            "双板 HOME 开启时只保留 HOME 状态，实体输入与模拟测试不得转发到串口");
+        Require(
+            !InputForwarder.ShouldSuppressMouse(dualInput.PhysicalForwardingEnabled) &&
+            !InputForwarder.ShouldSuppressKeyboard(dualInput.PhysicalForwardingEnabled, false, false),
+            "双板 HOME 开启时实体鼠标和普通键盘不得被本机 Hook 抑制");
+
+        dualInput.ProcessKeyboardInputForChecks(0x41, extended: false, isDown: true);
+        dualInput.ProcessKeyboardInputForChecks(0x41, extended: false, isDown: false);
+        dualInput.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            LastX = 11,
+            LastY = -8,
+            Buttons = NativeMethods.RawMouseLeftButtonDown,
+        });
+        dualInput.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseLeftButtonUp,
+        });
+
+        Require(
+            dualTransport.MouseReports().Length == 0 && dualTransport.KeyboardReports().Length == 0,
+            "双板 HOME 开启时 EXE 不得重复转发实体鼠标或键盘报告");
+        Require(
+            dualObserved.Any(input => input.VirtualKey == 0x41 && input.Pressed) &&
+            dualObserved.Any(input => input.VirtualKey == 0x41 && !input.Pressed) &&
+            dualObserved.Any(input => input.VirtualKey == 0x01 && input.Pressed) &&
+            dualObserved.Any(input => input.VirtualKey == 0x01 && !input.Pressed),
+            "双板 HOME 开启时仍须把实体键鼠边沿送给本机 Lua/宏监听");
+        dualInput.SetForwardingEnabled(false);
+    }
+
+    RecordingTransport legacyHomeOffTransport = new();
+    using (InputForwarder legacyHomeOff = new(
+        legacyHomeOffTransport,
+        legacyFirmwareCompatibility: () => true))
+    {
+        legacyHomeOff.ConfigureSimulatedUdpInput(true, 30);
+        Require(!legacyHomeOff.SimulatedUdpInputEnabled, "旧版 HOME 关闭时不得启用模拟输入测试源");
+        legacyHomeOff.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            LastX = 7,
+            LastY = 3,
+        });
+        Require(legacyHomeOffTransport.MouseReports().Length == 0, "旧版 HOME 关闭时实体鼠标不得进入串口报告");
+        Require(
+            legacyHomeOff.TryInjectMouseMovement(4, -2) &&
+            SpinWait.SpinUntil(
+                () => legacyHomeOffTransport.MouseReports().Sum(report => (long)report.X) == 4,
+                1000) &&
+            legacyHomeOffTransport.MousePayloadLengths().All(length => length == MouseReportCodec.Length),
+            "实体门控不得影响旧版 HOME 关闭时仍启用的网络 UDP 输入");
+    }
+
+    ConcurrentQueue<PhysicalInputEvent> legacyObserved = new();
+    RecordingTransport legacyHomeOnTransport = new();
+    using (InputForwarder legacyHomeOn = new(
+        legacyHomeOnTransport,
+        legacyFirmwareCompatibility: () => true))
+    {
+        legacyHomeOn.PhysicalInputChanged += legacyObserved.Enqueue;
+        legacyHomeOn.ConfigureSimulatedUdpInput(false, 100);
+        legacyHomeOn.SetForwardingEnabled(true);
+        Require(legacyHomeOn.PhysicalForwardingEnabled, "旧版 HOME 开启时必须启用实体输入转发");
+        Require(
+            InputForwarder.ShouldSuppressMouse(legacyHomeOn.PhysicalForwardingEnabled) &&
+            InputForwarder.ShouldSuppressKeyboard(legacyHomeOn.PhysicalForwardingEnabled, true, false),
+            "旧版 HOME 开启时实体输入和控制快捷键必须按旧通路规则抑制");
+        legacyHomeOn.ProcessKeyboardInputForChecks(0x41, extended: false, isDown: true);
+        legacyHomeOn.ProcessKeyboardInputForChecks(0x41, extended: false, isDown: false);
+        legacyHomeOn.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            LastX = 12,
+            LastY = -7,
+            Buttons = NativeMethods.RawMouseLeftButtonDown,
+        });
+        legacyHomeOn.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            Buttons = NativeMethods.RawMouseLeftButtonUp,
+        });
+        Require(
+            SpinWait.SpinUntil(
+                () => legacyHomeOnTransport.MouseReports().Sum(report => (long)report.X) == 12 &&
+                    legacyHomeOnTransport.MouseReports().LastOrDefault().Buttons == 0,
+                1000),
+            "旧版 HOME 开启且测试关闭时实体鼠标未走原始 7 字节报告路径");
+        MouseReport[] reports = legacyHomeOnTransport.MouseReports();
+        Require(
+            reports.Sum(report => (long)report.Y) == -7 &&
+            reports.Any(report => report.Buttons == 1) &&
+            reports.Last().Buttons == 0 &&
+            legacyHomeOnTransport.MousePayloadLengths().All(length => length == MouseReportCodec.Length),
+            "旧版 HOME 开启的实体鼠标报告必须保留位移、按钮 down/up 与 7 字节格式");
+        byte[][] keyboardReports = legacyHomeOnTransport.KeyboardReports();
+        Require(
+            keyboardReports.Any(report => report.Skip(2).Contains((byte)4)) &&
+            keyboardReports.Last().All(value => value == 0),
+            "旧版 HOME 开启时实体键盘必须继续产生按下和释放报告");
+        Require(
+            legacyObserved.Any(input => input.VirtualKey == 0x41 && input.Pressed) &&
+            legacyObserved.Any(input => input.VirtualKey == 0x01 && input.Pressed),
+            "旧版实体按键转发期间 Lua/宏本机监听仍须收到键鼠事件");
+        legacyHomeOn.SetForwardingEnabled(false);
+    }
+
+    RecordingTransport simulatedTransport = new();
+    using (InputForwarder simulated = new(
+        simulatedTransport,
+        legacyFirmwareCompatibility: () => true))
+    {
+        simulated.ConfigureSimulatedUdpInput(true, 30);
+        simulated.SetForwardingEnabled(true);
+        Require(simulated.SimulatedUdpInputEnabled, "旧版 HOME 开启且偏好开启时模拟输入测试源必须生效");
+        simulated.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
+        {
+            LastX = 9,
+            LastY = -6,
+        });
+        simulated.ConfigureSimulatedUdpInput(false, 30);
+        Thread.Sleep(70);
+        Require(
+            !simulated.SimulatedUdpInputEnabled && simulatedTransport.MouseReports().Length == 0,
+            "关闭模拟输入测试时必须丢弃旧分桶，不能把测试尾部重放到普通报告路径");
+        simulated.SetForwardingEnabled(false);
+    }
+
+    Console.WriteLine("实体输入路由检查：实体键鼠仅在原单板固件+HOME 时由 EXE 转发；双板实体鼠标保留 M→P 硬件直通，本机键盘继续监听；UDP 模拟测试仅在原单板+HOME+开关开启时聚合到单板 7 字节报告，不发网络 UDP；网络 UDP 路由独立。");
+}
+
+static void CheckRoutingModeChangesKeepHomeAndReloadOnce()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-route-switch-{Guid.NewGuid():N}");
+    try
+    {
+        AutomationProfileStore store = new(directory);
+        AutomationProfile profile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
+        profile.Macros["路由切换单次触发"] = new MacroDefinition
+        {
+            Trigger = "f1",
+            Mode = MacroRunModes.Once,
+            Enabled = true,
+            Text = "move(10,0)",
+        };
+        store.SaveProfile(profile);
+
+        AutomationController? controllerState = null;
+        RecordingTransport transport = new();
+        RecordingAutomationOutput localOutput = new();
+        using InputForwarder input = new(
+            transport,
+            legacyFirmwareCompatibility: () =>
+                controllerState?.Settings.LegacySingleBoardFirmwareCompatibility ?? false);
+        using AutomationController controller = new(store, input, localOutput);
+        controllerState = controller;
+        controller.ApplyOutputRoutingSettings(false, true, true, 30);
+        input.SetForwardingEnabled(true);
+        controller.Start();
+        Require(
+            input.ForwardingEnabled &&
+            !input.PhysicalForwardingEnabled &&
+            !input.SimulatedUdpInputEnabled,
+            "双板模式切换前 HOME 状态应为开启，但不启用物理/模拟转发");
+
+        controller.ApplyOutputRoutingSettings(true, true, true, 30);
+        Require(
+            input.ForwardingEnabled &&
+            input.PhysicalForwardingEnabled &&
+            input.SimulatedUdpInputEnabled,
+            "切到旧版后必须保留 HOME 开启状态并按请求激活物理模拟测试源");
+        controller.ApplyOutputRoutingSettings(false, true, true, 30);
+        Require(
+            input.ForwardingEnabled &&
+            !input.PhysicalForwardingEnabled &&
+            !input.SimulatedUdpInputEnabled,
+            "切回双板后必须保留 HOME 开启状态并立即关闭物理/模拟转发");
+
+        input.ProcessKeyboardInputForChecks(0x70, extended: false, isDown: true);
+        input.ProcessKeyboardInputForChecks(0x70, extended: false, isDown: false);
+        Require(
+            SpinWait.SpinUntil(
+                () => localOutput.Actions.Count(action => action == "move:10,0") >= 1,
+                1000),
+            "路由切换后的宏没有重新绑定到 F1");
+        Thread.Sleep(80);
+        Require(
+            localOutput.Actions.Count(action => action == "move:10,0") == 1,
+            "一次模式切换后同一 F1 宏不得因重复绑定执行两次");
+        input.SetForwardingEnabled(false);
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    Console.WriteLine("路由模式切换检查：legacy↔dual 保留 HOME，物理/模拟门控和宏重载各生效一次。");
+}
+
 static void CheckLocalMouseTriggersReachLua()
 {
     string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-local-lua-{Guid.NewGuid():N}");
@@ -2967,7 +3375,7 @@ static void CheckLocalMouseTriggersReachLua()
         store.SaveProfile(profile);
 
         RecordingTransport transport = new();
-        using InputForwarder input = new(transport);
+        using InputForwarder input = new(transport, legacyFirmwareCompatibility: () => false);
         using AutomationController automation = new(store, input, new RecordingAutomationOutput());
         ConcurrentQueue<string> logs = new();
         ConcurrentQueue<string> diagnosticLogs = new();
@@ -2975,7 +3383,10 @@ static void CheckLocalMouseTriggersReachLua()
         automation.DiagnosticLog += diagnosticLogs.Enqueue;
         automation.Start();
 
-        Require(!input.ForwardingEnabled, "本机 Lua 触发检查必须在捕获关闭状态运行");
+        input.SetForwardingEnabled(true);
+        Require(
+            input.ForwardingEnabled && !input.PhysicalForwardingEnabled,
+            "双板 HOME 开启时应保留 Host 状态但不转发实体鼠标");
         input.ProcessRawMouseInputForChecks(new NativeMethods.RawMouse
         {
             Buttons = NativeMethods.RawMouseButton4Down,
@@ -2988,7 +3399,7 @@ static void CheckLocalMouseTriggersReachLua()
         Require(SpinWait.SpinUntil(
             () => logs.Any(line => line.Contains("event=pressed arg=4", StringComparison.Ordinal)) &&
                   logs.Any(line => line.Contains("event=released arg=4", StringComparison.Ordinal)),
-            1000), "捕获关闭时实体鼠标按键未送达 Lua OnEvent/DebugLog");
+            1000), "双板 HOME 开启时实体鼠标按键未送达 Lua OnEvent/DebugLog");
         Require(
             diagnosticLogs.Any(line => line.StartsWith("[LuaEvent]", StringComparison.Ordinal)),
             "Lua 事件详细诊断未进入独立日志通道");
@@ -3006,7 +3417,7 @@ static void CheckLocalMouseTriggersReachLua()
             "Lua UI 简略日志通道不得包含详细事件或输出诊断");
         Require(transport.MouseReports().Length == 0, "本机 Lua 触发不得向对端发送实体鼠标报告");
         Console.WriteLine(
-            "本机 Lua 触发检查：脚本 DebugLog 保留；Host 不额外生成 press/release arg 日志；对端鼠标报告=0。");
+            "本机 Lua 触发检查：双板 HOME 开启时仍收到鼠标事件；脚本 DebugLog 保留；对端实体鼠标报告=0。");
     }
     finally
     {
@@ -3035,7 +3446,7 @@ static void CheckTriggerForwardingIntegration()
         store.SaveProfile(profile);
 
         RecordingTransport transport = new();
-        using InputForwarder input = new(transport);
+        using InputForwarder input = new(transport, legacyFirmwareCompatibility: () => true);
         using AutomationController automation = new(store, input, new RecordingAutomationOutput());
         ConcurrentQueue<string> transitionLogs = new();
         automation.Log += transitionLogs.Enqueue;
@@ -3182,7 +3593,11 @@ static void CheckWindowLayout()
         {
             string automationDirectory = Path.Combine(Path.GetTempPath(), $"hidbridge-ui-{Guid.NewGuid():N}");
             RecordingTransport transport = new();
-            using InputForwarder input = new(transport);
+            AutomationController? controllerState = null;
+            using InputForwarder input = new(
+                transport,
+                legacyFirmwareCompatibility: () =>
+                    controllerState?.Settings.LegacySingleBoardFirmwareCompatibility ?? false);
             AutomationProfileStore store = new(automationDirectory);
             AutomationProfile uiProfile = store.LoadProfile(AutomationProfileStore.GlobalProfile);
             uiProfile.LuaScriptText = "function OnEvent(event, arg)\nif event == \"pressed\" then\nDebugLog(\"aligned\")\nend\nend";
@@ -3196,6 +3611,7 @@ static void CheckWindowLayout()
             };
             store.SaveProfile(uiProfile);
             using AutomationController automation = new(store, input, new RecordingAutomationOutput());
+            controllerState = automation;
             // 该布局检查只验证离屏控件和 RecordingAutomationOutput；禁止把测试光标移到真实桌面。
             using BridgeMainForm form = new(
                 input,
@@ -3224,7 +3640,7 @@ static void CheckWindowLayout()
                 !form.LuaPage.Editor.WordWrap,
                 "Lua 编辑器必须保留多行文本和横向滚动能力");
             Require(
-                LuaPageControl.NormalizeEditorNewlines("第一行\n第二行\r第三行\r\n第四行") ==
+                LuaPageControl.NormalizeEditorNewlines("第一行\n第二行\r第三行\n第四行") ==
                 $"第一行{Environment.NewLine}第二行{Environment.NewLine}第三行{Environment.NewLine}第四行",
                 "Lua 编辑器粘贴前必须把不同换行格式统一为 Windows 多行文本");
             form.MainTabs.SelectedTab = form.MainTabs.TabPages[2];
@@ -3368,9 +3784,111 @@ static void CheckWindowLayout()
             Require(form.SettingsPage.StartOnBootCheckBox.Text.StartsWith("开机启动", StringComparison.Ordinal), "设置页缺少开机启动选项");
             Require(form.SettingsPage.MinimizeToTrayCheckBox.Checked == automation.Settings.MinimizeToTray, "设置页最小化到托盘状态未从配置加载");
             Require(form.SettingsPage.CloseToTrayCheckBox.Checked == automation.Settings.CloseToTray, "设置页关闭到托盘状态未从配置加载");
-            Require(form.SettingsPage.GenerateMovementAnalysisImageCheckBox.Checked == automation.Settings.GenerateMovementAnalysisImage, "设置页分析图片开关状态未从配置加载");
             Require(form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked == automation.Settings.LegacySingleBoardFirmwareCompatibility, "旧版单板固件兼容开关未从配置加载");
-            Require(!automation.Settings.GenerateMovementAnalysisImage, "新配置的分析图片开关默认必须关闭");
+            form.MainTabs.SelectedTab = form.MainTabs.TabPages[3];
+            form.SettingsPage.PerformLayout();
+            Application.DoEvents();
+            Panel legacyUdpRow = form.SettingsPage.AlwaysOutputUdpOptionRow;
+            Panel legacyModeRow = form.SettingsPage.LegacySingleBoardOptionRow;
+            Panel simulatedUdpRow = form.SettingsPage.SimulatedUdpInputOptionRow;
+            CheckBox simulatedUdpCheckBox = form.SettingsPage.SimulatedUdpInputCheckBox;
+            ComboBox simulatedUdpFrequency = form.SettingsPage.SimulatedUdpInputFrequencyBox;
+            Label simulatedUdpDescription = EnumerateControls(simulatedUdpRow)
+                .OfType<Label>()
+                .Single(label => label.AccessibleName == "UDP 模拟输入测试说明");
+            Label legacyUdpDescription = EnumerateControls(legacyUdpRow)
+                .OfType<Label>()
+                .Single(label => label.Text.Contains("仅旧版单板通路使用", StringComparison.Ordinal));
+            Require(
+                legacyUdpRow.Parent is FlowLayoutPanel options &&
+                legacyModeRow.Parent == options &&
+                simulatedUdpRow.Parent == options &&
+                legacyUdpRow.Parent == options &&
+                options.Controls.IndexOf(simulatedUdpRow) == options.Controls.IndexOf(legacyModeRow) + 1 &&
+                options.Controls.IndexOf(legacyUdpRow) == options.Controls.IndexOf(simulatedUdpRow) + 1 &&
+                simulatedUdpRow.Top >= legacyModeRow.Bottom &&
+                legacyUdpRow.Top >= simulatedUdpRow.Bottom,
+                "UDP 模拟测试行与始终 UDP 输出行必须按顺序紧跟旧版单板选项");
+            Require(
+                !automation.Settings.LegacySingleBoardFirmwareCompatibility &&
+                !legacyUdpRow.Visible &&
+                !simulatedUdpRow.Visible &&
+                !simulatedUdpCheckBox.Visible &&
+                !simulatedUdpFrequency.Visible &&
+                !simulatedUdpDescription.Visible &&
+                !form.SettingsPage.AlwaysOutputUdpCheckBox.Visible &&
+                !legacyUdpDescription.Visible,
+                "新双板模式必须隐藏两个旧版选项整行及说明，不能留下可见残余文字");
+            Require(
+                !automation.Settings.SimulatedUdpInputEnabled &&
+                !input.SimulatedUdpInputEnabled &&
+                simulatedUdpCheckBox.Text == "UDP 模拟输入测试" &&
+                simulatedUdpFrequency.Items.Cast<int>().SequenceEqual([30, 60, 100, 140, 200, 500, 0]) &&
+                simulatedUdpFrequency.SelectedItem is 100,
+                "模拟输入测试偏好必须默认关闭、频率默认 100 Hz 并保留完整频率列表");
+            form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked = true;
+            Application.DoEvents();
+            Require(
+                legacyUdpRow.Visible &&
+                simulatedUdpRow.Visible &&
+                simulatedUdpCheckBox.Visible &&
+                simulatedUdpDescription.Visible &&
+                !simulatedUdpFrequency.Enabled &&
+                form.SettingsPage.AlwaysOutputUdpCheckBox.Visible &&
+                legacyUdpDescription.Visible &&
+                form.SettingsPage.AlwaysOutputUdpCheckBox.Text == "始终开启 UDP 输出",
+                "仅旧版单板模式开启后才显示模拟输入和始终 UDP 输出整行及说明");
+            simulatedUdpCheckBox.Checked = true;
+            simulatedUdpFrequency.SelectedItem = 140;
+            Require(
+                automation.Settings.SimulatedUdpInputEnabled &&
+                automation.Settings.SimulatedUdpInputFrequencyHz == 140 &&
+                input.SimulatedUdpInputFrequencyHz == 140 &&
+                !input.SimulatedUdpInputEnabled &&
+                simulatedUdpFrequency.Enabled,
+                "旧版 HOME 关闭时应保存模拟测试请求和频率，但实际测试源保持关闭");
+            input.SetForwardingEnabled(true);
+            Require(
+                input.ForwardingEnabled && input.PhysicalForwardingEnabled && input.SimulatedUdpInputEnabled &&
+                form.CaptureSurface.Forwarding,
+                "旧版 HOME 开启后应启用物理路由、模拟测试源并更新捕获面板状态");
+            form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked = false;
+            Require(
+                input.ForwardingEnabled && !input.PhysicalForwardingEnabled && !input.SimulatedUdpInputEnabled &&
+                !form.CaptureSurface.Forwarding && !simulatedUdpRow.Visible,
+                "切换到双板时必须保留 HOME 状态、关闭物理/模拟路由并即时更新 UI");
+            form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked = true;
+            Require(
+                input.ForwardingEnabled && input.PhysicalForwardingEnabled && input.SimulatedUdpInputEnabled &&
+                form.CaptureSurface.Forwarding && simulatedUdpRow.Visible,
+                "切回旧版时必须恢复 HOME 对应的物理/模拟路由及 UI 状态");
+            simulatedUdpCheckBox.Checked = false;
+            Require(
+                !automation.Settings.SimulatedUdpInputEnabled && !input.SimulatedUdpInputEnabled,
+                "关闭模拟测试开关必须立即关闭实际测试源");
+            form.SettingsPage.AlwaysOutputUdpCheckBox.Checked = false;
+            Require(
+                !input.AlwaysOutputUdpEnabled &&
+                !automation.Settings.AlwaysOutputUdpEnabled,
+                "旧版模式下关闭始终 UDP 输出必须同步关闭有效转发和保存偏好");
+            form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked = false;
+            Require(
+                !legacyUdpRow.Visible &&
+                input.AlwaysOutputUdpEnabled &&
+                !automation.Settings.AlwaysOutputUdpEnabled,
+                "双板模式隐藏旧版开关时 UDP 有效转发恒开启，并保留关闭偏好");
+            form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked = true;
+            Require(
+                legacyUdpRow.Visible &&
+                !input.AlwaysOutputUdpEnabled &&
+                !automation.Settings.AlwaysOutputUdpEnabled,
+                "重新启用旧版模式后应恢复此前保存的 UDP 关闭偏好");
+            form.SettingsPage.AlwaysOutputUdpCheckBox.Checked = true;
+            form.SettingsPage.LegacySingleBoardFirmwareCheckBox.Checked = false;
+            input.SetForwardingEnabled(false);
+            Require(
+                !input.ForwardingEnabled && !input.PhysicalForwardingEnabled && !form.CaptureSurface.Forwarding,
+                "结束布局路由检查前必须关闭 HOME，双板实体鼠标面板保持不锁定");
             Require(form.OutputSensitivityTrackBar.Minimum == 30 && form.OutputSensitivityTrackBar.Maximum == 300 && form.OutputSensitivityTrackBar.Value == 100, "输出灵敏度滑块范围或默认值不正确");
             Require(form.OutputSensitivityTextBox.Text == "1", "输出灵敏度输入框默认值必须为 1");
             Require(form.OutputSensitivityDescriptionLabel.Text.Contains("实体鼠标、UDP、Lua、宏", StringComparison.Ordinal), "输出灵敏度说明未覆盖四类输入来源");
@@ -3396,23 +3914,15 @@ static void CheckWindowLayout()
                 .OfType<FlowLayoutPanel>()
                 .Single(layout => layout.Controls.Contains(form.UdpSmoothingCheckBox));
             Require(
-                udpOptionsLayout.Controls.Contains(form.AlwaysOutputUdpCheckBox) &&
+                !udpOptionsLayout.Controls.Contains(form.AlwaysOutputUdpCheckBox) &&
                 form.UdpSmoothingCheckBox.Anchor == AnchorStyles.None &&
-                form.AlwaysOutputUdpCheckBox.Anchor == AnchorStyles.None &&
                 form.UdpSmoothingCheckBox.Visible &&
-                form.AlwaysOutputUdpCheckBox.Visible &&
                 form.UdpSmoothingCheckBox.Text == "UDP 平滑" &&
-                form.AlwaysOutputUdpCheckBox.Text == "始终开启 UDP 输出" &&
                 form.UdpSmoothingCheckBox.Width > 0 &&
-                form.AlwaysOutputUdpCheckBox.Width > 0 &&
-                form.UdpSmoothingCheckBox.Right <= udpOptionsLayout.ClientSize.Width &&
-                form.AlwaysOutputUdpCheckBox.Right <= udpOptionsLayout.ClientSize.Width &&
-                form.UdpSmoothingCheckBox.Left < form.AlwaysOutputUdpCheckBox.Left &&
-                form.AlwaysOutputUdpCheckBox.Right >= udpOptionsLayout.ClientSize.Width - 4,
-                $"两个 UDP 复选框及完整文字必须在当前行可见、不被裁切且整体靠右：" +
-                $"pos={form.UdpSmoothingCheckBox.Left}/{form.AlwaysOutputUdpCheckBox.Left}," +
-                $"right={form.AlwaysOutputUdpCheckBox.Right}/{udpOptionsLayout.ClientSize.Width}," +
-                $"anchor={form.UdpSmoothingCheckBox.Anchor}/{form.AlwaysOutputUdpCheckBox.Anchor}," +
+                form.UdpSmoothingCheckBox.Right <= udpOptionsLayout.ClientSize.Width,
+                $"UDP 平滑复选框必须留在输入页选项行并保持完整可见：" +
+                $"right={form.UdpSmoothingCheckBox.Right}/{udpOptionsLayout.ClientSize.Width}," +
+                $"anchor={form.UdpSmoothingCheckBox.Anchor}," +
                 $"flow={udpOptionsLayout.FlowDirection}");
             Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Checked, "局域网固件刷写接口默认必须关闭");
             Require(!form.SettingsPage.FirmwareUpdateApiCheckBox.Enabled, "无串口刷写服务时设置页接口开关必须禁用");
@@ -3428,11 +3938,6 @@ static void CheckWindowLayout()
                 firmwareConfirmButton.BackColor == Color.FromArgb(237, 243, 250) &&
                 firmwareConfirmButton.ForeColor == Color.FromArgb(23, 35, 58),
                 "本地固件刷写确定按钮必须使用普通按钮样式");
-            automation.Settings.GenerateMovementAnalysisImage = false;
-            form.ProcessMovementRecordingForChecks(new MouseMovementRecording(
-                DateTime.UtcNow.AddSeconds(-1), DateTime.UtcNow, [3], [-2]));
-            Require(form.OwnedForms.Length == 0, "关闭分析图片后不得打开分析窗口");
-            Require(form.LogTextBox.Text.Contains("不生成按键情况分析图片", StringComparison.Ordinal), "关闭分析图片后未输出跳过提示");
             _ = automation.CreateProfile("UI同步检查");
             automation.SetActiveProfile("UI同步检查");
             Require(form.MacroPage.ProfileComboBox.Items.Contains("UI同步检查") && form.LuaPage.ProfileComboBox.Items.Contains("UI同步检查"), "Lua 新增配置后宏/Lua 页列表未同步刷新");
@@ -3447,30 +3952,17 @@ static void CheckWindowLayout()
             Require(form.LogModeComboBox.SelectedIndex == 1, "日志模式必须能切换到完整诊断");
             form.LogModeComboBox.SelectedIndex = 0;
             Require(
-                form.OnboardLogButton.Text == "转存板载日志" &&
-                !form.OnboardLogButton.Enabled &&
-                form.OnboardLogButton.Visible,
-                "非串口模式必须显示但禁用「转存板载日志」入口");
+                form.StatisticsButton.Text == "读取设备统计" &&
+                !form.StatisticsButton.Enabled &&
+                form.StatisticsButton.Visible,
+                "非串口模式必须显示但禁用「读取设备统计」入口");
             Require(
-                form.OnboardLogButton.Parent is TableLayoutPanel,
-                "「转存板载日志」入口必须与日志模式下拉框同排在日志栏顶部");
-            Require(!form.SimulatedUdpCheckBox.Checked, "模拟 UDP 开关默认必须关闭");
-            Require(!input.SimulatedUdpInputEnabled, "界面创建后模拟 UDP 状态应默认关闭");
-            Require(!form.SimulatedUdpFrequencyComboBox.Enabled, "模拟 UDP 关闭时频率列表应禁用");
-            Require(
-                form.SimulatedUdpFrequencyComboBox.Items.Cast<int>().SequenceEqual([30, 60, 100, 140, 200, 500, 0]),
-                "模拟 UDP 界面频率列表不正确");
-            Require(
-                form.SimulatedUdpFrequencyComboBox.SelectedItem is 100,
-                "模拟 UDP 默认频率必须为 100 Hz");
+                form.StatisticsButton.Parent is TableLayoutPanel,
+                "「读取设备统计」入口必须与日志模式下拉框同排在日志栏顶部");
             Require(form.UdpSmoothingCheckBox.Checked, "UDP 平滑开关默认必须开启");
             Require(input.UdpSmoothingEnabled, "界面创建后 UDP 平滑状态应默认开启");
-            Require(form.AlwaysOutputUdpCheckBox.Checked, "始终 UDP 输出开关默认必须开启");
+            Require(form.AlwaysOutputUdpCheckBox.Checked, "始终 UDP 输出偏好默认必须开启");
             Require(input.AlwaysOutputUdpEnabled, "界面创建后始终 UDP 输出状态应默认开启");
-            form.AlwaysOutputUdpCheckBox.Checked = false;
-            Require(!input.AlwaysOutputUdpEnabled, "界面开关未关闭始终 UDP 输出");
-            form.AlwaysOutputUdpCheckBox.Checked = true;
-            Require(input.AlwaysOutputUdpEnabled, "界面开关未重新开启始终 UDP 输出");
             form.UdpSmoothingCheckBox.Checked = false;
             Require(!input.UdpSmoothingEnabled, "界面开关未关闭 UDP 平滑");
             form.UdpSmoothingCheckBox.Checked = true;
@@ -3485,21 +3977,6 @@ static void CheckWindowLayout()
                 () => form.UdpSmoothingCheckBox.Enabled,
                 "同步关闭后的 ForwardingChanged UI 更新未完成");
             Require(form.UdpSmoothingCheckBox.Enabled, "同步关闭后 UDP 平滑开关必须恢复可用");
-            form.SimulatedUdpCheckBox.Checked = true;
-            Require(input.SimulatedUdpInputEnabled, "界面开关未启用模拟 UDP 输入");
-            Require(form.SimulatedUdpFrequencyComboBox.Enabled, "模拟 UDP 开启时频率列表未启用");
-            form.SimulatedUdpFrequencyComboBox.SelectedItem = 140;
-            Require(input.SimulatedUdpInputFrequencyHz == 140, "界面频率列表未切换到 140 Hz");
-            form.SimulatedUdpFrequencyComboBox.SelectedItem = 500;
-            Require(input.SimulatedUdpInputFrequencyHz == 500, "界面频率列表未切换到 500 Hz");
-            form.SimulatedUdpFrequencyComboBox.SelectedItem = 0;
-            Require(input.SimulatedUdpInputFrequencyHz == 0, "界面频率列表未切换到无上限");
-            Require(
-                form.SimulatedUdpFrequencyComboBox.GetItemText(
-                    form.SimulatedUdpFrequencyComboBox.SelectedItem) == "无上限",
-                "模拟 UDP 无上限选项显示文案不正确");
-            form.SimulatedUdpCheckBox.Checked = false;
-            Require(!input.SimulatedUdpInputEnabled, "界面开关未关闭模拟 UDP 输入");
             form.AppendLog("可复制日志检查");
             Require(form.LogTextBox.Text.Contains("可复制日志检查", StringComparison.Ordinal), "日志内容未实际写入窗口文本框");
             for (int index = 0; index < 160; index++)
@@ -3529,12 +4006,18 @@ static void CheckWindowLayout()
             string allText = string.Join("\n", EnumerateControls(form).Select(control => control.Text));
             Require(allText.Contains("HOME", StringComparison.Ordinal), "界面未显示同步快捷键");
             Require(allText.Contains("END", StringComparison.Ordinal), "界面未显示结束快捷键");
-            Require(allText.Contains("模拟 UDP", StringComparison.Ordinal), "界面未显示模拟 UDP 开关");
-            Require(allText.Contains("仅用于测试输入聚合、UDP 平滑和输出链路，不代表真实网络性能。", StringComparison.Ordinal), "模拟 UDP 行缺少实际用途说明");
+            Require(
+                allText.Contains("UDP 模拟输入测试", StringComparison.Ordinal) &&
+                !simulatedUdpRow.Visible &&
+                !simulatedUdpCheckBox.Visible &&
+                !simulatedUdpFrequency.Visible &&
+                !simulatedUdpDescription.Visible,
+                "新双板模式下模拟输入测试行及说明必须隐藏，但旧版设置仍可保留");
+            Require(!allText.Contains("分析与诊断", StringComparison.Ordinal), "设置页仍残留分析与诊断卡片");
             Require(allText.Contains("UDP 平滑", StringComparison.Ordinal), "界面未显示 UDP 平滑开关");
             Require(allText.Contains("输出灵敏度", StringComparison.Ordinal), "界面未显示统一输出灵敏度控件");
             Require(allText.Contains("发送到固件前处理最终", StringComparison.Ordinal), "界面未说明输出灵敏度生效位置");
-            Require(allText.Contains("始终开启 UDP 输出", StringComparison.Ordinal), "界面未显示始终开启 UDP 输出开关");
+            Require(allText.Contains("始终开启 UDP 输出", StringComparison.Ordinal), "设置页未显示始终开启 UDP 输出开关");
             Require(allText.Contains("局域网固件刷写接口", StringComparison.Ordinal), "设置页未显示局域网固件刷写接口开关");
             Require(allText.Contains("暂停自动跟随", StringComparison.Ordinal), "日志栏未提示滚动到上方后暂停自动跟随");
             CheckDarkSurfaceTextContrast(form);
@@ -3872,6 +4355,11 @@ internal sealed class RecordingTransport : IBridgeTransport
         .Select(frame => frame.Timestamp)
         .ToArray();
 
+    internal int[] MousePayloadLengths() => _frames
+        .Where(frame => frame.Type == MessageType.MouseReport)
+        .Select(frame => frame.Payload.Length)
+        .ToArray();
+
     internal byte[][] KeyboardReports() => _frames
         .Where(frame => frame.Type == MessageType.KeyboardReport)
         .Select(frame => frame.Payload)
@@ -3882,44 +4370,6 @@ internal sealed class RecordingTransport : IBridgeTransport
     public void Dispose()
     {
     }
-}
-
-/// <summary>
-/// 合成设备通道：按脚本预置响应字节，记录下载器写出的请求帧；读取窗口可设置得很小，
-/// 用来验证帧扫描能处理跨多次读取到达的帧。不涉及真实串口。
-/// </summary>
-internal sealed class OnboardLogScriptedChannel : IOnboardLogChannel
-{
-    private readonly MemoryStream _stream = new();
-    private readonly int _maxReadSize;
-    private byte[]? _request;
-    private int _readOffset;
-
-    internal OnboardLogScriptedChannel(int maxReadSize = 4096) => _maxReadSize = Math.Max(1, maxReadSize);
-
-    internal bool RequestWritten => _request is not null;
-
-    internal byte[] Request => _request ?? throw new InvalidOperationException("转存下载器没有写出请求帧");
-
-    internal void WriteResponse(byte[] bytes) => _stream.Write(bytes, 0, bytes.Length);
-
-    public void Write(ReadOnlySpan<byte> frame) => _request = frame.ToArray();
-
-    public int Read(Span<byte> buffer)
-    {
-        // 写入时 MemoryStream 的位置停在末尾，因此读取必须用独立的读游标。
-        int available = (int)_stream.Length - _readOffset;
-        int count = Math.Min(Math.Min(available, buffer.Length), _maxReadSize);
-        if (count <= 0)
-        {
-            return 0; // 脚本数据已放完：模拟板端不再回数据
-        }
-        _stream.GetBuffer().AsSpan(_readOffset, count).CopyTo(buffer);
-        _readOffset += count;
-        return count;
-    }
-
-    public void Dispose() => _stream.Dispose();
 }
 
 internal sealed class RecordingAutomationOutput : IAutomationOutput

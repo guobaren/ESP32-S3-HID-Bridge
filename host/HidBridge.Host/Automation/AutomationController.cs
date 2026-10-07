@@ -30,6 +30,13 @@ internal sealed class AutomationController : IDisposable
         _input = input;
         _output = new RoutedAutomationOutput(input, localOutput);
         Settings = store.LoadSettings();
+        if (!Input.SimulatedUdpMouseInput.SupportedFrequencies.Contains(Settings.SimulatedUdpInputFrequencyHz))
+        {
+            Settings.SimulatedUdpInputFrequencyHz = 100;
+        }
+        _input.ConfigureSimulatedUdpInput(
+            Settings.SimulatedUdpInputEnabled,
+            Settings.SimulatedUdpInputFrequencyHz);
         string activeProfile = store.ListProfiles().Contains(Settings.ActiveProfile, StringComparer.OrdinalIgnoreCase)
             ? Settings.ActiveProfile
             : AutomationProfileStore.GlobalProfile;
@@ -134,6 +141,52 @@ internal sealed class AutomationController : IDisposable
         StartupRegistration.SetEnabled(Settings.StartOnBoot);
     }
 
+    internal void ApplyOutputRoutingSettings(
+        bool legacySingleBoard,
+        bool alwaysOutputUdp,
+        bool simulatedUdpInput,
+        int simulatedUdpInputFrequencyHz)
+    {
+        bool modeChanged = Settings.LegacySingleBoardFirmwareCompatibility != legacySingleBoard;
+        bool oldAlwaysOutput = _input.AlwaysOutputUdpEnabled;
+        bool newAlwaysOutput = !legacySingleBoard || alwaysOutputUdp;
+        bool shouldRestartRuntime = modeChanged && _started;
+
+        if (shouldRestartRuntime)
+        {
+            StopRuntime();
+            _input.ResetOutputStateForRoutingChange();
+        }
+        else if (_started && !_input.ForwardingEnabled && oldAlwaysOutput && !newAlwaysOutput)
+        {
+            // 关闭旧版 HOME 独立 UDP 输出前，先向当前目标发送 release，再关掉发送门控。
+            _input.ResetOutputStateForRoutingChange();
+        }
+
+        Settings.LegacySingleBoardFirmwareCompatibility = legacySingleBoard;
+        Settings.AlwaysOutputUdpEnabled = alwaysOutputUdp;
+        Settings.SimulatedUdpInputEnabled = simulatedUdpInput;
+        Settings.SimulatedUdpInputFrequencyHz = simulatedUdpInputFrequencyHz;
+        _input.ConfigureAlwaysOutputUdp(newAlwaysOutput);
+        _input.ConfigureSimulatedUdpInput(simulatedUdpInput, simulatedUdpInputFrequencyHz);
+
+        if (shouldRestartRuntime)
+        {
+            // 再发一次 release 让 SerialBridge 按新兼容模式重连，并在新后端开始工作前清空状态。
+            _input.ResetOutputStateForRoutingChange();
+        }
+
+        if (modeChanged)
+        {
+            _input.RefreshPhysicalRoutingState();
+            if (shouldRestartRuntime)
+            {
+                ReloadActiveProfileRuntime();
+            }
+            PublishMacroLog($"自动化输出路由已更新：{DescribeOutputRoute()}。");
+        }
+    }
+
     private void ReloadActiveProfileRuntime()
     {
         lock (_stateLock)
@@ -211,22 +264,27 @@ internal sealed class AutomationController : IDisposable
 
     private void HandleForwardingTransitioning()
     {
-        try
-        {
-            StopRuntime();
-        }
-        finally
-        {
-            TryReleaseLocalInputs();
-        }
+        StopRuntime();
     }
 
     private void HandleForwardingChanged(object? sender, bool enabled)
     {
         ReloadActiveProfileRuntime();
-        PublishMacroLog(enabled
-            ? "自动化输出已切换到对端 HID。"
-            : "自动化输出已切换到本机 Win32 API。");
+        PublishMacroLog($"自动化输出路由已更新：{DescribeOutputRoute()}。");
+    }
+
+    private string DescribeOutputRoute()
+    {
+        if (Settings.LegacySingleBoardFirmwareCompatibility)
+        {
+            return _input.ForwardingEnabled
+                ? "鼠标与键盘走旧版单板串口通路"
+                : "鼠标与键盘走本机 Win32 API；UDP 由设置开关控制";
+        }
+
+        return _input.AutomationMouseRemoteOutputEnabled
+            ? "鼠标走 M 板软件报告，键盘走本机 Win32 API"
+            : "鼠标与键盘走本机 Win32 API（M 板串口当前不可用）";
     }
 
     private void StopRuntime()
@@ -240,6 +298,7 @@ internal sealed class AutomationController : IDisposable
             }
             _bindings.Clear();
         }
+        TryReleaseLocalInputs();
         LuaStateChanged?.Invoke(false);
     }
 
@@ -247,12 +306,20 @@ internal sealed class AutomationController : IDisposable
     {
         try
         {
-            _output.ReleaseLocalInputs();
-            DiagnosticLog?.Invoke("[LocalOutput] 已发送本机 Win32 ReleaseAll");
+            _output.ReleaseAll();
+            DiagnosticLog?.Invoke("[AutomationOutput] 已释放 Win32 输入及 M 板软件鼠标按键");
         }
         catch (Exception exception)
         {
-            PublishMacroLog($"本机 Win32 ReleaseAll 失败：{exception.Message}");
+            PublishMacroLog($"自动化输出 ReleaseAll 失败：{exception.Message}");
+            try
+            {
+                _output.ReleaseLocalInputs();
+            }
+            catch (Exception localException)
+            {
+                PublishMacroLog($"本机 Win32 ReleaseAll 失败：{localException.Message}");
+            }
         }
     }
 
@@ -287,7 +354,6 @@ internal sealed class AutomationController : IDisposable
             _input.ForwardingChanged -= HandleForwardingChanged;
         }
         StopRuntime();
-        TryReleaseLocalInputs();
         _lua.Dispose();
     }
 }

@@ -39,13 +39,9 @@ PROFILE_MAX_BYTES = 4096
 PROFILE_READ_CHUNK = 56
 PROFILE_WRITE_CHUNK = 60
 ONBOARD_LOG_READ_CHUNK = 56
-DEFAULT_BOOTSTRAP_TAIL_BYTES = 256 * 1024
 
 TYPE_DEVICE_PROBE = 0x06
 TYPE_DEVICE_HELLO = 0x07
-TYPE_LOG_READ_REQUEST = 0x08
-TYPE_LOG_READ_RESPONSE = 0x09
-TYPE_LOG_DUMP_REQUEST = 0x0B
 TYPE_DIAG_PROFILE_READ = 0x0D
 TYPE_DIAG_PROFILE_DATA = 0x0E
 TYPE_DIAG_PROFILE_BEGIN = 0x0F
@@ -64,9 +60,6 @@ TYPE_DIAG_PROFILE_REFRESH_REQUEST = 0x1C
 FRAME_NAMES = {
     TYPE_DEVICE_PROBE: "DEVICE_PROBE",
     TYPE_DEVICE_HELLO: "DEVICE_HELLO",
-    TYPE_LOG_READ_REQUEST: "LOG_READ_REQUEST",
-    TYPE_LOG_READ_RESPONSE: "LOG_READ_RESPONSE",
-    TYPE_LOG_DUMP_REQUEST: "LOG_DUMP_REQUEST",
     TYPE_DIAG_PROFILE_READ: "DIAG_PROFILE_READ",
     TYPE_DIAG_PROFILE_DATA: "DIAG_PROFILE_DATA",
     TYPE_DIAG_PROFILE_BEGIN: "DIAG_PROFILE_BEGIN",
@@ -568,7 +561,6 @@ class PortSession:
         self.diag_status_errors = 0
         self.diag_subscribed = False
         self.serial_error: Optional[str] = None
-        self.snapshot_info: Optional[dict[str, Any]] = None
         self.action_info: Optional[dict[str, Any]] = None
         self.read_chunk_size = 4096
         self._closed = False
@@ -695,8 +687,7 @@ class PortSession:
             record["role"] = ROLE_NAMES.get(frame.payload[16], "UNKNOWN")
         # 日志/设备 Profile 数据会含完整历史日志、序列号和描述符；原始内容只放在
         # RX 二进制文件，避免 JSONL 再复制一个不可检索的 base64 大字段。
-        if frame.message_type not in (TYPE_LOG_READ_RESPONSE, TYPE_DIAG_PROFILE_DATA,
-                                      TYPE_DIAG_STREAM_EVENT):
+        if frame.message_type not in (TYPE_DIAG_PROFILE_DATA, TYPE_DIAG_STREAM_EVENT):
             record["payload_hex"] = frame.payload.hex()
         self.write_json({"record_type": "frame", "direction": "rx",
                          "message_type": type_name, "message_type_id": frame.message_type,
@@ -918,7 +909,6 @@ class PortSession:
             "diag_stream_status": self.diag_stream_status,
             "diag_stream_subscribed_at_end": self.diag_subscribed,
             "latest_vendor_line": self.status.latest_vendor_line,
-            "onboard_log_snapshot": self.snapshot_info,
             "action": self.action_info,
             "capture": {
                 "rx_bytes_written": self.rx_bytes,
@@ -1107,112 +1097,6 @@ def identify_boards(sessions: list[PortSession], timeout_s: float) -> None:
         print("[风险] 两个串口被识别为同一角色；请核对 COM 端口和连接板卡。", file=sys.stderr)
 
 
-def decode_log_response(frame: Frame) -> tuple[int, int, bytes]:
-    if frame.message_type != TYPE_LOG_READ_RESPONSE or len(frame.payload) < 8:
-        raise ValueError("LOG_READ_RESPONSE payload 短于 8 字节")
-    offset, total = struct.unpack_from("<II", frame.payload, 0)
-    return offset, total, frame.payload[8:]
-
-
-def _parse_bootstrap_bytes(session: PortSession, data: bytes, snapshot: dict[str, Any]) -> None:
-    parts = data.split(b"\n")
-    if not data.endswith(b"\n") and parts:
-        final = parts.pop()
-    else:
-        final = b""
-    for index, raw_line in enumerate(parts):
-        if raw_line.endswith(b"\r"):
-            raw_line = raw_line[:-1]
-        session.record_console_line(raw_line, "onboard_log_snapshot", True,
-                                    snapshot.get("prefix_partial", False) and index == 0,
-                                    snapshot)
-    if final:
-        session.record_console_line(final, "onboard_log_snapshot", False, True, snapshot)
-
-
-def bootstrap_recent_logs(sessions: list[PortSession], session: PortSession,
-                          tail_bytes: int, timeout_s: float) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "status": "failed",
-        "source": "LOG_DUMP_REQUEST over this board UART0",
-        "requested_tail_bytes": tail_bytes,
-        "bytes_received": 0,
-        "prefix_partial": False,
-        "complete": False,
-    }
-    try:
-        probe_sequence = session.send_frame(TYPE_LOG_READ_REQUEST, struct.pack("<IB", 0, 1))
-        response = wait_for_frame(sessions, session, probe_sequence,
-                                  (TYPE_LOG_READ_RESPONSE,), timeout_s)
-        if response is None:
-            result["reason"] = "log-size probe timed out"
-            session.snapshot_info = result
-            return result
-        _offset, total, _data = decode_log_response(response)
-        result["total_bytes_reported"] = total
-        start_offset = max(0, total - tail_bytes)
-        expected_bytes = min(tail_bytes, max(0, total - start_offset))
-        result["start_offset"] = start_offset
-        result["older_bytes_omitted"] = start_offset
-        if expected_bytes == 0:
-            result.update(status="empty", complete=True)
-            session.snapshot_info = result
-            return result
-
-        dump_sequence = session.send_frame(TYPE_LOG_DUMP_REQUEST,
-                                           struct.pack("<II", start_offset, tail_bytes))
-        received = bytearray()
-        next_offset = start_offset
-        total_changed = False
-        ended = False
-        # 日志传输速率与闪存读速会变；超时留足裕量，同时有界退出。
-        dump_timeout = max(timeout_s, 6.0 + expected_bytes / 12000.0)
-        deadline = time.monotonic() + dump_timeout
-        while time.monotonic() < deadline:
-            pump_sessions(sessions)
-            while True:
-                frame = session.take_frame(dump_sequence, (TYPE_LOG_READ_RESPONSE,))
-                if frame is None:
-                    break
-                offset, current_total, data = decode_log_response(frame)
-                total_changed |= current_total != total
-                if not data:
-                    ended = True
-                    break
-                if offset != next_offset:
-                    result["offset_mismatch"] = {"expected": next_offset, "received": offset}
-                    ended = True
-                    break
-                if len(data) > ONBOARD_LOG_READ_CHUNK:
-                    result["oversized_chunk"] = len(data)
-                    ended = True
-                    break
-                received.extend(data)
-                next_offset += len(data)
-            if ended:
-                break
-            time.sleep(0.002)
-        result["bytes_received"] = len(received)
-        result["end_marker_received"] = ended and "offset_mismatch" not in result and \
-            "oversized_chunk" not in result
-        result["reported_total_changed_during_dump"] = total_changed
-        result["prefix_partial"] = start_offset > 0 and bool(received) and received[:1] != b"\n"
-        result["complete"] = (result["end_marker_received"] and
-                               len(received) == expected_bytes and
-                               "offset_mismatch" not in result and
-                               "oversized_chunk" not in result)
-        result["status"] = "complete" if result["complete"] else "partial"
-        if not result["complete"]:
-            result["reason"] = "stream ended early, offset mismatch, or timeout"
-        result["older_bytes_omitted"] = start_offset
-        snapshot = dict(result)
-        _parse_bootstrap_bytes(session, bytes(received), snapshot)
-    except (OSError, ValueError, struct.error) as error:
-        result["reason"] = str(error)
-    session.snapshot_info = result
-    return result
-
-
 def ensure_role(session: PortSession, role: int) -> None:
     if not session.status.role_verified:
         raise RuntimeError(f"{session.port_name} 未通过 DEVICE_HELLO nonce 匹配，拒绝按角色操作")
@@ -1374,12 +1258,8 @@ def print_status(sessions: list[PortSession], phase: str) -> None:
         hid = _short_fields(status.hid_stats, ("reports", "vendor_reports", "input_fail",
                                                "vendor_rx", "vendor_dropped", "failed"))
         queues = _short_queue_metrics(status.queue_metrics)
-        snapshot = session.snapshot_info
-        snapshot_label = (f"log={snapshot.get('status')}:{snapshot.get('bytes_received')}/"
-                          f"{snapshot.get('requested_tail_bytes')}B"
-                          if snapshot else "log=not-read")
         print(f"  {session.port_name:<8} {role:<12} {verified:<18} mouse={mouse} "
-              f"P-profile={copied} clone={clone} {snapshot_label}")
+              f"P-profile={copied} clone={clone}")
         if uart0:
             print(f"             UART0 {uart0}")
         if uart1:
@@ -1467,9 +1347,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
                         help="等待匹配 DEVICE_HELLO nonce 的最长秒数")
     parser.add_argument("--request-timeout", type=float, default=4.0,
                         help="单个 UART0 诊断请求的响应超时秒数")
-    parser.add_argument("--bootstrap-tail-bytes", type=int,
-                        default=DEFAULT_BOOTSTRAP_TAIL_BYTES,
-                        help="启动时每块板从板载日志尾部下载的最大字节数；0 表示跳过")
+    parser.add_argument("--bootstrap-tail-bytes", type=int, default=0,
+                        help="已废弃的兼容参数；板载日志下载已移除，此选项不发送任何命令")
     parser.add_argument("--save-profile", type=Path,
                         help="从已确认角色为 MOUSE_HOST 的串口读取当前 Profile 并保存原始 HIDP 二进制")
     parser.add_argument("--inject-profile", type=Path,
@@ -1491,7 +1370,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    # 板载日志可能包含损坏的 UTF-8；Windows 的 GBK 控制台不能编码替换字符。
+    # 原始 UART 文本可能包含损坏的 UTF-8；Windows 控制台统一使用替换字符。
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
@@ -1503,6 +1382,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--status-interval 必须大于 0")
     if args.bootstrap_tail_bytes < 0:
         parser.error("--bootstrap-tail-bytes 不能为负")
+    if args.bootstrap_tail_bytes:
+        print("[提示] --bootstrap-tail-bytes 已废弃，不再读取板载历史日志；使用 tools/read_device_stats.py 查询内存快照。")
     actions = (bool(args.save_profile), bool(args.inject_profile),
                bool(args.restore_auto_profile), args.inject_move is not None,
                args.inject_frame is not None, bool(args.force_profile_refresh))
@@ -1541,17 +1422,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"[打开] {port_name} @ {args.baud} baud；DTR=RTS=False；未清空接收缓冲")
 
         identify_boards(sessions, args.identity_timeout)
-
-        if args.bootstrap_tail_bytes:
-            print(f"[板载日志] 每端口读取最新 {args.bootstrap_tail_bytes} bytes，"
-                  "状态标记为日志观察值，可能因截取/轮转而过期。")
-            for session in sessions:
-                snapshot = bootstrap_recent_logs(sessions, session,
-                                                 args.bootstrap_tail_bytes,
-                                                 args.request_timeout)
-                print(f"[板载日志] {session.port_name}: {snapshot['status']} "
-                      f"{snapshot.get('bytes_received', 0)}/{snapshot.get('requested_tail_bytes')} bytes; "
-                      f"older_omitted={snapshot.get('older_bytes_omitted', 'unknown')}")
 
         set_diag_stream(sessions, True)
         # Drain the immediate subscription acknowledgements before optional Profile operations.

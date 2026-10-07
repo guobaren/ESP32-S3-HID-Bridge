@@ -157,10 +157,8 @@ static void write_u32_le(uint8_t *output, uint32_t value)
 
 static uint32_t read_u32_le(const uint8_t *input)
 {
-    return (uint32_t)input[0] |
-        ((uint32_t)input[1] << 8) |
-        ((uint32_t)input[2] << 16) |
-        ((uint32_t)input[3] << 24);
+    return (uint32_t)input[0] | ((uint32_t)input[1] << 8) |
+        ((uint32_t)input[2] << 16) | ((uint32_t)input[3] << 24);
 }
 
 static bool valid_report_type(uint8_t report_type)
@@ -289,7 +287,6 @@ bool dual_hid_set_report_decode(
     *data_length = payload[5];
     return true;
 }
-
 /*
  * 设备级 Vendor 控制请求/响应编解码（2026-09-27）。
  * 与 SET_REPORT 那套的区别：请求里带完整的 bmRequestType/bRequest/wValue/wIndex，
@@ -525,60 +522,38 @@ bool dual_hid_get_response_decode(
     return true;
 }
 
-bool dual_log_read_request_decode(
-    const uint8_t *payload,
-    size_t payload_length,
-    uint32_t *offset,
-    uint8_t *max_bytes)
-{
-    if (payload == NULL || offset == NULL || max_bytes == NULL ||
-        payload_length != DUAL_LOG_READ_REQUEST_LENGTH || payload[4] == 0U) {
-        return false;
-    }
-    *offset = read_u32_le(payload);
-    *max_bytes = payload[4];
-    return true;
-}
-
-bool dual_log_read_response_encode(
-    uint32_t offset,
-    uint32_t total_bytes,
-    const uint8_t *data,
-    size_t data_length,
+bool dual_vendor_session_encode(
+    uint32_t p_generation,
+    uint32_t m_generation,
+    uint32_t epoch,
     uint8_t *payload,
-    size_t capacity,
-    uint8_t *payload_length)
+    size_t capacity)
 {
-    if (payload == NULL || payload_length == NULL ||
-        data_length > DUAL_PROXY_MAX_PAYLOAD - DUAL_LOG_READ_RESPONSE_HEADER_LENGTH ||
-        (data == NULL && data_length != 0U) ||
-        capacity < DUAL_LOG_READ_RESPONSE_HEADER_LENGTH + data_length) {
+    if (payload == NULL || capacity < DUAL_LINK_VENDOR_SESSION_LENGTH ||
+        p_generation == 0U || m_generation == 0U || epoch == 0U) {
         return false;
     }
-    write_u32_le(&payload[0], offset);
-    write_u32_le(&payload[4], total_bytes);
-    if (data_length > 0U) {
-        memcpy(&payload[DUAL_LOG_READ_RESPONSE_HEADER_LENGTH], data, data_length);
-    }
-    *payload_length = (uint8_t)(DUAL_LOG_READ_RESPONSE_HEADER_LENGTH + data_length);
+    write_u32_le(&payload[DUAL_LINK_VENDOR_SESSION_P_GENERATION_OFFSET], p_generation);
+    write_u32_le(&payload[DUAL_LINK_VENDOR_SESSION_M_GENERATION_OFFSET], m_generation);
+    write_u32_le(&payload[DUAL_LINK_VENDOR_SESSION_EPOCH_OFFSET], epoch);
     return true;
 }
 
-bool dual_log_read_response_decode(
+bool dual_vendor_session_decode(
     const uint8_t *payload,
     size_t payload_length,
-    uint32_t *offset,
-    uint32_t *total_bytes,
-    const uint8_t **data,
-    size_t *data_length)
+    uint32_t *p_generation,
+    uint32_t *m_generation,
+    uint32_t *epoch)
 {
-    if (payload == NULL || offset == NULL || total_bytes == NULL || data == NULL ||
-        data_length == NULL || payload_length < DUAL_LOG_READ_RESPONSE_HEADER_LENGTH) {
+    if (payload == NULL || payload_length != DUAL_LINK_VENDOR_SESSION_LENGTH ||
+        p_generation == NULL || m_generation == NULL || epoch == NULL) {
         return false;
     }
-    *offset = read_u32_le(&payload[0]);
-    *total_bytes = read_u32_le(&payload[4]);
-    *data = &payload[DUAL_LOG_READ_RESPONSE_HEADER_LENGTH];
-    *data_length = payload_length - DUAL_LOG_READ_RESPONSE_HEADER_LENGTH;
-    return true;
+    *p_generation = read_u32_le(
+        &payload[DUAL_LINK_VENDOR_SESSION_P_GENERATION_OFFSET]);
+    *m_generation = read_u32_le(
+        &payload[DUAL_LINK_VENDOR_SESSION_M_GENERATION_OFFSET]);
+    *epoch = read_u32_le(&payload[DUAL_LINK_VENDOR_SESSION_EPOCH_OFFSET]);
+    return *p_generation != 0U && *m_generation != 0U && *epoch != 0U;
 }

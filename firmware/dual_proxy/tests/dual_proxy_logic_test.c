@@ -1,4 +1,7 @@
+#include "uart0_protocol_router.h"
+#include "m_udp_smoothing.h"
 #include "usb_stall_recovery_logic.h"
+#include "vendor_urb_pending_logic.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,15 +14,18 @@
 #include "hid_report_layout.h"
 #include "hid_vendor_session_logic.h"
 #include "link_recovery_logic.h"
+#include "makcu_ascii_logic.h"
+#include "makcu_v4_logic.h"
 #include "mouse_motion_smoother.h"
 #include "dual_proxy_runtime_config.h"
 #include "dual_status_led_logic.h"
 #include "usb_cdc_control_logic.h"
+#include "uart1_vendor_queue_logic.h"
 
 _Static_assert(DUAL_PROXY_REQUIRED_FREERTOS_HZ == 1000U, "FreeRTOS tick必须保持1000Hz");
 _Static_assert(DUAL_PROXY_LINK_TX_BATCH_LIMIT > 0U, "UART1批量上限回归保护失败");
 _Static_assert(DUAL_PROXY_HID_PERIOD_US == 1000U, "HID周期必须保持1000us");
-_Static_assert(MOUSE_MOTION_SMOOTHING_SLOTS == 5U, "软件移动必须保持5个1ms槽");
+_Static_assert(MOUSE_MOTION_SMOOTHING_MAX_SLOTS == 20U, "软件移动平滑最大窗必须保持20个1ms槽");
 _Static_assert(DUAL_MESSAGE_PROFILE_BEGIN == 0x24, "ProfileBegin消息类型回归保护失败");
 _Static_assert(DUAL_MESSAGE_PROFILE_CHUNK == 0x25, "ProfileChunk消息类型回归保护失败");
 _Static_assert(DUAL_MESSAGE_PROFILE_COMMIT == 0x26, "ProfileCommit消息类型回归保护失败");
@@ -28,6 +34,9 @@ _Static_assert(DUAL_MESSAGE_ROLE_ACK == 0x2F, "RoleAck消息类型回归保护�
 _Static_assert(DUAL_MESSAGE_PROFILE_REQUEST == 0x30, "ProfileRequest消息类型回归保护失败");
 _Static_assert(DUAL_MESSAGE_PROFILE_OFFER == 0x31, "ProfileOffer消息类型回归保护失败");
 _Static_assert(DUAL_MESSAGE_FLOW_ACK == 0x32, "FlowAck消息类型回归保护失败");
+_Static_assert(DUAL_MESSAGE_VENDOR_SESSION_BEGIN == 0x35, "VendorSessionBegin类型回归保护失败");
+_Static_assert(DUAL_MESSAGE_VENDOR_SESSION_ACK == 0x36, "VendorSessionAck类型回归保护失败");
+_Static_assert(DUAL_LINK_VENDOR_SESSION_LENGTH == 12U, "VendorSession长度回归保护失败");
 _Static_assert(DUAL_LINK_ROLE_ACK_LENGTH == 5U, "RoleAck长度回归保护失败");
 _Static_assert(DUAL_LINK_PROFILE_REQUEST_LENGTH == 8U, "ProfileRequest长度回归保护失败");
 _Static_assert(DUAL_LINK_PROFILE_OFFER_LENGTH == 12U, "ProfileOffer长度回归保护失败");
@@ -199,6 +208,383 @@ static void test_bridge_protocol(void)
     assert(capture.count == 2);
     assert(capture.frames[1].type == DUAL_MESSAGE_PING);
     assert(capture.frames[1].sequence == second.sequence);
+}
+
+typedef struct {
+    unsigned count;
+    makcu_ascii_command_t commands[16];
+} makcu_ascii_capture_t;
+
+static void capture_makcu_ascii_command(
+    const makcu_ascii_command_t *command,
+    void *context)
+{
+    makcu_ascii_capture_t *capture = (makcu_ascii_capture_t *)context;
+    assert(capture != NULL && command != NULL);
+    assert(capture->count < sizeof(capture->commands) / sizeof(capture->commands[0]));
+    capture->commands[capture->count++] = *command;
+}
+
+static void test_makcu_ascii_parser_and_session(void)
+{
+    makcu_ascii_parser_t parser;
+    makcu_ascii_parser_init(&parser);
+    makcu_ascii_capture_t capture = {0};
+    static const uint8_t first[] = "noise.move(12,-3,";
+    static const uint8_t second[] = ")km.left(1).wheel(-9)";
+    makcu_ascii_parser_feed(&parser, first, sizeof(first) - 1U,
+                            capture_makcu_ascii_command, &capture);
+    assert(capture.count == 0U);
+    makcu_ascii_parser_feed(&parser, second, sizeof(second) - 1U,
+                            capture_makcu_ascii_command, &capture);
+    assert(capture.count == 3U);
+    assert(capture.commands[0].kind == MAKCU_ASCII_COMMAND_MOVE);
+    assert(capture.commands[0].argument[0] == 12 &&
+           capture.commands[0].argument[1] == -3);
+    assert(strcmp(capture.commands[0].body, "move(12,-3,)") == 0);
+    assert(capture.commands[1].kind == MAKCU_ASCII_COMMAND_BUTTON &&
+           capture.commands[1].button_index == 0U &&
+           capture.commands[1].argument[0] == 1);
+    assert(capture.commands[2].kind == MAKCU_ASCII_COMMAND_WHEEL &&
+           capture.commands[2].argument[0] == -9);
+
+    static const uint8_t query[] = ".side2()";
+    makcu_ascii_parser_feed(&parser, query, sizeof(query) - 1U,
+                            capture_makcu_ascii_command, &capture);
+    assert(capture.count == 4U);
+    assert(capture.commands[3].kind == MAKCU_ASCII_COMMAND_BUTTON &&
+           capture.commands[3].query && capture.commands[3].button_index == 4U);
+
+    static const uint8_t malformed[] =
+        ".move(32768,0).left(3).left(2).move(1,x).unknown()";
+    makcu_ascii_parser_feed(&parser, malformed, sizeof(malformed) - 1U,
+                            capture_makcu_ascii_command, &capture);
+    assert(capture.count == 9U);
+    assert(capture.commands[4].kind == MAKCU_ASCII_COMMAND_ERROR &&
+           capture.commands[4].error == MAKCU_ASCII_ERROR_ARGUMENT);
+    assert(capture.commands[5].kind == MAKCU_ASCII_COMMAND_ERROR &&
+           capture.commands[5].error == MAKCU_ASCII_ERROR_ARGUMENT);
+    assert(capture.commands[6].kind == MAKCU_ASCII_COMMAND_ERROR &&
+           capture.commands[6].error == MAKCU_ASCII_ERROR_UNSUPPORTED);
+    assert(capture.commands[7].kind == MAKCU_ASCII_COMMAND_ERROR &&
+           capture.commands[7].error == MAKCU_ASCII_ERROR_ARGUMENT);
+    assert(capture.commands[8].kind == MAKCU_ASCII_COMMAND_ERROR &&
+           capture.commands[8].error == MAKCU_ASCII_ERROR_UNSUPPORTED);
+
+    char overlong[MAKCU_ASCII_COMMAND_MAX + 16U];
+    overlong[0] = '.';
+    memset(&overlong[1], 'x', sizeof(overlong) - 3U);
+    overlong[sizeof(overlong) - 2U] = '(';
+    overlong[sizeof(overlong) - 1U] = ')';
+    const unsigned before_overlong = capture.count;
+    makcu_ascii_parser_feed(&parser, (const uint8_t *)overlong,
+                            sizeof(overlong), capture_makcu_ascii_command,
+                            &capture);
+    assert(capture.count == before_overlong + 1U);
+    assert(capture.commands[before_overlong].kind == MAKCU_ASCII_COMMAND_ERROR &&
+           capture.commands[before_overlong].error == MAKCU_ASCII_ERROR_TOO_LONG);
+
+    const hid_mouse_report_layout_t layout = {
+        .valid = true,
+        .report_bytes = 2U,
+        .buttons_bit_offset = 3U,
+        .button_count = 6U,
+    };
+    const uint8_t report[] = {(uint8_t)((1U << 3U) | (1U << 5U)), 0x02U};
+    uint8_t physical_buttons = 0U;
+    assert(hid_mouse_report_read_buttons(report, sizeof(report), &layout,
+                                         &physical_buttons));
+    assert(physical_buttons == 0x05U);
+    assert(!hid_mouse_report_read_buttons(report, 1U, &layout,
+                                          &physical_buttons));
+
+    makcu_ascii_session_t session;
+    makcu_ascii_session_init(&session);
+    assert(session.echo_enabled);
+    bool send_report = false;
+    assert(makcu_ascii_session_set_button(&session, 0U, 1, &send_report));
+    assert(send_report && session.injected_buttons == 1U);
+    makcu_ascii_session_touch(&session, 100U);
+    assert(makcu_ascii_button_state(0U, 1U, session.injected_buttons) == 3U);
+    assert(makcu_ascii_button_state(0U, 1U, 0U) == 1U);
+    assert(makcu_ascii_button_state(0U, 0U, session.injected_buttons) == 2U);
+    assert(!makcu_ascii_session_lease_expired(&session, 1599U));
+
+    /* A GET is read-only: the caller does not touch the safety lease. */
+    (void)makcu_ascii_button_state(0U, 0U, session.injected_buttons);
+    assert(session.last_activity_ms == 100U);
+    assert(makcu_ascii_session_lease_expired(&session, 1600U));
+
+    assert(makcu_ascii_session_set_button(&session, 0U, 0, &send_report));
+    assert(send_report && session.injected_buttons == 0U);
+    makcu_ascii_session_touch(&session, 2000U);
+    assert(!makcu_ascii_session_lease_expired(&session, 3499U));
+    assert(makcu_ascii_session_lease_expired(&session, 3500U));
+    makcu_ascii_session_expire(&session);
+    assert(session.injected_buttons == 0U && !session.lease_active);
+}
+
+typedef struct {
+    unsigned count;
+    makcu_v4_command_t commands[64];
+} makcu_v4_capture_t;
+
+static void capture_makcu_v4_command(
+    const makcu_v4_command_t *command,
+    void *context)
+{
+    makcu_v4_capture_t *capture = (makcu_v4_capture_t *)context;
+    assert(capture != NULL && command != NULL);
+    assert(capture->count < sizeof(capture->commands) / sizeof(capture->commands[0]));
+    capture->commands[capture->count++] = *command;
+}
+
+static void feed_makcu_v4(makcu_v4_stream_parser_t *parser,
+                          makcu_v4_capture_t *capture,
+                          const uint8_t *bytes, size_t length,
+                          uint32_t now_ms)
+{
+    makcu_v4_stream_parser_feed(parser, bytes, length, now_ms,
+                                capture_makcu_v4_command, capture);
+}
+
+static void test_makcu_v4_parsers_and_state(void)
+{
+    makcu_v4_stream_parser_t parser;
+    makcu_v4_stream_parser_init(&parser);
+    makcu_v4_capture_t capture = {0};
+
+    /* Official ASCII spellings, CR-only probe termination, and V4 parameters. */
+    static const uint8_t ascii[] =
+        "km.move(20,-30,1,2,3,4,5)\r"
+        "km.stream(mouse, 1)\r\n"
+        "km.lock_mx+(1)\r"
+        "km.buttons(3,1000)\r"
+        "km.interpolate(255)\r"
+        "km.click(5,2,5000)\r"
+        "km.screen(32767,32767)\r"
+        "km.side2()\r";
+    feed_makcu_v4(&parser, &capture, ascii, sizeof(ascii) - 1U, 100U);
+    assert(capture.count == 8U);
+    assert(capture.commands[0].error == MAKCU_V4_ERROR_NONE &&
+           capture.commands[0].opcode == 0x18U &&
+           capture.commands[0].argument_count == 2U &&
+           capture.commands[0].argument[0] == 20 &&
+           capture.commands[0].argument[1] == -30);
+    assert(capture.commands[1].opcode == 0x52U &&
+           capture.commands[1].argument_count == 2U &&
+           capture.commands[1].argument[0] == 1 &&
+           capture.commands[1].argument[1] == 1);
+    assert(capture.commands[2].opcode == 0x60U &&
+           capture.commands[2].argument[0] == 6 &&
+           capture.commands[2].argument[1] == 1);
+    assert(capture.commands[3].opcode == 0x10U &&
+           capture.commands[3].argument[0] == 3 &&
+           capture.commands[3].argument[1] == 1000);
+    assert(capture.commands[4].opcode == 0x1FU &&
+           capture.commands[4].argument[0] == 255);
+    assert(capture.commands[5].opcode == 0x61U &&
+           capture.commands[5].argument[0] == 5 &&
+           capture.commands[5].argument[2] == 5000);
+    assert(capture.commands[6].opcode == 0x64U &&
+           capture.commands[6].argument[0] == 32767 &&
+           capture.commands[6].argument[1] == 32767);
+    assert(capture.commands[7].opcode == 0x15U &&
+           capture.commands[7].query);
+
+    static const uint8_t bad_ascii[] =
+        "km.lock_left(1)\rkm.click(0)\rkm.screen(32768,1)\r"
+        "km.move_mask(1,0,2,0)\rkm.stream(keyboard,1)\r";
+    const unsigned before_bad = capture.count;
+    feed_makcu_v4(&parser, &capture, bad_ascii, sizeof(bad_ascii) - 1U, 101U);
+    assert(capture.count == before_bad + 5U);
+    for (unsigned index = before_bad; index < capture.count; ++index) {
+        assert(capture.commands[index].error != MAKCU_V4_ERROR_NONE);
+    }
+    assert(capture.commands[before_bad + 4U].error == MAKCU_V4_ERROR_UNSUPPORTED);
+
+    /* A binary payload containing a valid-looking text command stays binary. */
+    const uint8_t payload_move_text[] = {'k','m','.','m','o','v','e','(','1',',','2',')'};
+    uint8_t frame[5U + sizeof(payload_move_text)];
+    size_t frame_length = 0U;
+    assert(makcu_v4_encode_frame(0x18U, payload_move_text,
+                                 sizeof(payload_move_text), frame,
+                                 sizeof(frame), &frame_length));
+    const unsigned before_binary_error = capture.count;
+    feed_makcu_v4(&parser, &capture, frame, frame_length, 110U);
+    assert(capture.count == before_binary_error + 1U);
+    assert(capture.commands[before_binary_error].transport ==
+           MAKCU_V4_TRANSPORT_BINARY);
+    assert(capture.commands[before_binary_error].error ==
+           MAKCU_V4_ERROR_ARGUMENT);
+
+    const uint8_t device_get[] = {0xDEU, 0xADU, 0U, 0U, 0x02U};
+    feed_makcu_v4(&parser, &capture, device_get, sizeof(device_get), 111U);
+    assert(capture.commands[capture.count - 1U].opcode == 0x02U &&
+           capture.commands[capture.count - 1U].query);
+
+    /* Legacy V3/AIO baud envelopes must not consume the next command byte. */
+    static const uint8_t legacy_a5_then_device[] = {
+        0xDEU, 0xADU, 5U, 0U, 0xA5U, 0x00U, 0xC2U, 0x01U, 0x00U,
+        0xDEU, 0xADU, 0U, 0U, 0x02U,
+    };
+    const unsigned before_legacy_a5 = capture.count;
+    feed_makcu_v4(&parser, &capture, legacy_a5_then_device,
+                  sizeof(legacy_a5_then_device), 111U);
+    assert(capture.count == before_legacy_a5 + 2U);
+    assert(capture.commands[before_legacy_a5].opcode == 0xA5U &&
+           capture.commands[before_legacy_a5].error == MAKCU_V4_ERROR_NONE &&
+           capture.commands[before_legacy_a5].payload_length == 4U);
+    assert(capture.commands[before_legacy_a5 + 1U].opcode == 0x02U &&
+           capture.commands[before_legacy_a5 + 1U].error ==
+               MAKCU_V4_ERROR_NONE);
+
+    static const uint8_t legacy_a4_then_device[] = {
+        0xDEU, 0xADU, 1U, 0U, 0xA4U,
+        0xDEU, 0xADU, 0U, 0U, 0x02U,
+    };
+    const unsigned before_legacy_a4 = capture.count;
+    feed_makcu_v4(&parser, &capture, legacy_a4_then_device,
+                  sizeof(legacy_a4_then_device), 111U);
+    assert(capture.count == before_legacy_a4 + 2U);
+    assert(capture.commands[before_legacy_a4].opcode == 0xA4U &&
+           capture.commands[before_legacy_a4].query &&
+           capture.commands[before_legacy_a4].error == MAKCU_V4_ERROR_NONE);
+    assert(capture.commands[before_legacy_a4 + 1U].opcode == 0x02U &&
+           capture.commands[before_legacy_a4 + 1U].error ==
+               MAKCU_V4_ERROR_NONE);
+
+    const uint8_t click5[] = {0xDEU, 0xADU, 1U, 0U, 0x61U, 5U};
+    feed_makcu_v4(&parser, &capture, click5, sizeof(click5), 112U);
+    assert(capture.commands[capture.count - 1U].error == MAKCU_V4_ERROR_NONE &&
+           capture.commands[capture.count - 1U].payload[0] == 5U);
+    const uint8_t click0[] = {0xDEU, 0xADU, 1U, 0U, 0x61U, 0U};
+    feed_makcu_v4(&parser, &capture, click0, sizeof(click0), 113U);
+    assert(capture.commands[capture.count - 1U].error ==
+           MAKCU_V4_ERROR_ARGUMENT);
+    const uint8_t keyboard[] = {0xDEU, 0xADU, 1U, 0U, 0x20U, 4U};
+    feed_makcu_v4(&parser, &capture, keyboard, sizeof(keyboard), 114U);
+    assert(capture.commands[capture.count - 1U].error ==
+           MAKCU_V4_ERROR_UNSUPPORTED);
+
+    /* An oversized declared frame is rejected and its full body is discarded. */
+    uint8_t oversized[5U + 65U + sizeof(device_get)];
+    oversized[0] = 0xDEU;
+    oversized[1] = 0xADU;
+    oversized[2] = 65U;
+    oversized[3] = 0U;
+    oversized[4] = 0x18U;
+    memset(&oversized[5], 'x', 65U);
+    memcpy(&oversized[70], device_get, sizeof(device_get));
+    const unsigned before_oversized = capture.count;
+    feed_makcu_v4(&parser, &capture, oversized, sizeof(oversized), 120U);
+    assert(capture.count == before_oversized + 2U);
+    assert(capture.commands[before_oversized].error == MAKCU_V4_ERROR_TOO_LONG);
+    assert(capture.commands[before_oversized + 1U].opcode == 0x02U);
+
+    const uint8_t partial[] = {0xDEU, 0xADU, 4U, 0U, 0x18U, 1U};
+    feed_makcu_v4(&parser, &capture, partial, sizeof(partial), 200U);
+    assert(parser.mode == 2U);
+    makcu_v4_stream_parser_tick(&parser, 451U);
+    assert(parser.mode == 0U);
+    static const uint8_t after_timeout[] = "km.device()\r";
+    feed_makcu_v4(&parser, &capture, after_timeout,
+                  sizeof(after_timeout) - 1U, 452U);
+    assert(capture.commands[capture.count - 1U].opcode == 0x02U &&
+           capture.commands[capture.count - 1U].error == MAKCU_V4_ERROR_NONE);
+
+    uint8_t error_frame[6];
+    size_t error_length = 0U;
+    assert(makcu_v4_encode_error(0x18U, error_frame, sizeof(error_frame),
+                                 &error_length));
+    const uint8_t expected_error[] = {0xDEU, 0xADU, 1U, 0U, 0x18U, 0xFFU};
+    assert(error_length == sizeof(expected_error));
+    assert(memcmp(error_frame, expected_error, sizeof(expected_error)) == 0);
+
+    makcu_v4_state_t state;
+    makcu_v4_state_init(&state);
+    assert(state.screen_width == 1920U && state.pointer_x == 960U &&
+           !state.echo_enabled && !state.mouse_stream_enabled &&
+           !state.buttons_enabled);
+    state.physical_buttons = 0x05U;
+    assert(makcu_v4_state_ascii_button(&state, 0U) == 1U);
+    assert(makcu_v4_state_set_button(&state, 0U, 1U));
+    assert(makcu_v4_state_ascii_button(&state, 0U) == 3U);
+    state.button_mask = 1U;
+    assert(makcu_v4_state_effective_physical_buttons(&state) == 0x04U);
+    assert(makcu_v4_state_ascii_button(&state, 0U) == 3U);
+    makcu_v4_state_touch(&state, 100U);
+    assert(!makcu_v4_state_lease_expired(&state, 1599U));
+    assert(makcu_v4_state_lease_expired(&state, 1600U));
+    assert(makcu_v4_state_schedule_click(&state, 2000U, 5000U));
+    assert(!makcu_v4_state_lease_expired(&state, 6999U));
+    assert(!makcu_v4_state_lease_expired(&state, 8499U));
+    assert(makcu_v4_state_lease_expired(&state, 8500U));
+    static const struct { uint8_t input; uint8_t normalized; } interpolate_cases[] = {
+        {0U, 0U}, {12U, 0U}, {13U, 25U}, {37U, 25U},
+        {38U, 50U}, {62U, 50U}, {63U, 75U}, {87U, 75U},
+        {88U, 100U}, {100U, 100U}, {255U, 255U},
+    };
+    for (size_t index = 0U;
+         index < sizeof(interpolate_cases) / sizeof(interpolate_cases[0]); ++index) {
+        uint8_t normalized = 0xAAU;
+        assert(makcu_v4_normalize_interpolate(
+            interpolate_cases[index].input, &normalized));
+        assert(normalized == interpolate_cases[index].normalized);
+    }
+    uint8_t normalized = 0U;
+    assert(!makcu_v4_normalize_interpolate(101U, &normalized));
+    assert(!makcu_v4_normalize_interpolate(254U, &normalized));
+    assert(!makcu_v4_normalize_interpolate(25U, NULL));
+    assert(makcu_v4_interpolate_slots(0U, 10U) == 0U);
+    assert(makcu_v4_interpolate_slots(25U, 10U) == 5U);
+    assert(makcu_v4_interpolate_slots(50U, 10U) == 10U);
+    assert(makcu_v4_interpolate_slots(75U, 10U) == 15U);
+    assert(makcu_v4_interpolate_slots(100U, 10U) == 20U);
+    assert(makcu_v4_interpolate_slots(255U, 1U) == 0U);
+    assert(makcu_v4_interpolate_slots(255U, 2U) == 0U);
+    assert(makcu_v4_interpolate_slots(255U, 3U) == 5U);
+    assert(makcu_v4_interpolate_slots(255U, 8U) == 10U);
+    assert(makcu_v4_interpolate_slots(255U, 22U) == 20U);
+    assert(makcu_v4_interpolate_slots(255U, UINT8_MAX) == 20U);
+    const int32_t motion_cases[][3] = {
+        {32768, 0, 0},       /* 已合并的 +32767 与 +1 */
+        {-32768, 0, 0},
+        {0, 0, 128},         /* 正向滚轮不能窄化为负数 */
+        {0, 0, -128},
+        {INT32_MIN, INT32_MAX, INT32_MIN},
+    };
+    for (size_t index = 0U;
+         index < sizeof(motion_cases) / sizeof(motion_cases[0]); ++index) {
+        int32_t remaining[3] = {
+            motion_cases[index][0], motion_cases[index][1],
+            motion_cases[index][2],
+        };
+        int64_t totals[3] = {0, 0, 0};
+        const uint32_t steps = makcu_v4_motion_steps(
+            remaining[0], remaining[1], remaining[2], 1U);
+        const uint32_t maximum_motion_steps = 16909321U; /* ceil(2^31 / 127) */
+        assert(steps > 0U && steps <= maximum_motion_steps);
+        if (remaining[2] == INT32_MIN) {
+            assert(steps == maximum_motion_steps);
+        }
+        for (uint32_t step = steps; step > 0U; --step) {
+            const int32_t x = makcu_v4_motion_step(remaining[0], step);
+            const int32_t y = makcu_v4_motion_step(remaining[1], step);
+            const int32_t wheel = makcu_v4_motion_step(remaining[2], step);
+            assert(x >= INT16_MIN && x <= INT16_MAX);
+            assert(y >= INT16_MIN && y <= INT16_MAX);
+            assert(wheel >= INT8_MIN && wheel <= INT8_MAX);
+            totals[0] += x; totals[1] += y; totals[2] += wheel;
+            remaining[0] -= x; remaining[1] -= y; remaining[2] -= wheel;
+        }
+        assert(remaining[0] == 0 && remaining[1] == 0 && remaining[2] == 0);
+        assert(totals[0] == motion_cases[index][0]);
+        assert(totals[1] == motion_cases[index][1]);
+        assert(totals[2] == motion_cases[index][2]);
+    }
+    makcu_v4_state_track_move(&state, INT32_MAX, INT32_MIN);
+    assert(state.pointer_x == state.screen_width - 1U && state.pointer_y == 0U);
 }
 
 static void test_cdc_parser_and_lease_release(void)
@@ -731,6 +1117,22 @@ static void test_dynamic_mouse_report_layout(void)
         0x03, 0x80, 0x14, 0x00, 0xfb, 0xff, 0x01, 0xff,
     };
     assert(memcmp(report, expected, sizeof(expected)) == 0);
+
+    uint8_t physical_masked[8] = {
+        0x01, 0x00, 0x7b, 0x00, 0x38, 0xff, 0x04, 0xfb,
+    };
+    assert(hid_mouse_report_apply_physical_masks(
+        &layout, physical_masked, sizeof(physical_masked),
+        0x01U, 0x0AU, 0x02U));
+    uint8_t physical_buttons = 0xFFU;
+    int32_t masked_x = 1, masked_y = 1, masked_wheel = 1, masked_pan = 1;
+    assert(hid_mouse_report_read_buttons(physical_masked,
+        sizeof(physical_masked), &layout, &physical_buttons));
+    assert(physical_buttons == 0U);
+    assert(hid_mouse_report_read_axes(physical_masked, sizeof(physical_masked),
+        &layout, &masked_x, &masked_y, &masked_wheel, &masked_pan));
+    assert(masked_x == 0 && masked_y == 0 && masked_wheel == 0 &&
+           masked_pan == -5);
     assert(!hid_mouse_report_apply_overlay(
         &layout, report, sizeof(report) - 1U, 0, 0, 0, 0, 0));
 }
@@ -744,15 +1146,17 @@ static void test_status_led_logic(void)
     dual_status_led_logic_set_role(&state, DUAL_STATUS_LED_ROLE_MOUSE_HOST);
     assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_RED);
     dual_status_led_logic_set_peer_connected(&state, true);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_GREEN);
+    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_BLUE);
     dual_status_led_logic_set_flow_error(&state, true);
     assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_RED);
     assert(dual_status_led_logic_color(&state, 250) == DUAL_STATUS_LED_COLOR_OFF);
     dual_status_led_logic_set_flow_error(&state, false);
     dual_status_led_logic_set_host_mouse_ready(&state, true);
+    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_BLUE);
+    dual_status_led_logic_set_peer_usb_ready(&state, true);
     assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_GREEN);
     dual_status_led_logic_set_host_mouse_ready(&state, false);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_GREEN);
+    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_BLUE);
 
     dual_status_led_logic_set_role(&state, DUAL_STATUS_LED_ROLE_PC_DEVICE);
     assert(dual_status_led_logic_color(&state, 1000) == DUAL_STATUS_LED_COLOR_BLUE);
@@ -1409,31 +1813,53 @@ static void test_profile_final_ack_requires_mounted_clone(void)
     const uint32_t crc = 0x01234567U;
     /* 已发布数据或安装中的重复 COMMIT 都只能得到接收确认。 */
     assert(link_profile_replay_result(transfer, crc, 0U, 0U, 0U, 0U,
-                                      false, false, false, true) ==
+                                      false, false, false, true, false) ==
            LINK_PROFILE_REPLAY_PENDING);
     assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
-                                      true, true, false, true) ==
+                                      true, true, false, true, false) ==
            LINK_PROFILE_REPLAY_PENDING);
     /* 身份相同但挂载尚未完成，或旧 epoch 正在清理，不能声称成功。 */
     assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
-                                      true, true, false, false) ==
+                                      true, true, false, true, true) ==
+           LINK_PROFILE_REPLAY_WAIT_HOST);
+    assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
+                                      true, true, true, true, false) ==
            LINK_PROFILE_REPLAY_PENDING);
     assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
-                                      true, true, true, true) ==
-           LINK_PROFILE_REPLAY_PENDING);
-    assert(link_profile_replay_result(transfer, crc, transfer, crc, 0U, 0U,
-                                      true, true, true, false) ==
+                                      true, true, true, false, false) ==
            LINK_PROFILE_REPLAY_MOUNTED);
     assert(link_profile_replay_result(transfer, crc ^ 1U, transfer, crc, 0U, 0U,
-                                      true, true, true, false) ==
+                                      true, true, true, false, false) ==
            LINK_PROFILE_REPLAY_PENDING);
     /* 两次挂载均失败后的同一 transfer 重放必须补发失败确认。 */
     assert(link_profile_replay_result(transfer, crc, 0U, 0U, transfer, crc,
-                                      false, false, false, false) ==
+                                      false, false, false, false, false) ==
            LINK_PROFILE_REPLAY_FAILED);
     assert(link_profile_replay_result(transfer + 1U, crc, 0U, 0U, transfer, crc,
-                                      false, false, false, false) ==
+                                      false, false, false, false, false) ==
            LINK_PROFILE_REPLAY_PENDING);
+    assert(link_profile_ack_is_wait_host(DUAL_PROFILE_ACK_STATUS_WAIT_HOST));
+    assert(!link_profile_ack_is_wait_host(DUAL_PROFILE_ACK_STATUS_MOUNTED));
+    assert(!link_commit_poll_enabled(true));
+    assert(link_commit_poll_enabled(false));
+
+    /* 主机即使在原 3 秒窗口后才配置，已安装克隆仍等待；仅 mounted 可最终成功。 */
+    for (unsigned elapsed_ms = 0U; elapsed_ms < 3100U; ++elapsed_ms) {
+        assert(link_profile_host_wait_action(true, false, true) ==
+               LINK_PROFILE_HOST_WAIT);
+    }
+    assert(link_profile_host_wait_action(true, true, true) ==
+           LINK_PROFILE_HOST_MOUNTED);
+    assert(link_profile_host_wait_action(true, false, false) ==
+           LINK_PROFILE_HOST_WAIT_CANCEL);
+    assert(link_profile_host_wait_action(false, false, true) ==
+           LINK_PROFILE_HOST_WAIT_CANCEL);
+    assert(!link_profile_host_probe_due(true, 1000,
+        1000 + LINK_COMMIT_HOST_PROBE_INTERVAL_US - 1));
+    assert(link_profile_host_probe_due(true, 1000,
+        1000 + LINK_COMMIT_HOST_PROBE_INTERVAL_US));
+    assert(!link_profile_host_probe_due(false, 1000,
+        1000 + 10 * LINK_COMMIT_HOST_PROBE_INTERVAL_US));
 
     link_flow_t commit;
     link_flow_reset(&commit);
@@ -1515,41 +1941,200 @@ static void test_profile_reuse_predicate(void)
 static void test_usb_stall_watch_bounds(void)
 {
     const int64_t now = 20000000LL;
-    assert(usb_stall_evidence_ready(now, 1, now - 300000, now - 250000, true, false));
-    assert(!usb_stall_evidence_ready(now, 1, now - 299999, now - 250000, true, false));
-    assert(!usb_stall_evidence_ready(now, 1, now - 300000, now - 249999, true, false));
-    assert(!usb_stall_evidence_ready(now, 1, now - 300000, 0, true, false));
-    assert(!usb_stall_evidence_ready(now, 1, 0, now - 250000, true, false));
-    assert(!usb_stall_evidence_ready(now, now - 9999999, now - 300000, now - 250000, true, false));
-    assert(!usb_stall_evidence_ready(now, 1, now - 300000, now - 250000, false, false));
-    assert(!usb_stall_evidence_ready(now, 1, now - 300000, now - 250000, true, true));
+    /* 没有 last_input 参数：静止或尚未产生过输入报告不会阻断心跳判定。 */
+    assert(usb_stall_evidence_ready(now, now - 10000000, now - 250000, true, false));
+    assert(!usb_stall_evidence_ready(now, now - 10000000, now - 249999, true, false));
+    assert(!usb_stall_evidence_ready(now, now - 10000000, 0, true, false));
+    assert(!usb_stall_evidence_ready(now, now - 9999999, now - 250000, true, false));
+    assert(!usb_stall_evidence_ready(now, now - 10000000, now - 250000, false, false));
+    assert(!usb_stall_evidence_ready(now, now - 10000000, now - 250000, true, true));
     assert(usb_stall_cooldown_ready(50000000, 20000000));
     assert(!usb_stall_cooldown_ready(49999999, 20000000));
     assert(usb_stall_cooldown_ready(now, 0));
-    assert(usb_stall_observed_delay(now, now - 300000, now - 250000) == 250000);
-    /* 每个心跳相位覆盖独立监测的判定上界；此处验证逻辑，不代表真实调度延迟。 */
+    assert(usb_stall_observed_delay(now, now - 250000) == 250000);
+
+    /* 心跳快照必须剔除普通 EP0 和尚未成功提交的 URB。 */
+    assert(vendor_urb_pending_matches_snapshot(true, true, true));
+    assert(!vendor_urb_pending_matches_snapshot(true, false, true));
+    assert(vendor_urb_pending_matches_snapshot(true, false, false));
+    assert(!vendor_urb_pending_matches_snapshot(false, true, true));
+
+    /* 每个心跳相位覆盖 20 ms 轮询下的触发边界；不代表真实调度延迟。 */
     for (int phase = 0; phase <= 100000; phase += 1000) {
-        const int64_t fault = 20000000;
+        const int64_t heartbeat_start = 20000000;
         int64_t fired = 0;
         for (int64_t elapsed = 0; elapsed <= 500000; elapsed += 20000) {
-            if (elapsed >= phase && usb_stall_evidence_ready(fault + elapsed, 1,
-                    fault, fault + phase, true, false)) {
+            if (elapsed >= phase && usb_stall_evidence_ready(
+                    heartbeat_start + elapsed, 1,
+                    heartbeat_start + phase, true, false)) {
                 fired = elapsed;
                 break;
             }
         }
-        assert(fired >= 300000 && fired <= 380000);
+        const int64_t observed_age = fired - phase;
+        assert(observed_age >= 250000 && observed_age < 270000);
     }
-    puts("usb_stall_watch_bounds: PASS (logic only)");
+    puts("usb_stall_watch_bounds: PASS (heartbeat-only logic)");
+}
+
+static void test_vendor_session_barrier_protocol(void)
+{
+    uint8_t payload[DUAL_LINK_VENDOR_SESSION_LENGTH] = {0};
+    uint32_t p_generation = 0U;
+    uint32_t m_generation = 0U;
+    uint32_t epoch = 0U;
+    assert(dual_vendor_session_encode(11U, 22U, 33U, payload, sizeof(payload)));
+    assert(dual_vendor_session_decode(payload, sizeof(payload),
+                                      &p_generation, &m_generation, &epoch));
+    assert(p_generation == 11U && m_generation == 22U && epoch == 33U);
+    assert(link_vendor_session_identity_matches(11U, 22U, 11U, 22U, 33U));
+    assert(!link_vendor_session_identity_matches(10U, 22U, 11U, 22U, 33U));
+    assert(!link_vendor_session_identity_matches(11U, 21U, 11U, 22U, 33U));
+    assert(link_vendor_session_epoch_is_newer(2U, 1U));
+    assert(link_vendor_session_epoch_is_newer(1U, UINT32_MAX));
+    assert(!link_vendor_session_epoch_is_newer(1U, 2U));
+    assert(!dual_vendor_session_encode(0U, 22U, 33U, payload, sizeof(payload)));
+    assert(!dual_vendor_session_decode(payload, sizeof(payload) - 1U,
+                                       &p_generation, &m_generation, &epoch));
+    /* BEGIN 只使控制帧 generation 失效，物理输入/按钮边沿沿原队列保留。 */
+    assert(uart1_uses_vendor_input_generation(DUAL_MESSAGE_RAW_HID_INPUT));
+    assert(!uart1_uses_vendor_control_generation(DUAL_MESSAGE_RAW_HID_INPUT));
+    assert(uart1_uses_vendor_control_generation(DUAL_MESSAGE_HID_SET_REPORT));
+    assert(uart1_uses_vendor_control_generation(DUAL_MESSAGE_VENDOR_CONTROL_REQUEST));
+    assert(!uart1_uses_vendor_control_generation(DUAL_MESSAGE_VENDOR_SESSION_BEGIN));
+    assert(uart1_is_retryable_vendor_session_barrier(DUAL_MESSAGE_VENDOR_SESSION_BEGIN));
+    assert(uart1_is_retryable_vendor_session_barrier(DUAL_MESSAGE_VENDOR_SESSION_ACK));
+    assert(!uart1_is_retryable_vendor_session_barrier(DUAL_MESSAGE_RAW_HID_INPUT));
+    assert(hid_vendor_session_ack_matches(11U, 22U, 33U, 11U, 22U, 33U));
+    assert(!hid_vendor_session_ack_matches(11U, 22U, 33U, 11U, 22U, 34U));
+    assert(!hid_vendor_session_ack_matches(11U, 22U, 33U, 11U, 0U, 33U));
+    assert(hid_vendor_session_begin_retry_due(true, false, 0U, 10U, 0, 1000));
+    assert(!hid_vendor_session_begin_retry_due(true, false, 1U, 10U, 1000, 100999));
+    assert(hid_vendor_session_begin_retry_due(true, false, 1U, 10U, 1000, 101000));
+    assert(!hid_vendor_session_begin_retry_due(true, false, 10U, 10U, 0, 200000));
+    assert(!hid_vendor_session_begin_retry_due(true, true, 1U, 10U, 0, 200000));
+    assert(!hid_vendor_session_begin_retry_due(false, false, 0U, 10U, 0, 200000));
+    assert(hid_vendor_session_pending_matches(51U, 7U, 51U, 7U));
+    assert(!hid_vendor_session_pending_matches(52U, 8U, 51U, 7U));
+    assert(!hid_vendor_session_pending_matches(0U, 7U, 0U, 7U));
+
+    /* 主机刚完成 SET_CONFIGURATION 时，worker尚未轮询到挂载状态；
+     * 只允许当前已安装克隆的首个厂商请求进入ACK门控。 */
+    assert(hid_vendor_session_control_entry_ready(
+        true, true, true, true, true, false, false, 9U, 9U));
+    assert(hid_vendor_session_control_entry_ready(
+        true, true, true, true, false, true, false, 9U, 9U));
+    assert(hid_vendor_session_control_entry_ready(
+        true, true, true, false, false, false, false, 8U, 3U));
+    assert(!hid_vendor_session_control_entry_ready(
+        true, true, false, true, true, false, false, 9U, 9U));
+    assert(!hid_vendor_session_control_entry_ready(
+        false, true, true, true, true, false, false, 9U, 9U));
+    assert(!hid_vendor_session_control_entry_ready(
+        true, false, true, true, true, false, false, 9U, 9U));
+    assert(!hid_vendor_session_control_entry_ready(
+        true, true, true, true, true, false, true, 9U, 9U));
+    assert(!hid_vendor_session_control_entry_ready(
+        true, true, true, true, true, false, false, 10U, 9U));
+    assert(!hid_vendor_session_control_entry_ready(
+        true, true, true, true, false, false, false, 9U, 9U));
+}
+
+
+static unsigned route_a5_count, route_v4_count;
+static void capture_routed_a5(const dual_frame_t *frame, void *context)
+{
+    (void)frame; (void)context; ++route_a5_count;
+}
+static void capture_routed_v4(const makcu_v4_command_t *command, void *context)
+{
+    (void)command; (void)context; ++route_v4_count;
+}
+static void test_uart0_protocol_isolation(void)
+{
+    uart0_protocol_router_t router;
+    uart0_protocol_router_init(&router, capture_routed_a5, capture_routed_v4, NULL);
+    route_a5_count = route_v4_count = 0;
+    dual_frame_t frame = {.version=2, .type=DUAL_MESSAGE_DIAG_REPORT_INJECT_REQUEST};
+    const uint8_t nested[] = "km.move(10,0)\r";
+    frame.payload_length = sizeof(nested)-1;
+    memcpy(frame.payload, nested, frame.payload_length);
+    uint8_t bytes[264]; size_t length = 0;
+    assert(dual_frame_serialize(&frame, bytes, sizeof(bytes), &length) == ESP_OK);
+    for (size_t i=0; i<length; ++i) uart0_protocol_router_feed(&router, bytes+i, 1, 1);
+    assert(route_a5_count == 1 && route_v4_count == 0);
+    bytes[length-1] ^= 1;
+    uart0_protocol_router_feed(&router, bytes, length, 2);
+    assert(route_a5_count == 1 && route_v4_count == 0);
+    bytes[length-1] ^= 1;
+    uint8_t v4[80]; size_t v4_length = 0;
+    assert(makcu_v4_encode_frame(0x02, bytes, (uint16_t)length, v4, sizeof(v4), &v4_length));
+    uart0_protocol_router_feed(&router, v4, v4_length, 3);
+    assert(route_a5_count == 1 && route_v4_count == 1);
+    const uint8_t incomplete[] = {0xA5,0x5A,2,2,0,0,64};
+    uart0_protocol_router_feed(&router, incomplete, sizeof(incomplete), 4);
+    const uint8_t query[] = "km.interpolate()\r";
+    uart0_protocol_router_feed(&router, query, sizeof(query)-1, 254);
+    assert(route_v4_count == 2 && route_a5_count == 1);
+    memset(bytes, 0, sizeof(bytes));
+    bytes[0]=0xA5; bytes[1]=0x5A; bytes[2]=2; bytes[6]=255;
+    memcpy(bytes+7, nested, sizeof(nested)-1);
+    uart0_protocol_router_feed(&router, bytes, sizeof(bytes), 300);
+    assert(route_v4_count == 2 && route_a5_count == 1);
+    uart0_protocol_router_feed(&router, query, sizeof(query)-1, 301);
+    assert(route_v4_count == 3);
+}
+
+static void test_m_udp_channel_and_single_smoothing(void)
+{
+    for (uint8_t slots=0; slots<=20; slots+=5) {
+        m_udp_smoothing_t state = {0};
+        dual_frame_t in = {.version=2, .type=DUAL_MESSAGE_MOUSE_REPORT, .payload_length=8};
+        in.payload[0]=1; in.payload[1]=100; in.payload[3]=0x9C; in.payload[4]=0xFF;
+        in.payload[5]=10; in.payload[7]=slots;
+        m_udp_smoothing_enqueue(&state, &in);
+        int total_x=0,total_y=0,total_wheel=0; unsigned reports=0;
+        for (int tick=1; tick<=25; ++tick) {
+            dual_frame_t out;
+            if (m_udp_smoothing_tick(&state,tick*1000,&out)) {
+                assert(out.payload_length == 8 && out.payload[7] == 0);
+                assert(out.payload[0] == 1);
+                total_x += (int16_t)((uint16_t)out.payload[1] | ((uint16_t)out.payload[2]<<8));
+                total_y += (int16_t)((uint16_t)out.payload[3] | ((uint16_t)out.payload[4]<<8));
+                total_wheel += (int8_t)out.payload[5]; ++reports;
+                assert(!m_udp_smoothing_tick(&state,tick*1000+100,&out));
+            }
+        }
+        assert(total_x == 100 && total_y == -100 && total_wheel == 10);
+        assert(reports == (slots == 0 ? 1 : slots));
+        m_udp_smoothing_enqueue(&state,&in);
+        in.payload[7]=5; m_udp_smoothing_enqueue(&state,&in);
+        total_x=0;
+        for (int tick=26; tick<=50; ++tick) {
+            dual_frame_t out;
+            if (m_udp_smoothing_tick(&state,tick*1000,&out))
+                total_x += (int16_t)((uint16_t)out.payload[1] | ((uint16_t)out.payload[2]<<8));
+        }
+        assert(total_x == 200);
+        m_udp_smoothing_enqueue(&state,&in);
+        m_udp_smoothing_reset(&state);
+        dual_frame_t out;
+        for (int tick=51; tick<=75; ++tick)
+            assert(!m_udp_smoothing_tick(&state,tick*1000,&out));
+    }
 }
 
 int main(void)
 {
+    test_uart0_protocol_isolation();
+    test_m_udp_channel_and_single_smoothing();
     test_merge_and_independent_release();
     test_rolling_smoother_preserves_overlapping_500hz_motion();
     test_saturation_is_split_without_loss();
     test_peek_commit_preserves_pending_on_retry();
     test_bridge_protocol();
+    test_makcu_ascii_parser_and_session();
+    test_makcu_v4_parsers_and_state();
     test_cdc_parser_and_lease_release();
     test_profile_model_and_roundtrip();
     test_profile_size_boundaries();
@@ -1583,6 +2168,7 @@ int main(void)
     test_profile_final_ack_requires_mounted_clone();
     test_profile_mount_retry_and_epoch_cancel();
     test_profile_reuse_predicate();
+    test_vendor_session_barrier_protocol();
     test_usb_stall_watch_bounds();
     puts("dual_proxy_logic_test: PASS");
     return 0;

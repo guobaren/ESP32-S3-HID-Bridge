@@ -40,6 +40,8 @@ internal sealed class InputForwarder : IDisposable
     private readonly NativeMethods.HookProc _keyboardProc;
     private readonly NativeMethods.HookProc _mouseProc;
     private readonly MouseReportPump _mouseReportPump;
+    private readonly Func<bool> _legacyFirmwareCompatibility;
+    private readonly Func<bool> _mouseHostAvailable;
     private readonly object _inputStateLock = new();
     private readonly object _captureLifecycleLock = new();
     private readonly object _keyboardEdgeLock = new();
@@ -74,20 +76,40 @@ internal sealed class InputForwarder : IDisposable
     private byte _kmboxMouseMask;
     private int _verticalWheelRemainder;
     private int _horizontalWheelRemainder;
+    private bool _simulatedUdpInputRequested;
+    private int _simulatedUdpInputFrequencyHz = 100;
     private bool _started;
 
-    internal InputForwarder(IBridgeTransport transport, Func<bool>? legacyFirmwareCompatibility = null)
+    internal InputForwarder(
+        IBridgeTransport transport,
+        Func<bool>? legacyFirmwareCompatibility = null,
+        Func<bool>? mouseHostAvailable = null)
     {
         _keyboardProc = KeyboardCallback;
         _mouseProc = MouseCallback;
-        _mouseReportPump = new MouseReportPump(transport, legacyFirmwareCompatibility: legacyFirmwareCompatibility);
+        _legacyFirmwareCompatibility = legacyFirmwareCompatibility ?? (() => false);
+        _mouseHostAvailable = mouseHostAvailable ?? (() => false);
+        _mouseReportPump = new MouseReportPump(
+            transport,
+            legacyFirmwareCompatibility: _legacyFirmwareCompatibility);
     }
 
     internal bool ForwardingEnabled => _mouseReportPump.Enabled;
+    internal bool PhysicalForwardingEnabled => _legacyFirmwareCompatibility() && ForwardingEnabled;
+    internal bool AutomationMouseRemoteOutputEnabled =>
+        _legacyFirmwareCompatibility() ? ForwardingEnabled : _mouseHostAvailable();
+    internal bool AutomationKeyboardRemoteOutputEnabled =>
+        _legacyFirmwareCompatibility() && ForwardingEnabled;
     internal bool AlwaysOutputUdpEnabled => _mouseReportPump.AlwaysOutputUdpEnabled;
     internal bool SimulatedUdpInputEnabled => _mouseReportPump.SimulatedUdpInputEnabled;
     internal int SimulatedUdpInputFrequencyHz => _mouseReportPump.SimulatedUdpInputFrequencyHz;
     internal bool UdpSmoothingEnabled => _mouseReportPump.UdpSmoothingEnabled;
+    internal int UdpSmoothingSlots => _mouseReportPump.UdpSmoothingSlots;
+    internal void SelectUdpSmoothingSlots(int slots) => _mouseReportPump.SelectUdpSmoothingSlots(slots);
+
+    internal void ConfigureUdpSmoothingSlots(int slots, bool fromRemote = false) =>
+        _mouseReportPump.ConfigureUdpSmoothingSlots(slots, fromRemote);
+
     internal byte KmboxMouseMaskForChecks
     {
         get
@@ -106,26 +128,43 @@ internal sealed class InputForwarder : IDisposable
     internal event EventHandler? ExitRequested;
     internal event Action<PhysicalInputEvent>? PhysicalInputChanged;
     internal event Action<KmboxMonitorReport>? KmboxMonitorReportAvailable;
-    internal event Action? MovementRecordingStarted
-    {
-        add => _mouseReportPump.MovementRecordingStarted += value;
-        remove => _mouseReportPump.MovementRecordingStarted -= value;
-    }
-    internal event Action<MouseMovementRecording>? MovementRecordingCompleted
-    {
-        add => _mouseReportPump.MovementRecordingCompleted += value;
-        remove => _mouseReportPump.MovementRecordingCompleted -= value;
-    }
-
+    internal event EventHandler? PhysicalRoutingChanged;
     internal void DisableForwarding() => SetForwarding(false, true);
 
     internal void SetForwardingEnabled(bool enabled) => SetForwarding(enabled);
 
-    internal void ConfigureSimulatedUdpInput(bool enabled, int frequencyHz) =>
-        _mouseReportPump.ConfigureSimulatedUdpInput(enabled, frequencyHz);
+    internal void ConfigureSimulatedUdpInput(bool enabled, int frequencyHz)
+    {
+        lock (_inputStateLock)
+        {
+            _simulatedUdpInputRequested = enabled;
+            _simulatedUdpInputFrequencyHz = frequencyHz;
+        }
+        ApplySimulatedUdpInputRouting();
+    }
+
+    internal void RefreshPhysicalRoutingState()
+    {
+        ApplySimulatedUdpInputRouting();
+        try
+        {
+            PhysicalRoutingChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"通知实体输入路由状态变化失败：{exception.Message}");
+        }
+    }
 
     internal void ConfigureAlwaysOutputUdp(bool enabled) =>
         _mouseReportPump.ConfigureAlwaysOutputUdp(enabled);
+
+    internal void ResetOutputStateForRoutingChange()
+    {
+        bool forwarding = ForwardingEnabled;
+        ClearInputState();
+        _mouseReportPump.ResetAndSendRelease(forwarding);
+    }
 
     internal void ConfigureUdpSmoothing(bool enabled) =>
         _mouseReportPump.ConfigureUdpSmoothing(enabled);
@@ -159,7 +198,7 @@ internal sealed class InputForwarder : IDisposable
 
     internal void SetRemoteMouseButtons(byte buttons)
     {
-        bool forwarding = ForwardingEnabled;
+        bool forwarding = PhysicalForwardingEnabled;
         byte combined;
         bool changed;
         lock (_inputStateLock)
@@ -189,7 +228,7 @@ internal sealed class InputForwarder : IDisposable
                     _remotePressedKeys.Add(key);
                 }
             }
-            report = BuildKeyboardReportLocked(ForwardingEnabled);
+            report = BuildKeyboardReportLocked(PhysicalForwardingEnabled);
         }
         _mouseReportPump.SendRemoteKeyboard(report);
     }
@@ -203,8 +242,8 @@ internal sealed class InputForwarder : IDisposable
             _remoteMouseButtons = 0;
             _remoteModifiers = 0;
             _remotePressedKeys.Clear();
-            mouseButtons = GetCombinedMouseButtonsLocked(ForwardingEnabled);
-            keyboardReport = BuildKeyboardReportLocked(ForwardingEnabled);
+            mouseButtons = GetCombinedMouseButtonsLocked(PhysicalForwardingEnabled);
+            keyboardReport = BuildKeyboardReportLocked(PhysicalForwardingEnabled);
         }
         _mouseReportPump.SetRemoteButtons(mouseButtons);
         _mouseReportPump.SendRemoteKeyboard(keyboardReport);
@@ -216,7 +255,7 @@ internal sealed class InputForwarder : IDisposable
         byte? keyToUnmask = null,
         bool clearAll = false)
     {
-        bool forwarding = ForwardingEnabled;
+        bool forwarding = PhysicalForwardingEnabled;
         byte previousButtons;
         byte currentButtons;
         byte[]? keyboardReport = null;
@@ -242,7 +281,7 @@ internal sealed class InputForwarder : IDisposable
             currentButtons = GetCombinedMouseButtonsLocked(forwarding);
             if (forwarding)
             {
-                keyboardReport = BuildKeyboardReportLocked(true);
+                keyboardReport = BuildKeyboardReportLocked(PhysicalForwardingEnabled);
             }
         }
 
@@ -265,6 +304,9 @@ internal sealed class InputForwarder : IDisposable
     internal bool EnqueueKeyboardInputForChecks(uint virtualKey, bool extended, bool isDown) =>
         TryEnqueueKeyboardTransition(virtualKey, extended, isDown);
 
+    internal void ProcessKeyboardInputForChecks(uint virtualKey, bool extended, bool isDown) =>
+        ProcessKeyboardInput(virtualKey, extended, isDown);
+
     internal bool EnqueueRawMouseInputForChecks(NativeMethods.RawMouse input) =>
         EnqueueRawMouseInputForChecks(IntPtr.Zero, input);
 
@@ -273,34 +315,38 @@ internal sealed class InputForwarder : IDisposable
 
     internal void SendAutomationMouseMove(int deltaX, int deltaY)
     {
-        if (!ForwardingEnabled)
+        if (!AutomationMouseRemoteOutputEnabled)
         {
             return;
         }
         byte buttons;
         lock (_inputStateLock)
         {
-            buttons = GetCombinedMouseButtonsLocked(true);
+            buttons = GetCombinedMouseButtonsLocked(PhysicalForwardingEnabled);
         }
-        _mouseReportPump.Accumulate(buttons, false, deltaX, deltaY, 0, 0);
+        _mouseReportPump.AccumulateAutomation(buttons, false, deltaX, deltaY, 0, 0);
     }
 
     internal void SendAutomationWheel(int delta)
     {
-        if (!ForwardingEnabled)
+        if (!AutomationMouseRemoteOutputEnabled)
         {
             return;
         }
         byte buttons;
         lock (_inputStateLock)
         {
-            buttons = GetCombinedMouseButtonsLocked(true);
+            buttons = GetCombinedMouseButtonsLocked(PhysicalForwardingEnabled);
         }
-        _mouseReportPump.Accumulate(buttons, false, 0, 0, delta, 0);
+        _mouseReportPump.AccumulateAutomation(buttons, false, 0, 0, delta, 0);
     }
 
-    internal void SetAutomationMouseButton(int button, bool pressed)
+    internal void SetAutomationMouseButton(int button, bool pressed, bool forceRemote = false)
     {
+        if (!forceRemote && !AutomationMouseRemoteOutputEnabled)
+        {
+            return;
+        }
         byte mask = button switch
         {
             1 => LeftButton,
@@ -314,7 +360,7 @@ internal sealed class InputForwarder : IDisposable
         bool changed;
         lock (_inputStateLock)
         {
-            byte previous = GetCombinedMouseButtonsLocked(true);
+            byte previous = GetCombinedMouseButtonsLocked(PhysicalForwardingEnabled);
             if (pressed)
             {
                 _automationMouseButtons |= mask;
@@ -323,17 +369,21 @@ internal sealed class InputForwarder : IDisposable
             {
                 _automationMouseButtons &= unchecked((byte)~mask);
             }
-            combined = GetCombinedMouseButtonsLocked(true);
+            combined = GetCombinedMouseButtonsLocked(PhysicalForwardingEnabled);
             changed = previous != combined;
         }
-        if (ForwardingEnabled && changed)
+        if (changed)
         {
-            _mouseReportPump.Accumulate(combined, true, 0, 0, 0, 0);
+            _mouseReportPump.SetRemoteButtons(combined);
         }
     }
 
-    internal void SetAutomationKey(byte hidUsage, bool pressed)
+    internal void SetAutomationKey(byte hidUsage, bool pressed, bool forceRemote = false)
     {
+        if (!forceRemote && !AutomationKeyboardRemoteOutputEnabled)
+        {
+            return;
+        }
         lock (_inputStateLock)
         {
             if (hidUsage is >= 224 and <= 231)
@@ -632,7 +682,10 @@ internal sealed class InputForwarder : IDisposable
             virtualKey,
             (data.Flags & NativeMethods.LlkhfExtended) != 0,
             isDown);
-        if (ShouldSuppressKeyboard(ForwardingEnabled, isControlHotkey, isUp))
+        if (ShouldSuppressKeyboard(
+                PhysicalForwardingEnabled,
+                _legacyFirmwareCompatibility() && isControlHotkey,
+                isUp))
         {
             return (IntPtr)1;
         }
@@ -698,7 +751,7 @@ internal sealed class InputForwarder : IDisposable
         if (isToggleHotkey || isExitHotkey)
         {
             _controlHotkeysDown.Add(virtualKey);
-            if (ForwardingEnabled)
+            if (PhysicalForwardingEnabled)
             {
                 SendKeyboardReport();
             }
@@ -720,7 +773,7 @@ internal sealed class InputForwarder : IDisposable
             NotifyPhysicalInput(virtualKey, false);
             return;
         }
-        if (ForwardingEnabled)
+        if (PhysicalForwardingEnabled)
         {
             // 目标端安全状态优先于 Lua/宏回调；released 回调即使阻塞或失败，
             // 对端也必须先收到不再包含该实体键的键盘报告。
@@ -849,7 +902,7 @@ internal sealed class InputForwarder : IDisposable
 
         // 低级钩子只负责可选的本地抑制。移动、按钮和滚轮统一由
         // Raw Input 按设备事件顺序处理，避免两条输入路径之间状态错序。
-        if (ShouldSuppressMouse(ForwardingEnabled))
+        if (ShouldSuppressMouse(PhysicalForwardingEnabled))
         {
             return (IntPtr)1;
         }
@@ -904,6 +957,7 @@ internal sealed class InputForwarder : IDisposable
         }
         ClearInputState();
         _mouseReportPump.ResetAndSendRelease(enabled);
+        ApplySimulatedUdpInputRouting();
         if (!enabled)
         {
             // 关闭时安全释放必须先于任何外部事件处理器，避免事件阻塞或异常造成卡键。
@@ -918,6 +972,7 @@ internal sealed class InputForwarder : IDisposable
         {
             ClearInputState();
             _mouseReportPump.ResetAndSendRelease(false);
+            ApplySimulatedUdpInputRouting();
             TryNotifyForwardingTransitioning();
             TryNotifyForwardingChanged(false);
         }
@@ -978,7 +1033,7 @@ internal sealed class InputForwarder : IDisposable
         // 累计报告，仍必须把实体鼠标按键送给宏和 Lua 的 OnEvent/IsPressed。
         ushort flags = input.ButtonFlags;
 
-        bool forwarding = ForwardingEnabled;
+        bool forwarding = PhysicalForwardingEnabled;
         byte combinedButtons;
         bool hasButtonChange;
         byte previousPhysicalButtons;
@@ -1115,7 +1170,7 @@ internal sealed class InputForwarder : IDisposable
 
     private void SendKeyboardReportLocked()
     {
-        byte[] report = BuildKeyboardReportLocked(true);
+        byte[] report = BuildKeyboardReportLocked(PhysicalForwardingEnabled);
         _mouseReportPump.SendKeyboard(report);
     }
 
@@ -1152,10 +1207,25 @@ internal sealed class InputForwarder : IDisposable
 
     private byte GetCombinedMouseButtonsLocked(bool includeForwardedInput)
     {
-        byte physicalAndAutomation = includeForwardedInput
-            ? unchecked((byte)((_mouseButtons & ~_kmboxMouseMask) | _automationMouseButtons))
+        byte physical = includeForwardedInput
+            ? unchecked((byte)(_mouseButtons & ~_kmboxMouseMask))
             : (byte)0;
-        return unchecked((byte)(physicalAndAutomation | _remoteMouseButtons));
+        return unchecked((byte)(physical | _automationMouseButtons | _remoteMouseButtons));
+    }
+
+    private void ApplySimulatedUdpInputRouting()
+    {
+        bool requested;
+        int frequencyHz;
+        lock (_inputStateLock)
+        {
+            requested = _simulatedUdpInputRequested;
+            frequencyHz = _simulatedUdpInputFrequencyHz;
+        }
+
+        _mouseReportPump.ConfigureSimulatedUdpInput(
+            requested && PhysicalForwardingEnabled,
+            frequencyHz);
     }
 
     private KmboxMonitorReport BuildKmboxMonitorReportLocked(int deltaX, int deltaY, int wheel) => new(

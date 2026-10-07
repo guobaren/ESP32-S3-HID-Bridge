@@ -12,6 +12,7 @@ internal static class SerialDeviceProbe
     internal const int ProbeTimeoutMilliseconds = 1500;
     private const int MaximumResponseBytes = 4096;
     private const int ProbeRetryMilliseconds = 250;
+    internal const byte PcDeviceRole = 1;
     internal const byte MouseHostRole = 2;
 
     private static ReadOnlySpan<byte> HelloSignature => "HIDBRDG2"u8;

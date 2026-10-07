@@ -58,6 +58,19 @@ esp_err_t dual_vendor_urb_control(
     size_t out_capacity,
     size_t *out_length);
 
+/* 标准设备描述符心跳专用入口；其 URB 会进入冻结检测的专用 pending 快照。 */
+esp_err_t dual_vendor_urb_heartbeat_control(
+    uint8_t device_address,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    size_t length,
+    uint32_t timeout_ms,
+    uint8_t *out_data,
+    size_t out_capacity,
+    size_t *out_length);
+
 /* 计数（供统计行观测）：提交/成功/超时/退役/设备重开。 */
 void dual_vendor_urb_stats(
     uint32_t *submitted,
@@ -72,3 +85,7 @@ void dual_vendor_urb_stats(
 
 /* 非阻塞快照：仅统计已成功提交且尚未收到完成回调的 EP0 URB。 */
 bool dual_vendor_urb_pending_snapshot(int64_t *oldest_start_us, uint32_t *count);
+
+/* stall watcher 专用：仅快照心跳 URB，普通控制请求不参与冻结判定。 */
+bool dual_vendor_urb_heartbeat_pending_snapshot(
+    int64_t *oldest_start_us, uint32_t *count);

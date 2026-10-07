@@ -1,4 +1,5 @@
 #include "vendor_urb.h"
+#include "vendor_urb_pending_logic.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +45,7 @@ typedef struct urb_wait {
     struct urb_wait *pending_next;
     int64_t started_us;
     bool submitted;
+    bool heartbeat;
     SemaphoreHandle_t done;
     usb_transfer_t *transfer;
     /* 超时线程与完成回调通过原子状态转移决定唯一释放者。 */
@@ -78,9 +80,10 @@ static volatile uint32_t s_latency_over_100ms;
 static portMUX_TYPE s_pending_mux = portMUX_INITIALIZER_UNLOCKED;
 static urb_wait_t *s_pending_head;
 
-static void track_pending(urb_wait_t *wait)
+static void track_pending(urb_wait_t *wait, bool heartbeat)
 {
     wait->started_us = esp_timer_get_time();
+    wait->heartbeat = heartbeat;
     portENTER_CRITICAL(&s_pending_mux);
     wait->pending_next = s_pending_head;
     s_pending_head = wait;
@@ -100,13 +103,15 @@ static void untrack_pending(urb_wait_t *wait)
     portEXIT_CRITICAL(&s_pending_mux);
 }
 
-bool dual_vendor_urb_pending_snapshot(int64_t *oldest_start_us, uint32_t *count)
+static bool pending_snapshot_filtered(
+    int64_t *oldest_start_us, uint32_t *count, bool heartbeat_only)
 {
     int64_t oldest = 0;
     uint32_t pending = 0;
     portENTER_CRITICAL(&s_pending_mux);
     for (urb_wait_t *item = s_pending_head; item != NULL; item = item->pending_next) {
-        if (item->submitted) {
+        if (vendor_urb_pending_matches_snapshot(
+                item->submitted, item->heartbeat, heartbeat_only)) {
             ++pending;
             if (oldest == 0 || item->started_us < oldest) {
                 oldest = item->started_us;
@@ -117,6 +122,17 @@ bool dual_vendor_urb_pending_snapshot(int64_t *oldest_start_us, uint32_t *count)
     if (oldest_start_us != NULL) { *oldest_start_us = oldest; }
     if (count != NULL) { *count = pending; }
     return pending != 0;
+}
+
+bool dual_vendor_urb_pending_snapshot(int64_t *oldest_start_us, uint32_t *count)
+{
+    return pending_snapshot_filtered(oldest_start_us, count, false);
+}
+
+bool dual_vendor_urb_heartbeat_pending_snapshot(
+    int64_t *oldest_start_us, uint32_t *count)
+{
+    return pending_snapshot_filtered(oldest_start_us, count, true);
 }
 
 static void urb_transfer_callback(usb_transfer_t *transfer)
@@ -292,7 +308,7 @@ static esp_err_t urb_set_report_once(
 
     ++s_submitted;
     const int64_t transfer_start_us = esp_timer_get_time();
-    track_pending(wait);
+    track_pending(wait, false);
     result = usb_host_transfer_submit_control(s_client, transfer);
     if (result == ESP_OK) {
         portENTER_CRITICAL(&s_pending_mux);
@@ -359,6 +375,7 @@ static esp_err_t urb_control_once(
     uint16_t w_index,
     const uint8_t *data,
     size_t length,
+    bool heartbeat,
     uint32_t timeout_ms,
     uint8_t *out_data,
     size_t out_capacity,
@@ -427,7 +444,7 @@ static esp_err_t urb_control_once(
 
     ++s_submitted;
     const int64_t transfer_start_us = esp_timer_get_time();
-    track_pending(wait);
+    track_pending(wait, heartbeat);
     result = usb_host_transfer_submit_control(s_client, transfer);
     if (result == ESP_OK) {
         portENTER_CRITICAL(&s_pending_mux);
@@ -529,7 +546,7 @@ esp_err_t dual_vendor_urb_set_report(
  * 通用 EP0 控制传输对外接口（2026-09-27）：供设备级 Vendor 请求转发使用。
  * IN 方向（bmRequestType bit7=1）把设备返回的数据写入 out_data/out_length。
  */
-esp_err_t dual_vendor_urb_control(
+static esp_err_t vendor_urb_control(
     uint8_t device_address,
     uint8_t bm_request_type,
     uint8_t b_request,
@@ -537,6 +554,7 @@ esp_err_t dual_vendor_urb_control(
     uint16_t w_index,
     const uint8_t *data,
     size_t length,
+    bool heartbeat,
     uint32_t timeout_ms,
     uint8_t *out_data,
     size_t out_capacity,
@@ -557,7 +575,8 @@ esp_err_t dual_vendor_urb_control(
     esp_err_t result = ESP_ERR_TIMEOUT;
     for (uint32_t attempt = 0; attempt < VENDOR_URB_EFFECTIVE_ATTEMPTS; ++attempt) {
         result = urb_control_once(bm_request_type, b_request, w_value, w_index,
-                                  data, length, DUAL_PROXY_ENABLE_HIDPP_TIMEOUT_DIAGNOSTIC ? timeout_ms : VENDOR_URB_EFFECTIVE_TIMEOUT_MS, out_data,
+                                  data, length, heartbeat,
+                                  DUAL_PROXY_ENABLE_HIDPP_TIMEOUT_DIAGNOSTIC ? timeout_ms : VENDOR_URB_EFFECTIVE_TIMEOUT_MS, out_data,
                                   out_capacity, out_length);
         if (result != ESP_ERR_TIMEOUT) {
             break;
@@ -568,6 +587,41 @@ esp_err_t dual_vendor_urb_control(
         }
     }
     return result;
+}
+
+esp_err_t dual_vendor_urb_control(
+    uint8_t device_address,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    const uint8_t *data,
+    size_t length,
+    uint32_t timeout_ms,
+    uint8_t *out_data,
+    size_t out_capacity,
+    size_t *out_length)
+{
+    return vendor_urb_control(
+        device_address, bm_request_type, b_request, w_value, w_index,
+        data, length, false, timeout_ms, out_data, out_capacity, out_length);
+}
+
+esp_err_t dual_vendor_urb_heartbeat_control(
+    uint8_t device_address,
+    uint8_t bm_request_type,
+    uint8_t b_request,
+    uint16_t w_value,
+    uint16_t w_index,
+    size_t length,
+    uint32_t timeout_ms,
+    uint8_t *out_data,
+    size_t out_capacity,
+    size_t *out_length)
+{
+    return vendor_urb_control(
+        device_address, bm_request_type, b_request, w_value, w_index,
+        NULL, length, true, timeout_ms, out_data, out_capacity, out_length);
 }
 
 void dual_vendor_urb_stats(

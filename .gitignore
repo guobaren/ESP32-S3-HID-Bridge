@@ -46,3 +46,5 @@ tools/artifacts/
 # 临时产物（构建/抓取的中间文件）
 /tmp/
 
+/tests/StatsSnapshotNative/stats_snapshot_harness.exe
+

@@ -65,12 +65,11 @@ internal sealed class AutomationSettings
     public bool StartOnBoot { get; set; }
     public bool MinimizeToTray { get; set; }
     public bool CloseToTray { get; set; } = true;
-    public bool GenerateMovementAnalysisImage { get; set; }
     public double OutputSensitivity { get; set; } = MouseOutputSensitivity.Default;
     public bool AlwaysOutputUdpEnabled { get; set; } = true;
-    public bool LegacySingleBoardFirmwareCompatibility { get; set; }
     public bool SimulatedUdpInputEnabled { get; set; }
     public int SimulatedUdpInputFrequencyHz { get; set; } = 100;
+    public bool LegacySingleBoardFirmwareCompatibility { get; set; }
     public bool FirmwareUpdateApiEnabled { get; set; }
     public string FirmwareManifestPath { get; set; } = string.Empty;
     public string FirmwareFlashPortName { get; set; } = string.Empty;

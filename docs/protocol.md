@@ -1,20 +1,21 @@
 # 主机输入协议（UART / USB CDC）
 
-> **适用范围**：本文的「帧格式 / 消息类型 / 双板透明代理内部协议 / 有界重试与去重规则 / 板载日志下载命令」适用于当前双板主线 `firmware/dual_proxy`（板载日志容量见下）。
-> 「主机局域网模拟鼠标 UDP 接口」整章属于**主机 EXE + 早期单板固件**形态（UDP/kmboxNet 远程输入），双板主线不涉及，保留供该产品线参考。
+> **适用范围**：本文的「帧格式 / 消息类型 / 双板透明代理内部协议 / 有界重试与去重规则 / 双板内存统计快照」适用于当前双板主线 `firmware/dual_proxy`。
+> 主机局域网 UDP/kmboxNet 接口由 Windows Host 接收；Host 可运行于旧版单板或双板模式，实际输出条件和路由见本章对应说明。
 > 标注为"早期单板"的段落（原生 USB CDC 探测窗口、BLE 节拍、Wi-Fi TCP）只适用于 `firmware/` 单板工程；双板克隆不开 CDC、无 Wi-Fi/BLE。
 
 ## 主机 loopback 串口命令 API
 
-主机 EXE 在现有 `FirmwareUpdateApiServer` HTTP 端口上提供三个仅限 loopback 的接口（当前配置端口为 `24815`）。串口 API 随主串口模式启动，即使设置页关闭“局域网固件刷写 API”仍可使用；该开关只关闭固件状态/刷写路由。旧构造方式或无串口桥接的模拟模式不提供串口路由。
+主机 EXE 在现有 `FirmwareUpdateApiServer` HTTP 端口上提供四个仅限 loopback 的串口接口（当前配置端口为 `24815`）。串口 API 随主串口模式启动，即使设置页关闭“局域网固件刷写 API”仍可使用；该开关只关闭固件状态/刷写路由。旧构造方式或无串口桥接的模拟模式不提供串口路由。
 
 | 方法与路径 | 行为 |
 |---|---|
-| `GET /api/v1/serial/ports` | 返回 `{"ports":["COM12","COM3"]}`；只列出 EXE 当前持有的主控制串口和对端日志镜像串口 |
+| `GET /api/v1/serial/ports` | 返回 `{"ports":["COM12","COM3"]}`；只列出 EXE 当前持有的主控制串口和对端串口镜像 |
 | `POST /api/v1/serial/write` | 将 JSON 中的十六进制字节同步写到指定的已打开端口 |
 | `POST /api/v1/serial/refresh` | 不带请求体；重新枚举可用串口并立即尝试接管未监听的对端镜像口，返回 `availablePorts` 与 `openPorts` |
+| `GET /api/v1/serial/stats` | 不带请求体；向所有当前已打开串口各发一次统计快照请求，收齐这些端口的完整分页后返回 `readAt`、`boards` |
 
-镜像启动后先等待主串口连接，再每 2 秒重试发现晚到的对端口；读线程发现串口断开后会释放镜像句柄并继续重试。每轮最多探测 3 个候选，探测时保持 DTR/RTS 低电平。发现/刷新只操作镜像串口，不会关闭或重开健康的主串口。固件刷写等独占租约期间自动暂停发现并让出镜像口，租约释放后先让主串口恢复，再继续发现。此 API 的 `refresh` 会尝试启动镜像监听；设置页“刷新端口”按钮只刷新刷写下拉列表，两者用途不同。
+镜像启动后先等待主串口连接，再每 2 秒重试发现晚到的对端口；读线程发现串口断开后会释放镜像句柄并继续重试。每轮最多探测 3 个候选：在 DTR/RTS 低电平下发送既有 `DeviceProbe` 随机挑战，并验证回复签名、挑战和 PC 角色，不依赖设备周期日志。发现/刷新只操作镜像串口，不会关闭或重开健康的主串口。固件刷写等独占租约期间自动暂停发现并让出镜像口，租约释放后先让主串口恢复，再继续发现。此 API 的 `refresh` 会尝试启动镜像监听；设置页“刷新端口”按钮只刷新刷写下拉列表，两者用途不同。
 
 写入请求示例：`{"portName":"COM12","hex":"<完整帧的十六进制字节>"}`。`hex` 必须是非空、偶数长度的 ASCII 十六进制字符串，单次最多 4096 字节；不接受空格、分隔符或奇数位。命令应包含完整 UART0 帧：帧头、版本、类型、序号、Payload 长度、Payload 和 CRC16，不能只发送 Payload。帧字段见下方「帧格式」。
 
@@ -22,7 +23,7 @@
 
 API 复用 EXE 已打开的串口，不打开、关闭或重连端口，也不切换 DTR/RTS，因此不会通过串口打开动作触发板子复位。主串口的注入写入与 `WriterLoop` 共用 `_writeSync`，完整写操作不会与鼠标帧字节交错。正在写出的完整批次会先释放写锁；已经从队列取出但尚未取得写锁的鼠标批次与注入命令按锁的取得顺序发送，所以先后次序可能不同于鼠标帧入队顺序。响应只确认主机串口 `Write` 已返回，不代表固件已接受或处理该 UART0 帧。写入受串口驱动的写超时限制，HTTP 请求超时前会再次检查取消状态，不会把待写命令留在队列中。
 
-本版根目录 `HidBridge.Host.exe` 已于 2026-09-29 替换并运行；此接口在该进程中可用。
+统计读取复用 EXE 已打开的串口，不重开端口、不切换 DTR/RTS、不暂停输入。统计请求序号独立于输入会话序号；一次查询不会更改输入帧去重状态。它对每个当前已打开端口发送查询，并要求每个端口的计数器页和队列页均完整且分页一致；缺页、重复页或格式不符会使整次查询失败。`boards` 只包含本次已打开并成功响应的端口：只有主串口打开时返回一块板，主串口和镜像串口都打开且均响应时才会包含 M/P 两板。`readAt` 是主机采集时间，板端 `uptimeMilliseconds` 表示该快照所在启动周期；计数器是自本次板端启动以来累计，不跨重启保存。
 
 主控制串口的设备日志继续写入现有 `DeviceLogPath` 文件。对端日志镜像另外创建同目录的 `host-serial-COMx-年月日-时分秒-毫秒.log` 文件（例如 `host-serial-COM3-20260929-043012-125.log`），每行写完立即刷新；只记录当前镜像日志策略保留的 ESP-IDF 行。固件刷写让出镜像串口时关闭当前镜像日志文件，恢复监听后为对应 COM 口新建文件。日志文件创建或写入失败只影响该路日志保存，不停止镜像串口读取或串口命令写入。
 
@@ -47,7 +48,7 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | 值 | 名称 | Payload |
 |---:|---|---|
 | `0x01` | KeyboardReport | 标准 8 字节 Boot Keyboard Report |
-| `0x02` | MouseReport | Host 当前发送 8 字节：前 7 字节为 `buttons`、小端有符号 16 位 `x/y`、有符号 8 位 `wheel/pan`，第 8 字节为固件平滑槽数 `0` 或 `5`；固件继续兼容旧 7 字节直通报告 |
+| `0x02` | MouseReport | Host 当前发送 8 字节：前 7 字节为 `buttons`、小端有符号 16 位 `x/y`、有符号 8 位 `wheel/pan`，第 8 字节为 M 端 UDP 平滑槽数 `0/5/10/15/20`；兼容旧 7 字节直通报告 |
 | `0x03` | ReleaseAll | 空 |
 | `0x04` | Ping | 空；维持当前输入租约 |
 | `0x05` | SessionStart | 空；申请新的输入租约，并先释放旧会话的全部输入 |
@@ -126,23 +127,89 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 **（主机 / 早期单板）** 协议 v2 不兼容旧的 5 字节鼠标报告。主机、固件与 Target Agent 必须使用同一版本。
 
 
-## 板载日志下载命令
+## 双板内存统计快照（UART0）
 
-每块板把控制台日志写入自己的 SPIFFS 分区（**4×512 KB 轮转 = 上限 2 MB**，`partitions.csv` 的 `storage` 为 4 MB；跨复位续写）。这些命令走
-**板子自己的 UART0**（鼠标侧板＝主机控制口；电脑侧板＝调试口，只跑日志服务），
-不占用输入租约，没建会话也能用：
+双板固件以 `0x1D` 主动请求一次性快照，并以 `0x1E` 返回分页数据。它只读取 RAM 中的累计计数和队列状态，不清零计数、不改变队列、不暂停输入，也不依赖周期统计开关。UART0 同时承载 ESP-IDF 实时文本日志和二进制帧；客户端应在混合字节流中扫描帧头并校验 CRC16。
 
 | Type | 名称 | Payload |
 |---:|---|---|
-| `0x08` | LOG_READ_REQUEST | `offset:u32`、`max_bytes:u8`（1..56）；设备回一条 `LOG_READ_RESPONSE` |
-| `0x09` | LOG_READ_RESPONSE | `offset:u32`、`total_bytes:u32`、`data:0..56`；`data` 为空表示流结束 |
-| `0x0A` | LOG_CLEAR_REQUEST | 空；清空全部日志文件后回一条 `total_bytes=0` 的 `LOG_READ_RESPONSE` |
-| `0x0B` | LOG_DUMP_REQUEST | `offset:u32`、`max_bytes:u32`；设备**连续**回多条 `LOG_READ_RESPONSE` 后以空 `data` 帧收尾 |
-| `0x0C` | LOG_STATS_CONTROL_REQUEST | Payload 1 字节：`0=关闭周期统计`、`1=开启周期统计`；运行时切换，不改变板载日志写盘开关。 |
+| `0x1D` | STATS_SNAPSHOT_REQUEST | 空；在板端当前启动周期内采集一次快照 |
+| `0x1E` | STATS_SNAPSHOT_RESPONSE | 版本化计数器页或队列页；帧序号回显请求序号 |
+
+响应 Payload 最长 64 字节，前 12 字节为公共头：`schema:u8, role:u8, kind:u8, page_index:u8, page_count:u8, status:u8, item_count:u8, reserved:u8, uptime_ms:u32`。当前 `schema=1`、`reserved=0`；`role=1` 是 P/PC_DEVICE，`role=2` 是 M/MOUSE_HOST。`kind=1` 表示计数器，`kind=2` 表示队列；页序号从 0 开始，两个 kind 各自编号、分别收齐。所有页来自同一个预先采集的快照，因而同一 role 的 `uptime_ms` 应一致。查询范围是进程当前已打开的所有端口；只返回实际响应且页完整的板卡，不保证一定同时有 P 与 M。非零 `status` 表示板端无法提供完整快照，客户端应判失败。
+
+计数器记录固定 10 字节：`id:u8, value_type:u8, value:u64`。`value_type=1` 时按无符号小端 `u64` 解码；`value_type=2` 时按有符号二补码小端 `i64` 解码（M 的 `motion_rx_dx/dy` 是有符号累计位移）。每页最多 5 条。当前 M 快照包含计数器 ID 1..36、通用 UART1 ID 49..66 和会话状态 ID 68，共 11 页；P 包含 ID 37..48、通用 UART1 ID 49..66 和 USB 状态 ID 67，共 7 页。
+
+| ID | 计数器 |
+|---:|---|
+| 1..18 | M：reports、vendor_reports、input_fail、control、control_fail、ctrl_retry、urb_sub、urb_ok、urb_to、urb_retry、recover、port_cycle、wheel、ctrl_lat_max_us、slow10、slow100、vmin_gap_us、errors |
+| 19..36 | M：motion_rx_dx、motion_rx_dy、motion_rx_ok、motion_rx_badlen、motion_rx_badparse、hb_ok、hb_fail、cycle_req、cycle_attempt、cycle_ok、cycle_fail、cycle_off_fail、cycle_on_fail、cycle_suppressed、input_restored、input_missing、late500、detect_max_us |
+| 37..48 | P：not_mounted、not_ready、attempt、submitted、failed、complete、transfer_fail、physical_rx、vendor_rx、vendor_submitted、vendor_dropped、get_timeouts |
+| 49..66 | 两板 UART1：uart1_tx、uart1_rx、uart1_rx_bytes、uart1_frame_err、uart1_rx_overflow、uart1_rx_pending_peak_bytes、uart1_heartbeat_gap_peak_ms、uart1_raw_tx_latency_peak_us、uart1_tx_write_fail、uart1_vendor_dropped、uart1_motion_dropped、uart1_profile_fail、uart1_gone_retry、uart1_gone_fail、uart1_budget_exhausted、uart_fifo_ovf_events、uart_buffer_full_events、uart_event_reset_dropped |
+| 67 | P：`p_usb_state`。低位 bit0..7 依次表示 attached、installed、clone_active、mounted、reconfigure_in_progress、waiting_host、final_ack_failed、disconnect_pending；bit8..15 是最近结果码（0 unknown、1 wait_host、2 final_ack_pending、3 mounted_acked、4 install_failed、5 final_ack_failed、6 canceled）；bit16 表示等待最终 ACK；高32位是 operation_epoch。 |
+| 68 | M：`m_vendor_session_state`。bit0..3 依次表示厂商会话有效、已收到首个厂商请求、peer generation 当前、Profile 等待主机；高32位是 vendor session epoch。 |
+
+以上 ID 与 `firmware/dual_proxy/main/stats_snapshot.h` 的枚举、`host/HidBridge.Host/Transport/DeviceStatistics.cs` 的 `CounterName`、`tools/read_device_stats.py` 的 `COUNTER_NAMES` 一致。Host API 与 Python 同时提供按位解码的 `state` 对象；字段定义与角色分组以三处映射及各自采集代码为准。
+
+队列记录固定 20 字节：`id:u8, unit:u8, capacity:u16, depth:u16, peak:u16, received:u32, rejected:u32, dropped:u32`。`unit=1` 表示队列项，`unit=2` 表示字节；每页最多 2 条。`0xFFFF` 表示未知的 u16 字段，`0xFFFFFFFF` 表示未知的 u32 字段。未知值在主机界面显示为“未采集”，API/Python JSON 输出为 `null`，不得当作零。UART1 RX ring 的队列 ID 13 以字节为单位；UART 硬件 FIFO 事件单独记录在计数器 64/65，不等于软件事件队列容量。
+
+| 队列 ID | 队列 | 所在板 |
+|---:|---|---|
+| 1..3 | host_hid_event、host_hid_report、host_hid_control | M |
+| 4..9 | UART1.tx、motion_tx、safety_tx、software_tx、vendor_tx、event | M 与 P |
+| 10..12 | vendor_input、motion_input、vendor_control | P |
+| 13 | UART1.rx_ring（字节） | M 与 P |
+
+当前 M 包含队列 1..9、13 共 10 条，队列页 5 页；P 包含队列 4..9、10..13 共 10 条，队列页 5 页。UART1 event 队列的 `received/rejected` 若底层无法准确提供则为 UNKNOWN；`dropped` 只表示 reset 时丢弃的事件通知条数。FIFO overflow 与 buffer-full 通知分别由计数器 64 和 65 汇报，单位是事件次数。
+
+主机 EXE 的鼠标捕获页提供“读取设备统计”入口；loopback API 可用 `GET /api/v1/serial/stats` 读取同一组两板快照。Python 独立串口读取工具为 `python tools/read_device_stats.py --port COM3`，示例端口为 P 板；只能在该端口未被 EXE 占用时使用，它在打开前将 DTR/RTS 设为低电平。当前默认 V4 构建下，P、M 均支持 A5 统计请求。P 维护口为 921600，M 默认为 115200；在 M 上发送有效 A5 请求会切换到 A5 输入所有者，清空待处理软件输入并释放按钮。查询前先停止 Makcu 客户端，不要交替争用同一串口。统计页字段及回归样例见 `tests/fixtures/stats_snapshot_c_frames.txt`。
+
+### MAKCU V4 鼠标 API（M 板 UART0）
+
+当前 `firmware/dual_proxy` 默认构建启用 `DUAL_PROXY_ENABLE_MAKCU_V4_API=ON`，并与旧 V3 风格 ASCII 模式互斥。2026-10-06 已将同版双板固件刷入 M/P：M（本次 COM12）锁定 `MOUSE_HOST` 后，UART0/CH340 使用 V4，默认 115200、8N1；P（本次 COM3）保留 A5/5A v2、921600 baud。串口号可能随拔插变化，使用前应重新确认角色。波特率设置仅保存在运行时，重启后恢复默认。
+
+V4 协议允许 `baud(4000000)`，但本机 Windows CH340 在切换主机串口到 4,000,000 baud 时返回 Win32 `PermissionError(31)`。测试工具已向 M 发送 A5 设置帧，但没有取得 4 Mbaud 下的 A4 查询结果；随后在 115200 的 A4 查询超时。一次 `esptool run` 硬复位（未写入或擦除 Flash）恢复默认速率，之后 115200 下 46 项只读检查为 46 PASS、0 FAIL，含 A4=115200。本机 4M 测试 `Failed`，4M 接口响应未验证；当前建议使用 115200，不应从协议字段推断本机 USB-UART 适配器支持 4 Mbaud。
+
+固定版本的官方 MAKCU SDK（revision `2616b1c3905bd0af65aa6ed338ead2b1c256bb6e`）使用 V4 二进制 API 完成 `Mouse.move(+20,0)` 和 `Mouse.move(-20,0)`。P 侧诊断收到各一条匹配的 `P_USB_REPORT_SUBMIT` 与 `P_USB_REPORT_COMPLETE`，两次 submit→complete 分别为 645 μs 和 484 μs。该观测证明了本轮报告到达 P 的 USB 提交/完成回调，不证明接收电脑的 Windows 光标或应用已经消费；G HUB、真实物理鼠标和长时运行仍待验收。该次历史检查期间 Host EXE 保持关闭。当前固件在 M UART0 共存解析 A5 与 V4，按有效命令切换输入所有者；切换会清空待处理输入并释放按钮，V4 所有者抑制 A5 诊断流。始终只让一个客户端操作该串口。
+
+新版固件在 M UART0 默认 115200 下隔离解析 A5 与 V4 完整帧，按有效命令切换输入所有者，并清空软件位移、释放按钮。默认发送端同时只使用一路；两个进程不能同时占用串口。V4 所有者抑制 A5 日志与诊断，A5 所有者保留 Host 控制；P 维护口仍为 921600。2026-10-06 已部署双板，V4 查询 46/0、五档及阈值 13 项真串口检查通过；真实移动未验收。ASCII `version()` 返回 `km.MAKCU` 作为握手标识；仅兼容下表鼠标子集，不承诺原厂时序。
+
+构建默认开启 V4；可显式关闭以生成保留 A5 的双板镜像。旧 ASCII 模式与 V4 互斥：
+
+```powershell
+idf.py build
+idf.py -D DUAL_PROXY_ENABLE_MAKCU_V4_API=OFF build
+```
+
+ASCII 命令以 CR 或 LF 结束，命令必须带 `km.` 前缀；接收器支持分片和连续帧。查询结果以 `结果\r\n>>> ` 结束；echo 默认关闭，开启后查询先回显原命令（`version()` 不回显）。成功 SET 在 echo 开启时回显命令并输出 `>>> `，echo 关闭时无响应；参数/角色/队列错误返回 `ERR\r\n>>> `。不支持的命令明确拒绝。`device()` 返回 `mouse`。按钮查询值按位表示：0 未按、1 物理、2 软件注入、3 两者同时按下。ASCII `snapshot()` 不支持。
+
+| ASCII 命令 | 二进制 opcode | 支持行为与限制 |
+|---|---:|---|
+| `device()` / `version()` | `0x02` / `0x04` | 查询设备类型与握手标识。二进制 `0x04` 返回 4 字节小端桥接 API 级别 `4`，不表示原厂固件版本。 |
+| `move(x,y)`、`move_now(x,y)`、`wheel(delta)` | `0x18`、`0x67`、`0x19` | 相对移动和滚轮；数值按官方载荷宽度校验，超出 USB 报告范围时分成多份报告，累计相对位移/滚轮量保持不变。`move_now` 仍通过固件调度任务提交。 |
+| `left()` … `side2()`、`left(0|1)` … `side2(0|1)` | `0x11..0x15` | 查询物理与注入状态，或通过现有软件鼠标报告注入按钮。`ms1`、`ms2` 是 `side1`、`side2` 别名。 |
+| `buttons(mode[,period])`、`stream(mouse,0|1)` | `0x10`、`0x52`、事件 `0x53` | 物理按钮变化订阅。二进制 `0x10` 与 `INPUT_STREAM(mouse)` 共用一个布尔订阅状态，默认关闭；订阅时先从 released 基线发送当前已按物理键，再按序发送边沿。二进制事件 payload 为 `kind=1,button,value`。ASCII mode 1/2 输出 `km.` 前缀、一个原始掩码字节和 CRLF；mode 3 输出一个裸掩码字节。ASCII `period` 接受 0..1000 ms，但当前实现忽略该值。队列溢出会清队列、关闭订阅；二进制发 `0x53`、payload `01 FF FF`，需客户端重新订阅。 |
+| `phys_buttons()` | `0x55` | 查询原始物理按钮掩码，低五位对应五个鼠标按钮。 |
+| `snapshot()` / `inject_snapshot()` | `0x56` | 仅二进制查询 40 字节桥接注入状态：byte 0 是软件按钮；1..2 为 lock mask；3 为零；4..35 键盘位图全零；36 插值值；37..39 为零。 |
+| `left_mask(0|1)`…`side2_mask(0|1)`、`move_mask(l,r,d,u)`、`wheel_mask(down,up)` | `0x16`、`0x17`、`0x1A..0x1E` | 屏蔽物理鼠标输入对应字段；只过滤物理报告，不影响软件注入。参数必须是 0/1。 |
+| `interpolate()` / `interpolate(0..100|255)` | `0x1F` | 设置 P 端平滑：0/25/50/75/100% 对应 0/5/10/15/20 个 1 ms 槽。其他 0..100 整数就近选择，13/38/63/88 为向上阈值；255 保留 AUTO，其他越界值拒绝。SET、GET 与 snapshot 返回规范值。 |
+| `lock_ml`、`lock_mr`、`lock_mm`、`lock_ms1`、`lock_ms2`、`lock_mx`、`lock_mx+`、`lock_mx-`、`lock_my`、`lock_my+`、`lock_my-`、`lock_mw`、`lock_mw+`、`lock_mw-` | `0x60` | 查询或设置与按钮、轴向、滚轮掩码对应的 14 个物理屏蔽目标；lock 与 mask 是同一屏蔽状态，双方可查询和解除。 |
+| `click(button[,count[,hold_ms]])` | `0x61` | button 为 1..5，count 为 1..255；hold 省略/为 0 时随机 35..75 ms，否则 1..5000 ms。点击按队列顺序由 1 ms 调度任务执行。 |
+| `moveto(x,y)` / `getpos()` / `screen()` / `screen(w,h)` | `0x62` / `0x63` / `0x64` | 追踪的软件屏幕坐标；屏幕宽高为 1..32767，目标坐标超出已设置屏幕时截到边界。`moveto` 通过相对移动近似定位，不是 USB 绝对指针接口。 |
+| `silent(x,y)`、`moving()` | `0x65`、`0x66` | `silent` 以屏幕绝对目标坐标排队执行“左键按下、移动到目标、松开并返回”；`moving` 查询是否有待处理移动。坐标会夹到屏幕范围。 |
+| `baud()` / `baud(0|115200|4000000)` | `0xA4` / `0xA5` | 查询/设置 M UART0 波特率；binary baud 使用 4 字节小端 u32，0 恢复默认 115200。协议接受 115200 和 4 Mbaud；本机 4M 测试 `Failed`，4M 接口响应未验证，建议使用 115200。 |
+
+二进制帧为 `DE AD LEN:u16le CMD PAYLOAD[LEN]`，`LEN` 只计 payload、不含 CMD；读取请求的响应沿用同 opcode，成功 SET 默认不返回，`INTERPOLATE(0x1F)` 返回所选比例。错误帧为 `DE AD 01 00 CMD FF`。解析器有界缓存并在声明长度内隔离 payload，避免将二进制内容误当 ASCII 命令；超长/截断输入按帧边界丢弃并超时恢复。
+
+移动、点击和 silent 动作由控制任务上的 1 ms 软件调度器串行执行，最多 8 个排队动作；插值是软件分片，不保证曲线或完成时间与原厂一致。有效输入 setter 续 1500 ms 租约，查询不续租；租约到期、设备断开、停止转发或角色切换会取消排队动作并释放注入按钮。物理按钮流在短输入回调中记录边沿，队列容量 64。键盘、手柄、flick 和设备管理 API 均不在支持范围，不能用构建通过推断真机兼容。
+
+### 旧 V3 风格 ASCII 子集（可选编译，默认关闭）
+
+`DUAL_PROXY_ENABLE_MAKCU_ASCII_API` 保留为旧实验接口，默认 OFF，并与 V4 互斥。它不是 MAKCU V4，也不应与上面的 V4 命令表混用。启用时它占用 M UART0 的 ASCII 命令口、屏蔽同端口 A5 和 ESP_LOG；现有部署没有使用此模式。旧协议实现细节可查 `firmware/dual_proxy/main/makcu_ascii_logic.c`，其硬件验收状态未验证。
 
 ### UART0 实时诊断与手动注入（双板固件）
 
-下表沿用本节 `A5 5A` 帧头、版本 2、序号回显和 CRC16。P、M 各自的 UART0 均可订阅；命令的结果只表示板端已接收或已排队，USB 提交、完成与电脑软件消费需要分别观察。
+下表沿用本节 `A5 5A` 帧头、版本 2、序号回显和 CRC16。当前默认 V4 构建下，P 和 M 均接受 A5 请求；M 上的有效 A5 请求会切换到 A5 输入所有者。V4 所有者抑制 A5 诊断流，切换所有者会释放软件按钮并清空待发移动；不要交替争用同一串口。命令的结果只表示板端已接收或已排队，USB 提交、完成与电脑软件消费需要分别观察。
 
 | Type | 名称 | Payload / 回复 |
 |---:|---|---|
@@ -166,7 +233,7 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 - 已包含 Report ID 的完整报告：当前报告 ID + 上述正文，共 9 字节（C539 当前为 `02` + 8 字节）；
 - M 会读取当前枚举到的鼠标布局。8 字节正文会自动补当前 Report ID，9 字节完整报告原样使用；不应把按钮字节误放在 Report ID 位置。
 
-M 收到命令后把报告送入与真实 USB Host 输入相同的 RX 回调，因此会经过 M 解析、UART1、P 分类、HID 提交和完成回调。命令受理不代表 P 已提交；应同时检查 `Host HID统计`、`HID统计`、`UART1帧统计` 和各队列的 `rejected/dropped/peak`。
+M 收到命令后把报告送入与真实 USB Host 输入相同的 RX 回调，因此会经过 M 解析、UART1、P 分类、HID 提交和完成回调。命令受理不代表 P 已提交；应查询 `0x1D` 统计快照，对照两端输入/提交/完成/失败计数与队列 `depth/peak/rejected/dropped`，并结合 `0x14`/`0x15` 诊断事件检查路径。统计计数自各板启动后累计，需同时记录板端 uptime。
 
 #### 移动命令与 HID 报告注入的区别
 
@@ -199,7 +266,7 @@ Invoke-RestMethod http://127.0.0.1:24815/api/v1/serial/write `
   -Body (@{ portName = 'COM12'; hex = $frameHex } | ConvertTo-Json)
 ```
 
-`tools/fetch_onboard_log.py::build_frame(0x1B, sequence, report)` 可生成完整 UART0 帧；`report` 使用 `struct.pack('<BBhhBB', buttons, 0, dx, dy, wheel, pan)`。API 返回成功只表示 Host 的串口 `Write` 完成。
+`tools/uart_protocol.py::build_frame(0x1B, sequence, report)` 可生成完整 UART0 帧；`report` 使用 `struct.pack('<BBhhBB', buttons, 0, dx, dy, wheel, pan)`。API 返回成功只表示 Host 的串口 `Write` 完成。
 
 4. 圆形移动应先按圆周采样点计算相邻整数增量，再逐帧发送；允许 `dx=dy=0`，不要为了“保持频率”强行补 `dx=1`。示意代码：
 
@@ -216,25 +283,11 @@ EXE 逐帧 HTTP 请求的实际间隔通常大于 1 ms；“目标间隔 1 ms”
 
 `source`：1=P 的 USB 应用回调，2=M 的 USB Host HID 报告，3=UART1 接收，4=UART1 已写出，5=UART0 已解析输入帧。UART0/1 的 `kind` 为原消息 type；USB `kind`：`0x80` SET_REPORT、`0x81` GET_REPORT 请求、`0x82` GET_REPORT 结果、`0x83` 设备级 vendor SETUP、`0x84` M 原始 HID 输入、`0x85` P USB 提交尝试、`0x86` USB 完成、`0x87` USB 失败。P 的 `0x83` 目前记录 SETUP 后仍返回 STALL，并不伪造厂商响应。各 USB 事件的 payload 前缀见 `diag_event_details()`；声明长度大于保存长度时客户端标记截断。
 
-固件把 USB 与 UART 数据路径的相关队列设为 128 项，逐队列输出 `QUEUE name=... received=... rejected=... dropped=... peak=... current=...`。`received` 是进入该队列入口的尝试，`rejected` 是校验/会话状态不允许入队，`dropped` 是容量满或显式清空的条目，`peak` 是观察到的深度峰值。UART 驱动自行管理的事件队列用 `consumed` 代替无法得知的内部入队次数；`overflow` 是驱动通知数。诊断事件队列本身也独立报告丢弃。
+队列 `capacity/depth/peak/received/rejected/dropped` 经 `0x1D` 快照读取，单位随记录中的 `unit` 字段为项或字节，不再依赖周期统计行。每个队列使用其实际容量和当前深度；UART1 RX ring 以字节为单位，不能与 UART 硬件 FIFO 容量混用。UART 驱动事件队列的 `received/rejected` 在不可观测时用 UNKNOWN，`dropped` 只计 reset 丢弃的通知条数；UART FIFO overflow 与 buffer-full 通知次数分别在计数器 64/65 中。
 
 `tools/dual_uart_inspect.py` 会实时显示并以 JSONL 保存事件，同时保存各端 UART0 原始 RX/TX 字节。示例：`python tools/dual_uart_inspect.py --ports COM3,COM13 --inject-move 20 0` 可经 M 的既有软件鼠标帧注入相对位移，观察 M UART0→M UART1 TX→P UART1 RX→P USB 提交/完成。`0x1B` 注入正文可不含 Report ID；M 会按当前已枚举鼠标布局自动补齐 Report ID，也接受已经带 ID 的完整报告，避免把按钮字节误当成 ID。P USB 提交成功仅表示 TinyUSB 接受报告，完成回调表示 USB 端传输完成，均不能单独证明目标应用已消费；两板事件目前按载荷与时间窗关联，尚无跨板统一 trace ID。串口订阅只覆盖固件已接入的 USB/HID 与 UART1 观察点，不包括控制器内部 ACK/NAK、总线重试和电脑端 USB 包。
 
-逻辑字节流按「最旧 → 最新」排列，`offset` 从 0 开始；`total_bytes` 是板端当前可读的
-总字节数（**上限 2 MB**）。客户端的推荐做法是发一条 `LOG_DUMP_REQUEST`，然后流式解析
-响应帧直到遇到空 `data` 帧。
-
-解析注意：日志文本与协议帧共用同一个串口，客户端必须**在混杂文本中扫描帧**（找
-`A5 5A`、校验长度与 CRC16，失败则后移一字节继续）。命令本身不受会话约束，也不会
-更新帧序号窗口。
-
-主机 EXE 侧的入口是鼠标捕获页日志栏右上角的**「转存板载日志」**按钮：它取当前已连接的
-串口，发一条 `LOG_DUMP_REQUEST{offset=0, max_bytes=1 MB}`，把收到的分片按 UTF-8 追加写入
-`log/device/onboard-log-yyyyMMdd-HHmmss.log`（默认目录，SaveFileDialog 可改）。转存期间
-串口被独占借出、键鼠同步先释放全部按键并暂停，结束后自动恢复控制连接；`host/HidBridge.Host/Transport/OnboardLogDownloader.cs`
-是该实现，打开串口时显式保持 DTR/RTS 为低，不会复位被测板。命令行/脚本路径见 `tools/fetch_onboard_log.py`。
-
-## 主机局域网模拟鼠标 UDP 接口（主机 EXE / 早期单板，非双板主线）
+## 主机局域网模拟鼠标 UDP 接口（Host 输入适配层）
 
 该接口是 Windows 主机 EXE 的输入适配层，不改变电脑到 ESP32 的串口/Wi-Fi 帧格式。默认监听 `0.0.0.0:24814`；可用 `bridge.local.json` 的 `remoteInputBindAddress` 和 `remoteInputPort` 覆盖。主界面左上角显示当前可用的局域网监听 IP 和端口。该 UDP 接口不做身份认证。
 
@@ -247,11 +300,11 @@ EXE 逐帧 HTTP 请求的实际间隔通常大于 1 ms；“目标间隔 1 ms”
 - `dx`、`dy`：有符号 16 位相对位移。
 - `wheel`、`pan`：有符号 8 位滚轮增量。
 - 四个增量不能全为零；未知字段会被忽略，超范围或无效 JSON 的数据报直接拒绝。
-- 命令在主机 `HOME` 同步开启，或“始终开启 UDP 输出”开关开启时进入 `MouseReportPump`。Host 以最高 500 Hz / 2 ms 聚合完整位移，不再在 Windows 用户态展开平滑槽。
-- 默认开启“UDP 平滑”时，桥接报告第 8 字节为 `5`。Host 以最高 500 Hz 合并后，该字节会经鼠标侧 UART0 和板间 `SOFTWARE_MOUSE` 原样传到 PC 侧板。PC 侧板将 X/Y/Wheel/Pan 分别按整数商和余数分摊到滚动的 5 个 1 ms 槽，由 1000 Hz USB HID 发送任务消费；新命令叠加到现有未来槽，不串行追加，因此停止输入后的计划尾部不超过 5 ms，且每条命令代数和严格守恒。实体鼠标 report 不进入此平滑器。
-- 关闭“UDP 平滑”后，第 8 字节为 `0`；固件先把已有 5 槽余量合并到当前槽，再加入新位移，下一次 USB 1 ms 周期直接输出。主界面开关只能在 `HOME` 同步关闭时切换；kmboxNet `trace` 可在线切换。同步关闭路径仍发送 `ReleaseAll` 并清空固件槽。
+- 旧版单板模式下，命令仅在 HOME 同步开启或“始终开启 UDP 输出”打开时进入 `MouseReportPump`；双板模式下网络 UDP 输出不受 HOME 和隐藏的旧版开关限制。Host 以最高 500 Hz / 2 ms 聚合完整位移，不在 Windows 用户态展开固件平滑槽。
+- 双板模式的 Host UDP 软件报告只在 M 平滑，档位为 0/5/10/15/20 个 1 ms 滚动槽；新命令叠加到未来槽。M 发给 P 的报告第 8 字节恒为 0，P 不做二次平滑。实体鼠标由 M→P 硬件直通，不进入 Host 软件平滑器。旧版单板模式使用原 7 字节鼠标报告，不使用 M/P 平滑。
+- EXE 复选框后可选 5/10/15/20 槽，取消勾选为 0。HOME 同步关闭后可修改本地档位；UDP JSON 可携带 `smoothing_slots`（仅 0/5/10/15/20，省略时保留 Host 设置）。此配置不修改 Makcu `interpolate`。ReleaseAll、会话重建及链路故障清空 M 待发位移并释放按钮。
 - BLE 固件接受 7/8 字节桥接报告但忽略第 8 字节，仍以 10 ms 节拍合并位移；只有原生 USB 路径执行 5 槽、1000 Hz 消费。
-- 监听停止、程序退出或关闭“始终开启 UDP 输出”时不保留远端待发送状态，并继续走现有 `ReleaseAll` 清理路径；仅按 HOME 关闭同步不会阻断该开关允许的后续 UDP 输入。
+- 监听停止或程序退出时不保留远端待发送状态，并继续走现有 `ReleaseAll` 清理路径。旧版单板模式关闭“始终开启 UDP 输出”且 HOME 关闭后会阻断网络输入；双板模式的该旧版开关隐藏，网络 UDP 不依赖 HOME 状态。
 
 ### Python 调用示范
 
@@ -260,7 +313,7 @@ EXE 逐帧 HTTP 请求的实际间隔通常大于 1 ms；“目标间隔 1 ms”
 ```python
 from tools.esp32_move import Esp32MouseSender
 
-sender = Esp32MouseSender("192.168.1.20", 24814)
+sender = Esp32MouseSender("192.0.2.10", 24814)
 try:
     sender.move(25, -10, wheel=0, pan=0)
 finally:
@@ -286,4 +339,4 @@ finally:
 - `mask_*`、`unmask_keyboard` 和 `unmask_all` 按原位图过滤实体鼠标按钮、X/Y、滚轮和指定 HID 键；monitor 回传仍保留过滤前状态。
 - `reboot`、`setconfig`、`setvidpid` 和 LCD 命令不应答，也不改变 Host 或 ESP32 配置。
 
-主机设置页的“模拟 UDP 输入（测试）”模式不会改变上述网络数据报格式，也不会向本机 UDP socket 发送回环数据报，默认关闭。它先按所选 `30/60/100/140/200/500 Hz` 最大频率整合实体鼠标移动和滚轮；选择“无上限”时，每个原始事件直接形成一条内部模拟 UDP 命令。结果提交到与网络命令相同的公共 UDP 后续入口，随后由 Host 500 Hz 聚合并由固件按 0/5 槽处理。按钮转换仍保持顺序。
+设置页的“UDP 模拟输入测试”默认关闭，仅旧版单板通路下显示，并且只在旧版单板模式、HOME 开启且测试开关打开时生效。它不会改变网络数据报格式，也不会向 UDP socket 发送回环数据报；测试输入按所选 `30/60/100/140/200/500 Hz` 聚合实体鼠标移动，再写入旧版单板 7 字节鼠标报告。选择“无上限”时每个原始事件直接进入内部报告路径。该测试源不适用于双板 M 软件输入，按钮边沿仍按顺序发送。

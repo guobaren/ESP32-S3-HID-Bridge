@@ -1,22 +1,22 @@
 using System.IO.Ports;
 using System.Text;
 using System.Globalization;
+using HidBridge.Protocol;
 
 namespace HidBridge.Host.Transport;
 
 /// <summary>
-/// 对端板卡日志监听与原始字节输入通道（2026-09-28）。
+/// 对端板卡实时串口文本镜像与原始字节输入通道。
 ///
 /// 背景：主串口（<see cref="SerialBridge"/> 用的那个）是双向控制通道，只连着一块板；
-/// 另一块板的日志此前完全看不到。本类额外打开**另一个**串口，只读、只把日志送到
-/// 独立文件，**从不打开第二个串口实例**。打不开、掉线、读失败都只是少一路日志。
+/// 另一块板的日志此前完全看不到。本类额外持有**另一个**串口，将实时文本写入独立文件，
+/// 同时把统计快照帧送到请求方，**从不为单次统计另开端口**。打不开、掉线、读失败都只是少一路镜像。
 ///
-/// 端口选择：排除主串口后逐个试探，只有**真的在输出 ESP-IDF 日志行**的串口才会被采用。
-/// 这样既不需要匹配 CH340 设备名，也不会误抓别的串口设备（例如 GPS、虚拟串口）。
+/// 端口选择：排除主串口后逐个发送随机 DeviceProbe 挑战，只有返回有效签名、挑战和 PC 角色的
+/// 串口才会被采用；发现过程不依赖周期日志，也不会误抓别的串口设备（例如 GPS、虚拟串口）。
 /// </summary>
 internal sealed class DeviceLogMirror : IDisposable
 {
-    private const int ProbeMilliseconds = 2500;
     private const int DiscoveryRetryMilliseconds = 2000;
     private const int MaximumCandidatesPerAttempt = 3;
 
@@ -45,6 +45,7 @@ internal sealed class DeviceLogMirror : IDisposable
     private volatile bool _stop;
     private string? _portName;
     private Func<string?>? _primaryPortProvider;
+    private readonly Action<string, BridgeFrame>? _diagnosticFrameReceived;
     private CancellationTokenSource? _activeDiscoveryCancellation;
     private bool _disposed;
     private bool _suspended;
@@ -61,12 +62,14 @@ internal sealed class DeviceLogMirror : IDisposable
         int baudRate,
         string hostLogPathTemplate,
         int retentionCount,
-        Func<string?>? primaryPortProvider = null)
+        Func<string?>? primaryPortProvider = null,
+        Action<string, BridgeFrame>? diagnosticFrameReceived = null)
     {
         _baudRate = baudRate;
         _hostLogPathTemplate = hostLogPathTemplate;
         _retentionCount = retentionCount;
         _primaryPortProvider = primaryPortProvider;
+        _diagnosticFrameReceived = diagnosticFrameReceived;
     }
 
     internal string? PortName => GetOpenPortName();
@@ -403,7 +406,7 @@ internal sealed class DeviceLogMirror : IDisposable
         }
     }
 
-    /// <summary>打开并探测：必须真的读到 ESP-IDF 日志行才认，避免误抓其它串口设备。</summary>
+    /// <summary>通过带随机 nonce 的握手确认 P 角色；不依赖周期日志，也不改变串口控制线。</summary>
     private bool TryOpenCandidate(string name, CancellationToken cancellationToken, out SerialPort? port)
     {
         port = null;
@@ -422,56 +425,21 @@ internal sealed class DeviceLogMirror : IDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
+            CloseAndDisposeCandidate(candidate);
             return false;
         }
 
         try
         {
-            candidate.DiscardInBuffer();
-            Decoder decoder = Encoding.UTF8.GetDecoder();
-            byte[] buffer = new byte[ReadBufferBytes];
-            char[] text = new char[ReadBufferBytes * 2];
-            StringBuilder pending = new();
-            long deadline = Environment.TickCount64 + ProbeMilliseconds;
-            while (Environment.TickCount64 < deadline)
+            if (!SerialDeviceProbe.Probe(candidate, new FrameCodec(), expectedRole: SerialDeviceProbe.PcDeviceRole))
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                int available;
-                try
-                {
-                    available = candidate.BytesToRead;
-                }
-                catch (InvalidOperationException)
-                {
-                    break;
-                }
-
-                if (available <= 0)
-                {
-                    cancellationToken.WaitHandle.WaitOne(20);
-                    continue;
-                }
-
-                int read = candidate.Read(buffer, 0, Math.Min(buffer.Length, available));
-                if (read <= 0)
-                {
-                    continue;
-                }
-
-                int charCount = decoder.GetChars(buffer, 0, read, text, 0, flush: false);
-                pending.Append(text, 0, charCount);
-                int newline;
-                while ((newline = pending.ToString().IndexOf('\n')) >= 0)
-                {
-                    string line = pending.ToString(0, newline).TrimEnd('\r');
-                    pending.Remove(0, newline + 1);
-                    if (IsEspIdfLogLine(line))
-                    {
-                        port = candidate;
-                        return true;
-                    }
-                }
+                CloseAndDisposeCandidate(candidate);
+                return false;
             }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            port = candidate;
+            return true;
         }
         catch (OperationCanceledException)
         {
@@ -502,17 +470,6 @@ internal sealed class DeviceLogMirror : IDisposable
         candidate.Dispose();
     }
 
-    private static bool IsEspIdfLogLine(string line)
-    {
-        string trimmed = line.TrimStart();
-        if (trimmed.Length < 3)
-        {
-            return false;
-        }
-
-        return (trimmed[0] is 'I' or 'W' or 'E' or 'D' or 'V') && trimmed[1] == ' ' && trimmed[2] == '(';
-    }
-
     private void ReadLoop()
     {
         SerialPort? port;
@@ -529,6 +486,7 @@ internal sealed class DeviceLogMirror : IDisposable
         byte[] buffer = new byte[ReadBufferBytes];
         char[] text = new char[ReadBufferBytes * 2];
         Decoder decoder = Encoding.UTF8.GetDecoder();
+        DeviceOutputFrameScanner scanner = new();
         StringBuilder pending = new();
         try
         {
@@ -556,7 +514,15 @@ internal sealed class DeviceLogMirror : IDisposable
                     continue;
                 }
 
-                int charCount = decoder.GetChars(buffer, 0, read, text, 0, flush: false);
+                byte[] textBytes = scanner.Feed(
+                    buffer.AsSpan(0, read),
+                    frame => _diagnosticFrameReceived?.Invoke(_portName ?? "?", frame));
+                if (textBytes.Length == 0)
+                {
+                    continue;
+                }
+
+                int charCount = decoder.GetChars(textBytes, 0, textBytes.Length, text, 0, flush: false);
                 pending.Append(text, 0, charCount);
                 int newline;
                 while ((newline = pending.ToString().IndexOf('\n')) >= 0)

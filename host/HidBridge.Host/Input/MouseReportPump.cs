@@ -21,7 +21,6 @@ internal sealed class MouseReportPump : IDisposable
     private readonly IBridgeTransport _transport;
     private readonly object _stateLock = new();
     private readonly object _sendLock = new();
-    private readonly MouseMovementRecorder _movementRecorder;
     private readonly UdpMouseSmoother _udpMouseSmoother = new();
     private readonly SimulatedUdpMouseInput _simulatedUdpInput = new();
     private readonly Queue<byte> _buttonStates = [];
@@ -60,19 +59,14 @@ internal sealed class MouseReportPump : IDisposable
     private bool _enabled;
     private bool _disposed;
 
-    internal event Action? MovementRecordingStarted;
-    internal event Action<MouseMovementRecording>? MovementRecordingCompleted;
-
     internal MouseReportPump(
         IBridgeTransport transport,
-        MouseMovementRecorder? movementRecorder = null,
         TimeSpan? statisticsInterval = null,
         Action<string>? statisticsSink = null,
         Func<bool>? legacyFirmwareCompatibility = null)
     {
         _transport = transport;
         _legacyFirmwareCompatibility = legacyFirmwareCompatibility ?? (() => false);
-        _movementRecorder = movementRecorder ?? new MouseMovementRecorder();
         _statisticsInterval = statisticsInterval ?? DefaultStatisticsInterval;
         if (_statisticsInterval <= TimeSpan.Zero)
         {
@@ -210,9 +204,32 @@ internal sealed class MouseReportPump : IDisposable
         int wheel,
         int pan)
     {
+        AccumulateCore(buttons, buttonsChanged, deltaX, deltaY, wheel, pan, allowWhenForwardingDisabled: false);
+    }
+
+    internal void AccumulateAutomation(
+        byte buttons,
+        bool buttonsChanged,
+        int deltaX,
+        int deltaY,
+        int wheel,
+        int pan)
+    {
+        AccumulateCore(buttons, buttonsChanged, deltaX, deltaY, wheel, pan, allowWhenForwardingDisabled: true);
+    }
+
+    private void AccumulateCore(
+        byte buttons,
+        bool buttonsChanged,
+        int deltaX,
+        int deltaY,
+        int wheel,
+        int pan,
+        bool allowWhenForwardingDisabled)
+    {
         lock (_stateLock)
         {
-            if (!_enabled || _disposed)
+            if ((!_enabled && !(allowWhenForwardingDisabled && _alwaysOutputUdp)) || _disposed)
             {
                 return;
             }
@@ -301,7 +318,6 @@ internal sealed class MouseReportPump : IDisposable
             }
 
             _transport.Send(MessageType.ReleaseAll, ReadOnlySpan<byte>.Empty);
-            _movementRecorder.ObserveReleaseAll(DateTime.UtcNow);
             Console.WriteLine($"已发送 ReleaseAll；释放后转发={(enabledAfterRelease ? "开启" : "关闭")}。");
 
             lock (_stateLock)
@@ -341,11 +357,6 @@ internal sealed class MouseReportPump : IDisposable
                 }
                 _senderTickCount++;
             }
-            MouseMovementRecording? completed = _movementRecorder.TryComplete(DateTime.UtcNow);
-            if (completed is not null)
-            {
-                NotifyRecordingCompleted(completed);
-            }
             SendPendingReport();
         }
     }
@@ -379,6 +390,39 @@ internal sealed class MouseReportPump : IDisposable
             lock (_stateLock)
             {
                 return _udpSmoothingEnabled;
+            }
+        }
+    }
+
+    internal int UdpSmoothingSlots
+    {
+        get { lock (_stateLock) { return _udpMouseSmoother.SmoothingSlots; } }
+    }
+
+    internal void SelectUdpSmoothingSlots(int slots)
+    {
+        if (slots is not (5 or 10 or 15 or 20)) throw new ArgumentOutOfRangeException(nameof(slots));
+        lock (_sendLock)
+        {
+            lock (_stateLock)
+            {
+                if (_disposed || _enabled) return;
+                _udpMouseSmoother.Configure(slots);
+            }
+        }
+    }
+
+    internal void ConfigureUdpSmoothingSlots(int slots, bool fromRemote = false)
+    {
+        if (slots is not (0 or 5 or 10 or 15 or 20))
+            throw new ArgumentOutOfRangeException(nameof(slots));
+        lock (_sendLock)
+        {
+            lock (_stateLock)
+            {
+                if (_disposed || (_enabled && !fromRemote)) return;
+                _udpSmoothingEnabled = slots != 0;
+                if (slots != 0) _udpMouseSmoother.Configure(slots);
             }
         }
     }
@@ -444,8 +488,16 @@ internal sealed class MouseReportPump : IDisposable
                 return;
             }
 
-            if (_simulatedUdpInput.TryDrain(out MouseDelta pending) && _enabled)
+            bool disablingOrInactive = _simulatedUdpInput.Enabled && (!enabled || !_enabled);
+            if (disablingOrInactive)
             {
+                // 关闭测试源或退出 HOME/旧版通路时丢弃旧分桶，不能把测试尾部当作
+                // 后续普通物理输入或网络 UDP 输入重新送出。
+                _simulatedUdpInput.ResetSession(Stopwatch.GetTimestamp());
+            }
+            else if (_simulatedUdpInput.TryDrain(out MouseDelta pending) && _enabled)
+            {
+                // 仅在测试源保持开启且目标通路仍活动时，频率切换才结清当前分桶。
                 RouteUdpDeltaLocked(pending);
             }
             _simulatedUdpInput.Configure(enabled, frequencyHz, Stopwatch.GetTimestamp());
@@ -476,11 +528,9 @@ internal sealed class MouseReportPump : IDisposable
     private void SendPendingReport()
     {
         MouseStatisticsSnapshot? statistics = null;
-        bool recordingStarted = false;
         lock (_sendLock)
         {
             byte[]? payload = null;
-            MouseReport submittedReport = default;
             lock (_stateLock)
             {
                 if ((_enabled || _alwaysOutputUdp) && !_disposed)
@@ -519,9 +569,8 @@ internal sealed class MouseReportPump : IDisposable
                                 wheel,
                                 pan,
                                 _udpSmoothingEnabled
-                                    ? MouseReportCodec.FirmwareSmoothingSlots
+                                    ? (byte)_udpMouseSmoother.SmoothingSlots
                                     : MouseReportCodec.FirmwareSmoothingDisabled);
-                        submittedReport = new MouseReport(buttons, x, y, wheel, pan);
                         RecordSubmittedIntervalLocked(Stopwatch.GetTimestamp());
                     }
 
@@ -536,18 +585,7 @@ internal sealed class MouseReportPump : IDisposable
             if (payload is not null)
             {
                 _transport.Send(MessageType.MouseReport, payload);
-                _movementRecorder.ObserveReport(
-                    submittedReport.Buttons,
-                    submittedReport.X,
-                    submittedReport.Y,
-                    DateTime.UtcNow,
-                    out recordingStarted);
             }
-        }
-
-        if (recordingStarted)
-        {
-            NotifyRecordingStarted();
         }
 
         if (statistics is not null)
@@ -571,31 +609,6 @@ internal sealed class MouseReportPump : IDisposable
         }
     }
 
-    private void NotifyRecordingStarted()
-    {
-        try
-        {
-            MovementRecordingStarted?.Invoke();
-        }
-        catch (Exception exception)
-        {
-            Console.Error.WriteLine($"通知鼠标移动记录开始失败：{exception.Message}");
-        }
-    }
-
-    private void NotifyRecordingCompleted(MouseMovementRecording recording)
-    {
-        try
-        {
-            MovementRecordingCompleted?.Invoke(recording);
-        }
-        catch (Exception exception)
-        {
-            Console.Error.WriteLine($"通知鼠标移动记录完成失败：{exception.Message}");
-        }
-    }
-
-
     private void RecordSubmittedIntervalLocked(long now)
     {
         if (_lastSubmittedTimestamp != 0)
@@ -615,7 +628,8 @@ internal sealed class MouseReportPump : IDisposable
 
     private MouseStatisticsSnapshot CaptureStatisticsLocked()
     {
-        UdpMouseSmootherStatistics udp = _udpMouseSmoother.GetStatistics();
+        UdpMouseSmootherStatistics udp = _udpMouseSmoother.GetStatistics() with
+        { SmoothingSlots = _udpSmoothingEnabled ? _udpMouseSmoother.SmoothingSlots : 0 };
         SimulatedUdpInputStatistics simulated = _simulatedUdpInput.GetStatistics();
         long minSubmittedIntervalUs = _minSubmittedIntervalUs;
         long maxSubmittedIntervalUs = _maxSubmittedIntervalUs;

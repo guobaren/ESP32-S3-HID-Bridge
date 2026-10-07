@@ -9,6 +9,9 @@
 #define DUAL_PROXY_PROTOCOL_VERSION 2
 #define DUAL_PROXY_MAX_PAYLOAD 64
 #define DUAL_LINK_USB_STATE_HID_CONNECTED 2U
+#define DUAL_PROFILE_ACK_STATUS_MOUNTED 0U
+#define DUAL_PROFILE_ACK_STATUS_FAILED 1U
+#define DUAL_PROFILE_ACK_STATUS_WAIT_HOST 2U
 
 typedef enum {
     DUAL_MESSAGE_KEYBOARD_REPORT = 0x01,
@@ -18,15 +21,6 @@ typedef enum {
     DUAL_MESSAGE_SESSION_START = 0x05,
     DUAL_MESSAGE_DEVICE_PROBE = 0x06,
     DUAL_MESSAGE_DEVICE_HELLO = 0x07,
-    /* 板载日志下载：主机协议侧命令，不参与输入租约。 */
-    DUAL_MESSAGE_LOG_READ_REQUEST = 0x08,
-    DUAL_MESSAGE_LOG_READ_RESPONSE = 0x09,
-    DUAL_MESSAGE_LOG_CLEAR_REQUEST = 0x0A,
-    /* 流式下载：一条请求换来连续多个 LOG_READ_RESPONSE，避免逐块往返。 */
-    DUAL_MESSAGE_LOG_DUMP_REQUEST = 0x0B,
-    DUAL_MESSAGE_LOG_STATS_CONTROL_REQUEST = 0x0C,
-    /* 运行时暂停/恢复板载写盘（payload 1 字节：0=恢复，1=暂停）。 */
-    DUAL_MESSAGE_LOG_CONTROL_REQUEST = 0x0C,
     /* UART0 诊断：Profile 分块读取与离线写入 P。 */
     DUAL_MESSAGE_DIAG_PROFILE_READ = 0x0D,
     DUAL_MESSAGE_DIAG_PROFILE_DATA = 0x0E,
@@ -63,6 +57,9 @@ typedef enum {
      * 稀少且不可控，没有这个注入就只能靠碰运气。payload ≤1 字节（内容忽略）。
      */
     DUAL_MESSAGE_DIAG_PROFILE_REFRESH_REQUEST = 0x1C,
+    /* 一次性主动读取内存统计快照；请求空 payload，响应分页。 */
+    DUAL_MESSAGE_STATS_SNAPSHOT_REQUEST = 0x1D,
+    DUAL_MESSAGE_STATS_SNAPSHOT_RESPONSE = 0x1E,
     DUAL_MESSAGE_LINK_HELLO = 0x20,
     DUAL_MESSAGE_PHYSICAL_MOUSE = 0x21,
     DUAL_MESSAGE_PHYSICAL_RELEASE = 0x22,
@@ -90,6 +87,9 @@ typedef enum {
      */
     DUAL_MESSAGE_VENDOR_CONTROL_REQUEST = 0x33,
     DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE = 0x34,
+    /* P原生USB新会话与M侧厂商请求代际同步（UART1专用）。 */
+    DUAL_MESSAGE_VENDOR_SESSION_BEGIN = 0x35,
+    DUAL_MESSAGE_VENDOR_SESSION_ACK = 0x36,
 } dual_message_type_t;
 
 typedef enum {
@@ -167,9 +167,9 @@ static inline bool dual_peer_profile_invalidated(
 #define DUAL_LINK_PROFILE_ACK_RECIPIENT_GENERATION_OFFSET 9U
 #define DUAL_LINK_PROFILE_ACK_SENDER_GENERATION_OFFSET 13U
 
-#define DUAL_LOG_READ_REQUEST_LENGTH 5U
-#define DUAL_LOG_DUMP_REQUEST_LENGTH 8U
-#define DUAL_LOG_READ_RESPONSE_HEADER_LENGTH 8U
+#define DUAL_STATS_SNAPSHOT_SCHEMA_VERSION 1U
+#define DUAL_STATS_SNAPSHOT_HEADER_LENGTH 12U
+#define DUAL_STATS_QUEUE_RECORD_LENGTH 20U
 #define DUAL_HID_RAW_INPUT_HEADER_LENGTH 3U
 #define DUAL_HID_SET_REPORT_HEADER_LENGTH 6U
 #define DUAL_HID_GET_REPORT_REQUEST_LENGTH 6U
@@ -188,6 +188,10 @@ static inline bool dual_peer_profile_invalidated(
 #define DUAL_LINK_FLOW_ACK_STATUS_OFFSET 5U
 #define DUAL_LINK_FLOW_ACK_RECIPIENT_GENERATION_OFFSET 6U
 #define DUAL_LINK_FLOW_ACK_SENDER_GENERATION_OFFSET 10U
+#define DUAL_LINK_VENDOR_SESSION_LENGTH 12U
+#define DUAL_LINK_VENDOR_SESSION_P_GENERATION_OFFSET 0U
+#define DUAL_LINK_VENDOR_SESSION_M_GENERATION_OFFSET 4U
+#define DUAL_LINK_VENDOR_SESSION_EPOCH_OFFSET 8U
 
 static inline bool dual_profile_request_may_send(
     uint8_t role,
@@ -404,24 +408,16 @@ bool dual_vendor_control_response_decode(
     const uint8_t **data,
     size_t *data_length);
 
-/* 板载日志下载：请求 offset + max_bytes，响应 offset + total_bytes + 数据。 */
-bool dual_log_read_request_decode(
-    const uint8_t *payload,
-    size_t payload_length,
-    uint32_t *offset,
-    uint8_t *max_bytes);
-bool dual_log_read_response_encode(
-    uint32_t offset,
-    uint32_t total_bytes,
-    const uint8_t *data,
-    size_t data_length,
+/* UART1双板会话同步；P/M generation与PC原生USB epoch均必须非零。 */
+bool dual_vendor_session_encode(
+    uint32_t p_generation,
+    uint32_t m_generation,
+    uint32_t epoch,
     uint8_t *payload,
-    size_t capacity,
-    uint8_t *payload_length);
-bool dual_log_read_response_decode(
+    size_t capacity);
+bool dual_vendor_session_decode(
     const uint8_t *payload,
     size_t payload_length,
-    uint32_t *offset,
-    uint32_t *total_bytes,
-    const uint8_t **data,
-    size_t *data_length);
+    uint32_t *p_generation,
+    uint32_t *m_generation,
+    uint32_t *epoch);

@@ -11,5 +11,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\host\HidBridge.Host\HidBridge.Host.csproj" />
     <ProjectReference Include="..\..\shared\HidBridge.Protocol\HidBridge.Protocol.csproj" />
+    <None Include="..\fixtures\stats_snapshot_c_frames.txt" Link="stats_snapshot_c_frames.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

@@ -17,10 +17,10 @@
 #include "hid_host_mouse.h"
 #include "hid_device_profile.h"
 #include "link_recovery_logic.h"
-#include "onboard_log.h"
 #include "pc_hid_output.h"
 #include "usb_cdc_control.h"
 #include "uart0_control.h"
+#include "uart0_output.h"
 #include "uart1_link.h"
 
 #define USB_ROLE_PROBE_INTERVAL_MS 3000
@@ -184,6 +184,8 @@ static void on_link_fault(void)
          * 直到下一次成功的 Profile ACK。 */
         dual_uart1_set_usb_state(DUAL_USB_STATE_DISCONNECTED);
         dual_hid_host_clear_control_queue();
+        dual_uart0_control_cancel_software_input();
+
     }
 }
 
@@ -281,11 +283,21 @@ static void on_link_frame(const dual_frame_t *frame)
                     dual_status_led_set_flow_error(true);
                 }
                 if (profile_result != LINK_PROFILE_REPLAY_PENDING) {
+                    const uint8_t profile_status =
+                        profile_result == LINK_PROFILE_REPLAY_MOUNTED ?
+                            DUAL_PROFILE_ACK_STATUS_MOUNTED :
+                        profile_result == LINK_PROFILE_REPLAY_WAIT_HOST ?
+                            DUAL_PROFILE_ACK_STATUS_WAIT_HOST :
+                            DUAL_PROFILE_ACK_STATUS_FAILED;
                     const esp_err_t replay_ack = dual_uart1_send_profile_ack_for_generation(
                         s_profile_receiver.published_transfer_id,
                         s_profile_receiver.published_crc32,
-                        profile_result == LINK_PROFILE_REPLAY_MOUNTED ? 0U : 1U,
+                        profile_status,
                         dual_uart1_peer_generation());
+                    dual_pc_hid_note_profile_ack_result(
+                        s_profile_receiver.published_transfer_id,
+                        s_profile_receiver.published_crc32,
+                        profile_status, replay_ack);
                     if (replay_ack != ESP_OK) {
                         dual_status_led_set_flow_error(true);
                         ESP_LOGW(TAG, "重复COMMIT的最终确认无法排队：%s",
@@ -466,7 +478,9 @@ static void on_link_frame(const dual_frame_t *frame)
             return;
         }
         if (frame->type == DUAL_MESSAGE_RAW_HID_INPUT ||
-            frame->type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE) {
+            frame->type == DUAL_MESSAGE_HID_GET_REPORT_RESPONSE ||
+            frame->type == DUAL_MESSAGE_VENDOR_CONTROL_RESPONSE ||
+            frame->type == DUAL_MESSAGE_VENDOR_SESSION_ACK) {
             dual_pc_hid_handle_vendor_frame(frame);
             return;
         }
@@ -561,8 +575,10 @@ static void on_link_frame(const dual_frame_t *frame)
             }
             return;
         }
-        if (frame->type == DUAL_MESSAGE_HID_SET_REPORT ||
-            frame->type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST) {
+        if (frame->type == DUAL_MESSAGE_VENDOR_SESSION_BEGIN ||
+            frame->type == DUAL_MESSAGE_HID_SET_REPORT ||
+            frame->type == DUAL_MESSAGE_HID_GET_REPORT_REQUEST ||
+            frame->type == DUAL_MESSAGE_VENDOR_CONTROL_REQUEST) {
             dual_hid_host_handle_control_frame(frame);
         }
     }
@@ -707,12 +723,11 @@ static esp_err_t start_pc_role(void)
     if (result != ESP_OK) {
         return result;
     }
-    dual_pc_hid_enable_reconfigure();
-    /* 电脑侧板的调试口只跑板载日志服务：目标电脑的排障常常拿不到它的控制台。 */
-    const esp_err_t log_service = dual_uart0_log_service_start(DUAL_ROLE_PC_DEVICE);
-    if (log_service != ESP_OK) {
-        ESP_LOGW(TAG, "UART0 板载日志服务启动失败：%s", esp_err_to_name(log_service));
+    result = dual_uart0_control_start(DUAL_ROLE_PC_DEVICE, NULL, NULL, NULL);
+    if (result != ESP_OK) {
+        return result;
     }
+    dual_pc_hid_enable_reconfigure();
     /* Prepare the receive path before advertising PC_DEVICE to the peer. */
     s_role = DUAL_ROLE_PC_DEVICE;
     dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
@@ -743,7 +758,7 @@ static void wait_clone_usb_start_delay(void)
     /*
      * 无条件等待：上电/复位（含 RTS 复位、软复位）后，克隆相关的 USB 操作
      * 一律延后 CLONE_USB_START_DELAY_MS 再开始，让供电与上电瞬间的电气状态先稳定。
-     * 注意不能写成“等到上电满 N 毫秒”——板子自身初始化（状态灯、板载日志挂载、
+     * 注意不能写成“等到上电满 N 毫秒”——板子自身初始化（状态灯、串口控制服务、
      * 描述符打印）就要 1 秒以上，那样判断会直接被跳过（首版就是这么失效的，
      * 日志里连一行都没有）。
      */
@@ -768,7 +783,12 @@ static esp_err_t start_mouse_role(void)
         s_host_started = true;
     }
     result = dual_uart0_control_start(
-        DUAL_ROLE_MOUSE_HOST, on_software_frame, on_software_release);
+        DUAL_ROLE_MOUSE_HOST, on_software_frame, on_software_release,
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+        dual_hid_host_makcu_physical_buttons);
+#else
+        NULL);
+#endif
     if (result != ESP_OK) {
         return result;
     }
@@ -920,11 +940,11 @@ static esp_err_t rotate_unresolved_probe(void)
 
 void app_main(void)
 {
-    /* 板载日志要最先起来：后面的身份探测、USB 重枚举和线序测试都可能失败，
-     * 那些现场恰恰需要“上电至今”的完整记录。失败只停用该功能，不阻塞启动。 */
-    const esp_err_t log_result = dual_onboard_log_start();
-    if (log_result != ESP_OK) {
-        ESP_LOGW(TAG, "板载日志不可用：%s；继续运行输入链路", esp_err_to_name(log_result));
+    ESP_ERROR_CHECK(dual_uart0_output_init());
+    const esp_err_t uart0_control_result = dual_uart0_control_start(
+        DUAL_ROLE_UNRESOLVED, NULL, NULL, NULL);
+    if (uart0_control_result != ESP_OK) {
+        ESP_LOGW(TAG, "UART0控制/统计服务启动失败：%s", esp_err_to_name(uart0_control_result));
     }
     ESP_ERROR_CHECK(esp_efuse_mac_get_default(s_node_id));
     const esp_err_t led_result = dual_status_led_init();
@@ -934,10 +954,9 @@ void app_main(void)
     ESP_LOGI(TAG, "dual_proxy启动 node=%02X%02X%02X%02X%02X%02X UART1 TX=GPIO17 RX=GPIO18 baud=921600",
              s_node_id[0], s_node_id[1], s_node_id[2],
              s_node_id[3], s_node_id[4], s_node_id[5]);
-    ESP_LOGI(TAG, "诊断开关：hidpp_timeout=%d link_gone_retry=%d periodic_stats=%d",
+    ESP_LOGI(TAG, "诊断开关：hidpp_timeout=%d link_gone_retry=%d",
              DUAL_PROXY_ENABLE_HIDPP_TIMEOUT_DIAGNOSTIC,
-             DUAL_PROXY_ENABLE_LINK_GONE_RETRY_DIAGNOSTIC,
-             DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG);
+             DUAL_PROXY_ENABLE_LINK_GONE_RETRY_DIAGNOSTIC);
     esp_err_t result = dual_uart1_start(
         DUAL_ROLE_UNRESOLVED, s_node_id, on_link_frame, on_link_fault);
     if (result != ESP_OK) {

@@ -7,6 +7,7 @@
 #include "bridge_protocol.h"
 #include "hid_device_profile.h"
 #include "link_recovery_logic.h"
+#include "stats_snapshot.h"
 
 esp_err_t dual_pc_hid_install_device(void);
 esp_err_t dual_pc_hid_start_sender(void);
@@ -23,6 +24,8 @@ esp_err_t dual_pc_hid_prepare_for_profile(void);
  */
 bool dual_pc_hid_installed_profile_matches(uint32_t crc32);
 link_profile_replay_result_t dual_pc_hid_profile_result(uint32_t transfer_id, uint32_t crc32);
+void dual_pc_hid_note_profile_ack_result(
+    uint32_t transfer_id, uint32_t crc32, uint8_t status, esp_err_t result);
 esp_err_t dual_pc_hid_reuse_installed_profile(uint32_t transfer_id, uint32_t crc32);
 esp_err_t dual_pc_hid_schedule_reconfigure(
     const hid_device_profile_t *profile, uint32_t transfer_id, uint32_t crc32);
@@ -49,3 +52,4 @@ bool dual_pc_hid_ready(void);
 bool dual_pc_hid_usb_attached(void);
 void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame);
 void dual_pc_hid_vendor_link_fault(void);
+void dual_pc_hid_collect_stats(dual_stats_snapshot_t *snapshot);

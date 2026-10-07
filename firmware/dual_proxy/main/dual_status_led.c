@@ -149,6 +149,14 @@ void dual_status_led_set_peer_connected(bool connected)
     notify_task();
 }
 
+void dual_status_led_set_peer_usb_ready(bool ready)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    dual_status_led_logic_set_peer_usb_ready(&s_state, ready);
+    portEXIT_CRITICAL(&s_state_lock);
+    notify_task();
+}
+
 void dual_status_led_set_flow_error(bool failed)
 {
     portENTER_CRITICAL(&s_state_lock);
