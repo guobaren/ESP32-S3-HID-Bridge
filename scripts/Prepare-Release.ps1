@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [switch]$SkipHostBuild,
     [switch]$BuildFirmware
@@ -55,13 +55,19 @@ try {
     }
 
     if ($BuildFirmware) {
-        Write-Host '构建 ESP32-S3 固件...' -ForegroundColor Cyan
+        Write-Host '构建 ESP32-S3 双板固件（firmware/，工程名 dual_s3_hid_proxy）...' -ForegroundColor Cyan
         Push-Location (Join-Path $repoRoot 'firmware')
         try {
             . ..\scripts\Enter-EspIdf.ps1
-            idf.py set-target esp32s3
-            if ($LASTEXITCODE -ne 0) {
-                throw "idf.py set-target 失败，退出码：$LASTEXITCODE"
+            # set-target 会重置已有 sdkconfig（分区表、TinyUSB 缓冲等），只在尚未配置过时执行一次。
+            if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'firmware\sdkconfig'))) {
+                idf.py set-target esp32s3
+                if ($LASTEXITCODE -ne 0) {
+                    throw "idf.py set-target 失败，退出码：$LASTEXITCODE"
+                }
+            }
+            else {
+                Write-Host '已存在 firmware\sdkconfig，跳过 idf.py set-target 以保留既有配置。' -ForegroundColor Yellow
             }
             idf.py build
             if ($LASTEXITCODE -ne 0) {
@@ -111,12 +117,12 @@ try {
     Copy-RequiredFile (Join-Path $repoRoot 'firmware\build\flasher_args.json') 'firmware\flasher_args.json'
     Copy-RequiredFile (Join-Path $repoRoot 'firmware\build\bootloader\bootloader.bin') 'firmware\bootloader\bootloader.bin'
     Copy-RequiredFile (Join-Path $repoRoot 'firmware\build\partition_table\partition-table.bin') 'firmware\partition_table\partition-table.bin'
-    Copy-RequiredFile (Join-Path $repoRoot 'firmware\build\esp32_s3_hid_bridge.bin') 'firmware\esp32_s3_hid_bridge.bin'
+    Copy-RequiredFile (Join-Path $repoRoot 'firmware\build\dual_s3_hid_proxy.bin') 'firmware\dual_s3_hid_proxy.bin'
 
     $packageReadme = @(
         '# ESP32-S3 HID Bridge 发布件',
         '',
-        '启动 `HidBridge.Host.exe` 即可使用。程序会优先使用同目录的 `bridge.json`，并自动加载 `profiles/` 下的默认配置。每个配置的宏正文位于 `macros/`，Lua 正文位于 `lua/`，`profile.json` 只保存文件关联和运行元数据。鼠标捕获页提供 0.3–3.0 的统一输出灵敏度，作用于发送到固件前的实体鼠标、UDP、Lua 和宏 X/Y 移动，1 为原始值，滚轮和按键不变；“始终开启 UDP 输出”默认开启，HOME 关闭时仍可发送网络 UDP。设置页的“模拟 UDP 输入（测试）”默认关闭，仅用于测试聚合、平滑和输出链路。Lua 输入栏左侧显示行号；Lua 页“检查”会在不改变换行的前提下对齐缩进并规范常见行内空格；`delay(ms)`、`sleep(ms)` 和 `Sleep(ms)` 共用可取消延时实现，`move(x, y)` 支持小数累计移动，Lua 错误会显示行号。Host 不额外生成 `press arg=`/`release arg=` 摘要，脚本主动调用 `DebugLog(...)` 的内容仍会显示。',
+        '启动 `HidBridge.Host.exe` 即可使用。程序会优先使用同目录的 `bridge.json`，并自动加载 `profiles/` 下的默认配置。每个配置的宏正文位于 `macros/`，Lua 正文位于 `lua/`，`profile.json` 只保存文件关联和运行元数据。鼠标捕获页提供 0.3–3.0 的统一输出灵敏度，只作用于 **Host 发往板端**的 X/Y 相对移动（网络 UDP、Lua/宏及软件输入），1 为原始值，滚轮和按键不变；**双板模式下 M→P 的实体鼠标是硬件直通，不经过该灵敏度**（旧单板模式的实体转发才受它影响）。“始终开启 UDP 输出”默认开启，HOME 关闭时仍可发送网络 UDP。设置页的“模拟 UDP 输入（测试）”默认关闭，仅用于测试聚合、平滑和输出链路。Lua 输入栏左侧显示行号；Lua 页“检查”会在不改变换行的前提下对齐缩进并规范常见行内空格；`delay(ms)`、`sleep(ms)` 和 `Sleep(ms)` 共用可取消延时实现，`move(x, y)` 支持小数累计移动，Lua 错误会显示行号。Host 不额外生成 `press arg=`/`release arg=` 摘要，脚本主动调用 `DebugLog(...)` 的内容仍会显示。',
         '',
         '## 驱动',
         '',
@@ -124,7 +130,11 @@ try {
         '',
         '## 固件',
         '',
-        '`firmware/flasher_args.json` 与同目录相对路径下的三段镜像组成可刷写固件。可在 Host 设置页选择该 JSON 清单，或使用本机刷写 API；清单包含 bootloader、partition table 和 app 三段。',
+        '本发布件携带的是**双板固件**（`firmware/`，工程名 `dual_s3_hid_proxy`）：**两块 ESP32-S3 刷同一个镜像** `firmware/dual_s3_hid_proxy.bin`，上电后由固件按 USB 连接证据与板间 UART1 身份协商 M（鼠标侧）/P（电脑侧）角色，不需要分别编译两份固件。`firmware/flasher_args.json` 与同目录相对路径下的三段镜像（bootloader、partition table、app）组成可刷写清单；可在 Host 设置页选择该 JSON 清单，或使用本机刷写 API，按 P→M 顺序分别刷入两块板。两块板必须刷同一版本：`PROFILE_ACK` 长度（17 bytes）即版本判据，混刷会判失败。',
+        '',
+        '单板固件不在本发布件内，也不由本分支构建；如需旧单板方案，请在 `single-board` 分支获取源码与构建入口。',
+        '',
+        '固件按 **4 MB Flash** 目标构建，分区表为 `nvs`（24 KB）、`phy_init`（4 KB）与 `factory` 应用（1 MB），表尾 `0x110000`（约 1.06 MB），因此 **4 MB 及以上的 ESP32-S3 板卡都可用**，8 MB 板卡同样可用（更大的 Flash 不会被使用）。板卡不需要 PSRAM。若此前刷过含 4 MB `storage` 分区的旧版本，本次需要整片重刷（bootloader + partition table + app 三段）。',
         '',
         '## 移动分析图',
         '',

@@ -3,7 +3,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $tempExe = Join-Path $env:TEMP ("stats-snapshot-harness-{0}.exe" -f [Guid]::NewGuid().ToString('N'))
 $fixture = Join-Path $root 'tests\fixtures\stats_snapshot_c_frames.txt'
 $include = Join-Path $PSScriptRoot 'include'
-$main = Join-Path $root 'firmware\dual_proxy\main'
+$main = Join-Path $root 'firmware\main'
 $sources = @(
     (Join-Path $PSScriptRoot 'stats_snapshot_harness.c'),
     (Join-Path $main 'stats_snapshot_codec.c'),

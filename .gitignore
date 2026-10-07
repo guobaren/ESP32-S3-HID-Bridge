@@ -11,6 +11,9 @@ firmware/managed_components/
 firmware/sdkconfig
 firmware/sdkconfig.old
 
+# 实验工程以仓库根为 -B 目标时的外部构建目录（例如 usb_bandwidth_probe）
+/build/
+
 # 本机配置
 host/HidBridge.Host/bridge.local.json
 target/HidBridge.TargetAgent/agent.local.json

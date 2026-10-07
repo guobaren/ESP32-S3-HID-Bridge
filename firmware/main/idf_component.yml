@@ -1,4 +1,5 @@
 dependencies:
-  idf: ">=5.2"
+  idf: ">=6.0"
   espressif/esp_tinyusb: "^2.2.1"
   espressif/led_strip: "^3.0.3"
+  usb_host_hid: "^1.0.1"

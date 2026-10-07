@@ -1,4 +1,17 @@
-# Name,   Type, SubType, Offset,   Size,     Flags
-nvs,      data, nvs,     0x9000,   0x6000,
-phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x1f0000,
+# 双板代理分区表：单应用 + 常规数据分区（NVS、PHY）。
+#
+# 历史上这里还有一个 storage（SPIFFS 4 MB）分区，供板载滚动日志使用；当时刻意
+# 留出远大于日志上限（2 MB，4 个 512 KB 文件轮转）的余量，是因为 SPIFFS 接近写满
+# 时会频繁 GC，而 flash 擦除期间缓存关闭、两个核都停，实测会饿死 UART1 接收任务
+# （见 docs/审计.md 的 A/B 对照），所以余量本身是稳定性手段。
+#
+# 板载滚动日志机制已在双板固件中移除（不再挂载 SPIFFS、不再提供 0x08/0x0A/0x0B
+# 读写命令，恢复计数只保存在 RAM、重启后重新累计），该分区因此无人使用，本次删除。
+# 表尾为 0x110000（约 1.06 MB）：4 MB Flash 板卡可用，8 MB 板卡同样可用（更大的
+# Flash 不会被使用）。若将来重新引入板载持久化存储，需要重新加回分区并整片重刷。
+#
+# 改动本表必须整片重刷（bootloader + partition table + app 三段）。
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x100000,

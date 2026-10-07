@@ -8,13 +8,13 @@ set "SCRIPT_DIR=%~dp0"
 rem ============================================================
 rem  ESP32-S3 HID Bridge one-click publish
 rem  Calls scripts\Publish-GitHubRelease.ps1 / Prepare-Release.ps1
-rem  Default: build latest Host Release + latest firmware, assemble
+rem  Default: build latest Host Release + latest DUAL-BOARD firmware
 rem  release/ contents, package ZIP into dist/, print checksum summary.
 rem  (Chinese messages are printed by the called PowerShell scripts.)
 rem
 rem  Usage: this script [options]
 rem    /SkipHostBuild   skip Host build (reuse root HidBridge.Host.exe)
-rem    /NoFirmware      skip firmware build (reuse firmware\build output)
+rem    /NoFirmware      skip dual-board firmware build (reuse firmware\build output)
 rem    /Github          also create a GitHub Release (requires gh login,
 rem                     clean tracked workspace, tag not existing remote)
 rem    /Draft           with /Github: create a draft Release
@@ -74,7 +74,7 @@ echo   ESP32-S3 HID Bridge one-click publish  (version %TAG%)
 echo ============================================================
 echo.
 if defined SKIP_HOST_BUILD echo   [INFO] /SkipHostBuild: reuse root EXE, skip Host build.
-if not defined BUILD_FIRMWARE echo   [INFO] /NoFirmware: reuse firmware\build output.
+if not defined BUILD_FIRMWARE echo   [INFO] /NoFirmware: reuse dual-board firmware\build output.
 echo.
 
 rem ---- assemble Prepare/Package arguments ----
@@ -132,7 +132,7 @@ exit /b 0
 echo Usage: one-click-publish.cmd [options]
 echo.
 echo   /SkipHostBuild   skip Host build (reuse root HidBridge.Host.exe)
-echo   /NoFirmware      skip firmware build (reuse firmware\build output)
+echo   /NoFirmware      skip dual-board firmware build (reuse firmware\build output)
 echo   /Github          also create a GitHub Release (requires gh login,
 echo                    clean tracked workspace, tag not existing remote)
 echo   /Draft           with /Github: create a draft Release
@@ -141,6 +141,6 @@ echo   Use /? to show this help
 echo.
 echo Examples:
 echo   one-click-publish.cmd                  default: full build + latest release/ + ZIP
-echo   one-click-publish.cmd /SkipHostBuild   reuse existing EXE, build firmware only
+echo   one-click-publish.cmd /SkipHostBuild   reuse existing EXE, build dual-board firmware only
 echo   one-click-publish.cmd /Github /Draft   package then create GitHub draft Release
 exit /b 1

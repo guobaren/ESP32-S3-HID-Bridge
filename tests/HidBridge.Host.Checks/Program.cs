@@ -2321,7 +2321,10 @@ static void CheckFirmwareUpdateApiPolicy()
         File.Copy(manifestPath, Path.Combine(customDirectory, "remote-selected.json"));
         File.Copy(plan.Images[0].Path, Path.Combine(customDirectory, "bootloader", "bootloader.bin"));
         File.Copy(plan.Images[1].Path, Path.Combine(customDirectory, "partition_table", "partition-table.bin"));
-        File.Copy(plan.Images[2].Path, Path.Combine(customDirectory, "esp32_s3_hid_bridge.bin"));
+        // 用清单里的真实镜像名（当前双板固件为 dual_s3_hid_proxy.bin），不写死旧单板镜像名。
+        string appImageName = Path.GetFileName(plan.Images[2].Path);
+        Require(appImageName == "dual_s3_hid_proxy.bin", $"双板 app 镜像名应与清单一致，实际为 {appImageName}");
+        File.Copy(plan.Images[2].Path, Path.Combine(customDirectory, appImageName));
         FirmwareFlashPlan customPlan = FirmwareFlashPlan.LoadFromManifest(
             Path.Combine(customDirectory, "remote-selected.json"));
         Require(

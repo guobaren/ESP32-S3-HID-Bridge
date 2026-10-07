@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""一次性读取指定 dual_proxy 板卡的 UART0 内存计数和队列快照。"""
+"""一次性读取指定双板固件（firmware/，工程名 dual_s3_hid_proxy）板卡的 UART0 内存计数和队列快照。"""
 
 from __future__ import annotations
 
@@ -197,7 +197,7 @@ class SnapshotCollector:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="读取指定 ESP32-S3 板卡的 dual_proxy 统计快照")
+    parser = argparse.ArgumentParser(description="读取指定 ESP32-S3 板卡的双板固件统计快照")
     parser.add_argument("--port", required=True, help="目标板 UART0 串口，例如 COM12")
     parser.add_argument("--baud", type=int, default=BAUD_DEFAULT)
     parser.add_argument("--timeout", type=float, default=4.0, help="完整收到所有分页的超时秒数")

@@ -1,0 +1,5 @@
+# 本工程由原 firmware/dual_proxy/ 提升到 firmware/；构建目录、组件下载目录与
+# sdkconfig 由仓库根 .gitignore 的 firmware/ 规则统一忽略，这里只保留本目录特有规则。
+/sdkconfig
+/sdkconfig.old
+/tests/*.exe

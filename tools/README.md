@@ -105,14 +105,14 @@ Get-Content "$env:TEMP\usb-cycle.txt"     # 每步真实结果都在这里
 
 ## 双板统计快照读取
 
-`dual_proxy` 固件保留 RAM 中的累计计数与实时队列快照，通过 UART0 `0x1D` 请求、`0x1E` 分页返回。快照包括恢复事务、输入处理、UART1 与各队列状态，不清零计数、不暂停输入。EXE 的“读取设备统计”入口复用已打开的两块板串口；单板 Python 工具仅用于 EXE 未占用的端口：
+双板固件（`firmware/`，工程名 `dual_s3_hid_proxy`）保留 RAM 中的累计计数与实时队列快照，通过 UART0 `0x1D` 请求、`0x1E` 分页返回。快照包括恢复事务、输入处理、UART1 与各队列状态，不清零计数、不暂停输入。EXE 的“读取设备统计”入口复用已打开的两块板串口；单板 Python 工具仅用于 EXE 未占用的端口：
 
 ```powershell
 python .\tools\read_device_stats.py --port COM14
 python .\tools\read_device_stats.py --port COM14 --baud 921600 --timeout 4
 ```
 
-工具在打开串口前把 DTR/RTS 设为低电平，并要求收到计数器页和队列页的完整快照。未知队列指标输出为 `null`。共享帧编码、CRC 与流式解析实现位于 `tools/uart_protocol.py`；`inject_mouse_motion.py`、`vendor_control_probe.py` 等诊断脚本复用此模块。统计协议字段和实际 C 编码 fixture 见 [docs/protocol.md](../docs/protocol.md) 的「双板内存统计快照」及 `tests/fixtures/stats_snapshot_c_frames.txt`。
+工具在打开串口前把 DTR/RTS 设为低电平（**这是本项目所有只读查询的默认做法**：不得用"带端口直接打开"的写法，否则会经开发板自动复位电路复位板子，RAM 计数被清零、USB 链路与克隆被打断；规则见 `AGENTS.md` 的「串口查询默认不触发复位」），并要求收到计数器页和队列页的完整快照。每次查询后应把设备上报的 `uptimeMilliseconds` 与墙钟间隔对照，确认 uptime 连续增长以自证没有复位。未知队列指标输出为 `null`。共享帧编码、CRC 与流式解析实现位于 `tools/uart_protocol.py`；`inject_mouse_motion.py`、`vendor_control_probe.py` 等诊断脚本复用此模块。统计协议字段和实际 C 编码 fixture 见 [docs/protocol.md](../docs/protocol.md) 的「双板内存统计快照」及 `tests/fixtures/stats_snapshot_c_frames.txt`。
 
 ## 软件鼠标移动延迟测试
 `measure_udp_smoothing.py` 测量 UDP 软件输入到本机光标的延迟、5 槽平滑和连续命令重叠效果：向运行 `HidBridge.Host.exe` 的地址发送相对位移，在运行脚本的机器上每 1 ms 采样一次 `GetCursorPos`，输出 CSV、JSON 和两个无依赖 SVG。

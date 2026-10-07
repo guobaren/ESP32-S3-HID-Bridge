@@ -1,9 +1,9 @@
-# 运行 dual_proxy 纯逻辑回归（clang -Wall -Wextra -Werror），不触碰硬件。
+# 运行双板固件（firmware/，工程名 dual_s3_hid_proxy）的纯逻辑回归（clang -Wall -Wextra -Werror），不触碰硬件。
 #
 # 用法：
 #   pwsh -File .\scripts\Test-DualProxyLogic.ps1
 #
-# 依赖：clang 在 PATH 中；本仓库为便携式 ESP-IDF（.esp-idf\environment）。
+# 依赖：clang 在 PATH 中；本仓库为便携式 ESP-IDF（.esp-idf\environment）；firmware\ 已执行过一次 idf.py build。
 # 退出码：0 表示编译与运行都通过，并输出 dual_proxy_logic_test: PASS。
 
 [CmdletBinding()]
@@ -13,7 +13,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$project = Join-Path $CheckoutRoot 'firmware\dual_proxy'
+$project = Join-Path $CheckoutRoot 'firmware'
 $sources = @(
     'main\bridge_protocol.c',
     'main\dual_input_aggregator.c',
@@ -25,10 +25,9 @@ $sources = @(
     'main\makcu_ascii_logic.c',
     'main\makcu_v4_logic.c',
     'main\uart0_protocol_router.c',
-    'main\m_udp_smoothing.c'
+    'main\m_udp_smoothing.c',
+    'main\mouse_motion_smoother.c'
 )
-# 共享的平滑器仍在旧单板工程里，逻辑测试复用同一份源码。
-$shared_sources = @('firmware\main\mouse_motion_smoother.c')
 
 $clang = (Get-Command clang -ErrorAction SilentlyContinue).Source
 if (-not $clang) {
@@ -50,16 +49,12 @@ $arguments = @(
     '-std=c11', '-Wall', '-Wextra', '-Werror',
     '-I', (Join-Path $project 'main'),
     '-I', $sdkconfigDir,
-    '-I', (Join-Path $CheckoutRoot 'firmware\main'),
     '-I', $espCommon,
     '-o', $output,
     (Join-Path $project 'tests\dual_proxy_logic_test.c')
 )
 foreach ($source in $sources) {
     $arguments += (Join-Path $project $source)
-}
-foreach ($source in $shared_sources) {
-    $arguments += (Join-Path $CheckoutRoot $source)
 }
 
 & $clang @arguments

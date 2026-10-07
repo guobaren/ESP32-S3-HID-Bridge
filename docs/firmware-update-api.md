@@ -18,7 +18,7 @@
 $headers = @{ 'X-HidBridge-Action' = 'flash-firmware' }
 $body = @{
     # 双板主线固件；该相对路径由运行中的 Host 进程从项目根目录解析
-    manifestPath = 'firmware/dual_proxy/build/flasher_args.json'
+    manifestPath = 'firmware/build/flasher_args.json'
 } | ConvertTo-Json
 Invoke-RestMethod `
     -Method Post `
@@ -52,8 +52,8 @@ Invoke-RestMethod -Uri 'http://<HOST_IP>:24815/api/v1/firmware/status'
 - POST 必须携带 `X-HidBridge-Action: flash-firmware`，正文必须提供 `manifestPath`。
 - 不接受远程上传固件或命令行参数；`manifestPath` 指向运行控制软件电脑上的本地文件；串口自动使用设置页已保存且当前存在的 `COM`，例如 `COM3`。
 - 清单中的相对镜像路径按 JSON 所在目录解析。
-- 双板 `dual_proxy` 的两块板**必须刷同一版本**：`PROFILE_ACK` 长度（17 bytes）即版本判据，混刷会判失败。分区表含 `storage`（SPIFFS 4 MB），若分区表有改动必须**整片重刷**三段。
-- 刷写不清除分区表中的 SPIFFS `storage` 分区。当前双板固件不再写入板载滚动日志；新固件的恢复计数只保存在 RAM，板卡重启后重新累计。
+- 双板工程的两块板**必须刷同一版本**：`PROFILE_ACK` 长度（17 bytes）即版本判据，混刷会判失败。当前分区表为单应用 + nvs/phy_init（表尾 `0x110000`，约 1.06 MB，构建目标 4 MB Flash），若分区表有改动必须**整片重刷**三段。
+- 分区表已删除历史上供板载滚动日志使用的 `storage`（SPIFFS 4 MB）分区：刷写不再涉及该分区，固件也不写入板载日志；恢复计数只保存在 RAM，板卡重启后重新累计。
 - 清单必须且只能包含 `0x0`、`0x8000`、`0x10000` 三段，并且所有镜像必须位于 JSON 所在目录内。
 - 控制软件刷写前关闭同步并发送 `ReleaseAll`，暂停当前控制连接并把设置页已选串口交给 esptool；不要求该串口先通过 HID Bridge 应用层握手。结束后恢复自动连接和原同步状态。
 - 程序退出时若仍在刷写，会等待 esptool 结束，避免主动中断写入。

@@ -56,7 +56,7 @@ def main() -> int:
             raise AssertionError(f"缺少必需状态 id={state_id} 时仍被接受")
         finally:
             collector.counters[state_name] = state_value
-    print("Python stats fixture 检查：PASS；28 个 dual_proxy C 编码 P/M 页具备必需状态，缺少 67/68 时拒绝，role、signed counter、20B queue 与 sentinel 匹配。")
+    print("Python stats fixture 检查：PASS；28 个双板固件 C 编码 P/M 页具备必需状态，缺少 67/68 时拒绝，role、signed counter、20B queue 与 sentinel 匹配。")
     return 0
 
 
