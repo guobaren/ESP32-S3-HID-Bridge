@@ -135,3 +135,20 @@ python .\tools\measure_udp_smoothing.py --host 192.0.2.10 --output-dir .\artifac
 50% 位移耗时、逐命令延迟、每步位移等写入 `summary.json`/CSV/SVG，仅作过程信息。多命令用例偏差 1px 时脚本会提示先检查 Windows 指针加速（设置→鼠标→提高指针精确度）与上一用例残留的平滑槽位。
 
 当前基线（2026-09-25，`artifacts/tests/move-latency-20260925/summary.json`）：连续两次运行均 `[结论] PASS`——第 1 次单次首动 `5.998 ms`、连续首动 `3.999 ms`；第 2 次 `6.999 ms`、`5.0 ms`；两次位移都是 `20px`/`60px` 精确一致。阈值仍为 `< 10 ms`，样本量 2 次，不代表长时稳定性。
+
+## Makcu 按键查询延迟测试
+`measure_makcu_button_query.py` 测量 **Makcu（MAK_API V4）接口取一次实体鼠标按键**的往返延迟，用于评估「改用 Makcu 接口查询按键」是否可行。脚本只发只读查询（`0x02`/`0x04`/`0x55`）与可选的一次 `0x61 click` 注入探针，**不复位板卡**（打开前 DTR/RTS 置低，见 `AGENTS.md`）。
+
+只读测量 M 板物理按键查询延迟（M UART0 必须空闲，Host EXE 占用时打不开）：
+
+```powershell
+py -3 .\tools\measure_makcu_button_query.py --detect
+py -3 .\tools\measure_makcu_button_query.py --port COM13 --count 200
+py -3 .\tools\measure_makcu_button_query.py --port COM13 --count 200 --gap-ms 5
+```
+
+- 计时必须用 `time.perf_counter`：本机 Python 3.9 的 `time.monotonic` 只有约 15.6 ms 粒度，会把往返记成 0 或 16000 µs。
+- 每次查询前清空输入缓冲，否则同步扫描会立刻吃到陈旧帧、把往返时间记成 0。
+- `0x10`（按钮事件订阅）的**设置不回包**，脚本按此处理；`0x53` 事件只在**物理**鼠标按键变化时产生，软件注入不产生事件，因此 `--stream-clicks` 一项要求 M 已接物理鼠标并由真人按键。
+
+实测基线（2026-10-10，M=COM13，115200，`artifacts/tests/makcu-button-query/`）：`0x55` 查询往返 n=200 中位 **3.33 ms**、均值 3.35 ms、P95 3.52 ms、最大 3.86 ms；加 5 ms 间隔的 200 Hz 轮询口径中位 **3.37 ms**。同一轮次内事件订阅延迟未取到（测量时 M 上无物理鼠标，`phys_buttons` 恒为 0）。

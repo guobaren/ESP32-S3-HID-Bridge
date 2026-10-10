@@ -356,7 +356,7 @@ dotnet run --project .\tests\HidBridge.Host.Checks -c Release
 
 - Windows PnP 节点存在不等于厂商驱动识别成功；固件记录到 USB report submit/complete 也不等于接收电脑的应用已消费。
 - 打开 CH340 调试口采集日志会经 DTR/RTS 触发板卡复位，采集结果必须标注这一扰动。
-- 早期的鼠标随机断连问题**已解决，此后未再复现**；未验证项与历史边界见[审计记录](docs/审计.md)。
+- 鼠标**随机断连（偶发无响应）仍会出现**，根因是 upstream ESP-IDF USB Host 缺陷（[IDFGH-14198](https://github.com/espressif/esp-idf/issues/14996)，官方至今未修）；当前版本靠应用层自愈兜底，**已把「断开→恢复」压缩到 1 秒以内**，通常只表现为极短顿挫、无需人工干预。这不是"已彻底消除"；判据、计数与未复测边界见[审计记录](docs/审计.md)与[固件说明](docs/固件.md)。
 
 ## 固件刷写
 
