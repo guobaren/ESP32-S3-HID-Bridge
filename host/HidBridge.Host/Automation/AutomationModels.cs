@@ -70,6 +70,9 @@ internal sealed class AutomationSettings
     public bool SimulatedUdpInputEnabled { get; set; }
     public int SimulatedUdpInputFrequencyHz { get; set; } = 100;
     public bool LegacySingleBoardFirmwareCompatibility { get; set; }
+    public bool MakcuEnabled { get; set; }
+    public bool ButtonStatePublishingEnabled { get; set; } = true;
+    public string ButtonStateMappingName { get; set; } = ButtonStateSharedMemory.DefaultMappingName;
     public bool FirmwareUpdateApiEnabled { get; set; }
     public string FirmwareManifestPath { get; set; } = string.Empty;
     public string FirmwareFlashPortName { get; set; } = string.Empty;

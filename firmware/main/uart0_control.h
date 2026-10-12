@@ -8,6 +8,15 @@ typedef void (*dual_software_report_callback_t)(const dual_frame_t *frame);
 typedef void (*dual_software_release_callback_t)(void);
 typedef uint8_t (*dual_software_physical_buttons_callback_t)(void);
 
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+/* Called only for decoded physical mouse reports and immediate mouse disconnects. */
+uint32_t dual_uart0_control_button_state_capture_epoch(void);
+uint32_t dual_uart0_control_button_state_capture_epoch_isr(void);
+void dual_uart0_control_button_state_update(uint8_t buttons, uint32_t observation_epoch);
+void dual_uart0_control_button_state_invalidate_for_epoch(uint32_t observation_epoch);
+void dual_uart0_control_button_state_invalidate(void);
+#endif
+
 esp_err_t dual_uart0_control_start(
     uint8_t role,
     dual_software_report_callback_t report_callback,

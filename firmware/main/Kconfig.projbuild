@@ -1,0 +1,11 @@
+menu "Dual HID Bridge"
+
+config DUAL_PROXY_USE_CHERRYUSB
+	bool "在 M 侧使用 CherryUSB HID Host 后端"
+	default n
+	depends on IDF_TARGET_ESP32S3
+	help
+	  启用后由 CherryUSB 管理 M 侧物理 HID Host；默认仍使用 ESP-IDF USB Host。
+	  CherryUSB 后端不会自动断电重启 USB 根端口。
+
+endmenu

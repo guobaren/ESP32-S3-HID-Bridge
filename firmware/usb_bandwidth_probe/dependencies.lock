@@ -1,0 +1,17 @@
+dependencies:
+  espressif/tinyusb:
+    dependencies: []
+    source:
+      path: ../managed_components/espressif__tinyusb
+      type: local
+    version: 0.21.0~2
+  idf:
+    source:
+      type: idf
+    version: 6.0.2
+direct_dependencies:
+- espressif/tinyusb
+- idf
+manifest_hash: 0133c9d59b77f4d30a39aef15df7614dca4467171ca0ebfca7f87cfd26b2bdb0
+target: esp32s3
+version: 3.0.0

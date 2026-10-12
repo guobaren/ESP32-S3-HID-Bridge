@@ -56,8 +56,17 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | `0x05` | SessionStart | 空；申请新的输入租约，并先释放旧会话的全部输入 |
 | `0x06` | DeviceProbe | 8 字节随机数；仅用于 COM 输入通道自动发现，不申请输入租约 |
 | `0x07` | DeviceHello | `HIDBRDG2` ASCII 标识、原样返回的 8 字节随机数，以及可选的角色字节（`1=PC_DEVICE`、`2=MOUSE_HOST`）；序号与 DeviceProbe 相同 |
+| `0x1F` | ButtonState | M 上行 1 字节：bit0..4 为原始物理鼠标按钮，bit7 为状态有效；Host 下行 1 字节 `0=取消订阅`、`1=订阅` |
+| `0x37` | MakcuModeRequest | 仅 M：单字节 opcode `0=关闭`、`1=开启`、`2=查询` |
+| `0x38` | MakcuModeStatus | M 返回 6 字节：`status:u8, enabled:u8, baud:u32le`；序号回显请求 |
 
 主机在每次 UART、原生 USB CDC 或 Wi-Fi 连接建立后先发送 `SessionStart`，之后至少每 500 ms 发送一次 `Ping`。固件默认在 1500 ms 内未收到当前会话的有效帧时执行 `ReleaseAll`，避免断线卡键。
+
+`ButtonState` 是 M 的物理按钮原始状态订阅，不使用物理输入屏蔽掩码。上行 Payload 只有 1 字节，bit0..4 依次表示物理按钮，bit5..6 保留为 0，bit7 为 valid；因此 `0x00` 表示“当前未知”，`0x80` 表示“状态已知且全部松开”。新物理连接在收到首个可解析的真实鼠标报告前保持 invalid；接口断开、物理报告无效或报告队列丢失时由固件失效状态。诊断注入报告不更新此状态。订阅后，状态变化在下一控制循环发送，之后以 **5 ms 目标间隔**重复发送完整状态；发送失败会保留待发状态并在后续控制循环重试。这里的“成功”只表示本机 UART TX ring 接受了帧，不是端到端确认。Makcu runtime 开启期间暂停 ButtonState 上行，避免 115200 Makcu 字节流混入 A5 状态帧。2026-10-10 COM13 实机观测：A5 订阅 2.391 s 收到 409 个合法帧，Makcu/115200 1.031 s 收到 0 帧，关闭后重订阅 2.391 s 收到 409 帧；全部帧 `valid=0`。此结果证明帧存在及暂停/恢复，不证明实体按键值，也不能从 Windows 批量读取窗口推断精确 5 ms/200 Hz。
+
+Host 当前源码已把完整 `ButtonState` 帧从 UART 文本流拆出，并只接受当前 M 串口连接、当前订阅会话的状态帧。它将状态发布到 64 字节命名映射 `HidBridge.Buttons.v1`，互斥量为 `HidBridge.Buttons.v1.Mutex`：偏移 `0/4/8/12` 为 `magic/version/size/reserved:u32`，`16` 为 `seq:u64`，`24` 为 QPC 秒 `f64`，`32` 为原始物理按钮 `u8`，`33` 保留，`34` 为 valid 位图（bit0=鼠标状态有效、bit1=当前 M 会话订阅健康），`35` 为连接状态，其余保留字节清零。发布完整头部与状态字段、最后写 `seq` 均在同一 mutex 内；锁忙时 Host 不阻塞接收线程，重试使用真实串口接收时刻的 QPC 时间，超过 200 ms 会发布 invalid/清零按钮。Host focused checks 覆盖映射布局、锁忙/过期、进程重启序号和弃锁恢复；Host 与 Sender 的独立双进程互通夹具经主代理复核为 29/29。2026-10-10 通过实际 COM13 与最终 Host DLL 完成 SerialBridge→MMF 组件集成：MMF `validBits=2→0→2`、seq `5→8→18`，Makcu OFF 后订阅恢复健康；当次物理 `valid=0`，尚未观测到实体按键值。记录为 `artifacts/tests/button-state-20261010/hardware/host_serialbridge_live_retry.json`。
+
+M 的 Makcu runtime 由 `MakcuModeRequest` 显式切换；上电默认关闭，P/M UART0 均为 921600、8N1。开启固定切到 115200，关闭固定切回 921600。模式状态码为 `0=成功/受理`、`1=角色错误`、`2=编译不支持`、`3=载荷无效`、`4=本地发送或切速失败`。状态查询不改变输入所有者；在 A5 模式中，`DeviceProbe`、`StatsSnapshotRequest`、`ButtonState` 订阅与 Makcu 模式查询同样是中性控制帧。Makcu runtime 开启时仅保留 `DeviceProbe`、Makcu 模式查询和 `ButtonState` 退订；`StatsSnapshotRequest` 因响应使用 A5 专用输出门控而被拒绝。切换命令的 `status=0` 只确认旧波特率下的 ACK 已发送并排空，响应里的 `enabled/baud` 是请求目标；查询命令的 `status=0` 才代表当前实际模式快照。Host 应在目标波特率重新查询并验证 M 角色与目标值后，才保存或显示切换成功。若 ACK 无法写入或在 100 ms 内未排空，固件保留旧模式；此时无法保证再发送错误响应。V4 `SET_BAUD` 仅接受 0 或 115200 作为当前速率 no-op，不允许绕过模式命令切换到其他波特率。本轮运行时切换要求 V4 capability 编译；V4 关闭时（包括仅旧 ASCII parser 编译）返回 unsupported 并保持 A5/921600。2026-10-10 实际 COM13 上切换请求及新速率查询/角色探测均通过，最终恢复 OFF/921600；对外仍须区分切换 ACK 的“受理”与新速率查询的“已生效”。
 
 `portName` 为 `auto` 时，主机依次打开当前可用 COM 口并发送 `DeviceProbe`。双板主线（`dual_s3_hid_proxy`）的正式拓扑只接受角色字节为 `MOUSE_HOST` 的响应，避免误连电脑侧板的开发串口；不带角色字节的旧固件只用于兼容诊断脚本。启动日志等非协议字节会被跳过。
 
@@ -139,6 +148,9 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 |---:|---|---|
 | `0x1D` | STATS_SNAPSHOT_REQUEST | 空；在板端当前启动周期内采集一次快照 |
 | `0x1E` | STATS_SNAPSHOT_RESPONSE | 版本化计数器页或队列页；帧序号回显请求序号 |
+| `0x1F` | BUTTON_STATE | 见上文订阅与物理状态定义；M 角色支持 |
+| `0x37` | MAKCU_MODE_REQUEST | 见上文模式切换 opcode 定义；M 角色支持 |
+| `0x38` | MAKCU_MODE_STATUS | 见上文 6 字节状态响应定义 |
 
 响应 Payload 最长 64 字节，前 12 字节为公共头：`schema:u8, role:u8, kind:u8, page_index:u8, page_count:u8, status:u8, item_count:u8, reserved:u8, uptime_ms:u32`。当前 `schema=1`、`reserved=0`；`role=1` 是 P/PC_DEVICE，`role=2` 是 M/MOUSE_HOST。`kind=1` 表示计数器，`kind=2` 表示队列；页序号从 0 开始，两个 kind 各自编号、分别收齐。所有页来自同一个预先采集的快照，因而同一 role 的 `uptime_ms` 应一致。查询范围是进程当前已打开的所有端口；只返回实际响应且页完整的板卡，不保证一定同时有 P 与 M。非零 `status` 表示板端无法提供完整快照，客户端应判失败。
 
@@ -166,17 +178,17 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 
 当前 M 包含队列 1..9、13 共 10 条，队列页 5 页；P 包含队列 4..9、10..13 共 10 条，队列页 5 页。UART1 event 队列的 `received/rejected` 若底层无法准确提供则为 UNKNOWN；`dropped` 只表示 reset 时丢弃的事件通知条数。FIFO overflow 与 buffer-full 通知分别由计数器 64 和 65 汇报，单位是事件次数。
 
-主机 EXE 的鼠标捕获页提供“读取设备统计”入口；loopback API 可用 `GET /api/v1/serial/stats` 读取同一组两板快照。Python 独立串口读取工具为 `python tools/read_device_stats.py --port COM3`，示例端口为 P 板；只能在该端口未被 EXE 占用时使用，它在打开前将 DTR/RTS 设为低电平。当前默认 V4 构建下，P、M 均支持 A5 统计请求。P 维护口为 921600，M 默认为 115200；在 M 上发送有效 A5 请求会切换到 A5 输入所有者，清空待处理软件输入并释放按钮。查询前先停止 Makcu 客户端，不要交替争用同一串口。统计页字段及回归样例见 `tests/fixtures/stats_snapshot_c_frames.txt`。
+主机 EXE 的鼠标捕获页提供“读取设备统计”入口；loopback API 可用 `GET /api/v1/serial/stats` 读取同一组两板快照。Python 独立串口读取工具为 `python tools/read_device_stats.py --port COM3`，示例端口为 P 板；只能在该端口未被 EXE 占用时使用，它在打开前将 DTR/RTS 设为低电平。P UART0 固定为 921600；按当前固件源码，M 上电默认也是 921600，只有显式开启 Makcu runtime 才切到 115200。Makcu runtime 开启时，M 仍能接收中性的 A5 `DeviceProbe`、`ButtonState` 退订和模式查询；A5 输入与诊断帧、ButtonState 订阅、`StatsSnapshotRequest` 均被拒绝。统计响应走 A5 专用输出门控，Makcu 占用 UART0 时无法返回，因此应先关闭 Makcu runtime 再读取统计。A5 输入报告会切换到 A5 所有者并清空待处理软件输入、释放按钮。查询应由一个串口客户端独占完成。统计页字段及回归样例见 `tests/fixtures/stats_snapshot_c_frames.txt`。
 
 ### MAKCU V4 鼠标 API（M 板 UART0）
 
-当前双板固件（`firmware/`，工程名 `dual_s3_hid_proxy`）默认构建启用 `DUAL_PROXY_ENABLE_MAKCU_V4_API=ON`，并与旧 V3 风格 ASCII 模式互斥。2026-10-06 已将同版双板固件刷入 M/P：M（本次 COM12）锁定 `MOUSE_HOST` 后，UART0/CH340 使用 V4，默认 115200、8N1；P（本次 COM3）保留 A5/5A v2、921600 baud。串口号可能随拔插变化，使用前应重新确认角色。波特率设置仅保存在运行时，重启后恢复默认。
+当前双板固件（`firmware/`，工程名 `dual_s3_hid_proxy`）默认构建启用 `DUAL_PROXY_ENABLE_MAKCU_V4_API=ON`，并与旧 V3 风格 ASCII 模式互斥。P/M UART0 上电均为 921600、8N1；M 的 V4 编译能力保留，但 runtime 默认关闭。M 只有在收到有效的 `MakcuModeRequest(opcode=1)` 并完成旧速率 ACK 排空后才切到 115200。2026-10-10 同一主镜像已刷入 COM3=P 与 COM13=M；刷后确认两板均为 921600、M 为 Makcu OFF，COM13 上 ON/OFF 与新速率查询及 M 角色探测通过。2026-10-06 的 115200 默认行为属于旧固件历史快照。串口号可能随拔插变化，使用前应重新确认角色。
 
-V4 协议允许 `baud(4000000)`，但本机 Windows CH340 在切换主机串口到 4,000,000 baud 时返回 Win32 `PermissionError(31)`。测试工具已向 M 发送 A5 设置帧，但没有取得 4 Mbaud 下的 A4 查询结果；随后在 115200 的 A4 查询超时。一次 `esptool run` 硬复位（未写入或擦除 Flash）恢复默认速率，之后 115200 下 46 项只读检查为 46 PASS、0 FAIL，含 A4=115200。本机 4M 测试 `Failed`，4M 接口响应未验证；当前建议使用 115200，不应从协议字段推断本机 USB-UART 适配器支持 4 Mbaud。
+历史 4 Mbaud 探测记录：本机 Windows CH340 切换到 4,000,000 baud 时曾返回 Win32 `PermissionError(31)`，未取得 4 Mbaud 下的查询结果；该测试不代表当前固件支持该速率。当前源码把 `0x37` 作为唯一模式切换入口，V4 `SET_BAUD` 不允许切换至 4 Mbaud。
 
-固定版本的官方 MAKCU SDK（revision `2616b1c3905bd0af65aa6ed338ead2b1c256bb6e`）使用 V4 二进制 API 完成 `Mouse.move(+20,0)` 和 `Mouse.move(-20,0)`。P 侧诊断收到各一条匹配的 `P_USB_REPORT_SUBMIT` 与 `P_USB_REPORT_COMPLETE`，两次 submit→complete 分别为 645 μs 和 484 μs。该观测证明了本轮报告到达 P 的 USB 提交/完成回调，不证明接收电脑的 Windows 光标或应用已经消费；G HUB、真实物理鼠标和长时运行仍待验收。该次历史检查期间 Host EXE 保持关闭。当前固件在 M UART0 共存解析 A5 与 V4，按有效命令切换输入所有者；切换会清空待处理输入并释放按钮，V4 所有者抑制 A5 诊断流。始终只让一个客户端操作该串口。
+固定版本的官方 MAKCU SDK（revision `2616b1c3905bd0af65aa6ed338ead2b1c256bb6e`）使用 V4 二进制 API 完成 `Mouse.move(+20,0)` 和 `Mouse.move(-20,0)`。P 侧诊断收到各一条匹配的 `P_USB_REPORT_SUBMIT` 与 `P_USB_REPORT_COMPLETE`，两次 submit→complete 分别为 645 μs 和 484 μs。该观测证明了本轮报告到达 P 的 USB 提交/完成回调，不证明接收电脑的 Windows 光标或应用已经消费；G HUB、真实物理鼠标和长时运行仍待验收。该次历史检查期间 Host EXE 保持关闭。当前固件在 M UART0 共存解析 A5 与 V4，按有效命令切换输入所有者；切换会清空待处理输入并释放按钮，V4 所有者抑制 A5 诊断流。A5 模式查询、角色探测与状态订阅不切换输入所有者；普通 A5 输入报告会切换回 A5 所有者。始终只让一个客户端操作该串口。
 
-直接调用前先正常退出 Host 并关闭其他占用 M 串口的程序。以下 pyserial 示例先查询接口标识，再移动并按左键，最后在 `finally` 中保证松开：
+同一版固件上电默认 A5/921600、Makcu runtime 关闭；由 Host 显式切换至 115200 或恢复 921600，并在新速率查询和 M 角色探测通过后确认结果。开启 Makcu 时 Host 持续占用 M UART0，直到真正退出进程；独立示例仅能在 Host 退出且串口未被其他程序占用时运行。以下示例假设设备已处于 115200 Makcu 模式，先查询接口标识，再移动并按左键，最后在 `finally` 中保证松开：
 
 ```python
 import serial
@@ -211,9 +223,9 @@ finally:
         ser.close()
 ```
 
-二进制接口的帧为 `DE AD LEN:u16le CMD PAYLOAD[LEN]`，`LEN` 只计 payload 字节数、不含命令字节。例如 `move(20,-5)` 使用 opcode `0x18`，payload 是两个有符号 16 位小端整数，完整帧为 `DE AD 04 00 18 14 00 FB FF`。`interpolate` 的 0/25/50/75/100 分别对应关闭/5/10/15/20 个平滑槽，其他 0..100 值就近选择，255 保留 AUTO；该设置与 Host 侧平滑档位互不影响。有效鼠标设置会续 1500 ms 输入租约，查询不续租，停止发送后固件会释放注入按钮。建议使用 115200：本机 CH340 切换到 4 Mbaud 时失败，不能按协议支持推断适配器可用（详见下一段）。调用本接口不需要启动 Host。
+二进制接口的帧为 `DE AD LEN:u16le CMD PAYLOAD[LEN]`，`LEN` 只计 payload 字节数、不含命令字节。例如 `move(20,-5)` 使用 opcode `0x18`，payload 是两个有符号 16 位小端整数，完整帧为 `DE AD 04 00 18 14 00 FB FF`。`interpolate` 的 0/25/50/75/100 分别对应关闭/5/10/15/20 个平滑槽，其他 0..100 值就近选择，255 保留 AUTO；该设置由 M 端统一软件平滑队列消费，转发给 P 时槽数固定为 0。有效鼠标设置会续 1500 ms 输入租约，查询不续租，停止发送后固件会释放注入按钮。当前切换流程由 `MakcuModeRequest` 控制，调用 API 前必须已开启 Makcu runtime；旧固件历史测试的 115200 速率不能作为当前上电速率推断。
 
-新版固件在 M UART0 默认 115200 下隔离解析 A5 与 V4 完整帧，按有效命令切换输入所有者，并清空软件位移、释放按钮。默认发送端同时只使用一路；两个进程不能同时占用串口。V4 所有者抑制 A5 日志与诊断，A5 所有者保留 Host 控制；P 维护口仍为 921600。2026-10-06 已部署双板，V4 查询 46/0、五档及阈值 13 项真串口检查通过；真实移动未验收。ASCII `version()` 返回 `km.MAKCU` 作为握手标识；仅兼容下表鼠标子集，不承诺原厂时序。
+M 端将 A5/UDP 与 Makcu 生成的标准 `MouseReport` 一并放入 M 的平滑队列，M 转发给 P 时把平滑槽数字段设为 0，避免 P 再次平滑。物理 USB 原始报告和专用 `DIAG_REPORT_INJECT_REQUEST` 原始诊断路径保持原样。2026-10-06 的串口查询和配置结果是旧固件历史记录，不代表当前源码已经刷入设备；当前源码、构建和 Host/Sender 互通夹具已验证，真机验收仍待完成。ASCII `version()` 返回 `km.MAKCU` 作为握手标识；仅兼容下表鼠标子集，不承诺原厂时序。
 
 构建默认开启 V4；可显式关闭以生成保留 A5 的双板镜像。旧 ASCII 模式与 V4 互斥：
 
@@ -233,12 +245,12 @@ ASCII 命令以 CR 或 LF 结束，命令必须带 `km.` 前缀；接收器支�
 | `phys_buttons()` | `0x55` | 查询原始物理按钮掩码，低五位对应五个鼠标按钮。 |
 | `snapshot()` / `inject_snapshot()` | `0x56` | 仅二进制查询 40 字节桥接注入状态：byte 0 是软件按钮；1..2 为 lock mask；3 为零；4..35 键盘位图全零；36 插值值；37..39 为零。 |
 | `left_mask(0|1)`…`side2_mask(0|1)`、`move_mask(l,r,d,u)`、`wheel_mask(down,up)` | `0x16`、`0x17`、`0x1A..0x1E` | 屏蔽物理鼠标输入对应字段；只过滤物理报告，不影响软件注入。参数必须是 0/1。 |
-| `interpolate()` / `interpolate(0..100|255)` | `0x1F` | 设置 P 端平滑：0/25/50/75/100% 对应 0/5/10/15/20 个 1 ms 槽。其他 0..100 整数就近选择，13/38/63/88 为向上阈值；255 保留 AUTO，其他越界值拒绝。SET、GET 与 snapshot 返回规范值。 |
+| `interpolate()` / `interpolate(0..100|255)` | `0x1F` | 设置 Makcu API 的插值规范值。由 M 的统一软件平滑队列消费，输出给 P 时槽数固定为 0；0/25/50/75/100% 对应 0/5/10/15/20 个 1 ms 槽。其他 0..100 整数就近选择，13/38/63/88 为向上阈值；255 保留 AUTO，其他越界值拒绝。SET、GET 与 snapshot 返回规范值。 |
 | `lock_ml`、`lock_mr`、`lock_mm`、`lock_ms1`、`lock_ms2`、`lock_mx`、`lock_mx+`、`lock_mx-`、`lock_my`、`lock_my+`、`lock_my-`、`lock_mw`、`lock_mw+`、`lock_mw-` | `0x60` | 查询或设置与按钮、轴向、滚轮掩码对应的 14 个物理屏蔽目标；lock 与 mask 是同一屏蔽状态，双方可查询和解除。 |
 | `click(button[,count[,hold_ms]])` | `0x61` | button 为 1..5，count 为 1..255；hold 省略/为 0 时随机 35..75 ms，否则 1..5000 ms。点击按队列顺序由 1 ms 调度任务执行。 |
 | `moveto(x,y)` / `getpos()` / `screen()` / `screen(w,h)` | `0x62` / `0x63` / `0x64` | 追踪的软件屏幕坐标；屏幕宽高为 1..32767，目标坐标超出已设置屏幕时截到边界。`moveto` 通过相对移动近似定位，不是 USB 绝对指针接口。 |
 | `silent(x,y)`、`moving()` | `0x65`、`0x66` | `silent` 以屏幕绝对目标坐标排队执行“左键按下、移动到目标、松开并返回”；`moving` 查询是否有待处理移动。坐标会夹到屏幕范围。 |
-| `baud()` / `baud(0|115200|4000000)` | `0xA4` / `0xA5` | 查询/设置 M UART0 波特率；binary baud 使用 4 字节小端 u32，0 恢复默认 115200。协议接受 115200 和 4 Mbaud；本机 4M 测试 `Failed`，4M 接口响应未验证，建议使用 115200。 |
+| `baud()` / `baud(0|115200)` | `0xA4` / `0xA5` | 查询 M UART0 当前速率；设置只接受 0 或 115200 作为 Makcu 模式下的 no-op。其他值（含 4 Mbaud、921600）明确拒绝，切换到 921600 必须通过 A5 `MakcuModeRequest`。 |
 
 二进制帧为 `DE AD LEN:u16le CMD PAYLOAD[LEN]`，`LEN` 只计 payload、不含 CMD；读取请求的响应沿用同 opcode，成功 SET 默认不返回，`INTERPOLATE(0x1F)` 返回所选比例。错误帧为 `DE AD 01 00 CMD FF`。解析器有界缓存并在声明长度内隔离 payload，避免将二进制内容误当 ASCII 命令；超长/截断输入按帧边界丢弃并超时恢复。
 
@@ -246,7 +258,7 @@ ASCII 命令以 CR 或 LF 结束，命令必须带 `km.` 前缀；接收器支�
 
 ### 旧 V3 风格 ASCII 子集（可选编译，默认关闭）
 
-`DUAL_PROXY_ENABLE_MAKCU_ASCII_API` 保留为旧实验接口，默认 OFF，并与 V4 互斥。它不是 MAKCU V4，也不应与上面的 V4 命令表混用。启用时它占用 M UART0 的 ASCII 命令口、屏蔽同端口 A5 和 ESP_LOG；现有部署没有使用此模式。旧协议实现细节可查 `firmware/main/makcu_ascii_logic.c`，其硬件验收状态未验证。
+`DUAL_PROXY_ENABLE_MAKCU_ASCII_API` 保留为旧实验接口，默认 OFF，并与 V4 互斥。它不是 MAKCU V4，也不应与上面的 V4 命令表混用。启用时它占用 M UART0 的 ASCII 命令口、屏蔽同端口 A5 和 ESP_LOG；现有部署没有使用此模式。本轮 `MakcuModeRequest` 仅由 V4 capability 提供运行时入口；V4=OFF 时即便编译了旧 ASCII parser，也不启用其 runtime，避免进入无法用 A5 命令退出的模式。V4=ON 时其内置 `km.*` ASCII 接口仍可与 V4 二进制 API 一起使用。旧协议实现细节可查 `firmware/main/makcu_ascii_logic.c`，其硬件验收状态未验证。
 
 ### UART0 实时诊断与手动注入（双板固件）
 

@@ -423,7 +423,8 @@ internal sealed class BridgeMainForm : Form
         _settingsPage = new SettingsPageControl(
             _automation,
             firmwareUpdateApi,
-            firmwareFlash);
+            firmwareFlash,
+            serialBridge);
         _tabs = new TabControl
         {
             Dock = DockStyle.Fill,

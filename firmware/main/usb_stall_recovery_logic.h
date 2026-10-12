@@ -7,7 +7,7 @@
 #define USB_STALL_HEARTBEAT_US 250000LL
 #define USB_STALL_TARGET_US 500000LL
 #define USB_STALL_WARMUP_US 10000000LL
-#define USB_STALL_COOLDOWN_US 30000000LL
+#define USB_STALL_COOLDOWN_US 5000000LL
 
 /* 只对已建立会话且标准心跳仍未完成的设备判定，不要求先产生物理输入报告。 */
 static inline bool usb_stall_evidence_ready(int64_t now, int64_t ready,

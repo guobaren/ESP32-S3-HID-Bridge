@@ -1,4 +1,5 @@
 using System.Text.Json;
+using HidBridge.Host.Input;
 
 namespace HidBridge.Host.Automation;
 
@@ -36,9 +37,12 @@ internal sealed class AutomationProfileStore
         {
             if (File.Exists(_settingsPath))
             {
-                return JsonSerializer.Deserialize<AutomationSettings>(
-                           File.ReadAllText(_settingsPath),
-                           JsonOptions) ?? new AutomationSettings();
+                AutomationSettings settings = JsonSerializer.Deserialize<AutomationSettings>(
+                    File.ReadAllText(_settingsPath),
+                    JsonOptions) ?? new AutomationSettings();
+                settings.ButtonStateMappingName = ButtonStateSharedMemory.NormalizeConfiguredMappingName(
+                    settings.ButtonStateMappingName);
+                return settings;
             }
         }
         catch (Exception exception) when (exception is IOException or JsonException)

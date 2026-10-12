@@ -1,4 +1,18 @@
 dependencies:
+  cherry-embedded/cherryusb:
+    component_hash: ec3fda70779076a4a996abc52684fcafe4c61b269b722b775562f96c042c08f6
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    version: 1.5.2~2
   espressif/esp_tinyusb:
     component_hash: 0fab24246e07bdf919c6489d17a590cffbffbbf6a9c44d6235641645c8b946b7
     dependencies:
@@ -46,7 +60,7 @@ dependencies:
     - esp32s31
     version: 0.21.0~2
   espressif/usb:
-    component_hash: 6c2cff118141dbbca181d0d27d71801fdddfc78f7ac03ae43f6e5a8cbd89cb99
+    component_hash: 99eee72ea224d9117d4c342442717a1f20bf8112e2ab5d7d7038b827874f4c92
     dependencies:
     - name: idf
       require: private
@@ -61,7 +75,7 @@ dependencies:
     - esp32p4
     - esp32h4
     - linux
-    version: 1.5.0
+    version: 1.6.0
   espressif/usb_host_hid:
     dependencies: []
     source:
@@ -73,11 +87,12 @@ dependencies:
       type: idf
     version: 6.0.2
 direct_dependencies:
+- cherry-embedded/cherryusb
 - espressif/esp_tinyusb
 - espressif/led_strip
 - espressif/usb
 - espressif/usb_host_hid
 - idf
-manifest_hash: 1f060a8dd69182776da1c99bac5028f7602ce6c1c944d2aad15cb3d9e9b16f99
+manifest_hash: 6771d71f03396dd6e37d80f3413564064994915ccd975bd490b4d058a01a5785
 target: esp32s3
 version: 3.0.0

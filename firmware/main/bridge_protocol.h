@@ -60,6 +60,8 @@ typedef enum {
     /* 一次性主动读取内存统计快照；请求空 payload，响应分页。 */
     DUAL_MESSAGE_STATS_SNAPSHOT_REQUEST = 0x1D,
     DUAL_MESSAGE_STATS_SNAPSHOT_RESPONSE = 0x1E,
+    /* M UART0：下行 0/1 订阅控制，上行物理按钮原始位与 valid 位。 */
+    DUAL_MESSAGE_BUTTON_STATE = 0x1F,
     DUAL_MESSAGE_LINK_HELLO = 0x20,
     DUAL_MESSAGE_PHYSICAL_MOUSE = 0x21,
     DUAL_MESSAGE_PHYSICAL_RELEASE = 0x22,
@@ -90,7 +92,39 @@ typedef enum {
     /* P原生USB新会话与M侧厂商请求代际同步（UART1专用）。 */
     DUAL_MESSAGE_VENDOR_SESSION_BEGIN = 0x35,
     DUAL_MESSAGE_VENDOR_SESSION_ACK = 0x36,
+    /* M UART0：显式查询/切换 Makcu runtime 模式及状态响应。 */
+    DUAL_MESSAGE_MAKCU_MODE_REQUEST = 0x37,
+    DUAL_MESSAGE_MAKCU_MODE_STATUS = 0x38,
 } dual_message_type_t;
+
+#define DUAL_BUTTON_STATE_PAYLOAD_LENGTH 1U
+#define DUAL_MAKCU_MODE_REQUEST_PAYLOAD_LENGTH 1U
+#define DUAL_MAKCU_MODE_STATUS_PAYLOAD_LENGTH 6U
+#define DUAL_MAKCU_MODE_STATUS_ENABLED_OFFSET 1U
+#define DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET 2U
+
+typedef enum {
+    DUAL_MAKCU_MODE_STATUS_OK = 0,
+    DUAL_MAKCU_MODE_STATUS_WRONG_ROLE = 1,
+    DUAL_MAKCU_MODE_STATUS_UNSUPPORTED = 2,
+    DUAL_MAKCU_MODE_STATUS_INVALID = 3,
+    DUAL_MAKCU_MODE_STATUS_TX_FAILED = 4,
+} dual_makcu_mode_status_t;
+
+typedef enum {
+    DUAL_MAKCU_MODE_OP_DISABLE = 0,
+    DUAL_MAKCU_MODE_OP_ENABLE = 1,
+    DUAL_MAKCU_MODE_OP_QUERY = 2,
+} dual_makcu_mode_opcode_t;
+
+bool dual_makcu_mode_request_decode(
+    const uint8_t *payload, uint8_t payload_length, uint8_t *opcode);
+bool dual_makcu_mode_status_encode(
+    uint8_t status, bool enabled, uint32_t baud,
+    uint8_t *payload, size_t capacity);
+bool dual_makcu_mode_status_decode(
+    const uint8_t *payload, uint8_t payload_length,
+    uint8_t *status, bool *enabled, uint32_t *baud);
 
 typedef enum {
     DUAL_DIAG_SOURCE_P_USB = 1,

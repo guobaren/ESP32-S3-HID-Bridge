@@ -24,6 +24,7 @@
 #include "usb_stall_recovery_logic.h"
 #include "dual_proxy_runtime_config.h"
 #include "uart0_control.h"
+#include "hid_host_cherryusb_backend.h"
 
 /*
  * 厂商控制传输走直连通道（每请求独立 URB + 自定超时 + 孤儿等待回调回收）还是走
@@ -137,6 +138,10 @@ typedef struct {
     bool has_report_id;
     uint8_t mouse_report_id;
     hid_mouse_report_layout_t mouse_layout;
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+    uint32_t button_state_epoch;
+#endif
+    uint32_t interface_epoch;
     bool stop;
     uint8_t data[HID_RAW_REPORT_MAX];
 } raw_report_event_t;
@@ -148,6 +153,7 @@ typedef struct {
     bool has_report_id;
     uint8_t mouse_report_id;
     uint8_t interface_number;
+    uint32_t interface_epoch;
     hid_host_device_handle_t handle;
     /* 鼠标接口的字段布局（枚举时保存）：RX 回调里用它把报告解析成位移，
      * 供"收到的位移"统计使用（2026-09-27）。 */
@@ -257,6 +263,14 @@ static size_t s_profile_serialized_length;
 static uint8_t s_profile_device_addr = UINT8_MAX;
 static volatile uint32_t s_profile_revision;
 static volatile bool s_profile_refresh_requested;
+/* CherryUSB接口回调位于这些字段的原实现声明之前。 */
+static volatile uint8_t s_wheel_byte_offset = 0xFFU;
+static volatile int64_t s_mouse_ready_us;
+static void notify_release_callback(bool device_gone);
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+static bool s_cherry_profile_complete;
+static bool s_cherry_device_cache_cleared;
+#endif
 static TaskHandle_t s_profile_task;
 static SemaphoreHandle_t s_profile_mutex;
 static SemaphoreHandle_t s_vendor_session_state_mutex;
@@ -289,6 +303,10 @@ static volatile uint32_t s_vendor_control_requests;
 static volatile uint32_t s_vendor_control_failures;
 static volatile bool s_device_present;
 static volatile bool s_mouse_present;
+static volatile bool s_report_safety_release_pending;
+static uint32_t s_interface_generation_counter;
+
+static void maybe_report_mouse_gone(void);
 
 #define HID_STATS_PERIOD_MS 5000
 
@@ -493,6 +511,10 @@ static void profile_reset_collector(void)
     s_profile_serialized_length = 0U;
     ++s_profile_revision;
     hid_device_profile_init(&s_profile_build);
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    s_cherry_profile_complete = false;
+    s_cherry_device_cache_cleared = false;
+#endif
     memset(s_interface_slots, 0, sizeof(s_interface_slots));
     if (s_control_queue != NULL) {
         queue_reset_count_dropped(s_control_queue, &s_control_queue_metrics);
@@ -645,6 +667,316 @@ static void profile_collect_interface(const hid_host_dev_params_t *params,
     }
 }
 
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+static void cherry_report_queue_overflow_release(void)
+{
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+    dual_uart0_control_button_state_invalidate();
+#endif
+    notify_release_callback(false);
+}
+
+esp_err_t dual_hid_host_backend_interface_open(
+    uint8_t interface_number,
+    uint8_t subclass,
+    uint8_t protocol,
+    const uint8_t *report_descriptor,
+    size_t report_descriptor_length,
+    uint32_t generation)
+{
+    if (report_descriptor == NULL || report_descriptor_length == 0U ||
+        report_descriptor_length > HID_PROFILE_MAX_REPORT_DESCRIPTOR) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    hid_mouse_report_layout_t layout = {0};
+    const bool mouse_interface = hid_report_find_mouse_layout(
+        report_descriptor, report_descriptor_length, &layout);
+    const bool has_report_id = report_descriptor_has_report_id(
+        report_descriptor, report_descriptor_length);
+
+    bool first_interface;
+    portENTER_CRITICAL(&s_interface_state_mux);
+    first_interface = !any_interface_active_locked();
+    hid_interface_slot_t *slot = allocate_interface_slot(interface_number);
+    if (slot == NULL) {
+        portEXIT_CRITICAL(&s_interface_state_mux);
+        return ESP_ERR_NO_MEM;
+    }
+    if (generation == 0U) {
+        generation = ++s_interface_generation_counter;
+        if (generation == 0U) {
+            generation = ++s_interface_generation_counter;
+        }
+    }
+    slot->interface_epoch = generation;
+    slot->started = true;
+    slot->mouse_interface = mouse_interface;
+    slot->has_report_id = has_report_id;
+    slot->mouse_report_id = mouse_interface ? layout.report_id : 0U;
+    slot->mouse_layout = layout;
+    __atomic_store_n(&s_device_present, true, __ATOMIC_RELEASE);
+    refresh_mouse_present_locked();
+    if (mouse_interface) {
+        __atomic_store_n(&s_mouse_ready_us, esp_timer_get_time(), __ATOMIC_RELEASE);
+        if (layout.wheel.bit_offset != HID_MOUSE_FIELD_INVALID_OFFSET) {
+            s_wheel_byte_offset = (uint8_t)(layout.wheel.bit_offset / 8U);
+        }
+    }
+    portEXIT_CRITICAL(&s_interface_state_mux);
+
+    if (first_interface && s_profile_mutex != NULL) {
+        xSemaphoreTake(s_profile_mutex, portMAX_DELAY);
+        s_cherry_device_cache_cleared = false;
+        xSemaphoreGive(s_profile_mutex);
+    }
+
+    if (mouse_interface) {
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+        dual_uart0_control_button_state_invalidate();
+#endif
+        dual_status_led_set_host_mouse_ready(true);
+    }
+    ESP_LOGI(TAG,
+             "CherryUSB HID接口已启动：interface=%u subclass=%u protocol=%u mouse=%s report_id=%s",
+             interface_number, subclass, protocol, mouse_interface ? "yes" : "no",
+             has_report_id ? "yes" : "no");
+    return ESP_OK;
+}
+
+void dual_hid_host_backend_interface_close(
+    uint8_t interface_number,
+    uint32_t generation,
+    bool device_gone)
+{
+    bool mouse_interface = false;
+    bool no_interfaces = false;
+    portENTER_CRITICAL(&s_interface_state_mux);
+    hid_interface_slot_t *slot = find_interface_slot(interface_number);
+    if (slot != NULL && slot->interface_epoch == generation) {
+        mouse_interface = slot->mouse_interface;
+        memset(slot, 0, sizeof(*slot));
+        refresh_mouse_present_locked();
+        no_interfaces = !any_interface_active_locked();
+        __atomic_store_n(&s_device_present, !no_interfaces, __ATOMIC_RELEASE);
+        if (no_interfaces) {
+            __atomic_store_n(&s_mouse_present, false, __ATOMIC_RELEASE);
+        }
+    }
+    portEXIT_CRITICAL(&s_interface_state_mux);
+
+    if (mouse_interface) {
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+        dual_uart0_control_button_state_invalidate();
+#endif
+        dual_status_led_set_host_mouse_ready(false);
+        __atomic_store_n(&s_report_safety_release_pending, true, __ATOMIC_RELEASE);
+        if (s_report_task != NULL) {
+            xTaskNotifyGive(s_report_task);
+        }
+    }
+    if (s_control_queue != NULL) {
+        queue_reset_count_dropped(s_control_queue, &s_control_queue_metrics);
+    }
+    bool clear_profile_cache = false;
+    if (s_profile_mutex != NULL) {
+        xSemaphoreTake(s_profile_mutex, portMAX_DELAY);
+        if ((device_gone || no_interfaces) && !s_cherry_device_cache_cleared) {
+            s_cherry_device_cache_cleared = true;
+            s_profile_serialized_length = 0U;
+            ++s_profile_revision;
+            s_cherry_profile_complete = false;
+            clear_profile_cache = true;
+        }
+        xSemaphoreGive(s_profile_mutex);
+        if (clear_profile_cache) {
+            dual_uart1_cancel_profile();
+        }
+    }
+    if (device_gone && no_interfaces && s_mouse_gone_pending_us == 0) {
+        s_mouse_gone_pending_us = esp_timer_get_time();
+    }
+    ESP_LOGW(TAG, "CherryUSB HID接口已注销：interface=%u mouse=%s gone=%s",
+             interface_number, mouse_interface ? "yes" : "no",
+             (device_gone && no_interfaces) ? "yes" : "no");
+}
+
+static bool cherry_build_report_event(
+    raw_report_event_t *event,
+    uint8_t interface_number,
+    uint32_t generation,
+    const uint8_t *report,
+    size_t report_length,
+    bool from_isr)
+{
+    if (event == NULL || report == NULL || report_length == 0U ||
+        report_length > HID_RAW_REPORT_MAX || report_length > UINT8_MAX) {
+        return false;
+    }
+    bool found = false;
+    if (from_isr) {
+        portENTER_CRITICAL_ISR(&s_interface_state_mux);
+    } else {
+        portENTER_CRITICAL(&s_interface_state_mux);
+    }
+    hid_interface_slot_t *slot = find_interface_slot(interface_number);
+    if (slot != NULL && slot->started && slot->interface_epoch == generation) {
+        event->interface_number = interface_number;
+        event->interface_epoch = generation;
+        event->length = (uint8_t)report_length;
+        event->mouse_report = slot->mouse_interface;
+        event->has_report_id = slot->has_report_id;
+        event->mouse_report_id = slot->mouse_report_id;
+        event->mouse_layout = slot->mouse_layout;
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+        if (slot->mouse_interface) {
+            event->button_state_epoch = from_isr
+                ? dual_uart0_control_button_state_capture_epoch_isr()
+                : dual_uart0_control_button_state_capture_epoch();
+        }
+#endif
+        memcpy(event->data, report, report_length);
+        found = true;
+    }
+    if (from_isr) {
+        portEXIT_CRITICAL_ISR(&s_interface_state_mux);
+    } else {
+        portEXIT_CRITICAL(&s_interface_state_mux);
+    }
+    return found;
+}
+
+bool dual_hid_host_backend_enqueue_report_from_isr(
+    uint8_t interface_number,
+    uint32_t generation,
+    const uint8_t *report,
+    size_t report_length,
+    BaseType_t *higher_priority_task_woken)
+{
+    raw_report_event_t event = {0};
+    if (higher_priority_task_woken != NULL) {
+        *higher_priority_task_woken = pdFALSE;
+    }
+    queue_metric_increment(&s_report_queue_metrics.received);
+    if (stopping_requested() || s_report_queue == NULL ||
+        !cherry_build_report_event(&event, interface_number, generation,
+                                   report, report_length, true) ||
+        xQueueSendFromISR(s_report_queue, &event,
+                          higher_priority_task_woken) != pdTRUE) {
+        queue_metric_increment(&s_report_queue_metrics.dropped);
+        __atomic_add_fetch(&s_errors, 1U, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_report_safety_release_pending, true, __ATOMIC_RELEASE);
+        if (s_report_task != NULL) {
+            BaseType_t notify_woken = pdFALSE;
+            vTaskNotifyGiveFromISR(s_report_task, &notify_woken);
+            if (higher_priority_task_woken != NULL && notify_woken == pdTRUE) {
+                *higher_priority_task_woken = pdTRUE;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+bool dual_hid_host_backend_enqueue_report(
+    uint8_t interface_number,
+    uint32_t generation,
+    const uint8_t *report,
+    size_t report_length,
+    bool injected)
+{
+    raw_report_event_t event = {0};
+    queue_metric_increment(&s_report_queue_metrics.received);
+    if (stopping_requested() || s_report_queue == NULL ||
+        !cherry_build_report_event(&event, interface_number, generation,
+                                   report, report_length, false)) {
+        queue_metric_increment(&s_report_queue_metrics.rejected);
+        return false;
+    }
+    event.injected = injected;
+    if (xQueueSend(s_report_queue, &event, 0) != pdTRUE) {
+        queue_metric_increment(&s_report_queue_metrics.dropped);
+        __atomic_add_fetch(&s_errors, 1U, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_report_safety_release_pending, true, __ATOMIC_RELEASE);
+        if (s_report_task != NULL) {
+            xTaskNotifyGive(s_report_task);
+        }
+        return false;
+    }
+    queue_metric_observe_depth(&s_report_queue_metrics, s_report_queue);
+    return true;
+}
+
+void dual_hid_host_backend_request_safety_release(void)
+{
+    __atomic_store_n(&s_report_safety_release_pending, true, __ATOMIC_RELEASE);
+    if (s_report_task != NULL) {
+        xTaskNotifyGive(s_report_task);
+    }
+}
+
+void dual_hid_host_backend_request_safety_release_from_isr(
+    BaseType_t *higher_priority_task_woken)
+{
+    __atomic_store_n(&s_report_safety_release_pending, true, __ATOMIC_RELEASE);
+    if (s_report_task != NULL) {
+        BaseType_t local_woken = pdFALSE;
+        vTaskNotifyGiveFromISR(s_report_task,
+            higher_priority_task_woken != NULL ? higher_priority_task_woken
+                                               : &local_woken);
+    }
+}
+
+esp_err_t dual_hid_host_backend_publish_profile(
+    uint8_t device_address,
+    const hid_device_profile_t *profile,
+    uint8_t expected_hid_interfaces,
+    uint8_t collected_hid_interfaces)
+{
+    if (profile == NULL || device_address == UINT8_MAX ||
+        expected_hid_interfaces == 0U ||
+        expected_hid_interfaces > HID_PROFILE_MAX_REPORT_DESCRIPTORS ||
+        collected_hid_interfaces != expected_hid_interfaces ||
+        profile->report_descriptor_count != expected_hid_interfaces ||
+        profile->device_descriptor.length != 18U ||
+        profile->config_descriptor.length < 9U ||
+        profile->config_descriptor.length > HID_PROFILE_MAX_CONFIG_DESCRIPTOR ||
+        (uint16_t)(profile->config_descriptor.data[2] |
+            ((uint16_t)profile->config_descriptor.data[3] << 8U)) !=
+            profile->config_descriptor.length ||
+        (profile->flags & HID_PROFILE_FLAG_PARTIAL) != 0U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    for (uint8_t index = 0; index < expected_hid_interfaces; ++index) {
+        if (profile->report_descriptors[index].length == 0U ||
+            profile->report_descriptors[index].length >
+                HID_PROFILE_MAX_REPORT_DESCRIPTOR) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+    }
+
+    if (s_profile_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_profile_mutex, portMAX_DELAY);
+    s_profile_build = *profile;
+    s_profile_device_addr = device_address;
+    s_cherry_profile_complete = true;
+    s_cherry_device_cache_cleared = false;
+    ++s_profile_revision;
+    xSemaphoreGive(s_profile_mutex);
+    if (s_profile_task != NULL) {
+        xTaskNotifyGive(s_profile_task);
+    }
+    return ESP_OK;
+}
+
+void dual_hid_host_backend_service_disconnect(void)
+{
+    maybe_report_mouse_gone();
+}
+#endif
+
 static void profile_publish_task(void *argument)
 {
     (void)argument;
@@ -659,10 +991,21 @@ static void profile_publish_task(void *argument)
             const uint8_t refresh_addr = s_profile_device_addr;
             xSemaphoreGive(s_profile_mutex);
             if (refresh_addr != UINT8_MAX) {
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+                const esp_err_t refresh_result =
+                    dual_hid_host_cherryusb_refresh_profile();
+                if (refresh_result != ESP_OK) {
+                    ++s_errors;
+                    ESP_LOGE(TAG, "CherryUSB Profile刷新失败：%s",
+                             esp_err_to_name(refresh_result));
+                    continue;
+                }
+#else
                 if (!profile_collect_raw_usb_descriptors(refresh_addr)) {
                     ESP_LOGE(TAG, "按电脑侧申请重新读取原始 USB 信息失败");
                     continue;
                 }
+#endif
             } else {
                 dual_status_led_set_flow_error(true);
                 continue;
@@ -681,6 +1024,13 @@ static void profile_publish_task(void *argument)
             xSemaphoreGive(s_profile_mutex);
             continue;
         }
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+        if (!s_cherry_profile_complete) {
+            xSemaphoreGive(s_profile_mutex);
+            ESP_LOGW(TAG, "CherryUSB复合HID接口快照未完整，暂不发布Profile");
+            continue;
+        }
+#endif
         s_profile_snapshot = s_profile_build;
         const uint8_t device_addr = s_profile_device_addr;
         xSemaphoreGive(s_profile_mutex);
@@ -800,6 +1150,11 @@ uint8_t dual_hid_host_makcu_physical_buttons(void)
 
 static void notify_release_callback(bool device_gone)
 {
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+    if (device_gone) {
+        dual_uart0_control_button_state_invalidate();
+    }
+#endif
 #if DUAL_PROXY_ENABLE_MAKCU_ASCII_API || DUAL_PROXY_ENABLE_MAKCU_V4_API
     __atomic_store_n(&s_makcu_physical_buttons, 0U, __ATOMIC_RELEASE);
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
@@ -811,8 +1166,6 @@ static void notify_release_callback(bool device_gone)
         s_release_callback(device_gone);
     }
 }
-/* 滚轮字节偏移（相对报表正文，不含 report ID）；0xFF 表示未知。 */
-static volatile uint8_t s_wheel_byte_offset = 0xFFU;
 static volatile uint32_t s_wheel_reports;
 /* 控制传输重试与异常记录。 */
 #define VENDOR_CONTROL_RETRIES 2U
@@ -860,8 +1213,6 @@ static volatile bool s_injected_report_pending;
 static volatile int64_t s_last_ctrl_ok_us;     /* 最近一次控制传输成功 */
 static volatile int64_t s_last_ctrl_fail_us;   /* 最近一次控制传输失败 */
 static volatile int64_t s_stall_recovery_us;   /* 最近一次因数据冻结触发的恢复 */
-/* 鼠标接口就绪时刻：用于判定枚举后的预热期。 */
-static volatile int64_t s_mouse_ready_us;
 static volatile uint32_t s_vendor_session_epoch;
 static volatile uint32_t s_vendor_session_peer_generation;
 static volatile int64_t s_vendor_session_first_request_us;
@@ -897,6 +1248,108 @@ static bool vendor_control_event_lock_if_current(const hid_control_event_t *even
     }
     return true;
 }
+
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+static void cherry_process_control_event(const hid_control_event_t *request)
+{
+    uint8_t response[DUAL_VENDOR_CONTROL_MAX_DATA] = {0};
+    uint8_t set_data[DUAL_HID_CONTROL_MAX_DATA + 1U] = {0};
+    size_t response_length = 0U;
+    size_t request_length = 0U;
+    uint8_t *data = response;
+    size_t data_capacity = sizeof(response);
+
+    if (request->vendor_control) {
+        const bool is_in = (request->bm_request_type & 0x80U) != 0U;
+        if (is_in) {
+            request_length = request->w_length;
+        } else {
+            request_length = request->length;
+            data = (uint8_t *)request->data;
+            data_capacity = request->length;
+        }
+    } else if (!request->get_report) {
+        request_length = request->length;
+        if (request->report_id != 0U) {
+            if (request_length + 1U > sizeof(set_data)) {
+                ++s_vendor_control_failures;
+                return;
+            }
+            set_data[0] = request->report_id;
+            memcpy(&set_data[1], request->data, request->length);
+            ++request_length;
+        } else if (request_length != 0U) {
+            memcpy(set_data, request->data, request->length);
+        }
+        data = set_data;
+        data_capacity = sizeof(set_data);
+    } else {
+        request_length = request->requested_length;
+        if (request->report_id != 0U && request_length < sizeof(response)) {
+            ++request_length;
+        }
+    }
+
+    const esp_err_t result = dual_hid_host_cherryusb_control(
+        request->get_report,
+        request->vendor_control,
+        request->interface_number,
+        request->report_id,
+        request->report_type,
+        request->bm_request_type,
+        request->b_request,
+        request->w_value,
+        request->w_index,
+        request->vendor_control ? request->w_length : (uint16_t)request_length,
+        request->vendor_control ? VENDOR_URB_TIMEOUT_MS : HID_GET_REPORT_TIMEOUT_MS,
+        data,
+        data_capacity,
+        &response_length);
+
+    if (result == ESP_OK) {
+        s_ctrl_fail_streak = 0U;
+        __atomic_store_n(&s_last_ctrl_ok_us, esp_timer_get_time(), __ATOMIC_RELEASE);
+    } else {
+        ++s_vendor_control_failures;
+        __atomic_store_n(&s_last_ctrl_fail_us, esp_timer_get_time(), __ATOMIC_RELEASE);
+    }
+
+    const uint8_t status = result == ESP_OK
+        ? DUAL_HID_REPORT_STATUS_OK
+        : (result == ESP_ERR_TIMEOUT ? DUAL_HID_REPORT_STATUS_TIMEOUT
+                                     : DUAL_HID_REPORT_STATUS_UNSUPPORTED);
+    if (request->get_report && status == DUAL_HID_REPORT_STATUS_OK &&
+        request->report_id != 0U && response_length != 0U &&
+        response[0] == request->report_id) {
+        memmove(response, response + 1U, response_length - 1U);
+        --response_length;
+    }
+    ESP_LOGI(TAG, "CherryUSB控制请求：vendor=%u get=%u interface=%u id=%02X "
+             "type=%u len=%u index=%04X result=%s",
+             request->vendor_control ? 1U : 0U, request->get_report ? 1U : 0U,
+             request->interface_number, request->report_id, request->report_type,
+             (unsigned)request_length, request->vendor_control ? request->w_index
+                 : request->interface_number, esp_err_to_name(result));
+
+    if (request->vendor_control) {
+        if (vendor_control_event_lock_if_current(request)) {
+            const bool send_data = status == DUAL_HID_REPORT_STATUS_OK &&
+                (request->bm_request_type & 0x80U) != 0U;
+            (void)dual_uart1_send_vendor_control_response(
+                request->transaction_id, status,
+                send_data ? response : NULL, send_data ? response_length : 0U);
+            xSemaphoreGive(s_vendor_session_state_mutex);
+        }
+    } else if (request->get_report && vendor_control_event_lock_if_current(request)) {
+        (void)dual_uart1_send_hid_get_response(
+            request->transaction_id, status, request->interface_number,
+            request->report_id,
+            status == DUAL_HID_REPORT_STATUS_OK ? response : NULL,
+            status == DUAL_HID_REPORT_STATUS_OK ? response_length : 0U);
+        xSemaphoreGive(s_vendor_session_state_mutex);
+    }
+}
+#endif
 
 static int64_t vendor_session_note_first_request(uint32_t epoch)
 {
@@ -945,7 +1398,19 @@ static void raw_report_task(void *argument)
     (void)argument;
     raw_report_event_t event;
     while (true) {
-        if (xQueueReceive(s_report_queue, &event, portMAX_DELAY) != pdTRUE) {
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+        if (__atomic_exchange_n(&s_report_safety_release_pending, false,
+                                __ATOMIC_ACQ_REL)) {
+            cherry_report_queue_overflow_release();
+        }
+#endif
+        if (xQueueReceive(s_report_queue, &event,
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+                          pdMS_TO_TICKS(100)
+#else
+                          portMAX_DELAY
+#endif
+                          ) != pdTRUE) {
             continue;
         }
         if (event.stop) {
@@ -954,6 +1419,25 @@ static void raw_report_task(void *argument)
         if (stopping_requested()) {
             continue;
         }
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+        if (__atomic_exchange_n(&s_report_safety_release_pending, false,
+                                __ATOMIC_ACQ_REL)) {
+            cherry_report_queue_overflow_release();
+        }
+        if (event.interface_epoch != 0U) {
+            bool current = false;
+            portENTER_CRITICAL(&s_interface_state_mux);
+            hid_interface_slot_t *current_slot =
+                find_interface_slot(event.interface_number);
+            current = current_slot != NULL && current_slot->started &&
+                current_slot->interface_epoch == event.interface_epoch;
+            portEXIT_CRITICAL(&s_interface_state_mux);
+            if (!current) {
+                queue_metric_increment(&s_report_queue_metrics.dropped);
+                continue;
+            }
+        }
+#endif
         dual_diag_stream_record(DUAL_DIAG_SOURCE_M_USB,
                                 DUAL_DIAG_KIND_M_RAW_HID_INPUT,
                                 event.data, event.length);
@@ -970,20 +1454,39 @@ static void raw_report_task(void *argument)
                 int32_t axis_x = 0, axis_y = 0, axis_wheel = 0, axis_pan = 0;
                 if (axis_length != event.mouse_layout.report_bytes) {
                     __atomic_add_fetch(&s_motion_rx_bad_length, 1U, __ATOMIC_RELAXED);
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+                    if (!event.injected) {
+                        /* 畸形物理报告也必须让旧按钮快照失效，不能继续续期卡键状态。 */
+                        dual_uart0_control_button_state_invalidate_for_epoch(
+                            event.button_state_epoch);
+                    }
+#endif
                 } else {
-#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API || DUAL_PROXY_ENABLE_MAKCU_V4_API
+#if DUAL_PROXY_ENABLE_BUTTON_STATE || DUAL_PROXY_ENABLE_MAKCU_ASCII_API || DUAL_PROXY_ENABLE_MAKCU_V4_API
                     uint8_t physical_buttons = 0U;
-                    if (hid_mouse_report_read_buttons(
-                            axis_report, axis_length, &event.mouse_layout,
-                            &physical_buttons)) {
+                    const bool buttons_valid = hid_mouse_report_read_buttons(
+                        axis_report, axis_length, &event.mouse_layout,
+                        &physical_buttons);
+                    if (buttons_valid && !event.injected) {
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+                        dual_uart0_control_button_state_update(
+                            physical_buttons, event.button_state_epoch);
+#endif
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API || DUAL_PROXY_ENABLE_MAKCU_V4_API
                         __atomic_store_n(&s_makcu_physical_buttons,
                                          physical_buttons, __ATOMIC_RELEASE);
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
-                        if (!event.injected) {
-                            dual_uart0_control_v4_physical_buttons(physical_buttons);
-                        }
+                        dual_uart0_control_v4_physical_buttons(physical_buttons);
+#endif
 #endif
                     }
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+                    else if (!event.injected) {
+                        /* 无法解析按钮字段时，不能继续把旧快照当作已知状态。 */
+                        dual_uart0_control_button_state_invalidate_for_epoch(
+                            event.button_state_epoch);
+                    }
+#endif
 #endif
                     if (hid_mouse_report_read_axes(axis_report, axis_length,
                                                    &event.mouse_layout, &axis_x, &axis_y,
@@ -1130,6 +1633,10 @@ static void hid_control_task(void *argument)
         (void)vendor_session_note_first_request(request.vendor_session_epoch);
         /* G HUB 的初始化是成组 SET/GET，期间移动报文让路。 */
         host_vendor_note_request();
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+        cherry_process_control_event(&request);
+        continue;
+#endif
         if (request.vendor_control) {
             /*
              * 设备级 Vendor 控制请求：与具体 HID 接口无关（wIndex 由主机任意指定），
@@ -1497,9 +2004,11 @@ void dual_hid_host_collect_stats(dual_stats_snapshot_t *snapshot)
     int64_t urb_latency_max_us = 0;
     uint32_t urb_over_10ms = 0U;
     uint32_t urb_over_100ms = 0U;
+#if !CONFIG_DUAL_PROXY_USE_CHERRYUSB
     dual_vendor_urb_stats(&urb_submitted, &urb_completed, &urb_timeouts,
                           &urb_aborted, &urb_reopens, &urb_retries,
                           &urb_latency_max_us, &urb_over_10ms, &urb_over_100ms);
+#endif
     dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_URB_SUB, urb_submitted);
     dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_URB_OK, urb_completed);
     dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_URB_TO, urb_timeouts);
@@ -1611,21 +2120,37 @@ static void hid_interface_callback(
         }
         raw_report_event_t queued = {
             .interface_number = slot->interface_number,
+            .interface_epoch = slot->interface_epoch,
             .length = (uint8_t)length,
             .mouse_report = slot->mouse_interface,
             .injected = injected,
             .has_report_id = slot->has_report_id,
             .mouse_report_id = slot->mouse_report_id,
             .mouse_layout = slot->mouse_layout,
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+            .button_state_epoch = slot->mouse_interface && !injected
+                ? dual_uart0_control_button_state_capture_epoch() : 0U,
+#endif
         };
         memcpy(queued.data, data, length);
         if (s_report_queue == NULL) {
             queue_metric_increment(&s_report_queue_metrics.rejected);
             ++s_errors;
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+            if (slot->mouse_interface && !injected) {
+                dual_uart0_control_button_state_invalidate();
+            }
+#endif
             notify_release_callback(false);
         } else if (xQueueSend(s_report_queue, &queued, 0) != pdTRUE) {
             queue_metric_increment(&s_report_queue_metrics.dropped);
             ++s_errors;
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+            if (slot->mouse_interface && !injected) {
+                /* 丢失物理报告后先报告未知，下一份实物报告会建立新快照。 */
+                dual_uart0_control_button_state_invalidate();
+            }
+#endif
             notify_release_callback(false);
         } else {
             queue_metric_observe_depth(&s_report_queue_metrics, s_report_queue);
@@ -1655,6 +2180,10 @@ static void hid_interface_callback(
         portEXIT_CRITICAL(&s_interface_state_mux);
 
         if (mouse_interface) {
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+            /* The snapshot becomes unknown at interface disconnect, without the USB debounce. */
+            dual_uart0_control_button_state_invalidate();
+#endif
             ESP_LOGW(TAG, "鼠标 HID 接口断开：interface=%u", params.iface_num);
             dual_status_led_set_host_mouse_ready(false);
         } else {
@@ -2100,6 +2629,10 @@ static void hid_event_task(void *argument)
                 continue;
             }
             if (started_mouse_interface) {
+#if DUAL_PROXY_ENABLE_BUTTON_STATE
+                /* A new physical connection stays invalid until its first real report. */
+                dual_uart0_control_button_state_invalidate();
+#endif
                 dual_status_led_set_host_mouse_ready(true);
                 ESP_LOGI(TAG,
                          "动态鼠标输入已启动：interface=%u report_id=%u bytes=%u",
@@ -2420,6 +2953,9 @@ static void delete_runtime_storage(void)
     s_errors = 0;
     s_profile_revision = 0;
     s_profile_refresh_requested = false;
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    s_cherry_profile_complete = false;
+#endif
     s_vendor_reports = 0;
     s_vendor_input_failures = 0;
     s_vendor_control_requests = 0;
@@ -2430,6 +2966,7 @@ static void delete_runtime_storage(void)
     s_logged_device_addr = UINT8_MAX;
     __atomic_store_n(&s_device_present, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_mouse_present, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_report_safety_release_pending, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_stopping, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_host_lib_stop_requested, false, __ATOMIC_RELEASE);
 }
@@ -2442,6 +2979,13 @@ static esp_err_t dual_hid_host_stop_internal(void)
     if (result != ESP_OK) {
         return result;
     }
+
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    result = dual_hid_host_cherryusb_stop();
+    if (result != ESP_OK) {
+        return result;
+    }
+#endif
 
     result = wait_for_host_install_result(HID_HOST_STOP_TIMEOUT_MS);
     if (result != ESP_OK) {
@@ -2593,12 +3137,17 @@ esp_err_t dual_hid_host_start(
     __atomic_store_n(&s_vendor_session_first_request_us, 0, __ATOMIC_RELEASE);
     s_profile_revision = 0;
     s_profile_refresh_requested = false;
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    s_cherry_profile_complete = false;
+#endif
     s_vendor_reports = 0;
     s_vendor_input_failures = 0;
     s_vendor_control_requests = 0;
     s_vendor_control_failures = 0;
     __atomic_store_n(&s_device_present, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_mouse_present, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_report_safety_release_pending, false, __ATOMIC_RELEASE);
+    s_interface_generation_counter = 0U;
     memset(s_interface_slots, 0, sizeof(s_interface_slots));
     profile_reset_collector();
     s_hid_event_queue = xQueueCreate(HID_EVENT_QUEUE_LENGTH, sizeof(hid_event_t));
@@ -2607,6 +3156,35 @@ esp_err_t dual_hid_host_start(
     if (s_hid_event_queue == NULL || s_report_queue == NULL || s_control_queue == NULL) {
         goto no_memory;
     }
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    if (xTaskCreate(profile_publish_task, "hid_profile_publish", 4096, NULL, 6,
+                    &s_profile_task) != pdPASS) {
+        goto no_memory;
+    }
+    s_worker_task_mask |= TASK_EXIT_PROFILE;
+    if (xTaskCreate(raw_report_task, "hid_raw_reports", 3072, NULL, 4,
+                    &s_report_task) != pdPASS) {
+        goto no_memory;
+    }
+    s_worker_task_mask |= TASK_EXIT_REPORT;
+    if (xTaskCreate(hid_control_task, "hid_control_worker", HID_CONTROL_TASK_STACK,
+                    NULL, 7, &s_control_task) != pdPASS) {
+        goto no_memory;
+    }
+    s_worker_task_mask |= TASK_EXIT_CONTROL;
+    if (xTaskCreate(hid_stats_task, "hid_host_stats", 3072, NULL, 2,
+                    &s_stats_task) != pdPASS) {
+        goto no_memory;
+    }
+    s_worker_task_mask |= TASK_EXIT_STATS;
+    result = dual_hid_host_cherryusb_start();
+    if (result != ESP_OK) {
+        goto startup_failed_with_error;
+    }
+    ESP_LOGI(TAG, "CherryUSB HID Host已启动；保留Report Protocol并等待完整HID Profile");
+    release_lifecycle_lock();
+    return ESP_OK;
+#else
     if (xTaskCreate(usb_host_library_task, "usb_host_events", 4096,
                    xTaskGetCurrentTaskHandle(), 4, &s_usb_host_task) != pdPASS) {
         goto no_memory;
@@ -2702,6 +3280,7 @@ esp_err_t dual_hid_host_start(
     ESP_LOGI(TAG, "USB Host探测栈已启动；支持protocol=2标准鼠标接口，等待应用确认角色");
     release_lifecycle_lock();
     return ESP_OK;
+#endif
 
 no_memory:
     result = ESP_ERR_NO_MEM;
@@ -2952,6 +3531,15 @@ esp_err_t dual_hid_host_vendor_selftest(
     size_t out_capacity,
     size_t *out_length)
 {
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    if (out_length == NULL || (out_data == NULL && out_capacity != 0U)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_length = 0U;
+    return dual_hid_host_cherryusb_control(
+        false, true, 0U, 0U, 0U, bm_request_type, b_request, w_value,
+        w_index, w_length, timeout_ms, out_data, out_capacity, out_length);
+#else
     hid_host_device_handle_t handle = NULL;
     portENTER_CRITICAL(&s_interface_state_mux);
     for (size_t index = 0; index < HID_INTERFACE_SLOT_COUNT; ++index) {
@@ -2972,6 +3560,7 @@ esp_err_t dual_hid_host_vendor_selftest(
     return dual_vendor_urb_control(params.addr, bm_request_type, b_request,
                                    w_value, w_index, NULL, w_length, timeout_ms,
                                    out_data, out_capacity, out_length);
+#endif
 }
 
 /*
@@ -2985,6 +3574,50 @@ bool dual_hid_host_inject_report(const uint8_t *raw_report, size_t length)
     if (raw_report == NULL || length == 0U || length > sizeof(s_injected_report)) {
         return false;
     }
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    uint8_t interface_number = 0U;
+    uint32_t generation = 0U;
+    bool has_report_id = false;
+    uint8_t report_id = 0U;
+    size_t body_length = 0U;
+    portENTER_CRITICAL(&s_interface_state_mux);
+    for (size_t index = 0; index < HID_INTERFACE_SLOT_COUNT; ++index) {
+        const hid_interface_slot_t *slot = &s_interface_slots[index];
+        if (slot->active && slot->started && slot->mouse_interface) {
+            interface_number = slot->interface_number;
+            generation = slot->interface_epoch;
+            has_report_id = slot->has_report_id;
+            report_id = slot->mouse_report_id;
+            body_length = slot->mouse_layout.report_bytes;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_interface_state_mux);
+    if (generation == 0U || body_length == 0U) {
+        return false;
+    }
+    if (has_report_id && length == body_length) {
+        if (length + 1U > sizeof(s_injected_report)) {
+            return false;
+        }
+        s_injected_report[0] = report_id;
+        memcpy(&s_injected_report[1], raw_report, length);
+        s_injected_report_length = length + 1U;
+    } else {
+        memcpy(s_injected_report, raw_report, length);
+        s_injected_report_length = length;
+    }
+    raw_report_event_t event = {0};
+    if (!cherry_build_report_event(&event, interface_number, generation,
+                                   s_injected_report, s_injected_report_length,
+                                   false)) {
+        return false;
+    }
+    event.injected = true;
+    return dual_hid_host_backend_enqueue_report(
+        interface_number, generation, s_injected_report, s_injected_report_length,
+        true);
+#else
     hid_host_device_handle_t handle = NULL;
     portENTER_CRITICAL(&s_interface_state_mux);
     for (size_t index = 0; index < HID_INTERFACE_SLOT_COUNT; ++index) {
@@ -3034,4 +3667,5 @@ bool dual_hid_host_inject_report(const uint8_t *raw_report, size_t length)
     __atomic_store_n(&s_injected_report_pending, true, __ATOMIC_RELEASE);
     hid_interface_callback(handle, HID_HOST_INTERFACE_EVENT_INPUT_REPORT, NULL);
     return true;
+#endif
 }

@@ -2,15 +2,23 @@ using System.Diagnostics;
 using System.IO.Ports;
 using System.Buffers.Binary;
 using System.Text;
+using HidBridge.Host.Automation;
+using HidBridge.Host.Input;
 using HidBridge.Protocol;
 
 namespace HidBridge.Host.Transport;
 
 internal sealed record SerialPortRefreshSnapshot(string[] AvailablePorts, string[] OpenPorts);
 
-internal sealed class SerialBridge : IBridgeTransport
+internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
 {
+    private readonly record struct OutboundFrame(byte[] Bytes, long Epoch);
+
+    private const int A5BaudRate = MakcuModeCoordinator.A5BaudRate;
+    private const int MakcuBaudRate = MakcuModeCoordinator.MakcuBaudRate;
     private const int MaxOutboundFrames = 32;
+    private const int ModeResponseTimeoutMilliseconds = 1200;
+    private const int TraceStopTimeoutMilliseconds = 2000;
     private static readonly string[] ReducedLogMarkers =
     [
         "BLE connection parameters",
@@ -31,6 +39,7 @@ internal sealed class SerialBridge : IBridgeTransport
     ];
 
     private readonly BridgeOptions _options;
+    private readonly AutomationSettings _settings;
     private readonly RuntimeLogSettings _logSettings;
     private readonly Func<bool> _legacyFirmwareCompatibility;
     private readonly FrameCodec _codec = new();
@@ -39,13 +48,27 @@ internal sealed class SerialBridge : IBridgeTransport
     private readonly object _writeSync = new();
     private readonly SemaphoreSlim _statsQueryGate = new(1, 1);
     private readonly DeviceStatsPendingRequestRegistry _statsRequests = new();
-    private readonly Queue<byte[]> _outboundFrames = [];
+    private readonly Queue<OutboundFrame> _outboundFrames = [];
+    private readonly ButtonStateSharedMemory _buttonStatePublisher;
+    private readonly System.Threading.Timer _buttonStateRetryTimer;
+    private readonly MakcuModeCoordinator _makcuModeCoordinator;
     private readonly AutoResetEvent _outboundSignal = new(false);
     private readonly Thread _writerThread;
     private readonly System.Threading.Timer _heartbeatTimer;
     private SerialPort? _port;
     private string? _connectedPortName;
     private bool _connectedLegacyCompatibility;
+    private int _connectedBaudRate = A5BaudRate;
+    private int _makcuModeEnabled;
+    private int _modeTransitioning;
+    private long _routingEpoch;
+    private long _connectionEpoch;
+    private bool _buttonSubscriptionRequested;
+    private bool _buttonSubscriptionHealthy;
+    private bool _buttonStatePublishPending;
+    private byte _physicalButtons;
+    private bool _physicalMouseValid;
+    private long _physicalButtonStateTimestampQpc;
     private int _heartbeatActive;
     private DateTime _nextConnectAttemptUtc;
     private bool _sessionStarted;
@@ -74,11 +97,22 @@ internal sealed class SerialBridge : IBridgeTransport
     public SerialBridge(
         BridgeOptions options,
         RuntimeLogSettings logSettings,
-        Func<bool>? legacyFirmwareCompatibility = null)
+        Func<bool>? legacyFirmwareCompatibility = null,
+        AutomationSettings? settings = null)
     {
         _options = options;
+        _settings = settings ?? new AutomationSettings();
         _logSettings = logSettings;
         _legacyFirmwareCompatibility = legacyFirmwareCompatibility ?? (() => false);
+        _settings.ButtonStateMappingName = ButtonStateSharedMemory.NormalizeConfiguredMappingName(
+            _settings.ButtonStateMappingName);
+        _buttonStatePublisher = new ButtonStateSharedMemory(_settings.ButtonStateMappingName);
+        _buttonStateRetryTimer = new System.Threading.Timer(
+            _ => RetryButtonStatePublish(),
+            null,
+            Timeout.Infinite,
+            Timeout.Infinite);
+        _makcuModeCoordinator = new MakcuModeCoordinator(this);
         _batchStatisticsStartTimestamp = Stopwatch.GetTimestamp();
         _nextBatchStatisticsTimestamp = _batchStatisticsStartTimestamp + Stopwatch.Frequency;
         _writerThread = new Thread(WriterLoop)
@@ -120,7 +154,7 @@ internal sealed class SerialBridge : IBridgeTransport
     {
         lock (_sync)
         {
-            if (_disposed || _exclusivePortLeaseActive || !EnsureConnected())
+            if (_disposed || _exclusivePortLeaseActive || IsInputWriteGated || !EnsureConnected())
             {
                 return;
             }
@@ -146,6 +180,12 @@ internal sealed class SerialBridge : IBridgeTransport
         TimeSpan timeout,
         CancellationToken cancellationToken = default)
     {
+        if (Volatile.Read(ref _makcuModeEnabled) != 0 ||
+            Volatile.Read(ref _modeTransitioning) != 0)
+        {
+            throw new InvalidOperationException(
+                "M 板当前处于 Makcu 模式或正在切换；UART0 统计响应仅支持 A5 模式，请先关闭 Makcu。");
+        }
         if (timeout <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(timeout));
@@ -265,6 +305,452 @@ internal sealed class SerialBridge : IBridgeTransport
         }
     }
 
+    internal async Task<MakcuModeChangeResult> SetMakcuModeAsync(
+        bool enabled,
+        CancellationToken cancellationToken = default)
+    {
+        if (_settings.LegacySingleBoardFirmwareCompatibility)
+        {
+            return new MakcuModeChangeResult(
+                false,
+                Volatile.Read(ref _makcuModeEnabled) != 0,
+                Volatile.Read(ref _makcuModeEnabled) != 0 ? MakcuBaudRate : A5BaudRate,
+                "旧版单板通路与双板 Makcu 模式不能同时启用。");
+        }
+
+        bool connected = await WaitForConnectionAsync(
+            TimeSpan.FromSeconds(5),
+            cancellationToken).ConfigureAwait(false);
+        if (!connected)
+        {
+            return new MakcuModeChangeResult(
+                false,
+                Volatile.Read(ref _makcuModeEnabled) != 0,
+                Volatile.Read(ref _connectedBaudRate),
+                "尚未验证 M 板角色，无法切换 Makcu 模式。");
+        }
+
+        bool currentEnabled = Volatile.Read(ref _makcuModeEnabled) != 0;
+        int currentBaud = Volatile.Read(ref _connectedBaudRate);
+        return await Task.Run(
+            () => _makcuModeCoordinator.SetEnabledAsync(
+                enabled,
+                currentEnabled,
+                currentBaud,
+                compiledCapabilityAvailable: true,
+                cancellationToken: cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<bool> SetButtonStatePublishingEnabledAsync(
+        bool enabled,
+        CancellationToken cancellationToken = default)
+    {
+        return await Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (_sync)
+            {
+                _settings.ButtonStatePublishingEnabled = enabled;
+                bool available = !_disposed && !_exclusivePortLeaseActive &&
+                    !IsInputWriteGated && !_connectedLegacyCompatibility &&
+                    _port?.IsOpen == true;
+                bool sent = true;
+                if (available)
+                {
+                    sent = WriteButtonSubscriptionLocked(enabled);
+                }
+                _buttonSubscriptionRequested = enabled && available && sent;
+                _buttonSubscriptionHealthy = false;
+                _physicalButtons = 0;
+                _physicalMouseValid = false;
+                _physicalButtonStateTimestampQpc = 0;
+                PublishButtonStateLocked(_port?.IsOpen == true && !_exclusivePortLeaseActive
+                    ? (byte)1
+                    : (byte)0);
+                Console.WriteLine($"M 板物理按键状态发布已{(enabled ? "启用" : "停用")}。");
+                return sent;
+            }
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private bool IsInputWriteGated =>
+        Volatile.Read(ref _modeTransitioning) != 0 ||
+        Volatile.Read(ref _makcuModeEnabled) != 0;
+
+    internal static bool IsOutboundBatchEligible(
+        long batchEpoch,
+        long currentRoutingEpoch,
+        bool modeGated) => !modeGated && batchEpoch == currentRoutingEpoch;
+
+    private void OnMainPortFrame(string portName, long connectionEpoch, BridgeFrame frame)
+    {
+        if (frame.Type == MessageType.StatsSnapshotResponse)
+        {
+            OnDiagnosticFrame(portName, frame);
+            return;
+        }
+        if (frame.Type != MessageType.ButtonState || frame.Payload.Length != 1)
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            if (_disposed || _exclusivePortLeaseActive || IsInputWriteGated ||
+                connectionEpoch != Volatile.Read(ref _connectionEpoch) ||
+                !string.Equals(_connectedPortName, portName, StringComparison.OrdinalIgnoreCase) ||
+                !_buttonSubscriptionRequested || _connectedLegacyCompatibility)
+            {
+                return;
+            }
+
+            byte value = frame.Payload[0];
+            bool healthyChanged = !_buttonSubscriptionHealthy;
+            _buttonSubscriptionHealthy = true;
+            _physicalMouseValid = (value & 0x80) != 0;
+            _physicalButtons = _physicalMouseValid ? (byte)(value & 0x1F) : (byte)0;
+            _physicalButtonStateTimestampQpc = Stopwatch.GetTimestamp();
+            PublishButtonStateLocked(2);
+            if (healthyChanged)
+            {
+                Console.WriteLine("M 板物理按键状态订阅已通过当前连接的真实状态帧确认。");
+            }
+        }
+    }
+
+    private void PublishButtonStateLocked(byte connectionState)
+    {
+        bool published = _buttonStatePublisher.TryPublish(new ButtonStateSnapshot(
+            _physicalButtons,
+            _physicalMouseValid,
+            _buttonSubscriptionHealthy,
+            connectionState,
+            _physicalButtonStateTimestampQpc));
+        _buttonStatePublishPending = !published;
+        _buttonStateRetryTimer.Change(
+            published ? Timeout.Infinite : 5,
+            Timeout.Infinite);
+    }
+
+    private void RetryButtonStatePublish()
+    {
+        lock (_sync)
+        {
+            if (_disposed || !_buttonStatePublishPending)
+            {
+                return;
+            }
+
+            PublishButtonStateLocked(_port?.IsOpen == true && !_exclusivePortLeaseActive
+                ? (byte)(_buttonSubscriptionHealthy ? 2 : 1)
+                : (byte)0);
+        }
+    }
+
+    private bool WriteButtonSubscriptionLocked(bool enabled, bool allowDuringTransition = false)
+    {
+        SerialPort? port = _port;
+        if (port?.IsOpen != true)
+        {
+            return false;
+        }
+
+        byte[] payload = [enabled ? (byte)1 : (byte)0];
+        byte[] frame = _codec.Encode(MessageType.ButtonState, payload);
+        try
+        {
+            lock (_writeSync)
+            {
+                if (!ReferenceEquals(_port, port) || !port.IsOpen ||
+                    (IsInputWriteGated && !allowDuringTransition))
+                {
+                    return false;
+                }
+                port.Write(frame, 0, frame.Length);
+            }
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or InvalidOperationException or UnauthorizedAccessException or TimeoutException)
+        {
+            Console.Error.WriteLine($"M 板物理按键订阅命令写入失败：{exception.Message}");
+            return false;
+        }
+    }
+
+    async Task<bool> IMakcuModeHandshake.BeginTransitionAsync(CancellationToken cancellationToken)
+    {
+        SerialPort? port;
+        bool unsubscribe;
+        lock (_sync)
+        {
+            if (_disposed || _exclusivePortLeaseActive || _port?.IsOpen != true ||
+                Interlocked.CompareExchange(ref _modeTransitioning, 1, 0) != 0)
+            {
+                return false;
+            }
+
+            Interlocked.Increment(ref _routingEpoch);
+            _outboundFrames.Clear();
+            Monitor.PulseAll(_sync);
+            _sessionStarted = false;
+            Interlocked.Increment(ref _connectionEpoch);
+            unsubscribe = _buttonSubscriptionRequested;
+            _buttonSubscriptionRequested = false;
+            _buttonSubscriptionHealthy = false;
+            _physicalButtons = 0;
+            _physicalMouseValid = false;
+            _physicalButtonStateTimestampQpc = 0;
+            PublishButtonStateLocked(1);
+            port = _port;
+        }
+
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // 获取写门构成 fence：已出队的旧 batch 只能在此之前完成，或因 epoch 不匹配而被丢弃。
+            lock (_writeSync)
+            {
+                if (!ReferenceEquals(_port, port) || port?.IsOpen != true)
+                {
+                    return false;
+                }
+            }
+            if (unsubscribe)
+            {
+                _ = WriteButtonSubscriptionLocked(enabled: false, allowDuringTransition: true);
+            }
+            return await StopDeviceTraceAndConfirmAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // 不能确认唯一 reader 停止时保留 gate；调用方会显示失败且不会开第二 reader。
+            throw;
+        }
+    }
+
+    Task<MakcuModeSnapshot?> IMakcuModeHandshake.SendRequestAsync(
+        bool enabled,
+        CancellationToken cancellationToken) =>
+        Task.Run(() => SendMakcuModeRequestBlocking(enabled, cancellationToken), cancellationToken);
+
+    Task IMakcuModeHandshake.SetBaudRateAsync(int baudRate, CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            SerialPort port = GetPortForModeHandshake();
+            lock (_writeSync)
+            {
+                if (!ReferenceEquals(_port, port) || !port.IsOpen)
+                {
+                    throw new IOException("模式切换时 M 板串口已断开。");
+                }
+                port.BaudRate = baudRate;
+                Volatile.Write(ref _connectedBaudRate, baudRate);
+            }
+        }, cancellationToken);
+
+    Task<MakcuModeSnapshot?> IMakcuModeHandshake.QueryAsync(CancellationToken cancellationToken) =>
+        Task.Run(() => QueryMakcuModeBlocking(GetPortForModeHandshake(), cancellationToken), cancellationToken);
+
+    Task<bool> IMakcuModeHandshake.ProbeMouseHostAsync(CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            SerialPort port = GetPortForModeHandshake();
+            return SerialDeviceProbe.Probe(port, _codec, SerialDeviceProbe.MouseHostRole);
+        }, cancellationToken);
+
+    Task<MakcuModeSnapshot?> IMakcuModeHandshake.QueryAtBaudAsync(
+        int baudRate,
+        CancellationToken cancellationToken) =>
+        Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            SerialPort port = GetPortForModeHandshake();
+            lock (_writeSync)
+            {
+                if (!ReferenceEquals(_port, port) || !port.IsOpen)
+                {
+                    throw new IOException("模式恢复时 M 板串口已断开。");
+                }
+                port.BaudRate = baudRate;
+                Volatile.Write(ref _connectedBaudRate, baudRate);
+            }
+            return QueryMakcuModeBlocking(port, cancellationToken);
+        }, cancellationToken);
+
+    Task<bool> IMakcuModeHandshake.EndTransitionAsync(
+        bool enabled,
+        int baudRate,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            SerialPort? port = _port;
+            if (_disposed || _exclusivePortLeaseActive || port?.IsOpen != true ||
+                port.BaudRate != baudRate ||
+                (enabled && baudRate != MakcuBaudRate) ||
+                (!enabled && baudRate != A5BaudRate))
+            {
+                return Task.FromResult(false);
+            }
+
+            _connectedBaudRate = baudRate;
+            Volatile.Write(ref _makcuModeEnabled, enabled ? 1 : 0);
+            _sessionStarted = false;
+            _buttonSubscriptionRequested = !enabled &&
+                !_connectedLegacyCompatibility &&
+                _settings.ButtonStatePublishingEnabled;
+            _buttonSubscriptionHealthy = false;
+            _physicalButtons = 0;
+            _physicalMouseValid = false;
+            _physicalButtonStateTimestampQpc = 0;
+            long connectionEpoch = Interlocked.Increment(ref _connectionEpoch);
+            PublishButtonStateLocked(1);
+            try
+            {
+                StartDeviceTrace(port, port.PortName, connectionEpoch);
+            }
+            catch (Exception exception) when (
+                exception is IOException or InvalidOperationException or UnauthorizedAccessException or ArgumentException)
+            {
+                _buttonSubscriptionRequested = false;
+                Console.Error.WriteLine($"恢复设备日志读取器失败：{exception.Message}");
+                return Task.FromResult(false);
+            }
+
+            if (_buttonSubscriptionRequested &&
+                !WriteButtonSubscriptionLocked(enabled: true, allowDuringTransition: true))
+            {
+                _buttonSubscriptionRequested = false;
+            }
+
+            Volatile.Write(ref _modeTransitioning, 0);
+            Console.WriteLine(
+                $"M 板串口输入门已恢复：{(enabled ? "Makcu" : "A5")} / {baudRate} baud。");
+            return Task.FromResult(true);
+        }
+    }
+
+    private SerialPort GetPortForModeHandshake()
+    {
+        lock (_sync)
+        {
+            if (_disposed || _exclusivePortLeaseActive || Volatile.Read(ref _modeTransitioning) == 0 ||
+                _port?.IsOpen != true)
+            {
+                throw new IOException("没有处于受控模式切换中的已打开 M 板串口。");
+            }
+            return _port;
+        }
+    }
+
+    private MakcuModeSnapshot? SendMakcuModeRequestBlocking(
+        bool enabled,
+        CancellationToken cancellationToken)
+    {
+        byte opcode = enabled ? MakcuModeProtocol.EnableOpcode : MakcuModeProtocol.DisableOpcode;
+        SerialPort port = GetPortForModeHandshake();
+        byte[] frame = MakcuModeProtocol.CreateRequest(_codec, opcode, out ushort sequence);
+        lock (_writeSync)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ReferenceEquals(_port, port) || !port.IsOpen)
+            {
+                throw new IOException("发送 Makcu 模式请求前 M 板串口已断开。");
+            }
+            port.Write(frame, 0, frame.Length);
+        }
+        BridgeFrame response = ReadModeStatusFrame(port, sequence, cancellationToken);
+        return MakcuModeProtocol.TryDecodeStatus(response, sequence, out MakcuModeSnapshot snapshot)
+            ? snapshot
+            : null;
+    }
+
+    private MakcuModeSnapshot? QueryMakcuModeBlocking(
+        SerialPort port,
+        CancellationToken cancellationToken = default)
+    {
+        byte[] frame = MakcuModeProtocol.CreateRequest(
+            _codec,
+            MakcuModeProtocol.QueryOpcode,
+            out ushort sequence);
+        lock (_writeSync)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ReferenceEquals(_port, port) && _port is not null)
+            {
+                // 首次发现时 port 尚未写入 _port；运行时查询必须始终沿用同一端口对象。
+                throw new IOException("Makcu 状态查询目标串口已变化。");
+            }
+            if (!port.IsOpen)
+            {
+                throw new IOException("Makcu 状态查询目标串口已关闭。");
+            }
+            port.Write(frame, 0, frame.Length);
+        }
+        BridgeFrame response = ReadModeStatusFrame(port, sequence, cancellationToken);
+        return MakcuModeProtocol.TryDecodeStatus(response, sequence, out MakcuModeSnapshot snapshot)
+            ? snapshot
+            : null;
+    }
+
+    private BridgeFrame ReadModeStatusFrame(
+        SerialPort port,
+        ushort expectedSequence,
+        CancellationToken cancellationToken)
+    {
+        DeviceOutputFrameScanner scanner = new();
+        byte[] buffer = new byte[256];
+        BridgeFrame? matched = null;
+        long deadline = Stopwatch.GetTimestamp() +
+            (long)(ModeResponseTimeoutMilliseconds * (double)Stopwatch.Frequency / 1000);
+        while (Stopwatch.GetTimestamp() < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!port.IsOpen)
+            {
+                throw new IOException("等待 Makcu 模式响应时串口已关闭。");
+            }
+            int available = port.BytesToRead;
+            if (available <= 0)
+            {
+                Thread.Sleep(2);
+                continue;
+            }
+            int read;
+            try
+            {
+                read = port.Read(buffer, 0, Math.Min(buffer.Length, available));
+            }
+            catch (TimeoutException)
+            {
+                continue;
+            }
+            if (read <= 0)
+            {
+                continue;
+            }
+            _ = scanner.Feed(buffer.AsSpan(0, read), frame =>
+            {
+                if (frame.Type == MessageType.MakcuModeStatus &&
+                    frame.Sequence == expectedSequence)
+                {
+                    matched = frame;
+                }
+            });
+            if (matched is BridgeFrame response)
+            {
+                return response;
+            }
+        }
+        throw new TimeoutException(
+            $"等待 MakcuModeStatus 序号 {expectedSequence} 超时（{ModeResponseTimeoutMilliseconds} ms）。");
+    }
+
     private bool EnqueueFrameLocked(byte[] frame)
     {
         bool backpressured = false;
@@ -275,12 +761,13 @@ internal sealed class SerialBridge : IBridgeTransport
             Monitor.Wait(_sync, 10);
         }
         if (_disposed || _writerStopping || _exclusivePortLeaseActive ||
+                IsInputWriteGated ||
             _port?.IsOpen != true)
         {
             return false;
         }
 
-        _outboundFrames.Enqueue(frame);
+        _outboundFrames.Enqueue(new OutboundFrame(frame, Volatile.Read(ref _routingEpoch)));
         if (backpressured)
         {
             _backpressureCount++;
@@ -310,6 +797,7 @@ internal sealed class SerialBridge : IBridgeTransport
                 SerialPort? port;
                 byte[] batch;
                 int frameCount;
+                long batchEpoch;
                 lock (_sync)
                 {
                     if (_writerStopping)
@@ -328,7 +816,7 @@ internal sealed class SerialBridge : IBridgeTransport
                     }
 
                     port = _port;
-                    (batch, frameCount) = DrainOutboundBatchLocked();
+                    (batch, frameCount, batchEpoch) = DrainOutboundBatchLocked();
                     Monitor.PulseAll(_sync);
                 }
 
@@ -336,7 +824,11 @@ internal sealed class SerialBridge : IBridgeTransport
                 {
                     lock (_writeSync)
                     {
-                        if (!ReferenceEquals(_port, port) || !port.IsOpen)
+                        if (!ReferenceEquals(_port, port) || !port.IsOpen ||
+                            !IsOutboundBatchEligible(
+                                batchEpoch,
+                                Volatile.Read(ref _routingEpoch),
+                                IsInputWriteGated))
                         {
                             continue;
                         }
@@ -365,23 +857,28 @@ internal sealed class SerialBridge : IBridgeTransport
         }
     }
 
-    private (byte[] Batch, int FrameCount) DrainOutboundBatchLocked()
+    private (byte[] Batch, int FrameCount, long Epoch) DrainOutboundBatchLocked()
     {
-        int frameCount = _outboundFrames.Count;
+        long epoch = _outboundFrames.Peek().Epoch;
         int length = 0;
-        foreach (byte[] frame in _outboundFrames)
+        foreach (OutboundFrame queued in _outboundFrames)
         {
-            length += frame.Length;
+            if (queued.Epoch == epoch)
+            {
+                length += queued.Bytes.Length;
+            }
         }
         byte[] batch = new byte[length];
         int offset = 0;
-        while (_outboundFrames.Count > 0)
+        int frameCount = 0;
+        while (_outboundFrames.Count > 0 && _outboundFrames.Peek().Epoch == epoch)
         {
-            byte[] frame = _outboundFrames.Dequeue();
+            byte[] frame = _outboundFrames.Dequeue().Bytes;
             Buffer.BlockCopy(frame, 0, batch, offset, frame.Length);
             offset += frame.Length;
+            frameCount++;
         }
-        return (batch, frameCount);
+        return (batch, frameCount, epoch);
     }
 
     /// <summary>列出当前由控制串口或对端日志镜像实际持有的端口，不主动探测或打开端口。</summary>
@@ -441,6 +938,12 @@ internal sealed class SerialBridge : IBridgeTransport
         {
             cancellationToken.ThrowIfCancellationRequested();
             peerLogMirror = _peerLogMirror;
+            if (string.Equals(_connectedPortName, portName, StringComparison.OrdinalIgnoreCase) &&
+                IsInputWriteGated)
+            {
+                throw new InvalidOperationException(
+                    "M 板处于 Makcu 模式或正在切换；普通串口写入已关闭，不能绕过模式门控。");
+            }
             if (!_disposed && !_exclusivePortLeaseActive && _port?.IsOpen == true &&
                 string.Equals(_port.PortName, portName, StringComparison.OrdinalIgnoreCase))
             {
@@ -497,7 +1000,7 @@ internal sealed class SerialBridge : IBridgeTransport
 
     private bool EnsureConnected()
     {
-        if (_exclusivePortLeaseActive)
+        if (_exclusivePortLeaseActive || IsInputWriteGated)
         {
             return false;
         }
@@ -517,6 +1020,11 @@ internal sealed class SerialBridge : IBridgeTransport
                 $"旧版单板兼容模式已{(requestedLegacyCompatibility ? "启用" : "停用")}，正在释放旧输入并重新连接串口。");
             ClosePortForInputModeChange();
             _nextConnectAttemptUtc = DateTime.MinValue;
+        }
+
+        if (_traceTask is not null && !TryFinalizeStoppedTrace())
+        {
+            return false;
         }
 
         if (DateTime.UtcNow < _nextConnectAttemptUtc)
@@ -541,57 +1049,92 @@ internal sealed class SerialBridge : IBridgeTransport
 
         foreach (string portName in candidates)
         {
-            SerialPort? candidate = null;
-            try
+            bool legacyCompatibility = requestedLegacyCompatibility;
+            int[] baudRates = legacyCompatibility
+                ? [_options.BaudRate]
+                : _settings.MakcuEnabled
+                    ? [A5BaudRate, MakcuBaudRate]
+                    : [A5BaudRate];
+            foreach (int baudRate in baudRates)
             {
-                candidate = CreatePort(portName);
-                candidate.Open();
-                bool legacyCompatibility = requestedLegacyCompatibility;
-                byte? expectedRole = legacyCompatibility ? null : SerialDeviceProbe.MouseHostRole;
-                bool probeMatched = legacyCompatibility ||
-                    SerialDeviceProbe.Probe(candidate, _codec, expectedRole);
-                if (!probeMatched && !legacyCompatibility && candidate.BaudRate != 115200)
+                SerialPort? candidate = null;
+                try
                 {
-                    candidate.Dispose();
-                    candidate = CreatePort(portName);
-                    candidate.BaudRate = 115200;
+                    candidate = CreatePort(portName, baudRate);
                     candidate.Open();
-                    probeMatched = SerialDeviceProbe.Probe(candidate, _codec, expectedRole);
-                }
-                if (!probeMatched)
-                {
-                    Console.WriteLine($"{portName} 未返回 HID Bridge 握手，已忽略。");
-                    candidate.Dispose();
-                    continue;
-                }
+                    bool probeMatched = legacyCompatibility ||
+                        SerialDeviceProbe.Probe(candidate, _codec, SerialDeviceProbe.MouseHostRole);
+                    bool makcuEnabled = false;
+                    if (probeMatched && !legacyCompatibility && baudRate == MakcuBaudRate)
+                    {
+                        MakcuModeSnapshot? status = QueryMakcuModeBlocking(candidate);
+                        probeMatched = status is { Status: 0, Enabled: true, BaudRate: MakcuBaudRate };
+                        makcuEnabled = probeMatched;
+                    }
+                    if (!probeMatched)
+                    {
+                        candidate.Dispose();
+                        candidate = null;
+                        continue;
+                    }
 
-                if (legacyCompatibility)
-                {
-                    Console.WriteLine(
-                        $"{portName} 已按旧版单板通路直接连接；跳过新角色握手，后续使用旧版传输。");
-                }
+                    if (legacyCompatibility)
+                    {
+                        Console.WriteLine(
+                            $"{portName} 已按旧版单板通路直接连接；跳过新角色握手，后续使用旧版传输。");
+                    }
 
-                _port = candidate;
-                _connectedLegacyCompatibility = legacyCompatibility;
-                Volatile.Write(ref _connectedPortName, portName);
-                StartDeviceTrace(candidate, portName);
-                Console.WriteLine($"已连接 {portName}。");
-                return true;
-            }
-            catch (Exception exception) when (
-                exception is IOException or InvalidOperationException or UnauthorizedAccessException or
-                    TimeoutException or ArgumentException)
-            {
-                Console.Error.WriteLine($"暂时无法使用 {portName}：{exception.Message}");
-                candidate?.Dispose();
+                    _port = candidate;
+                    _connectedLegacyCompatibility = legacyCompatibility;
+                    _connectedBaudRate = baudRate;
+                    Volatile.Write(ref _makcuModeEnabled, makcuEnabled ? 1 : 0);
+                    Volatile.Write(ref _connectedPortName, portName);
+                    _sessionStarted = false;
+                    long connectionEpoch = Interlocked.Increment(ref _connectionEpoch);
+                    _buttonSubscriptionRequested = !legacyCompatibility &&
+                        !makcuEnabled &&
+                        _settings.ButtonStatePublishingEnabled;
+                    _buttonSubscriptionHealthy = false;
+                    _physicalButtons = 0;
+                    _physicalMouseValid = false;
+                    _physicalButtonStateTimestampQpc = 0;
+                    PublishButtonStateLocked(1);
+                    StartDeviceTrace(candidate, portName, connectionEpoch);
+                    if (_buttonSubscriptionRequested && !WriteButtonSubscriptionLocked(enabled: true))
+                    {
+                        _buttonSubscriptionRequested = false;
+                        PublishButtonStateLocked(1);
+                    }
+                    Console.WriteLine($"已连接 {portName} @ {baudRate} baud。");
+                    return true;
+                }
+                catch (Exception exception) when (
+                    exception is IOException or InvalidOperationException or UnauthorizedAccessException or
+                        TimeoutException or ArgumentException or InvalidDataException)
+                {
+                    Console.Error.WriteLine($"暂时无法使用 {portName} @ {baudRate}：{exception.Message}");
+                    if (ReferenceEquals(_port, candidate))
+                    {
+                        _port = null;
+                        Volatile.Write(ref _connectedPortName, null);
+                        _connectedLegacyCompatibility = false;
+                        RequestStopDeviceTrace();
+                    }
+                    candidate?.Dispose();
+                }
             }
         }
 
         return false;
     }
 
-    private void StartDeviceTrace(SerialPort port, string portName)
+    private void StartDeviceTrace(SerialPort port, string portName, long connectionEpoch)
     {
+        if (_traceTask is not null && !TryFinalizeStoppedTrace())
+        {
+            throw new InvalidOperationException(
+                "上一条设备日志读取线程仍在运行，不能启动第二个串口读取器。");
+        }
         BufferedDeviceLog? sink = null;
         try
         {
@@ -622,7 +1165,9 @@ internal sealed class SerialBridge : IBridgeTransport
         _traceWriter = sink;
         _traceCancellation = new CancellationTokenSource();
         CancellationToken cancellation = _traceCancellation.Token;
-        _traceTask = Task.Run(() => TraceDeviceOutput(port, portName, cancellation, sink), cancellation);
+        _traceTask = Task.Run(
+            () => TraceDeviceOutput(port, portName, connectionEpoch, cancellation, sink),
+            cancellation);
     }
 
     internal static StreamWriter CreateTraceWriter(string path, bool fullLogging)
@@ -644,6 +1189,7 @@ internal sealed class SerialBridge : IBridgeTransport
     private void TraceDeviceOutput(
         SerialPort port,
         string portName,
+        long connectionEpoch,
         CancellationToken cancellation,
         BufferedDeviceLog? sink)
     {
@@ -654,61 +1200,45 @@ internal sealed class SerialBridge : IBridgeTransport
         StringBuilder pending = new();
         try
         {
-            while (!cancellation.IsCancellationRequested)
-            {
-                int available;
-                try
+            RunDeviceTraceReadLoop(
+                isOpen: () => port.IsOpen,
+                bytesToRead: () => port.BytesToRead,
+                read: port.Read,
+                buffer,
+                cancellation,
+                (received, read) =>
                 {
-                    available = port.IsOpen ? port.BytesToRead : 0;
-                }
-                catch (InvalidOperationException)
-                {
-                    break;
-                }
-
-                if (available <= 0)
-                {
-                    Thread.Sleep(10);
-                    continue;
-                }
-
-                int read = port.Read(buffer, 0, Math.Min(buffer.Length, available));
-                if (read <= 0)
-                {
-                    continue;
-                }
-
-                byte[] textBytes = scanner.Feed(
-                    buffer.AsSpan(0, read),
-                    frame => OnDiagnosticFrame(portName, frame));
-                if (textBytes.Length == 0)
-                {
-                    continue;
-                }
-
-                int charCount = decoder.GetChars(textBytes, 0, textBytes.Length, textBuffer, 0, flush: false);
-                pending.Append(textBuffer, 0, charCount);
-                while (true)
-                {
-                    int newline = pending.ToString().IndexOf('\n');
-                    if (newline < 0)
+                    byte[] textBytes = scanner.Feed(
+                        received.AsSpan(0, read),
+                        frame => OnMainPortFrame(portName, connectionEpoch, frame));
+                    if (textBytes.Length == 0)
                     {
-                        break;
+                        return;
                     }
 
-                    string line = pending.ToString(0, newline).TrimEnd('\r');
-                    pending.Remove(0, newline + 1);
-                    if (!string.IsNullOrWhiteSpace(line))
+                    int charCount = decoder.GetChars(textBytes, 0, textBytes.Length, textBuffer, 0, flush: false);
+                    pending.Append(textBuffer, 0, charCount);
+                    while (true)
                     {
-                        WriteDeviceTraceLine(sink, portName, line);
+                        int newline = pending.ToString().IndexOf('\n');
+                        if (newline < 0)
+                        {
+                            break;
+                        }
+
+                        string line = pending.ToString(0, newline).TrimEnd('\r');
+                        pending.Remove(0, newline + 1);
+                        if (!string.IsNullOrWhiteSpace(line))
+                        {
+                            WriteDeviceTraceLine(sink, portName, line);
+                        }
                     }
-                }
-                if (pending.Length >= 65536)
-                {
-                    WriteDeviceTraceLine(sink, portName, pending.ToString());
-                    pending.Clear();
-                }
-            }
+                    if (pending.Length >= 65536)
+                    {
+                        WriteDeviceTraceLine(sink, portName, pending.ToString());
+                        pending.Clear();
+                    }
+                });
         }
         catch (Exception exception) when (exception is IOException or InvalidOperationException or TimeoutException)
         {
@@ -726,6 +1256,41 @@ internal sealed class SerialBridge : IBridgeTransport
                 {
                     WriteDeviceTraceLine(sink, portName, line);
                 }
+            }
+        }
+    }
+
+    internal static void RunDeviceTraceReadLoop(
+        Func<bool> isOpen,
+        Func<int> bytesToRead,
+        Func<byte[], int, int, int> read,
+        byte[] buffer,
+        CancellationToken cancellation,
+        Action<byte[], int> processRead)
+    {
+        while (!cancellation.IsCancellationRequested)
+        {
+            if (!isOpen())
+            {
+                return;
+            }
+
+            int available = bytesToRead();
+            int requested = available <= 0 ? 1 : Math.Min(buffer.Length, available);
+            int readCount;
+            try
+            {
+                readCount = read(buffer, 0, requested);
+            }
+            catch (TimeoutException)
+            {
+                // SerialPort.ReadTimeout 为 100 ms；每次超时后回到循环顶部检查取消令牌。
+                continue;
+            }
+
+            if (readCount > 0)
+            {
+                processRead(buffer, readCount);
             }
         }
     }
@@ -782,41 +1347,89 @@ internal sealed class SerialBridge : IBridgeTransport
         line.StartsWith("D (", StringComparison.Ordinal) ||
         line.StartsWith("V (", StringComparison.Ordinal);
 
-    private void StopDeviceTrace()
+    private void RequestStopDeviceTrace()
     {
-        CancellationTokenSource? cancellation = _traceCancellation;
-        _traceCancellation = null;
-        if (cancellation is not null)
-        {
-            cancellation.Cancel();
-        }
-
-        try
-        {
-            _traceTask?.Wait(500);
-        }
-        catch (AggregateException)
-        {
-            // 端口关闭期间的读取异常不应阻止重连。
-        }
-        finally
-        {
-            _traceTask = null;
-            cancellation?.Dispose();
-            try
-            {
-                _traceWriter?.Dispose();
-            }
-            catch (IOException)
-            {
-                // 日志关闭失败不应阻止串口重连。
-            }
-            _traceWriter = null;
-        }
+        _traceCancellation?.Cancel();
+        _ = TryFinalizeStoppedTrace();
     }
 
-    private SerialPort CreatePort(string portName) =>
-        new(portName, _options.BaudRate, Parity.None, 8, StopBits.One)
+    private async Task<bool> StopDeviceTraceAndConfirmAsync(CancellationToken cancellationToken)
+    {
+        CancellationTokenSource? cancellation = _traceCancellation;
+        Task? task = _traceTask;
+        cancellation?.Cancel();
+        if (task is null)
+        {
+            FinalizeTraceResources(task, cancellation);
+            return true;
+        }
+        try
+        {
+            await task.WaitAsync(
+                TimeSpan.FromMilliseconds(TraceStopTimeoutMilliseconds),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            Console.Error.WriteLine(
+                "设备日志读取线程未在限定时间内退出；保留任务引用并阻止启动第二个读取器。");
+            return false;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Task.Run 可能在任务体开始前因取消而完成。
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+        {
+            // TraceDeviceOutput 已处理并记录读取异常；此处只确认任务已结束。
+        }
+        FinalizeTraceResources(task, cancellation);
+        return true;
+    }
+
+    private bool TryFinalizeStoppedTrace()
+    {
+        Task? task = _traceTask;
+        if (task is null)
+        {
+            return true;
+        }
+        if (!task.IsCompleted)
+        {
+            return false;
+        }
+        _ = task.Exception;
+        FinalizeTraceResources(task, _traceCancellation);
+        return true;
+    }
+
+    private void FinalizeTraceResources(Task? task, CancellationTokenSource? cancellation)
+    {
+        if (task is not null && !task.IsCompleted)
+        {
+            return;
+        }
+        if (!ReferenceEquals(_traceTask, task))
+        {
+            return;
+        }
+
+        _traceTask = null;
+        _traceCancellation = null;
+        cancellation?.Dispose();
+        try
+        {
+            _traceWriter?.Dispose();
+        }
+        catch (IOException)
+        {
+            // 设备日志关闭失败不应阻止串口恢复。
+        }
+        _traceWriter = null;
+    }
+
+    private SerialPort CreatePort(string portName, int baudRate) =>
+        new(portName, baudRate, Parity.None, 8, StopBits.One)
         {
             Handshake = Handshake.None,
             DtrEnable = false,
@@ -838,7 +1451,14 @@ internal sealed class SerialBridge : IBridgeTransport
     {
         _outboundFrames.Clear();
         Monitor.PulseAll(_sync);
-        StopDeviceTrace();
+        Interlocked.Increment(ref _connectionEpoch);
+        _buttonSubscriptionRequested = false;
+        _buttonSubscriptionHealthy = false;
+        _physicalButtons = 0;
+        _physicalMouseValid = false;
+        _physicalButtonStateTimestampQpc = 0;
+        PublishButtonStateLocked(0);
+        RequestStopDeviceTrace();
         lock (_writeSync)
         {
             try
@@ -854,6 +1474,8 @@ internal sealed class SerialBridge : IBridgeTransport
                 Volatile.Write(ref _connectedPortName, null);
                 _port = null;
                 _connectedLegacyCompatibility = false;
+                _connectedBaudRate = A5BaudRate;
+                Volatile.Write(ref _makcuModeEnabled, 0);
                 _sessionStarted = false;
             }
         }
@@ -863,7 +1485,14 @@ internal sealed class SerialBridge : IBridgeTransport
     {
         _outboundFrames.Clear();
         Monitor.PulseAll(_sync);
-        StopDeviceTrace();
+        Interlocked.Increment(ref _connectionEpoch);
+        _buttonSubscriptionRequested = false;
+        _buttonSubscriptionHealthy = false;
+        _physicalButtons = 0;
+        _physicalMouseValid = false;
+        _physicalButtonStateTimestampQpc = 0;
+        PublishButtonStateLocked(0);
+        RequestStopDeviceTrace();
         lock (_writeSync)
         {
             SerialPort? oldPort = _port;
@@ -896,6 +1525,8 @@ internal sealed class SerialBridge : IBridgeTransport
                 Volatile.Write(ref _connectedPortName, null);
                 _port = null;
                 _connectedLegacyCompatibility = false;
+                _connectedBaudRate = A5BaudRate;
+                Volatile.Write(ref _makcuModeEnabled, 0);
                 _sessionStarted = false;
             }
         }
@@ -911,6 +1542,69 @@ internal sealed class SerialBridge : IBridgeTransport
 
     internal string? GetConnectedPortName() => Volatile.Read(ref _connectedPortName);
 
+    internal bool IsMakcuModeEnabled => Volatile.Read(ref _makcuModeEnabled) != 0;
+
+    internal bool IsModeTransitioning => Volatile.Read(ref _modeTransitioning) != 0;
+
+    internal int ConnectedBaudRate => Volatile.Read(ref _connectedBaudRate);
+
+    internal bool IsA5ModeReadyForAutomation
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return !_disposed && !_writerStopping && !_exclusivePortLeaseActive &&
+                    !_legacyFirmwareCompatibility() && !_connectedLegacyCompatibility &&
+                    !IsInputWriteGated && _connectedBaudRate == A5BaudRate &&
+                    _port?.IsOpen == true && _traceTask is { IsCompleted: false };
+            }
+        }
+    }
+
+    internal bool IsMakcuModeSessionReady
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return IsConfirmedMakcuModeSessionLocked();
+            }
+        }
+    }
+
+    private bool IsConfirmedMakcuModeSessionLocked() =>
+        IsValidMakcuModeChangeConnection(
+            disposed: _disposed,
+            writerStopping: _writerStopping,
+            exclusivePortLeaseActive: _exclusivePortLeaseActive,
+            legacyFirmwareCompatibility: _legacyFirmwareCompatibility(),
+            connectedLegacyCompatibility: _connectedLegacyCompatibility,
+            modeTransitioning: Volatile.Read(ref _modeTransitioning) != 0,
+            makcuModeEnabled: Volatile.Read(ref _makcuModeEnabled) == 1,
+            connectedBaudRate: _connectedBaudRate,
+            portOpen: _port?.IsOpen == true,
+            traceReaderRunning: _traceTask is { IsCompleted: false });
+
+    internal static bool IsValidMakcuModeChangeConnection(
+        bool disposed,
+        bool writerStopping,
+        bool exclusivePortLeaseActive,
+        bool legacyFirmwareCompatibility,
+        bool connectedLegacyCompatibility,
+        bool modeTransitioning,
+        bool makcuModeEnabled,
+        int connectedBaudRate,
+        bool portOpen,
+        bool traceReaderRunning) =>
+        !disposed && !writerStopping && !exclusivePortLeaseActive &&
+        !legacyFirmwareCompatibility && !connectedLegacyCompatibility &&
+        !modeTransitioning && makcuModeEnabled &&
+        connectedBaudRate == MakcuBaudRate && portOpen && traceReaderRunning;
+
+    internal string ButtonStateMappingName => _buttonStatePublisher.MappingName;
+    internal string ButtonStateMutexName => _buttonStatePublisher.MutexName;
+
     internal bool IsMouseHostAvailable
     {
         get
@@ -919,6 +1613,7 @@ internal sealed class SerialBridge : IBridgeTransport
             {
                 return !_disposed && !_writerStopping && !_exclusivePortLeaseActive &&
                     !_legacyFirmwareCompatibility() && !_connectedLegacyCompatibility &&
+                    !IsInputWriteGated &&
                     _port?.IsOpen == true;
             }
         }
@@ -955,6 +1650,10 @@ internal sealed class SerialBridge : IBridgeTransport
             if (_exclusivePortLeaseActive)
             {
                 throw new InvalidOperationException($"串口正被{_exclusivePortPurpose ?? "其它串口任务"}占用。");
+            }
+            if (Volatile.Read(ref _modeTransitioning) != 0)
+            {
+                throw new InvalidOperationException("M 板正在切换 Makcu 模式，当前不能让出串口。");
             }
             string selectedPort = NormalizeFirmwarePortName(portName);
             if (!GetAvailablePortNames().Contains(selectedPort, StringComparer.OrdinalIgnoreCase))
@@ -1002,7 +1701,8 @@ internal sealed class SerialBridge : IBridgeTransport
             cancellationToken.ThrowIfCancellationRequested();
             lock (_sync)
             {
-                if (!_disposed && !_exclusivePortLeaseActive && EnsureConnected())
+                if (!_disposed && !_exclusivePortLeaseActive &&
+                    (IsConfirmedMakcuModeSessionLocked() || EnsureConnected()))
                 {
                     return true;
                 }
@@ -1052,6 +1752,9 @@ internal sealed class SerialBridge : IBridgeTransport
         {
             ClosePort();
         }
+        _ = StopDeviceTraceAndConfirmAsync(CancellationToken.None).GetAwaiter().GetResult();
+        _buttonStateRetryTimer.Dispose();
+        _buttonStatePublisher.Dispose();
         _outboundSignal.Dispose();
     }
 

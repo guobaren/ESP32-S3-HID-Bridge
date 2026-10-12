@@ -3,6 +3,54 @@
 #include <stdbool.h>
 #include <string.h>
 
+bool dual_makcu_mode_request_decode(
+    const uint8_t *payload, uint8_t payload_length, uint8_t *opcode)
+{
+    if (payload == NULL || opcode == NULL ||
+        payload_length != DUAL_MAKCU_MODE_REQUEST_PAYLOAD_LENGTH ||
+        payload[0] > DUAL_MAKCU_MODE_OP_QUERY) {
+        return false;
+    }
+    *opcode = payload[0];
+    return true;
+}
+
+bool dual_makcu_mode_status_encode(
+    uint8_t status, bool enabled, uint32_t baud,
+    uint8_t *payload, size_t capacity)
+{
+    if (payload == NULL || capacity < DUAL_MAKCU_MODE_STATUS_PAYLOAD_LENGTH ||
+        status > DUAL_MAKCU_MODE_STATUS_TX_FAILED) {
+        return false;
+    }
+    payload[0] = status;
+    payload[DUAL_MAKCU_MODE_STATUS_ENABLED_OFFSET] = enabled ? 1U : 0U;
+    payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET] = (uint8_t)baud;
+    payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET + 1U] = (uint8_t)(baud >> 8U);
+    payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET + 2U] = (uint8_t)(baud >> 16U);
+    payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET + 3U] = (uint8_t)(baud >> 24U);
+    return true;
+}
+
+bool dual_makcu_mode_status_decode(
+    const uint8_t *payload, uint8_t payload_length,
+    uint8_t *status, bool *enabled, uint32_t *baud)
+{
+    if (payload == NULL || status == NULL || enabled == NULL || baud == NULL ||
+        payload_length != DUAL_MAKCU_MODE_STATUS_PAYLOAD_LENGTH ||
+        payload[0] > DUAL_MAKCU_MODE_STATUS_TX_FAILED ||
+        payload[DUAL_MAKCU_MODE_STATUS_ENABLED_OFFSET] > 1U) {
+        return false;
+    }
+    *status = payload[0];
+    *enabled = payload[DUAL_MAKCU_MODE_STATUS_ENABLED_OFFSET] != 0U;
+    *baud = (uint32_t)payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET] |
+        ((uint32_t)payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET + 1U] << 8U) |
+        ((uint32_t)payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET + 2U] << 16U) |
+        ((uint32_t)payload[DUAL_MAKCU_MODE_STATUS_BAUD_OFFSET + 3U] << 24U);
+    return true;
+}
+
 static void parser_reset(dual_parser_t *parser)
 {
     parser->length = 0;

@@ -17,8 +17,15 @@ void dual_uart0_output_set_makcu_mode(bool enabled);
 
 /* 仅允许任务上下文调用；当前持锁任务递归调用会返回错误。 */
 esp_err_t dual_uart0_output_lock(void);
+/* UART0 control-loop path: never waits for the shared output mutex. */
+esp_err_t dual_uart0_output_try_lock(void);
 void dual_uart0_output_unlock(void);
 esp_err_t dual_uart0_output_wait_tx_idle(void);
+/* Requires the current task to hold the output mutex. Bounded complete frames; checks TX-ring space and never waits for idle. */
+esp_err_t dual_uart0_output_write_locked_nonblocking(
+    const void *data, size_t length, bool allow_makcu_mode);
+/* Requires the current task to hold the output mutex; bounded drain for mode transitions. */
+esp_err_t dual_uart0_output_wait_tx_done_locked(uint32_t timeout_ms);
 esp_err_t dual_uart0_output_write(const void *data, size_t length);
 /* 仅在 Makcu ASCII 独占模式下写响应；普通日志和 A5 帧会被屏蔽。 */
 esp_err_t dual_uart0_output_write_makcu_ascii(const void *data, size_t length);

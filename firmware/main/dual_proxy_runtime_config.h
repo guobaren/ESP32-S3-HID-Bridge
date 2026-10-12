@@ -22,6 +22,10 @@
 #ifndef DUAL_PROXY_ENABLE_MAKCU_V4_API
 #define DUAL_PROXY_ENABLE_MAKCU_V4_API 1
 #endif
+/* Physical mouse button snapshots are independent of either Makcu parser. */
+#ifndef DUAL_PROXY_ENABLE_BUTTON_STATE
+#define DUAL_PROXY_ENABLE_BUTTON_STATE 1
+#endif
 /* 统计只通过UART0主动快照查询，不提供运行时周期输出开关。 */
 #define DUAL_PROXY_ENABLE_PERIODIC_STATS_LOG 0
 

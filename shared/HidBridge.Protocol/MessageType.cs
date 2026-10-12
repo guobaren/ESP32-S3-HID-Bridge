@@ -23,6 +23,9 @@ public enum MessageType : byte
     DiagInjectResult = 0x18,
     StatsSnapshotRequest = 0x1D,
     StatsSnapshotResponse = 0x1E,
+    ButtonState = 0x1F,
     VendorSessionBegin = 0x35,
     VendorSessionAck = 0x36,
+    MakcuModeRequest = 0x37,
+    MakcuModeStatus = 0x38,
 }

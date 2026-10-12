@@ -1,0 +1,5 @@
+menu "USB throughput probe"
+    config USB_PROBE_VENDOR
+        bool "Use Vendor Bulk / WinUSB instead of CDC"
+        default n
+endmenu

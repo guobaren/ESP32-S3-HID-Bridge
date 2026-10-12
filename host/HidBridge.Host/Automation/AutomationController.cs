@@ -12,6 +12,7 @@ internal sealed class AutomationController : IDisposable
     }
 
     private readonly object _stateLock = new();
+    private readonly object _runtimeTransitionSync = new();
     private readonly AutomationProfileStore _store;
     private readonly Input.InputForwarder _input;
     private readonly RoutedAutomationOutput _output;
@@ -19,17 +20,20 @@ internal sealed class AutomationController : IDisposable
     private readonly LuaScriptRunner _lua;
     private AutomationProfile _activeProfile;
     private bool _started;
+    private bool _makcuModeRuntimePaused;
     private bool _disposed;
 
     internal AutomationController(
         AutomationProfileStore store,
         Input.InputForwarder input,
-        IAutomationOutput? localOutput = null)
+        IAutomationOutput? localOutput = null,
+        AutomationSettings? settings = null)
     {
         _store = store;
         _input = input;
         _output = new RoutedAutomationOutput(input, localOutput);
-        Settings = store.LoadSettings();
+        Settings = settings ?? store.LoadSettings();
+        _makcuModeRuntimePaused = Settings.MakcuEnabled;
         if (!Input.SimulatedUdpMouseInput.SupportedFrequencies.Contains(Settings.SimulatedUdpInputFrequencyHz))
         {
             Settings.SimulatedUdpInputFrequencyHz = 100;
@@ -52,6 +56,55 @@ internal sealed class AutomationController : IDisposable
     internal AutomationProfile ActiveProfile => _activeProfile;
     internal bool LuaActive => _lua.Active;
     internal long LocalReleaseAllCount => _output.LocalReleaseAllCount;
+    internal bool MakcuModeRuntimePaused
+    {
+        get
+        {
+            lock (_runtimeTransitionSync)
+            {
+                return _makcuModeRuntimePaused;
+            }
+        }
+    }
+
+    internal int LoadedAutomationBindingCount
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _bindings.Count;
+            }
+        }
+    }
+
+    internal void PrepareMakcuModeTransition()
+    {
+        lock (_runtimeTransitionSync)
+        {
+            _makcuModeRuntimePaused = true;
+            StopRuntime();
+            _input.ResetOutputStateForRoutingChange();
+        }
+    }
+
+    internal bool CompleteMakcuModeTransition(bool a5ModeReady)
+    {
+        lock (_runtimeTransitionSync)
+        {
+            if (!a5ModeReady || Settings.MakcuEnabled || _disposed)
+            {
+                return false;
+            }
+
+            _makcuModeRuntimePaused = false;
+            if (_started)
+            {
+                ReloadActiveProfileRuntime();
+            }
+            return true;
+        }
+    }
 
     internal event Action<string>? Log;
     internal event Action<string>? MacroLog;
@@ -63,15 +116,18 @@ internal sealed class AutomationController : IDisposable
 
     internal void Start()
     {
-        if (_started)
+        lock (_runtimeTransitionSync)
         {
-            return;
+            if (_started)
+            {
+                return;
+            }
+            _input.PhysicalInputChanged += HandlePhysicalInput;
+            _input.ForwardingTransitioning += HandleForwardingTransitioning;
+            _input.ForwardingChanged += HandleForwardingChanged;
+            _started = true;
+            ReloadActiveProfileRuntime();
         }
-        _input.PhysicalInputChanged += HandlePhysicalInput;
-        _input.ForwardingTransitioning += HandleForwardingTransitioning;
-        _input.ForwardingChanged += HandleForwardingChanged;
-        _started = true;
-        ReloadActiveProfileRuntime();
     }
 
     internal IReadOnlyList<string> ListProfiles() => _store.ListProfiles();
@@ -124,8 +180,16 @@ internal sealed class AutomationController : IDisposable
 
     internal void StartLua(string text)
     {
-        _lua.Start(text);
-        LuaStateChanged?.Invoke(_lua.Active);
+        lock (_runtimeTransitionSync)
+        {
+            if (_makcuModeRuntimePaused)
+            {
+                throw new InvalidOperationException(
+                    "Makcu 模式或串口模式未确认期间，Lua 与宏保持停止；确认恢复 A5/921600 后再启动。");
+            }
+            _lua.Start(text);
+            LuaStateChanged?.Invoke(_lua.Active);
+        }
     }
 
     internal void StopLua()
@@ -135,10 +199,13 @@ internal sealed class AutomationController : IDisposable
         PublishLuaLog("Lua 脚本已停止。");
     }
 
-    internal void SaveSettings()
+    internal void SaveSettings(bool updateStartupRegistration = true)
     {
         _store.SaveSettings(Settings);
-        StartupRegistration.SetEnabled(Settings.StartOnBoot);
+        if (updateStartupRegistration)
+        {
+            StartupRegistration.SetEnabled(Settings.StartOnBoot);
+        }
     }
 
     internal void ApplyOutputRoutingSettings(
@@ -189,47 +256,56 @@ internal sealed class AutomationController : IDisposable
 
     private void ReloadActiveProfileRuntime()
     {
-        lock (_stateLock)
+        lock (_runtimeTransitionSync)
         {
-            foreach ((string name, MacroDefinition macro) in _activeProfile.Macros)
+            if (_makcuModeRuntimePaused || _disposed)
             {
-                if (!macro.Enabled || string.IsNullOrWhiteSpace(macro.Trigger))
+                return;
+            }
+
+            lock (_stateLock)
+            {
+                foreach ((string name, MacroDefinition macro) in _activeProfile.Macros)
                 {
-                    continue;
-                }
-                try
-                {
-                    ParsedMacro parsed = MacroParser.Parse(macro.Text, macro.Mode);
-                    if (parsed.Errors.Count > 0)
+                    if (!macro.Enabled || string.IsNullOrWhiteSpace(macro.Trigger))
                     {
-                        PublishMacroLog($"宏 {name} 存在解析错误，已跳过：{parsed.Errors[0]}");
                         continue;
                     }
-                    HotkeyDefinition hotkey = HotkeyDefinition.Parse(macro.Trigger);
-                    _bindings.Add(new Binding
+                    try
                     {
-                        Hotkey = hotkey,
-                        Job = new MacroJob(name, macro.Mode, parsed, _output, PublishMacroLog),
-                    });
+                        ParsedMacro parsed = MacroParser.Parse(macro.Text, macro.Mode);
+                        if (parsed.Errors.Count > 0)
+                        {
+                            PublishMacroLog($"宏 {name} 存在解析错误，已跳过：{parsed.Errors[0]}");
+                            continue;
+                        }
+                        HotkeyDefinition hotkey = HotkeyDefinition.Parse(macro.Trigger);
+                        _bindings.Add(new Binding
+                        {
+                            Hotkey = hotkey,
+                            Job = new MacroJob(name, macro.Mode, parsed, _output, PublishMacroLog),
+                        });
+                    }
+                    catch (Exception exception)
+                    {
+                        PublishMacroLog($"宏 {name} 加载失败：{exception.Message}");
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(_activeProfile.LuaScriptText))
+            {
+                try
+                {
+                    _lua.Start(_activeProfile.LuaScriptText);
                 }
                 catch (Exception exception)
                 {
-                    PublishMacroLog($"宏 {name} 加载失败：{exception.Message}");
+                    PublishLuaLog($"Lua 自动启动失败：{exception.Message}");
                 }
             }
+            LuaStateChanged?.Invoke(_lua.Active);
         }
-        if (!string.IsNullOrWhiteSpace(_activeProfile.LuaScriptText))
-        {
-            try
-            {
-                _lua.Start(_activeProfile.LuaScriptText);
-            }
-            catch (Exception exception)
-            {
-                PublishLuaLog($"Lua 自动启动失败：{exception.Message}");
-            }
-        }
-        LuaStateChanged?.Invoke(_lua.Active);
     }
 
     private void HandlePhysicalInput(PhysicalInputEvent input)
@@ -280,6 +356,11 @@ internal sealed class AutomationController : IDisposable
             return _input.ForwardingEnabled
                 ? "鼠标与键盘走旧版单板串口通路"
                 : "鼠标与键盘走本机 Win32 API；UDP 由设置开关控制";
+        }
+
+        if (Settings.MakcuEnabled)
+        {
+            return "Makcu 运行模式占用 M 板串口；自动化鼠标暂不可用，键盘走本机 Win32 API";
         }
 
         return _input.AutomationMouseRemoteOutputEnabled

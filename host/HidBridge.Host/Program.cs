@@ -33,6 +33,15 @@ internal static class Program
         try
         {
             BridgeOptions options = BridgeOptions.Load();
+            AutomationProfileStore profileStore = new();
+            AutomationSettings automationSettings = profileStore.LoadSettings();
+            if (automationSettings.LegacySingleBoardFirmwareCompatibility &&
+                automationSettings.MakcuEnabled)
+            {
+                automationSettings.MakcuEnabled = false;
+                profileStore.SaveSettings(automationSettings);
+                Console.Error.WriteLine("配置同时启用了旧版单板与 Makcu；已关闭 Makcu 设置，避免两种串口通路冲突。");
+            }
             RuntimeLogSettings logSettings = new(
                 options.ShowDeviceLogInUi ? RuntimeLogMode.Full : RuntimeLogMode.Reduced);
             logWriter.EnableFile(options.HostLogPath, options.HostLogRetentionCount);
@@ -60,15 +69,19 @@ internal static class Program
                 serialBridge = new SerialBridge(
                     options,
                     logSettings,
-                    () => automation?.Settings.LegacySingleBoardFirmwareCompatibility ?? false);
+                    () => automationSettings.LegacySingleBoardFirmwareCompatibility,
+                    automationSettings);
+                Console.WriteLine(
+                    $"ButtonState 共享区：映射={serialBridge.ButtonStateMappingName}，" +
+                    $"互斥量={serialBridge.ButtonStateMutexName}，" +
+                    $"发布开关={(automationSettings.ButtonStatePublishingEnabled ? "启用" : "停用")}。");
                 transport = serialBridge;
             }
             input = new InputForwarder(
                 transport,
-                () => automation?.Settings.LegacySingleBoardFirmwareCompatibility ?? false,
+                () => automationSettings.LegacySingleBoardFirmwareCompatibility,
                 () => serialBridge?.IsMouseHostAvailable ?? false);
-            AutomationProfileStore profileStore = new();
-            automation = new AutomationController(profileStore, input);
+            automation = new AutomationController(profileStore, input, settings: automationSettings);
             automation.Log += automationLogWriter.WriteLine;
             automation.DiagnosticLog += automationLogWriter.WriteLine;
             if (serialBridge is not null)
@@ -79,7 +92,7 @@ internal static class Program
                  * 任何文件写入失败都只影响该路日志，不影响串口读取与命令写入。
                  */
                 logMirror = new DeviceLogMirror(
-                    options.BaudRate,
+                    MakcuModeCoordinator.A5BaudRate,
                     options.DeviceLogPath,
                     options.DeviceLogRetentionCount,
                     serialBridge.GetConnectedPortName,
@@ -133,6 +146,13 @@ internal static class Program
                 firmwareFlash,
                 lanEndpointDescription: remoteInput?.DisplayEndpoint,
                 serialBridge: serialBridge);
+            form.Shown += async (_, _) =>
+            {
+                if (automationSettings.MakcuEnabled && serialBridge is not null)
+                {
+                    await form.SettingsPage.RestoreMakcuModeOnStartupAsync();
+                }
+            };
             logWriter.Attach(form.AppendLog);
             Console.WriteLine($"目标端点：{endpoint}");
             Console.WriteLine($"本地实时日志：{logWriter.FilePath}");

@@ -1,4 +1,5 @@
 #include "uart0_protocol_router.h"
+#include "button_state_logic.h"
 #include "m_udp_smoothing.h"
 #include "usb_stall_recovery_logic.h"
 #include "vendor_urb_pending_logic.h"
@@ -10,6 +11,7 @@
 #include "bridge_protocol.h"
 #include "dual_input_aggregator.h"
 #include "hid_device_profile.h"
+#include "hid_host_cherryusb_logic.h"
 #include "hid_clone_descriptor.h"
 #include "hid_report_layout.h"
 #include "hid_vendor_session_logic.h"
@@ -74,6 +76,106 @@ static void test_merge_and_independent_release(void)
     dual_input_physical_release(&state);
     assert(dual_input_take_report(&state, &report, false));
     assert(report.buttons == 0);
+}
+
+static void test_cherryusb_control_and_report_request_mapping(void)
+{
+    size_t payload_length = 0U;
+    assert(cherryusb_ep0_payload_length(26U, 18U, 18U, &payload_length));
+    assert(payload_length == 18U);
+    assert(!cherryusb_ep0_payload_length(7U, 18U, 18U, &payload_length));
+    assert(!cherryusb_ep0_payload_length(27U, 18U, 18U, &payload_length));
+    assert(cherryusb_hid_report_wvalue(2U, 7U) == 0x0207U);
+    assert(cherryusb_hid_report_windex(3U) == 3U);
+}
+
+static void test_cherryusb_heartbeat_diagnostics_ring_and_recovery(void)
+{
+    cherry_heartbeat_diagnostics_t diagnostics = {0};
+    assert(cherry_heartbeat_classify_outcome(
+        CHERRY_CONTROL_STAGE_LIFECYCLE_LOCK, false, false, false) ==
+        CHERRY_HEARTBEAT_OUTCOME_BUSY);
+    assert(cherry_heartbeat_classify_outcome(
+        CHERRY_CONTROL_STAGE_EP0_LOCK, true, true, false) ==
+        CHERRY_HEARTBEAT_OUTCOME_BUSY);
+    assert(cherry_heartbeat_classify_outcome(
+        CHERRY_CONTROL_STAGE_DEVICE_STATE, true, false, false) ==
+        CHERRY_HEARTBEAT_OUTCOME_NO_DEVICE);
+    assert(cherry_heartbeat_classify_outcome(
+        CHERRY_CONTROL_STAGE_DEVICE_STATE, true, false, true) ==
+        CHERRY_HEARTBEAT_OUTCOME_FAILURE);
+    /* URB错误码即使是NOT_FOUND，也不会被阶段分类误判为物理断开。 */
+    assert(cherry_heartbeat_classify_outcome(
+        CHERRY_CONTROL_STAGE_URB, true, false, false) ==
+        CHERRY_HEARTBEAT_OUTCOME_FAILURE);
+    assert(cherry_heartbeat_classify_outcome(
+        CHERRY_CONTROL_STAGE_DEVICE_STATE, false, false, false) ==
+        CHERRY_HEARTBEAT_OUTCOME_FAILURE);
+
+    for (uint32_t index = 1U; index <= 10U; ++index) {
+        cherry_heartbeat_failure_t failure = {
+            .sequence = cherry_heartbeat_next_sequence(&diagnostics),
+            .uptime_us = (int64_t)index * 100000LL,
+            .stage = index == 1U ? CHERRY_CONTROL_STAGE_LIFECYCLE_LOCK
+                : index == 2U ? CHERRY_CONTROL_STAGE_DEVICE_STATE
+                : CHERRY_CONTROL_STAGE_URB,
+            .esp_error = -1,
+            .raw_urb_result_valid = index != 3U,
+            .raw_urb_result = index == 3U ? 0 : -7,
+            .raw_actual_length_valid = false,
+            .raw_actual_length = 0U,
+        };
+        const cherry_heartbeat_outcome_t outcome =
+            cherry_heartbeat_classify_outcome(failure.stage,
+                index == 2U, false, false);
+        cherry_heartbeat_record_failure(&diagnostics, failure, outcome);
+    }
+
+    assert(diagnostics.heartbeat_sequence == 10U);
+    assert(diagnostics.non_success_count == 10U);
+    assert(diagnostics.failure_count == 8U);
+    assert(diagnostics.busy_count == 1U);
+    assert(diagnostics.no_device_count == 1U);
+    assert(diagnostics.stage_counts[CHERRY_CONTROL_STAGE_LIFECYCLE_LOCK] == 1U);
+    assert(diagnostics.stage_counts[CHERRY_CONTROL_STAGE_DEVICE_STATE] == 1U);
+    assert(diagnostics.stage_counts[CHERRY_CONTROL_STAGE_URB] == 8U);
+    assert(diagnostics.history_count == CHERRYUSB_HEARTBEAT_HISTORY_CAPACITY);
+    const cherry_heartbeat_failure_t *oldest =
+        cherry_heartbeat_history_at(&diagnostics, 0U);
+    const cherry_heartbeat_failure_t *newest =
+        cherry_heartbeat_history_at(&diagnostics, CHERRYUSB_HEARTBEAT_HISTORY_CAPACITY - 1U);
+    assert(oldest != NULL && oldest->sequence == 3U);
+    assert(!oldest->raw_urb_result_valid && oldest->raw_urb_result == 0);
+    assert(!oldest->raw_actual_length_valid && oldest->raw_actual_length == 0U);
+    assert(newest != NULL && newest->sequence == 10U);
+    assert(cherry_heartbeat_history_at(&diagnostics,
+        CHERRYUSB_HEARTBEAT_HISTORY_CAPACITY) == NULL);
+
+    cherry_heartbeat_diagnostics_t streak = {0};
+    cherry_heartbeat_failure_t failure = {
+        .sequence = cherry_heartbeat_next_sequence(&streak),
+        .uptime_us = 1000000LL,
+        .stage = CHERRY_CONTROL_STAGE_URB,
+    };
+    cherry_heartbeat_record_failure(&streak, failure,
+                                    CHERRY_HEARTBEAT_OUTCOME_FAILURE);
+    failure.sequence = cherry_heartbeat_next_sequence(&streak);
+    failure.uptime_us = 1500000LL;
+    cherry_heartbeat_record_failure(&streak, failure,
+                                    CHERRY_HEARTBEAT_OUTCOME_FAILURE);
+    const cherry_heartbeat_failure_t *second =
+        cherry_heartbeat_history_at(&streak, 1U);
+    assert(second != NULL && second->consecutive_failures == 2U);
+    assert(second->streak_duration_us == 500000LL);
+
+    cherry_heartbeat_recovery_t recovery = {0};
+    assert(cherry_heartbeat_record_success(&streak, 3U, 1900000LL, &recovery));
+    assert(recovery.sequence == 3U && recovery.consecutive_failures == 2U);
+    assert(recovery.streak_duration_us == 900000LL);
+    assert(streak.recovery_count == 1U && !streak.streak_active);
+    assert(!cherry_heartbeat_record_success(&streak, 4U, 2000000LL, &recovery));
+    assert(streak.recovery_count == 1U && streak.success_count == 2U);
+    puts("cherryusb_heartbeat_diagnostics: PASS");
 }
 
 static void test_rolling_smoother_preserves_overlapping_500hz_motion(void)
@@ -208,6 +310,29 @@ static void test_bridge_protocol(void)
     assert(capture.count == 2);
     assert(capture.frames[1].type == DUAL_MESSAGE_PING);
     assert(capture.frames[1].sequence == second.sequence);
+
+    uint8_t opcode = UINT8_MAX;
+    const uint8_t enable_request[] = {DUAL_MAKCU_MODE_OP_ENABLE};
+    assert(dual_makcu_mode_request_decode(enable_request,
+        sizeof(enable_request), &opcode));
+    assert(opcode == DUAL_MAKCU_MODE_OP_ENABLE);
+    const uint8_t invalid_request[] = {3U};
+    assert(!dual_makcu_mode_request_decode(invalid_request,
+        sizeof(invalid_request), &opcode));
+    assert(!dual_makcu_mode_request_decode(enable_request, 0U, &opcode));
+
+    uint8_t mode_status[DUAL_MAKCU_MODE_STATUS_PAYLOAD_LENGTH] = {0};
+    assert(dual_makcu_mode_status_encode(DUAL_MAKCU_MODE_STATUS_OK, true,
+        115200U, mode_status, sizeof(mode_status)));
+    uint8_t status = UINT8_MAX;
+    bool enabled = false;
+    uint32_t baud = 0U;
+    assert(dual_makcu_mode_status_decode(mode_status, sizeof(mode_status),
+        &status, &enabled, &baud));
+    assert(status == DUAL_MAKCU_MODE_STATUS_OK && enabled && baud == 115200U);
+    mode_status[DUAL_MAKCU_MODE_STATUS_ENABLED_OFFSET] = 2U;
+    assert(!dual_makcu_mode_status_decode(mode_status, sizeof(mode_status),
+        &status, &enabled, &baud));
 }
 
 typedef struct {
@@ -1949,8 +2074,9 @@ static void test_usb_stall_watch_bounds(void)
     assert(!usb_stall_evidence_ready(now, now - 9999999, now - 250000, true, false));
     assert(!usb_stall_evidence_ready(now, now - 10000000, now - 250000, false, false));
     assert(!usb_stall_evidence_ready(now, now - 10000000, now - 250000, true, true));
-    assert(usb_stall_cooldown_ready(50000000, 20000000));
-    assert(!usb_stall_cooldown_ready(49999999, 20000000));
+    /* cooldown 在 5 秒边界放行，少 1 us 时仍抑制。 */
+    assert(usb_stall_cooldown_ready(25000000, 20000000));
+    assert(!usb_stall_cooldown_ready(24999999, 20000000));
     assert(usb_stall_cooldown_ready(now, 0));
     assert(usb_stall_observed_delay(now, now - 250000) == 250000);
 
@@ -2084,6 +2210,102 @@ static void test_uart0_protocol_isolation(void)
     assert(route_v4_count == 2 && route_a5_count == 1);
     uart0_protocol_router_feed(&router, query, sizeof(query)-1, 301);
     assert(route_v4_count == 3);
+
+    /* V4 parser idle 时，中性 ButtonState 与模式查询仍按完整 A5 帧路由。 */
+    dual_frame_t neutral = {.version=2,
+        .type=DUAL_MESSAGE_MAKCU_MODE_REQUEST,
+        .sequence=0x2345,
+        .payload_length=1,
+        .payload={DUAL_MAKCU_MODE_OP_QUERY}};
+    assert(dual_frame_serialize(&neutral, bytes, sizeof(bytes), &length) == ESP_OK);
+    uart0_protocol_router_feed(&router, bytes, length, 302);
+    assert(route_a5_count == 2 && route_v4_count == 3);
+    neutral.type = DUAL_MESSAGE_BUTTON_STATE;
+    neutral.payload[0] = 1U;
+    assert(dual_frame_serialize(&neutral, bytes, sizeof(bytes), &length) == ESP_OK);
+    uart0_protocol_router_feed(&router, bytes, length, 303);
+    assert(route_a5_count == 3 && route_v4_count == 3);
+}
+
+static void test_uart0_a5_route_policy(void)
+{
+    dual_frame_t frame = {.version=2, .payload_length=0};
+
+    frame.type = DUAL_MESSAGE_DEVICE_PROBE;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+           UART0_A5_ROUTE_IGNORE);
+    frame.payload_length = 8U;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+           UART0_A5_ROUTE_NEUTRAL);
+    frame.type = DUAL_MESSAGE_STATS_SNAPSHOT_REQUEST;
+    frame.payload_length = 0U;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+           UART0_A5_ROUTE_REJECT_MAKCU_ACTIVE);
+    assert(uart0_protocol_router_classify_a5_frame(&frame, false, false) ==
+           UART0_A5_ROUTE_NEUTRAL);
+
+    frame.type = DUAL_MESSAGE_MAKCU_MODE_REQUEST;
+    frame.payload_length = DUAL_MAKCU_MODE_REQUEST_PAYLOAD_LENGTH;
+    frame.payload[0] = DUAL_MAKCU_MODE_OP_QUERY;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+           UART0_A5_ROUTE_NEUTRAL);
+
+    frame.type = DUAL_MESSAGE_BUTTON_STATE;
+    frame.payload_length = DUAL_BUTTON_STATE_PAYLOAD_LENGTH;
+    frame.payload[0] = 0U;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+           UART0_A5_ROUTE_NEUTRAL);
+    frame.payload[0] = 1U;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+           UART0_A5_ROUTE_REJECT_MAKCU_ACTIVE);
+    assert(uart0_protocol_router_classify_a5_frame(&frame, false, false) ==
+           UART0_A5_ROUTE_NEUTRAL);
+
+    const uint8_t active_rejected[] = {
+        DUAL_MESSAGE_KEYBOARD_REPORT,
+        DUAL_MESSAGE_MOUSE_REPORT,
+        DUAL_MESSAGE_RELEASE_ALL,
+        DUAL_MESSAGE_PING,
+        DUAL_MESSAGE_SESSION_START,
+        DUAL_MESSAGE_DIAG_PROFILE_READ,
+        DUAL_MESSAGE_DIAG_PROFILE_BEGIN,
+        DUAL_MESSAGE_DIAG_PROFILE_CHUNK,
+        DUAL_MESSAGE_DIAG_PROFILE_COMMIT,
+        DUAL_MESSAGE_DIAG_PROFILE_MODE,
+        DUAL_MESSAGE_DIAG_STREAM_CONTROL,
+        DUAL_MESSAGE_DIAG_INJECT_REQUEST,
+        DUAL_MESSAGE_DIAG_VENDOR_TEST_REQUEST,
+        DUAL_MESSAGE_DIAG_REPORT_INJECT_REQUEST,
+        DUAL_MESSAGE_DIAG_PROFILE_REFRESH_REQUEST,
+    };
+    for (size_t index = 0U;
+         index < sizeof(active_rejected) / sizeof(active_rejected[0]);
+         ++index) {
+        frame.type = active_rejected[index];
+        frame.payload_length = 0U;
+        assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+               UART0_A5_ROUTE_REJECT_MAKCU_ACTIVE);
+        assert(uart0_protocol_router_classify_a5_frame(&frame, false, false) ==
+               UART0_A5_ROUTE_SELECT_A5_OWNER);
+    }
+
+    frame.type = 0x0CU; /* 未分配类型不能继承旧数值区间的路由行为。 */
+    assert(uart0_protocol_router_classify_a5_frame(&frame, false, false) ==
+           UART0_A5_ROUTE_IGNORE);
+    frame.type = DUAL_MESSAGE_DEVICE_HELLO; /* 仅响应类型。 */
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, false) ==
+           UART0_A5_ROUTE_IGNORE);
+
+    frame.type = DUAL_MESSAGE_MAKCU_MODE_REQUEST;
+    frame.payload_length = DUAL_MAKCU_MODE_REQUEST_PAYLOAD_LENGTH;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, true, true) ==
+           UART0_A5_ROUTE_REJECT_TRANSITION_TAIL);
+    frame.type = DUAL_MESSAGE_MOUSE_REPORT;
+    assert(uart0_protocol_router_classify_a5_frame(&frame, false, true) ==
+           UART0_A5_ROUTE_REJECT_TRANSITION_TAIL);
+    assert(!uart0_protocol_router_v4_command_allowed(false, false));
+    assert(uart0_protocol_router_v4_command_allowed(true, false));
+    assert(!uart0_protocol_router_v4_command_allowed(true, true));
 }
 
 static void test_m_udp_channel_and_single_smoothing(void)
@@ -2125,11 +2347,99 @@ static void test_m_udp_channel_and_single_smoothing(void)
     }
 }
 
+static void test_button_state_subscription_heartbeat_and_generation(void)
+{
+    dual_button_state_t state;
+    dual_button_state_init(&state);
+    assert(!dual_button_state_due(&state, 1000));
+
+    dual_button_state_set_subscribed(&state, true);
+    assert(dual_button_state_due(&state, 1000));
+    const uint32_t invalid_generation = dual_button_state_generation(&state);
+    assert(dual_button_state_payload(&state) == 0U);
+    dual_button_state_record_send(&state, invalid_generation, true, 1000);
+    assert(!dual_button_state_due(&state, 5999));
+    assert(dual_button_state_due(&state, 6000));
+
+    dual_button_state_t boot_at_zero;
+    dual_button_state_init(&boot_at_zero);
+    dual_button_state_set_subscribed(&boot_at_zero, true);
+    const uint32_t zero_generation = dual_button_state_generation(&boot_at_zero);
+    dual_button_state_record_send(&boot_at_zero, zero_generation, true, 0);
+    assert(!dual_button_state_due(&boot_at_zero, 4999));
+    assert(dual_button_state_due(&boot_at_zero, 5000));
+
+    /* 写入失败保留 dirty，且不推进心跳计时。 */
+    dual_button_state_record_send(&state, invalid_generation, false, 6000);
+    assert(dual_button_state_due(&state, 6000));
+    dual_button_state_record_send(&state, invalid_generation, true, 6000);
+    assert(!dual_button_state_due(&state, 10999));
+    assert(dual_button_state_due(&state, 11000));
+
+    dual_button_state_update_physical(&state, 0xF5U);
+    const uint32_t pressed_generation = dual_button_state_generation(&state);
+    assert(dual_button_state_payload(&state) == 0x95U);
+    assert(dual_button_state_due(&state, 11001));
+
+    /* 发送期间物理状态变化后，旧 generation 不能清除新状态的 dirty。 */
+    dual_button_state_update_physical(&state, 0x02U);
+    dual_button_state_record_send(&state, pressed_generation, true, 11002);
+    assert(dual_button_state_due(&state, 11002));
+    assert(dual_button_state_payload(&state) == 0x82U);
+    const uint32_t latest_generation = dual_button_state_generation(&state);
+    dual_button_state_record_send(&state, latest_generation, true, 11003);
+    assert(!dual_button_state_due(&state, 15999));
+    assert(dual_button_state_due(&state, 16003));
+
+    dual_button_state_invalidate(&state);
+    assert(dual_button_state_due(&state, 16004));
+    assert(dual_button_state_payload(&state) == 0U);
+    const uint32_t disconnected_generation = dual_button_state_generation(&state);
+    dual_button_state_record_send(&state, disconnected_generation, true, 16005);
+    assert(!dual_button_state_due(&state, 16006));
+
+    dual_button_state_set_subscribed(&state, false);
+    assert(!dual_button_state_due(&state, 16006));
+    dual_button_state_update_physical(&state, 0x04U);
+    assert(!dual_button_state_due(&state, 16007));
+    dual_button_state_set_subscribed(&state, true);
+    assert(dual_button_state_payload(&state) == 0x84U);
+    assert(dual_button_state_due(&state, 16008));
+
+    /* 同一连接中已排队的报告必须按序更新，即使按钮 generation 已变化。 */
+    dual_button_state_t observed;
+    dual_button_state_init(&observed);
+    const uint32_t connection_epoch =
+        dual_button_state_observation_epoch(&observed);
+    assert(dual_button_state_update_physical_for_epoch(
+        &observed, connection_epoch, 1U));
+    assert(dual_button_state_update_physical_for_epoch(
+        &observed, connection_epoch, 3U));
+    assert(dual_button_state_payload(&observed) == 0x83U);
+
+    dual_button_state_invalidate(&observed);
+    const uint32_t reconnected_epoch =
+        dual_button_state_observation_epoch(&observed);
+    assert(reconnected_epoch != connection_epoch);
+    assert(!dual_button_state_update_physical_for_epoch(
+        &observed, connection_epoch, 0U));
+    assert(!observed.valid);
+    assert(dual_button_state_update_physical_for_epoch(
+        &observed, reconnected_epoch, 4U));
+    assert(dual_button_state_payload(&observed) == 0x84U);
+    assert(!dual_button_state_invalidate_for_epoch(&observed, connection_epoch));
+    assert(observed.valid);
+}
+
 int main(void)
 {
+    test_button_state_subscription_heartbeat_and_generation();
     test_uart0_protocol_isolation();
+    test_uart0_a5_route_policy();
     test_m_udp_channel_and_single_smoothing();
     test_merge_and_independent_release();
+    test_cherryusb_control_and_report_request_mapping();
+    test_cherryusb_heartbeat_diagnostics_ring_and_recovery();
     test_rolling_smoother_preserves_overlapping_500hz_motion();
     test_saturation_is_split_without_loss();
     test_peek_commit_preserves_pending_on_retry();

@@ -54,7 +54,8 @@ internal sealed class DeviceOutputFrameScanner
                 CopyPrefixToText(text, 1);
                 continue;
             }
-            if (frame.Type == MessageType.StatsSnapshotResponse)
+            if (frame.Type is MessageType.StatsSnapshotResponse or MessageType.ButtonState or
+                MessageType.MakcuModeStatus or MessageType.DeviceHello)
             {
                 onFrame(frame);
                 _pending.RemoveRange(0, frameLength);
