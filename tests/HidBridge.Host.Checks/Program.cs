@@ -156,9 +156,17 @@ if (args.Any(argument => argument.Equals("--button-state-only", StringComparison
     CheckButtonStateScannerFrames();
     CheckDeviceTraceBlockingReadAndCancellation();
     CheckMakcuModeCoordinator();
+    CheckMakcuReconnectStateSync();
     CheckButtonStateSettingsDefaults();
     CheckMakcuAutomationPauseGate();
     Console.WriteLine("ButtonState MMF/失效、串口分帧、Makcu模式协调和设置默认专项：PASS");
+    return 0;
+}
+
+if (args.Any(argument => argument.Equals("--makcu-reconnect-only", StringComparison.OrdinalIgnoreCase)))
+{
+    CheckMakcuReconnectStateSync();
+    Console.WriteLine("Makcu 重连实态同步专项：PASS");
     return 0;
 }
 
@@ -182,6 +190,7 @@ CheckMouseStatisticsLoggingDoesNotBlockPump();
 CheckStatisticsActivityGate();
 CheckMouseMovementRecordingAndChart();
 CheckSerialDiscoveryProtocol();
+CheckMakcuReconnectStateSync();
 CheckSerialModeSwitchReleaseSequence();
 CheckStatsSnapshotProtocol();
 CheckStatsSnapshotHttpApi();
@@ -1393,6 +1402,101 @@ static void CheckMakcuModeCoordinator()
             !SerialBridge.IsOutboundBatchEligible(9, 9, modeGated: true),
         "epoch变化或模式门关闭期间，已出队旧batch必须被拒绝写串口");
     Console.WriteLine("Makcu模式协调检查：ACK/实态分离、unsupported恢复、双速率查实和writer epoch门均通过。");
+}
+
+static void CheckMakcuReconnectStateSync()
+{
+    Require(
+        SerialBridge.GetDiscoveryBaudRates(
+            legacyCompatibility: false,
+            legacyBaudRate: 460800).SequenceEqual(
+                [MakcuModeCoordinator.A5BaudRate, MakcuModeCoordinator.MakcuBaudRate]),
+        "双板模式必须固定先探测 921600，再回退 115200，不能读取保存的 MakcuEnabled");
+    Require(
+        SerialBridge.GetDiscoveryBaudRates(
+            legacyCompatibility: true,
+            legacyBaudRate: 460800).SequenceEqual([460800]),
+        "旧版单板兼容模式必须继续只使用自己的配置波特率");
+
+    MakcuModeSnapshot validMakcu = new(
+        Enabled: true,
+        BaudRate: MakcuModeCoordinator.MakcuBaudRate,
+        Status: 0);
+    Require(
+        SerialBridge.IsVerifiedMakcuModeConnection(
+            roleProbeMatched: true,
+            validMakcu),
+        "M 角色与 Makcu 启用状态均已验证时必须接受 115200 会话");
+    Require(
+        !SerialBridge.IsVerifiedMakcuModeConnection(
+            roleProbeMatched: false,
+            validMakcu),
+        "端口能打开或状态可查询但未验证 M 角色时不得识别为 Makcu");
+    foreach (MakcuModeSnapshot invalid in new[]
+             {
+                 new MakcuModeSnapshot(false, MakcuModeCoordinator.MakcuBaudRate, 0),
+                 new MakcuModeSnapshot(true, MakcuModeCoordinator.A5BaudRate, 0),
+                 new MakcuModeSnapshot(true, MakcuModeCoordinator.MakcuBaudRate, 2),
+             })
+    {
+        Require(
+            !SerialBridge.IsVerifiedMakcuModeConnection(
+                roleProbeMatched: true,
+                invalid),
+            $"不接受不完整或拒绝的 Makcu 状态：{invalid}");
+    }
+    Require(
+        !SerialBridge.IsVerifiedMakcuModeConnection(
+            roleProbeMatched: true,
+            status: null),
+        "115200 未取得 Makcu 状态响应时不得识别为 Makcu");
+
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-makcu-reconnect-{Guid.NewGuid():N}");
+    try
+    {
+        AutomationProfileStore store = new(directory);
+        AutomationSettings observed = store.LoadSettings();
+        observed.AlwaysOutputUdpEnabled = false;
+        observed.ButtonStatePublishingEnabled = false;
+        observed.ButtonStateMappingName = "Local\\HidBridge.Buttons.ReconnectState";
+        observed.FirmwareFlashPortName = "COM123";
+        Require(observed.TryEnableVerifiedMakcuMode(), "旧 false 与已验证 115200 冲突时必须允许同步为开");
+        Require(
+            observed.MakcuEnabled &&
+            !observed.AlwaysOutputUdpEnabled &&
+            !observed.ButtonStatePublishingEnabled &&
+            observed.ButtonStateMappingName == "Local\\HidBridge.Buttons.ReconnectState" &&
+            observed.FirmwareFlashPortName == "COM123",
+            "实态同步只能修改 MakcuEnabled，不得覆盖其它共享设置");
+        Require(!observed.TryEnableVerifiedMakcuMode(), "相同 Makcu 状态不得重复修改设置");
+        store.SaveSettings(observed);
+        AutomationSettings restored = store.LoadSettings();
+        Require(
+            restored.MakcuEnabled &&
+            !restored.AlwaysOutputUdpEnabled &&
+            !restored.ButtonStatePublishingEnabled &&
+            restored.ButtonStateMappingName == "Local\\HidBridge.Buttons.ReconnectState" &&
+            restored.FirmwareFlashPortName == "COM123",
+            "已验证 Makcu 开关与无关设置必须一起完整落盘并可重新加载");
+
+        AutomationSettings legacy = store.LoadSettings();
+        legacy.LegacySingleBoardFirmwareCompatibility = true;
+        legacy.MakcuEnabled = false;
+        Require(
+            !legacy.TryEnableVerifiedMakcuMode() &&
+            !legacy.MakcuEnabled,
+            "旧版单板兼容模式必须保持独立，实态同步不得将其改为 Makcu");
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    Console.WriteLine(
+        "Makcu重连同步检查：固定921600→115200、仅验证Makcu后置开、旧单板隔离、仅改MakcuEnabled并持久化：PASS");
 }
 
 static void CheckButtonStateSettingsDefaults()

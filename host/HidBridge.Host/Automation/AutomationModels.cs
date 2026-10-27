@@ -78,6 +78,17 @@ internal sealed class AutomationSettings
     public string FirmwareFlashPortName { get; set; } = string.Empty;
     public int WindowWidth { get; set; } = 1080;
     public int WindowHeight { get; set; } = 760;
+
+    internal bool TryEnableVerifiedMakcuMode()
+    {
+        if (LegacySingleBoardFirmwareCompatibility || MakcuEnabled)
+        {
+            return false;
+        }
+
+        MakcuEnabled = true;
+        return true;
+    }
 }
 
 internal readonly record struct PhysicalInputEvent(

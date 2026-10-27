@@ -44,6 +44,7 @@ internal sealed class SettingsPageControl : UserControl
     private Button _confirmFlashButton = null!;
     private readonly Label _statusLabel;
     private bool _loading;
+    private bool _makcuModeUserTransitionActive;
 
     internal SettingsPageControl(
         AutomationController controller,
@@ -252,7 +253,17 @@ internal sealed class SettingsPageControl : UserControl
         _simulatedUdpInputFrequencyBox.SelectedIndexChanged += (_, _) => SaveSettings();
         _alwaysOutputUdpCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _firmwareUpdateApiCheckBox.CheckedChanged += (_, _) => SaveSettings();
+        if (_serialBridge is not null)
+        {
+            _serialBridge.VerifiedMakcuModeObserved += QueueVerifiedMakcuModeSync;
+            HandleCreated += (_, _) => SynchronizeVerifiedMakcuModeFromConnection(reportStatus: false);
+            Disposed += (_, _) =>
+            {
+                _serialBridge.VerifiedMakcuModeObserved -= QueueVerifiedMakcuModeSync;
+            };
+        }
         LoadSettings();
+        SynchronizeVerifiedMakcuModeFromConnection(reportStatus: false);
     }
 
     internal CheckBox StartOnBootCheckBox => _startOnBootCheckBox;
@@ -790,6 +801,12 @@ internal sealed class SettingsPageControl : UserControl
             return;
         }
 
+        if (_serialBridge.IsMakcuModeSessionReady)
+        {
+            SynchronizeVerifiedMakcuModeFromConnection(reportStatus: true);
+            return;
+        }
+
         _makcuModeCheckBox.Enabled = false;
         _controller.PrepareMakcuModeTransition();
         try
@@ -823,6 +840,96 @@ internal sealed class SettingsPageControl : UserControl
         finally
         {
             _makcuModeCheckBox.Enabled = true;
+        }
+    }
+
+    private void QueueVerifiedMakcuModeSync()
+    {
+        if (IsDisposed || !IsHandleCreated)
+        {
+            return;
+        }
+
+        try
+        {
+            BeginInvoke(new Action(() =>
+            {
+                if (!_makcuModeUserTransitionActive &&
+                    _serialBridge?.IsMakcuModeSessionReady == true)
+                {
+                    ApplyVerifiedMakcuMode(reportStatus: true);
+                }
+            }));
+        }
+        catch (InvalidOperationException)
+        {
+            // 控件句柄正在销毁；当前实态会在下次创建句柄或连接验证时重新读取。
+        }
+    }
+
+    private bool SynchronizeVerifiedMakcuModeFromConnection(bool reportStatus)
+    {
+        if (_serialBridge is null ||
+            _controller.Settings.LegacySingleBoardFirmwareCompatibility ||
+            _legacySingleBoardFirmwareCheckBox.Checked)
+        {
+            return false;
+        }
+
+        if (!_serialBridge.IsMakcuModeSessionReady)
+        {
+            return false;
+        }
+
+        ApplyVerifiedMakcuMode(reportStatus);
+        return true;
+    }
+
+    private void ApplyVerifiedMakcuMode(bool reportStatus)
+    {
+        if (IsDisposed || _loading ||
+            _makcuModeUserTransitionActive ||
+            _serialBridge?.IsMakcuModeSessionReady != true ||
+            _controller.Settings.LegacySingleBoardFirmwareCompatibility ||
+            _legacySingleBoardFirmwareCheckBox.Checked)
+        {
+            return;
+        }
+
+        if (!_controller.MakcuModeRuntimePaused)
+        {
+            // 只暂停 Host 侧宏/Lua；实际模式已由设备验证，不发送切换命令。
+            _controller.PrepareMakcuModeTransition();
+        }
+
+        bool settingsChanged = _controller.Settings.TryEnableVerifiedMakcuMode();
+        bool checkBoxChanged = !_makcuModeCheckBox.Checked;
+        SetMakcuModeCheckBox(true);
+        if (!settingsChanged && !checkBoxChanged)
+        {
+            return;
+        }
+
+        try
+        {
+            // 直接序列化共享设置，不重放其他 UI 开关，也不触发 CheckedChanged 切换逻辑。
+            _controller.SaveSettings(updateStartupRegistration: false);
+            if (!reportStatus)
+            {
+                return;
+            }
+
+            _statusLabel.ForeColor = SuccessColor;
+            _statusLabel.Text = "已根据 115200 下 M 板角色与 Makcu 启用状态同步开关并保存；未发送切换命令。";
+        }
+        catch (Exception exception)
+        {
+            if (reportStatus)
+            {
+                _statusLabel.ForeColor = ErrorColor;
+                _statusLabel.Text =
+                    $"设备实际模式已验证为 Makcu/115200，但设置保存失败：{exception.Message}";
+            }
         }
     }
 
@@ -868,6 +975,7 @@ internal sealed class SettingsPageControl : UserControl
 
         _makcuModeCheckBox.Enabled = false;
         _buttonStatePublishingCheckBox.Enabled = false;
+        _makcuModeUserTransitionActive = true;
         _controller.PrepareMakcuModeTransition();
         try
         {
@@ -913,6 +1021,7 @@ internal sealed class SettingsPageControl : UserControl
         }
         finally
         {
+            _makcuModeUserTransitionActive = false;
             _makcuModeCheckBox.Enabled = true;
             _buttonStatePublishingCheckBox.Enabled = _serialBridge is not null;
         }

@@ -94,6 +94,8 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
     private int _outboundQueuePeak;
     private long _backpressureCount;
 
+    internal event Action? VerifiedMakcuModeObserved;
+
     public SerialBridge(
         BridgeOptions options,
         RuntimeLogSettings logSettings,
@@ -1050,11 +1052,7 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
         foreach (string portName in candidates)
         {
             bool legacyCompatibility = requestedLegacyCompatibility;
-            int[] baudRates = legacyCompatibility
-                ? [_options.BaudRate]
-                : _settings.MakcuEnabled
-                    ? [A5BaudRate, MakcuBaudRate]
-                    : [A5BaudRate];
+            int[] baudRates = GetDiscoveryBaudRates(legacyCompatibility, _options.BaudRate);
             foreach (int baudRate in baudRates)
             {
                 SerialPort? candidate = null;
@@ -1068,7 +1066,7 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
                     if (probeMatched && !legacyCompatibility && baudRate == MakcuBaudRate)
                     {
                         MakcuModeSnapshot? status = QueryMakcuModeBlocking(candidate);
-                        probeMatched = status is { Status: 0, Enabled: true, BaudRate: MakcuBaudRate };
+                        probeMatched = IsVerifiedMakcuModeConnection(probeMatched, status);
                         makcuEnabled = probeMatched;
                     }
                     if (!probeMatched)
@@ -1106,6 +1104,10 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
                         PublishButtonStateLocked(1);
                     }
                     Console.WriteLine($"已连接 {portName} @ {baudRate} baud。");
+                    if (!legacyCompatibility && makcuEnabled)
+                    {
+                        VerifiedMakcuModeObserved?.Invoke();
+                    }
                     return true;
                 }
                 catch (Exception exception) when (
@@ -1127,6 +1129,17 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
 
         return false;
     }
+
+    internal static int[] GetDiscoveryBaudRates(bool legacyCompatibility, int legacyBaudRate) =>
+        legacyCompatibility
+            ? [legacyBaudRate]
+            : [A5BaudRate, MakcuBaudRate];
+
+    internal static bool IsVerifiedMakcuModeConnection(
+        bool roleProbeMatched,
+        MakcuModeSnapshot? status) =>
+        roleProbeMatched &&
+        status is { Status: 0, Enabled: true, BaudRate: MakcuBaudRate };
 
     private void StartDeviceTrace(SerialPort port, string portName, long connectionEpoch)
     {
