@@ -101,12 +101,14 @@ internal sealed class FirmwareFlashDialog : Form
                 _finished = true;
                 _closeButton.Enabled = true;
                 AppendLog(snapshot.State == "succeeded"
-                    ? "刷写完成。"
+                    ? $"刷写成功：{snapshot.Message}"
                     : $"刷写失败：{snapshot.Message}");
                 _statusLabel.ForeColor = snapshot.State == "succeeded"
-                    ? Color.FromArgb(34, 125, 70)
+                    ? snapshot.ControlConnectionState == "failed"
+                        ? Color.FromArgb(160, 95, 0)
+                        : Color.FromArgb(34, 125, 70)
                     : Color.FromArgb(170, 42, 42);
-                _statusLabel.Text = snapshot.State == "succeeded" ? "刷写完成" : "刷写失败";
+                _statusLabel.Text = DescribeFinishedStatus(snapshot);
             }
             return;
         }
@@ -115,6 +117,14 @@ internal sealed class FirmwareFlashDialog : Form
             ? $"刷写中：{snapshot.Message}"
             : "等待开始…";
     }
+
+    internal static string DescribeFinishedStatus(FirmwareFlashSnapshot snapshot) =>
+        snapshot.State != "succeeded" ? "刷写失败" : snapshot.ControlConnectionState switch
+        {
+            "failed" => "刷写成功；M 控制连接恢复失败",
+            "not_requested" => "刷写成功；未要求恢复 M 控制连接",
+            _ => "刷写完成",
+        };
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {

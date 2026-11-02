@@ -16,12 +16,14 @@
 #include "freertos/portmacro.h"
 
 #include "dual_proxy_runtime_config.h"
+#include "dual_proxy_app.h"
 #include "diag_stream.h"
 #include "dual_status_led.h"
 #include "hid_device_profile.h"
 #include "link_recovery_logic.h"
 #include "mouse_motion_smoother.h"
 #include "uart1_vendor_queue_logic.h"
+#include "usb_role_logic.h"
 
 #define LINK_UART UART_NUM_1
 #define LINK_TX_GPIO 17
@@ -69,7 +71,7 @@ static volatile int64_t s_raw_tx_latency_peak_us;
  * 短暂卡顿不再引发拆卸；真正掉线只是晚 2 秒被发现（输入本来就已中断）。
  */
 #define LINK_TIMEOUT_MS 3000
-#define LINK_HELLO_LENGTH 12
+#define LINK_HELLO_LENGTH DUAL_LINK_HELLO_LENGTH
 #define LINK_PING_LENGTH 4
 #define LINK_STATS_PERIOD_US 5000000LL
 #define LINK_PROFILE_FAIRNESS_LIMIT 8U
@@ -476,6 +478,24 @@ static TaskHandle_t s_tx_task;
 static dual_link_frame_callback_t s_frame_callback;
 static dual_link_fault_callback_t s_fault_callback;
 static volatile bool s_fault_in_progress;
+static bool s_role_probe_requested;
+static bool s_role_probe_rx_parked;
+static bool s_role_probe_tx_parked;
+
+/* 只在任务不持有锁、没有在途解析/发送时交出状态所有权。 */
+static bool role_probe_checkpoint(bool transmitter)
+{
+    bool *parked = transmitter ? &s_role_probe_tx_parked : &s_role_probe_rx_parked;
+    if (!__atomic_load_n(&s_role_probe_requested, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    __atomic_store_n(parked, true, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&s_role_probe_requested, __ATOMIC_ACQUIRE)) {
+        vTaskDelay(1);
+    }
+    __atomic_store_n(parked, false, __ATOMIC_RELEASE);
+    return true;
+}
 static uint8_t s_profile_buffers[2][HID_PROFILE_MAX_BLOB];
 static uint8_t s_profile_active_buffer;
 static uint32_t s_profile_length;
@@ -766,7 +786,7 @@ static bool peer_sequence_is_new(uint16_t sequence)
 static bool accept_peer_frame(const dual_frame_t *frame)
 {
     if (frame->type == DUAL_MESSAGE_LINK_HELLO) {
-        if (frame->payload_length != LINK_HELLO_LENGTH) {
+        if (!dual_role_hello_valid(frame->payload, frame->payload_length)) {
             ++s_crc_or_frame_errors;
             return false;
         }
@@ -776,6 +796,11 @@ static bool accept_peer_frame(const dual_frame_t *frame)
             return false;
         }
         if (frame->payload[1] > DUAL_USB_STATE_ERROR) {
+            ++s_rejected_peers;
+            return false;
+        }
+        const uint8_t usb_role = frame->payload[DUAL_LINK_HELLO_USB_ROLE_OFFSET];
+        if (usb_role != DUAL_ROLE_UNRESOLVED && usb_role != peer_role) {
             ++s_rejected_peers;
             return false;
         }
@@ -828,6 +853,10 @@ static bool accept_peer_frame(const dual_frame_t *frame)
                 peer_generation_changed) {
                 s_profile_request_cleanup_ready = false;
             }
+            if (s_role == DUAL_ROLE_MOUSE_HOST) {
+                /* 新对端会话必须重新等本次 Profile 的匹配成功 ACK。 */
+                dual_status_led_set_host_profile_ready(false);
+            }
             dual_status_led_set_flow_error(false);
             s_role_ack_logged = false;
             s_peer_sequence_initialized = false;
@@ -875,6 +904,7 @@ static bool accept_peer_frame(const dual_frame_t *frame)
         s_last_peer_rx_us = esp_timer_get_time();
         dual_status_led_set_peer_connected(true);
         if (peer_role != DUAL_ROLE_UNRESOLVED && s_role != DUAL_ROLE_UNRESOLVED) {
+            /* 此 ACK 只确认运行角色握手，不表示本板存在 USB；身份补全只看 usb_role。 */
             uint8_t ack[5] = {peer_role};
             write_u32_le(&ack[1], peer_generation);
             (void)enqueue_item(DUAL_MESSAGE_ROLE_ACK, ack, sizeof(ack));
@@ -1310,7 +1340,8 @@ static esp_err_t enqueue_item(uint8_t type, const uint8_t *payload, uint8_t leng
         motion ? &s_motion_tx_queue_metrics :
         vendor ? &s_vendor_tx_queue_metrics : &s_tx_queue_metrics;
     queue_metric_increment(&target_metrics->received);
-    if (target == NULL || s_tx_queue == NULL || s_motion_tx_queue == NULL ||
+    if (__atomic_load_n(&s_role_probe_requested, __ATOMIC_ACQUIRE) ||
+        target == NULL || s_tx_queue == NULL || s_motion_tx_queue == NULL ||
         s_safety_tx_queue == NULL ||
         s_software_tx_queue == NULL || s_vendor_tx_queue == NULL ||
         length > DUAL_PROXY_MAX_PAYLOAD) {
@@ -1619,6 +1650,7 @@ static void send_link_status(void)
     uint8_t hello[LINK_HELLO_LENGTH] = {0};
     hello[0] = s_role;
     hello[1] = s_usb_state;
+    hello[DUAL_LINK_HELLO_USB_ROLE_OFFSET] = dual_proxy_usb_role_claim();
     memcpy(&hello[2], s_node_id, sizeof(s_node_id));
     write_u32_le(&hello[8], s_generation);
     send_status_frame(DUAL_MESSAGE_LINK_HELLO, hello, sizeof(hello));
@@ -1661,6 +1693,10 @@ static void link_tx_task(void *argument)
     uint32_t last_rx_software = 0;
     uint8_t vendor_turn = 0;
     while (true) {
+        if (role_probe_checkpoint(true)) {
+            last_status_us = 0;
+            continue;
+        }
         const int64_t now_us = esp_timer_get_time();
         /*
          * Only an empty pair of queues may enter the heartbeat wait.  If a
@@ -2138,6 +2174,9 @@ static void link_tx_task(void *argument)
             taskEXIT_CRITICAL(&s_profile_mux);
             dual_status_led_set_peer_connected(false);
             dual_status_led_set_peer_usb_ready(false);
+            if (s_role == DUAL_ROLE_MOUSE_HOST) {
+                dual_status_led_set_host_profile_ready(false);
+            }
             ESP_LOGW(TAG, "UART1对端超时，清理实体输入");
             log_recovery("peer_timeout", NULL);
             queue_fault();
@@ -2281,7 +2320,12 @@ static void link_rx_task(void *argument)
     uart_event_t event;
     int64_t last_dequeue_us = 0;
     while (true) {
-        if (xQueueReceive(s_uart_event_queue, &event, portMAX_DELAY) != pdTRUE) {
+        if (role_probe_checkpoint(false)) {
+            dual_parser_init(&parser, on_link_frame, NULL);
+            last_dequeue_us = 0;
+            continue;
+        }
+        if (xQueueReceive(s_uart_event_queue, &event, pdMS_TO_TICKS(20)) != pdTRUE) {
             continue;
         }
         const int64_t dequeued_us = esp_timer_get_time();
@@ -2390,6 +2434,10 @@ esp_err_t dual_uart1_start(
     s_role = role;
     s_peer_role = DUAL_ROLE_UNRESOLVED;
     s_usb_state = DUAL_USB_STATE_WAITING;
+    dual_status_led_set_host_profile_ready(false);
+    dual_status_led_set_local_usb_ready(false);
+    dual_status_led_set_peer_connected(false);
+    dual_status_led_set_peer_usb_ready(false);
     memcpy(s_node_id, node_id, sizeof(s_node_id));
     /* 每次启动必须产生新的会话标识。旧实现截取启动时间低 16 位，
      * 相同时序的物理复位会重复 generation，使对端把新会话的低序号
@@ -2578,18 +2626,120 @@ esp_err_t dual_uart1_start(
     return ESP_OK;
 }
 
+esp_err_t dual_uart1_begin_role_probe(void)
+{
+    if (s_rx_task == NULL || s_tx_task == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    __atomic_store_n(&s_role_probe_requested, true, __ATOMIC_RELEASE);
+    notify_tx_task();
+    const int64_t deadline = esp_timer_get_time() + 3000000LL;
+    while (!__atomic_load_n(&s_role_probe_rx_parked, __ATOMIC_ACQUIRE) ||
+           !__atomic_load_n(&s_role_probe_tx_parked, __ATOMIC_ACQUIRE)) {
+        if (esp_timer_get_time() >= deadline) {
+            /* 保持暂停请求，禁止在未知所有权状态下重用旧会话。 */
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1);
+    }
+    /* 生产者已停止且 TX 已交出所有权：最后释放帧后不再发送任何旧队列输入。
+     * UART 只证明写入/排空，接收端是否收到仍需真实链路验收。 */
+    if (s_role == DUAL_ROLE_MOUSE_HOST) {
+        const uint8_t reason = 1U;
+        if (!send_status_frame(DUAL_MESSAGE_PHYSICAL_RELEASE, &reason, 1U) ||
+            !send_status_frame(DUAL_MESSAGE_SOFTWARE_RELEASE, NULL, 0U)) {
+            return ESP_FAIL;
+        }
+    }
+    if (uart_wait_tx_done(LINK_UART, pdMS_TO_TICKS(200)) != ESP_OK) {
+        return ESP_ERR_TIMEOUT;
+    }
+    reset_tx_queues();
+    (void)uart_flush_input(LINK_UART);
+    xQueueReset(s_uart_event_queue);
+    s_role = DUAL_ROLE_UNRESOLVED;
+    s_peer_role = DUAL_ROLE_UNRESOLVED;
+    s_usb_state = DUAL_USB_STATE_WAITING;
+    s_peer_usb_state = DUAL_USB_STATE_WAITING;
+    const uint32_t previous_generation = s_generation;
+    do {
+        s_generation = esp_random();
+    } while (s_generation == 0U || s_generation == previous_generation);
+    s_peer_online = false;
+    s_peer_generation_initialized = false;
+    s_peer_sequence_initialized = false;
+    s_role_ack_logged = false;
+    s_last_peer_rx_us = 0;
+    s_next_sequence = 0;
+    s_next_flow_id = s_generation;
+    s_recovery_started_us = 0;
+    s_gone_completed_valid = false;
+    s_gone_completed_accepted = false;
+    s_gone_completed_event_id = 0U;
+    s_gone_completed_peer_generation = 0U;
+    s_mouse_connection_id = 1U;
+    s_profile_length = 0;
+    s_profile_crc32 = 0;
+    s_profile_transfer_id = 0;
+    s_profile_offset = 0;
+    s_profile_pending = false;
+    s_profile_phase = LINK_PROFILE_PHASE_IDLE;
+    s_profile_peer_generation_valid = false;
+    s_profile_last_commit_us = 0;
+    s_profile_waiting_host = false;
+    s_profile_wait_host_last_probe_us = 0;
+    s_profile_commit_receipt_seen = false;
+    s_profile_retransmit_attempts = 0;
+    s_profile_request_cleanup_ready = false;
+    s_profile_request_waiting_offer = false;
+    s_profile_request_waiting_device = false;
+    s_profile_request_offer_seen = false;
+    s_profile_request_accepted_us = 0;
+    s_request_offer_retries = 0;
+    link_flow_reset(&s_request_flow);
+    link_flow_reset(&s_offer_flow);
+    link_flow_reset(&s_commit_flow);
+    link_flow_reset(&s_gone_flow);
+    dual_status_led_set_peer_connected(false);
+    dual_status_led_set_peer_usb_ready(false);
+    dual_status_led_set_host_profile_ready(false);
+    __atomic_store_n(&s_role_probe_requested, false, __ATOMIC_RELEASE);
+    /* 返回前确认两个任务已离开旧暂停点，避免下一次暂停误用旧 ACK。 */
+    while (__atomic_load_n(&s_role_probe_rx_parked, __ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&s_role_probe_tx_parked, __ATOMIC_ACQUIRE)) {
+        vTaskDelay(1);
+    }
+    ESP_LOGI(TAG, "USB身份重新探测：已作废旧UART1会话 generation=%" PRIu32,
+             s_generation);
+    return ESP_OK;
+}
+
 esp_err_t dual_uart1_lock_role(uint8_t role)
 {
     if (role != DUAL_ROLE_PC_DEVICE && role != DUAL_ROLE_MOUSE_HOST) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_role == role) {
+        /* 重复锁定只同步 P 本地与 peer 状态，不从旧 s_usb_state 恢复 M 的
+         * Profile ACK latch，也不清除已收到的当前 ACK。生命周期事件会作废旧 latch。 */
+        dual_status_led_set_local_usb_ready(
+            role == DUAL_ROLE_PC_DEVICE &&
+            s_usb_state == DUAL_USB_STATE_HID_CONNECTED);
+        dual_status_led_set_peer_connected(s_peer_online);
+        dual_status_led_set_peer_usb_ready(
+            s_peer_usb_state == DUAL_USB_STATE_HID_CONNECTED);
         return ESP_OK;
     }
     if (s_role != DUAL_ROLE_UNRESOLVED) {
         return ESP_ERR_INVALID_STATE;
     }
     s_role = role;
+    /* M 不得从可能残留的 HID_CONNECTED 值恢复旧 Profile 就绪；只有匹配 ACK 可置位。
+     * P 的本地 USB 状态可从当前状态同步，但其灯仍需完整 mounted 门控。 */
+    dual_status_led_set_host_profile_ready(false);
+    dual_status_led_set_local_usb_ready(
+        role == DUAL_ROLE_PC_DEVICE &&
+        s_usb_state == DUAL_USB_STATE_HID_CONNECTED);
     dual_status_led_set_peer_connected(s_peer_online);
     dual_status_led_set_peer_usb_ready(
         s_peer_usb_state == DUAL_USB_STATE_HID_CONNECTED);
@@ -2599,6 +2749,18 @@ esp_err_t dual_uart1_lock_role(uint8_t role)
 
 void dual_uart1_set_usb_state(uint8_t usb_state)
 {
+    const bool connected = usb_state == DUAL_USB_STATE_HID_CONNECTED;
+    if (s_role == DUAL_ROLE_MOUSE_HOST) {
+        /* M 调用 HID_CONNECTED 的唯一运行时入口是匹配当前事务的成功 PROFILE_ACK。 */
+        dual_status_led_set_host_profile_ready(connected);
+        dual_status_led_set_local_usb_ready(false);
+    } else if (s_role == DUAL_ROLE_PC_DEVICE) {
+        dual_status_led_set_host_profile_ready(false);
+        dual_status_led_set_local_usb_ready(connected);
+    } else {
+        dual_status_led_set_host_profile_ready(false);
+        dual_status_led_set_local_usb_ready(false);
+    }
     if (s_usb_state == usb_state) {
         return;
     }
@@ -2975,6 +3137,8 @@ esp_err_t dual_uart1_queue_profile(
     if (blob == NULL || length == 0 || length > HID_PROFILE_MAX_BLOB) {
         return ESP_ERR_INVALID_ARG;
     }
+    /* 新传输要重新等与本次 transfer/generation 匹配的成功确认。 */
+    dual_status_led_set_host_profile_ready(false);
     xSemaphoreTake(s_profile_buffer_mutex, portMAX_DELAY);
     uint8_t inactive_buffer;
     taskENTER_CRITICAL(&s_profile_mux);
@@ -3025,6 +3189,7 @@ esp_err_t dual_uart1_queue_profile(
 void dual_uart1_cancel_profile(void)
 {
     /* 拔出后不能在下一轮心跳或对端复位时重播旧鼠标描述符。 */
+    dual_status_led_set_host_profile_ready(false);
     taskENTER_CRITICAL(&s_profile_mux);
     s_profile_pending = false;
     link_flow_reset(&s_offer_flow);
@@ -3044,6 +3209,7 @@ void dual_uart1_cancel_profile(void)
 void dual_uart1_deferred_refresh(void)
 {
     /* P 的请求要求重新采集：旧提议与旧传输一律作废，由新采集重新排队。 */
+    dual_status_led_set_host_profile_ready(false);
     taskENTER_CRITICAL(&s_profile_mux);
     s_profile_pending = false;
     link_flow_reset(&s_offer_flow);

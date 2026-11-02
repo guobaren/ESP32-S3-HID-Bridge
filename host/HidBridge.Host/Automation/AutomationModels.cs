@@ -71,6 +71,7 @@ internal sealed class AutomationSettings
     public int SimulatedUdpInputFrequencyHz { get; set; } = 100;
     public bool LegacySingleBoardFirmwareCompatibility { get; set; }
     public bool MakcuEnabled { get; set; }
+    public int MakcuProtocolVersion { get; set; } = 4;
     public bool ButtonStatePublishingEnabled { get; set; } = true;
     public string ButtonStateMappingName { get; set; } = ButtonStateSharedMemory.DefaultMappingName;
     public bool FirmwareUpdateApiEnabled { get; set; }

@@ -1,3 +1,9 @@
+# KMNET / Makcu 鼠标链路测试
+
+副机图形工具：`kmnet_link_test.py`，支持 KMNET 的 IPv4 / 端口 / UUID 或 Makcu 的本机 COM 串口（115200），共用方向、自定义位移、方框和停止测试。Makcu 使用项目 V4 / 老版共有 ASCII 子集，先在 Host 开启模式并真正退出 Host 释放串口。源码需 pyserial 3.5，EXE 已内置。使用说明见 [kmnet-link-test-使用说明.md](kmnet-link-test-使用说明.md)。
+
+Windows 免 Python 分发包由 `build-kmnet-link-test.ps1` 生成到 `dist/KmnetLinkTest-win-x64.zip`；协议与界面专项运行 `python -m unittest discover -s tools -p test_kmnet_link_test.py -v`。回包仅证明协议往返，目标实际光标移动仍需实机观察。
+
 # 命令行蓝牙验证工具
 
 `connect-ble-hid.ps1` 使用 **Windows PowerShell 5.1** 的 WinRT API 完成本机 BLE HID 的发现、配对与连接，不需要打开 Windows 蓝牙设置界面：
@@ -152,3 +158,37 @@ py -3 .\tools\measure_makcu_button_query.py --port COM13 --count 200 --gap-ms 5
 - `0x10`（按钮事件订阅）的**设置不回包**，脚本按此处理；`0x53` 事件只在**物理**鼠标按键变化时产生，软件注入不产生事件，因此 `--stream-clicks` 一项要求 M 已接物理鼠标并由真人按键。
 
 实测基线（2026-10-10，M=COM13，115200，`artifacts/tests/makcu-button-query/`）：`0x55` 查询往返 n=200 中位 **3.33 ms**、均值 3.35 ms、P95 3.52 ms、最大 3.86 ms；加 5 ms 间隔的 200 Hz 轮询口径中位 **3.37 ms**。同一轮次内事件订阅延迟未取到（测量时 M 上无物理鼠标，`phys_buttons` 恒为 0）。
+
+## 单击重复（一次点击被上报成两次）定位
+
+用于定位"边移动边点击时有几率输出两次按下"的问题。完整现象、根因、修复方案与验收判据见 `docs/问题-单击重复.md`。下列分析脚本全部**只读离线**处理 P 板 `dual_uart_inspect.py` 产出的 `.jsonl`，不访问设备。
+
+采集需要两路，分别在板侧与目标电脑侧：
+
+```powershell
+# 板侧：订阅 P 板 UART0 诊断流（DTR/RTS 置低，不复位）
+python .\tools\dual_uart_inspect.py --ports COM13 --seconds 240 --status-interval 5 `
+  --outdir artifacts/tests/<日期> --tag click-dup
+
+# 目标电脑侧：必须在 P 板作为 HID 设备所连接的那台电脑上运行
+python .\tools\measure_click_timing.py --seconds 120
+```
+
+离线分析按用途选用：
+
+```powershell
+python .\tools\cross_check_state.py <jsonl>                # id/ts 双判据 + 判据前提（时间戳单调性）
+python .\tools\dump_click_window.py <jsonl> --span-ms 25   # 按时间轴摊开 RX/SUB/COMP 逐帧
+python .\tools\diag_drop_profile.py <jsonl> --bucket-s 20  # 丢弃率的时间分布与事件类型构成
+python .\tools\trace_click_dup.py <jsonl> --out report.txt # 三层交错追踪
+python .\tools\analyze_click_dup.py <jsonl> --out report.txt # 按住段与回落统计
+python .\tools\probe_body_order.py <jsonl> <body_hex>      # 某份报告在两层出现的位置
+```
+
+判读要点：
+
+- 三层事件：`RAW_HID_INPUT`（M 送来）/ `P_USB_REPORT_SUBMIT`（P 提交）/ `P_USB_REPORT_COMPLETE`（PC 取走）；鼠标接口报告的按钮位在正文首字节，引脚为 `interface=1, report_id=2, 8 字节正文`。
+- `P_USB_REPORT_COMPLETE` 的载荷**含 report ID**（`declared_payload_length` 比正文多 1），解析时必须剥掉，否则按钮位会取成 report ID（表现为 `buttons=2` 恒定、回落恒为 0）。
+- 诊断流的 `captured`/`dropped` 是**开机累计值**（`firmware/main/diag_stream.c:130-137`：队列已存在时不重置），跨轮比较必须做差。
+- 丢弃只会让"段内夹零"变少、不会制造现象，故观测值是下界；但逐帧"矛盾"判据约有 10% 假阳性风险（RX 报告被丢弃时会被误判）。
+- 采集时**缓慢移动**可把事件率压到约 1200/秒以下；超过约 2100/秒（≈69 KB/s）时 UART0（921600 bps，与 ESP_LOG 共用）饱和，丢弃率迅速上升。

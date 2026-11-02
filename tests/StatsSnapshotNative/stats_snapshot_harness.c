@@ -3,6 +3,7 @@
 
 #include "bridge_protocol.h"
 #include "stats_snapshot.h"
+#include "usb_host_diagnostics.h"
 
 #define TEST_SEQUENCE 0xA17CU
 
@@ -62,13 +63,65 @@ static void fill_snapshot(uint8_t role, dual_stats_snapshot_t *snapshot)
                 DUAL_P_USB_STATE_RESULT_SHIFT) |
             DUAL_P_USB_STATE_ATTACHED | DUAL_P_USB_STATE_INSTALLED |
             DUAL_P_USB_STATE_CLONE_ACTIVE | DUAL_P_USB_STATE_MOUNTED);
-        add_queue(snapshot, 10U, 1U, 32U, 2U, 11U, 225U, 4U, 3U);
-        add_queue(snapshot, 11U, 1U, 64U, 3U, 23U, 910U, 5U, 1U);
-        add_queue(snapshot, 12U, 1U, 8U, 0U, 5U, 78U, 0U, 0U);
+        add_queue(snapshot, 10U, 1U, 128U, 2U, 11U, 225U, 4U, 3U);
+        add_queue(snapshot, 11U, 1U, 0U, 0U, 0U, 0U, 0U, 0U);
+        add_queue(snapshot, 12U, 1U, 128U, 0U, 5U, 78U, 0U, 0U);
     }
 
     for (uint8_t id = 49; id <= 66; ++id) {
         add_counter(snapshot, id, 1U, (uint64_t)id * 1000U);
+    }
+    if (role == DUAL_ROLE_MOUSE_HOST) {
+        add_counter(snapshot, 69U, 1U,
+            DUAL_USB_HOST_DIAG_FLAGS_AVAILABLE |
+            DUAL_USB_HOST_DIAG_FLAGS_BACKEND_CHERRYUSB |
+            (UINT64_C(1) << DUAL_USB_HOST_DIAG_FLAGS_SCHEMA_SHIFT) |
+            DUAL_USB_HOST_DIAG_FLAGS_CAP_DWC2_IRQ |
+            DUAL_USB_HOST_DIAG_FLAGS_CAP_HUB_EVENTS |
+            DUAL_USB_HOST_DIAG_FLAGS_CAP_INPUT_HEARTBEAT |
+            DUAL_USB_HOST_DIAG_FLAGS_REGISTER_VALID |
+            DUAL_USB_HOST_DIAG_FLAGS_LIFECYCLE_VALID |
+            DUAL_USB_HOST_DIAG_FLAGS_INPUT_VALID |
+            DUAL_USB_HOST_DIAG_FLAGS_INITIALIZED |
+            DUAL_USB_HOST_DIAG_FLAGS_HPORT_PRESENT |
+            DUAL_USB_HOST_DIAG_FLAGS_CONNECTED |
+            DUAL_USB_HOST_DIAG_FLAGS_PROFILE_READY);
+        for (uint8_t id = 70U; id <= 96U; ++id) {
+            uint8_t type = 1U;
+            uint64_t value = (uint64_t)id * 100U;
+            if (id == 87U) {
+                type = 2U;
+                value = (uint64_t)(int64_t)-7;
+            } else if (id == 90U) {
+                type = 2U;
+                value = (uint64_t)(int64_t)-9;
+            } else if (id == 81U) {
+                value = (UINT64_C(0x00010002));
+            } else if (id == 86U) {
+                value = DUAL_USB_HOST_DIAG_STAGE_ENUMERATE_SUCCESS;
+            } else if (id == 89U) {
+                value = DUAL_USB_HOST_DIAG_STAGE_HID_INIT_URB_RAW;
+            } else if (id == 75U) {
+                value = 4U;
+            } else if (id == 74U) {
+                value = 7U;
+            } else if (id == 76U) {
+                value = 3U;
+            } else if (id == 80U) {
+                value = 2U;
+            } else if (id == 83U) {
+                value = 6U;
+            } else if (id == 84U) {
+                value = 5U;
+            } else if (id == 85U) {
+                value = 1U;
+            } else if (id == 92U) {
+                value = 1234U;
+            } else if (id == 93U) {
+                value = 12U;
+            }
+            add_counter(snapshot, id, type, value);
+        }
     }
     for (uint8_t id = 4; id <= 8; ++id) {
         add_queue(snapshot, id, 1U, 32U, (uint16_t)(id - 4U), 16U,

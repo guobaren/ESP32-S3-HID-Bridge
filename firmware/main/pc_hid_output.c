@@ -1,4 +1,5 @@
 #include "pc_hid_output.h"
+#include "usb_role_logic.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -43,7 +44,7 @@
 #define CLONE_STRING_CAPACITY (HID_PROFILE_MAX_STRING_BYTES + 1U)
 #define RECONFIGURE_TASK_STACK 8192
 #define RECONFIGURE_TASK_PRIORITY 4
-#define VENDOR_INPUT_QUEUE_LENGTH 128
+#define PC_RAW_INPUT_QUEUE_LENGTH 128U
 #define VENDOR_CONTROL_QUEUE_LENGTH 128
 #define VENDOR_CLONE_READY_TIMEOUT_MS 5000U
 /*
@@ -54,27 +55,16 @@
  */
 #define CLONE_HANDSHAKE_GRACE_US 2500000LL
 #define VENDOR_BUSY_WINDOW_US 400000LL
-/* 厂商输入队列里给移动报文保留的上限，其余槽位留给厂商/握手报文。 */
-#define VENDOR_MOTION_QUEUE_CAP 96U
-/*
- * 移动专用队列：与厂商队列同为 128 槽。
- * 先用过 8 槽 + “满了清空只留最新”，实测丢得太多、手感明显变差，按用户要求
- * 改回 128 槽（宁可容忍少量积压延迟，也不要把移动采样丢掉）。
- * 消费端仍保持“厂商优先”，避免握手/查询排在移动后面。
- */
-#define MOTION_INPUT_QUEUE_LENGTH 128U
-/* 一次最多合并多少条积压移动（32 条约 32 ms 的量）。 */
-#define MOTION_MERGE_MAX_ITEMS 32U
 /* 移动报文在应用层停留时间的峰值（到达→提交），单位微秒。 */
 static volatile int64_t s_motion_latency_peak_us;
-static volatile uint32_t s_motion_queue_peak;
+/* 保留旧日志字段；移动输入已共用 FIFO，此专用队列峰值恒为 0。 */
+static const uint32_t s_motion_queue_peak = 0U;
 /* 非纯移动（含按键）报文在应用层的停留峰值，以及"等克隆就绪"循环的等待统计。
  * 这段路径此前完全没有观测：它在克隆未就绪时最长可等 5 秒。 */
 static volatile int64_t s_vendor_item_latency_peak_us;
 static volatile uint32_t s_vendor_ready_wait_count;
 static volatile int64_t s_vendor_ready_wait_total_us;
 static volatile uint32_t s_motion_merged_total;
-static QueueHandle_t s_motion_input_queue;
 static volatile int64_t s_clone_mount_us;
 static volatile int64_t s_vendor_busy_us;
 /*
@@ -129,7 +119,8 @@ typedef struct {
 } queue_metrics_t;
 
 static queue_metrics_t s_vendor_input_queue_metrics;
-static queue_metrics_t s_motion_input_queue_metrics;
+/* Queue ID 11 是兼容槽位：已退役的 motion FIFO 指标明确保持为 0。 */
+static const queue_metrics_t s_motion_input_queue_metrics;
 static queue_metrics_t s_vendor_control_queue_metrics;
 
 static void queue_metric_increment(volatile uint32_t *counter)
@@ -286,6 +277,7 @@ static TaskHandle_t s_reconfigure_task;
 static esp_timer_handle_t s_sender_timer;
 static volatile bool s_sender_stop_requested;
 static volatile bool s_reconfigure_enabled;
+static bool s_reconfigure_quiesced = true;
 static volatile bool s_reconfigure_disconnect_requested;
 static volatile bool s_reconfigure_profile_pending;
 static volatile bool s_reconfigure_waiting_host;
@@ -314,7 +306,8 @@ static uint32_t s_reconfigure_installed_transfer_id;
 static uint32_t s_reconfigure_installed_crc32;
 static uint32_t s_reconfigure_failed_transfer_id;
 static uint32_t s_reconfigure_failed_crc32;
-/* Profile CRC 命中并复用已挂载克隆的次数（跳过卸载+重装）。 */
+static bool s_reconfigure_profile_data_reused;
+/* 复用已验证 Profile 数据并完成 USB 重枚举挂载的次数。 */
 static uint32_t s_profile_reused;
 /* 同一 (type, flow) 的“已完成重复请求”只打印一次，避免刷屏。 */
 static uint8_t s_reconfigure_dup_logged_type;
@@ -325,6 +318,8 @@ static bool s_reconfigure_disconnect_failed;
 static dual_input_state_t s_state;
 static volatile bool s_force_release;
 static volatile bool s_installed;
+/* 安装调用失败后仍须经过 TinyUSB 卸载确认，才允许交出 USB PHY。 */
+static volatile bool s_device_cleanup_pending;
 static volatile bool s_pc_usb_attached;
 static volatile uint32_t s_hid_timer_ticks;
 static volatile uint32_t s_hid_not_mounted;
@@ -436,6 +431,7 @@ typedef struct {
     uint8_t interface_number;
     uint8_t report_id;
     uint8_t length;
+    bool motion_only;
     uint8_t data[DUAL_HID_RAW_INPUT_MAX_DATA];
 } vendor_input_item_t;
 
@@ -755,7 +751,7 @@ static bool reconfigure_epoch_is_current(uint32_t epoch)
 {
     bool current;
     xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
-    current = dual_profile_operation_is_current(
+    current = s_reconfigure_enabled && dual_profile_operation_is_current(
         epoch, s_reconfigure_epoch, s_reconfigure_disconnect_requested);
     xSemaphoreGive(s_reconfigure_mutex);
     return current;
@@ -1052,14 +1048,10 @@ static void vendor_input_task(void *argument)
     (void)argument;
     vendor_input_item_t item;
     while (true) {
-        /*
-         * 厂商队列优先但不等待（0 超时）：有厂商/握手报文就先处理它，没有就
-         * 立刻取移动——不给移动白加延迟。两者都空时在移动队列上等 10 ms。
-         */
-        if (xQueueReceive(s_vendor_input_queue, &item, 0) != pdTRUE) {
-            if (xQueueReceive(s_motion_input_queue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
-                continue;
-            }
+        /* 所有 raw Input 共用同一 FIFO；输入到达会唤醒这次 receive。 */
+        if (xQueueReceive(s_vendor_input_queue, &item,
+                          pdMS_TO_TICKS(10)) != pdTRUE) {
+            continue;
         }
         if (item.length == 0U) {
             ++s_vendor_input_dropped;
@@ -1078,10 +1070,7 @@ static void vendor_input_task(void *argument)
          * 移动报文不需要等：没就绪就直接丢（等识别完再移动不会丢，见
          * CLONE_HANDSHAKE_GRACE_US 的注释）。
          */
-        const bool motion_only = item.length > 0U &&
-            item.report_id == s_clone_mouse_layout.report_id &&
-            item.length == s_clone_mouse_layout.report_bytes &&
-            item.data[0] == 0U;
+        const bool motion_only = item.motion_only;
         if (motion_only && item.enqueued_us != 0) {
             const int64_t residence = esp_timer_get_time() - item.enqueued_us;
             if (residence > s_motion_latency_peak_us) {
@@ -1275,10 +1264,7 @@ static esp_err_t ensure_vendor_runtime(void)
         s_vendor_session_mutex = xSemaphoreCreateMutex();
     }
     s_vendor_input_queue = xQueueCreate(
-        VENDOR_INPUT_QUEUE_LENGTH, sizeof(vendor_input_item_t));
-    /* 移动报文走独立的 128 槽队列，消费端保持厂商控制与报告优先。 */
-    s_motion_input_queue = xQueueCreate(MOTION_INPUT_QUEUE_LENGTH,
-                                        sizeof(vendor_input_item_t));
+        PC_RAW_INPUT_QUEUE_LENGTH, sizeof(vendor_input_item_t));
     s_vendor_control_queue = xQueueCreate(
         VENDOR_CONTROL_QUEUE_LENGTH, sizeof(vendor_control_item_t));
     s_get_gate = xSemaphoreCreateBinary();
@@ -1785,11 +1771,7 @@ void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame)
             return;
         }
         uint8_t item_instance = 0U;
-        /*
-         * 判断这条原始输入是不是“纯移动报文”（鼠标接口、匹配鼠标布局、按键字节为 0）。
-         * 只有它能被牺牲：握手窗口内直接丢，或队列里到达上限时丢，用于保证
-         * G HUB 的 SET/GET_REPORT 握手永远有槽位可用。
-         */
+        /* 仅用于保留已有握手期/厂商突发期纯移动丢弃策略，不再分队列。 */
         const bool motion_only = data_length > 0U && data_length == s_clone_mouse_layout.report_bytes &&
             item.report_id == s_clone_mouse_layout.report_id &&
             clone_instance_for_interface(item.interface_number, &item_instance) &&
@@ -1800,8 +1782,8 @@ void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame)
                 now_us - s_clone_mount_us < CLONE_HANDSHAKE_GRACE_US;
             const bool vendor_busy = vendor_burst_active();
             if (handshake_window || vendor_busy) {
-                queue_metric_increment(&s_motion_input_queue_metrics.received);
-                queue_metric_increment(&s_motion_input_queue_metrics.rejected);
+                queue_metric_increment(&s_vendor_input_queue_metrics.received);
+                queue_metric_increment(&s_vendor_input_queue_metrics.rejected);
                 ++s_vendor_motion_skipped;
                 return;
             }
@@ -1809,29 +1791,12 @@ void dual_pc_hid_handle_vendor_frame(const dual_frame_t *frame)
         item.session_generation = vendor_session_generation();
         item.enqueued_us = esp_timer_get_time();
         item.length = (uint8_t)data_length;
+        item.motion_only = motion_only;
         if (data_length != 0U) {
             memcpy(item.data, data, data_length);
         }
         ++s_vendor_input_received;
-        if (motion_only) {
-            /* 移动走独立队列；只在真的排满时才丢（计到 vendor_input_dropped）。 */
-            queue_metric_increment(&s_motion_input_queue_metrics.received);
-            if (s_motion_input_queue == NULL) {
-                queue_metric_increment(&s_motion_input_queue_metrics.rejected);
-                ++s_vendor_input_dropped;
-            } else if (xQueueSend(s_motion_input_queue, &item, 0) != pdTRUE) {
-                queue_metric_increment(&s_motion_input_queue_metrics.dropped);
-                ++s_vendor_input_dropped;
-            } else {
-                queue_metric_observe_depth(&s_motion_input_queue_metrics,
-                                           s_motion_input_queue);
-                const uint32_t depth = (uint32_t)uxQueueMessagesWaiting(s_motion_input_queue);
-                if (depth > s_motion_queue_peak) {
-                    s_motion_queue_peak = depth;
-                }
-            }
-            return;
-        }
+        /* 按 UART 回调到达顺序入统一 FIFO；完整 body、Report ID 与 interface 不合并。 */
         queue_metric_increment(&s_vendor_input_queue_metrics.received);
         if (s_vendor_input_queue == NULL) {
             queue_metric_increment(&s_vendor_input_queue_metrics.rejected);
@@ -2168,31 +2133,29 @@ void dual_pc_hid_collect_stats(dual_stats_snapshot_t *snapshot)
     }
     usb_state |= (uint64_t)operation_epoch << DUAL_P_USB_STATE_EPOCH_SHIFT;
     dual_stats_snapshot_add_counter(snapshot, DUAL_STAT_P_USB_STATE, usb_state);
-    const QueueHandle_t queues[] = {
-        s_vendor_input_queue, s_motion_input_queue, s_vendor_control_queue
-    };
-    const queue_metrics_t *metrics[] = {
-        &s_vendor_input_queue_metrics, &s_motion_input_queue_metrics,
-        &s_vendor_control_queue_metrics
-    };
-    const uint16_t capacities[] = {
-        VENDOR_INPUT_QUEUE_LENGTH, MOTION_INPUT_QUEUE_LENGTH,
-        VENDOR_CONTROL_QUEUE_LENGTH
-    };
-    const uint8_t ids[] = {
-        DUAL_STATS_QUEUE_PC_VENDOR_INPUT, DUAL_STATS_QUEUE_PC_MOTION_INPUT,
-        DUAL_STATS_QUEUE_PC_VENDOR_CONTROL
-    };
-    for (size_t index = 0; index < sizeof(queues) / sizeof(queues[0]); ++index) {
-        const uint16_t depth = queues[index] == NULL ? DUAL_STATS_UNKNOWN_U16 :
-            (uint16_t)uxQueueMessagesWaiting(queues[index]);
-        const uint16_t peak = (uint16_t)__atomic_load_n(&metrics[index]->peak,
-                                                        __ATOMIC_RELAXED);
-        dual_stats_snapshot_add_queue(snapshot, ids[index], capacities[index], depth, peak,
-            __atomic_load_n(&metrics[index]->received, __ATOMIC_RELAXED),
-            __atomic_load_n(&metrics[index]->rejected, __ATOMIC_RELAXED),
-            __atomic_load_n(&metrics[index]->dropped, __ATOMIC_RELAXED));
-    }
+    const uint16_t input_depth = s_vendor_input_queue == NULL ?
+        DUAL_STATS_UNKNOWN_U16 :
+        (uint16_t)uxQueueMessagesWaiting(s_vendor_input_queue);
+    dual_stats_snapshot_add_queue(snapshot, DUAL_STATS_QUEUE_PC_VENDOR_INPUT,
+        PC_RAW_INPUT_QUEUE_LENGTH, input_depth,
+        (uint16_t)__atomic_load_n(&s_vendor_input_queue_metrics.peak,
+                                  __ATOMIC_RELAXED),
+        __atomic_load_n(&s_vendor_input_queue_metrics.received, __ATOMIC_RELAXED),
+        __atomic_load_n(&s_vendor_input_queue_metrics.rejected, __ATOMIC_RELAXED),
+        __atomic_load_n(&s_vendor_input_queue_metrics.dropped, __ATOMIC_RELAXED));
+    /* Queue ID 11 保留协议槽位，但已无对应队列，不能将 ID 10 虚报两次。 */
+    dual_stats_snapshot_add_queue(snapshot, DUAL_STATS_QUEUE_PC_MOTION_INPUT,
+        0U, 0U, 0U, 0U, 0U, 0U);
+    const uint16_t control_depth = s_vendor_control_queue == NULL ?
+        DUAL_STATS_UNKNOWN_U16 :
+        (uint16_t)uxQueueMessagesWaiting(s_vendor_control_queue);
+    dual_stats_snapshot_add_queue(snapshot, DUAL_STATS_QUEUE_PC_VENDOR_CONTROL,
+        VENDOR_CONTROL_QUEUE_LENGTH, control_depth,
+        (uint16_t)__atomic_load_n(&s_vendor_control_queue_metrics.peak,
+                                  __ATOMIC_RELAXED),
+        __atomic_load_n(&s_vendor_control_queue_metrics.received, __ATOMIC_RELAXED),
+        __atomic_load_n(&s_vendor_control_queue_metrics.rejected, __ATOMIC_RELAXED),
+        __atomic_load_n(&s_vendor_control_queue_metrics.dropped, __ATOMIC_RELAXED));
 }
 
 static void sender_task(void *argument)
@@ -2352,6 +2315,9 @@ static esp_err_t install_tinyusb(bool clone)
     const esp_err_t result = tinyusb_driver_install(&config);
     if (result == ESP_OK) {
         s_installed = true;
+        s_device_cleanup_pending = false;
+    } else {
+        s_device_cleanup_pending = true;
     }
     return result;
 }
@@ -2406,57 +2372,55 @@ static esp_err_t stop_installed_usb(void)
     dual_pc_hid_release_all();
     vTaskDelay(pdMS_TO_TICKS(3));
     vendor_session_wait_idle();
-    if (!s_installed) {
+    if (!s_installed && !s_device_cleanup_pending) {
         clear_clone_session_state();
         s_pc_usb_attached = false;
         update_pc_ready_led();
         return ESP_OK;
     }
-    esp_err_t result = dual_usb_cdc_control_stop();
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "停止 CDC 控制失败(%s)，继续拆除 USB 栈", esp_err_to_name(result));
-        result = ESP_OK;
-    }
-    const esp_err_t sender_result = dual_pc_hid_stop_sender();
-    if (sender_result != ESP_OK) {
-        ESP_LOGW(TAG, "停止发送任务失败(%s)，继续拆除 USB 栈",
-                 esp_err_to_name(sender_result));
+    if (s_installed) {
+        esp_err_t cdc_result = dual_usb_cdc_control_stop();
+        if (cdc_result != ESP_OK) {
+            ESP_LOGW(TAG, "停止 CDC 控制失败(%s)，继续拆除 USB 栈",
+                     esp_err_to_name(cdc_result));
+        }
+        const esp_err_t sender_result = dual_pc_hid_stop_sender();
+        if (sender_result != ESP_OK) {
+            ESP_LOGW(TAG, "停止发送任务失败(%s)，继续拆除 USB 栈",
+                     esp_err_to_name(sender_result));
+        }
     }
     esp_err_t uninstall = tinyusb_driver_uninstall();
-    if (uninstall == ESP_ERR_INVALID_STATE) {
-        /*
-         * esp_tinyusb 在任务已退出（例如启动期 del 路径）时会返回 INVALID_STATE：
-         * 此时栈本来就不在，“拆除”这个目标已经达成。之前把它当失败，会让克隆门
-         * 永久关闭并无限重试（实测：tinyusb_driver_uninstall -> Deinit TinyUSB
-         * task failed -> P侧USB清理重试耗尽，接收端再也没有克隆设备）。
-         */
-        ESP_LOGW(TAG, "TinyUSB 栈已不在（任务已自行退出或未装入），按已拆除处理");
-        uninstall = ESP_OK;
-    }
     if (uninstall == ESP_OK) {
         s_installed = false;
+        s_device_cleanup_pending = false;
         s_pc_usb_attached = false;
         clear_clone_session_state();
         update_pc_ready_led();
         s_usb_reconfigure_guard_until_us = esp_timer_get_time() +
             (int64_t)USB_RECONFIGURE_EVENT_GUARD_MS * 1000LL;
     } else {
-        result = uninstall;
+        s_device_cleanup_pending = true;
     }
-    return result;
+    return uninstall;
 }
 
 esp_err_t dual_pc_hid_prepare_for_profile(void){
     /* 启动板间接收前同步撤下探测用设备，防止已就绪的鼠标侧 Profile
      * 抢在异步 disconnect 之前到达，随后又被该 disconnect 覆盖。 */
     if (s_state_mutex == NULL) {
-        return ESP_ERR_NO_MEM;
+        return (!s_installed && !s_device_cleanup_pending) ? ESP_OK : ESP_ERR_NO_MEM;
     }
     s_usb_reconfigure_in_progress = true;
     dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
     const esp_err_t result = stop_installed_usb();
     s_usb_reconfigure_in_progress = false;
     return result;
+}
+
+bool dual_pc_hid_device_cleanup_pending(void)
+{
+    return s_device_cleanup_pending;
 }
 
 static esp_err_t install_profile_attempt(uint32_t operation_epoch, uint8_t attempt)
@@ -2527,6 +2491,12 @@ static void reconfigure_task(void *argument)
             bool allow_profile_request = false;
 
             xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+            if (!s_reconfigure_enabled) {
+                s_reconfigure_quiesced = true;
+                xSemaphoreGive(s_reconfigure_mutex);
+                break;
+            }
+            s_reconfigure_quiesced = false;
             disconnect_requested = s_reconfigure_disconnect_requested;
             if (disconnect_requested) {
                 operation_epoch = s_reconfigure_epoch;
@@ -2784,6 +2754,15 @@ static void reconfigure_task(void *argument)
                      dual_uart1_peer_generation() != profile_peer_generation)) {
                     result = ESP_ERR_INVALID_STATE;
                 } else {
+                    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+                    if (dual_profile_operation_is_current(
+                            operation_epoch, s_reconfigure_epoch,
+                            s_reconfigure_disconnect_requested) &&
+                        tud_mounted() && s_reconfigure_profile_data_reused) {
+                        ++s_profile_reused;
+                        s_reconfigure_profile_data_reused = false;
+                    }
+                    xSemaphoreGive(s_reconfigure_mutex);
                     esp_err_t ack_result = ESP_OK;
                     if (s_work_transfer_id != 0U) {
                         for (uint8_t ack_try = 0U;
@@ -2867,6 +2846,7 @@ static void reconfigure_task(void *argument)
             s_reconfigure_installed_operation_epoch = 0U;
             s_profile_final_ack_failed = false;
             s_profile_last_result = DUAL_P_USB_RESULT_INSTALL_FAILED;
+            s_reconfigure_profile_data_reused = false;
             xSemaphoreGive(s_reconfigure_mutex);
             update_pc_ready_led();
             xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
@@ -2891,7 +2871,7 @@ static void reconfigure_task(void *argument)
 
 esp_err_t dual_pc_hid_install_device(void)
 {
-    if (s_installed) {
+    if (s_installed || s_device_cleanup_pending) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_state_mutex == NULL) {
@@ -3014,6 +2994,7 @@ void dual_pc_hid_enable_reconfigure(void)
     s_profile_final_ack_failed = false;
     s_profile_last_result = DUAL_P_USB_RESULT_UNKNOWN;
     s_reconfigure_disconnect_failed = false;
+    s_reconfigure_profile_data_reused = false;
     s_reconfigure_cleanup_done = false;
     s_reconfigure_cleanup_attempts = 0;
     s_reconfigure_ack_attempts = 0;
@@ -3033,10 +3014,9 @@ void dual_pc_hid_enable_reconfigure(void)
 }
 
 /*
- * Profile CRC 复用判定（2026-09-28）：本轮 OFFER 的 CRC32 与"已安装 Profile"一致、
- * 且克隆确实挂载、没有在途操作时返回 true。判定本身是纯函数
- * link_profile_reuse_allowed()（link_recovery_logic.h），并有纯逻辑回归覆盖。
- * 只读、无副作用：调用方据此决定 OFFER 阶段是否排清理屏障。
+ * Profile数据复用判定：本轮OFFER的CRC与已安装Profile一致，且设备已安装、克隆活动
+ * 并mounted、没有在途操作时返回true。复用只用于从当前活动Profile做内存快照；
+ * 新published事务仍会排入完整USB重枚举worker。判定为纯函数并有逻辑回归覆盖。
  */
 link_profile_replay_result_t dual_pc_hid_profile_result(uint32_t transfer_id, uint32_t crc32)
 {
@@ -3093,7 +3073,7 @@ bool dual_pc_hid_installed_profile_matches(uint32_t crc32)
     }
     xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
     const bool reusable = link_profile_reuse_allowed(
-        s_reconfigure_enabled, s_clone_active, tud_mounted(),
+        s_reconfigure_enabled, s_clone_active, s_installed, tud_mounted(),
         s_usb_reconfigure_in_progress, s_reconfigure_profile_pending,
         s_reconfigure_disconnect_requested, s_reconfigure_disconnect_failed,
         crc32, s_reconfigure_installed_crc32);
@@ -3101,69 +3081,89 @@ bool dual_pc_hid_installed_profile_matches(uint32_t crc32)
     return reusable;
 }
 
+/* 调用方持有 s_reconfigure_mutex：普通安装与复用重枚举共用这份状态迁移。 */
+static esp_err_t queue_profile_reconfigure_locked(
+    const hid_device_profile_t *profile,
+    uint32_t transfer_id,
+    uint32_t crc32,
+    uint32_t peer_generation,
+    bool profile_data_reused,
+    uint32_t *operation_epoch_out)
+{
+    if (!s_reconfigure_enabled || profile == NULL || s_reconfigure_disconnect_requested ||
+        s_reconfigure_disconnect_failed) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint32_t operation_epoch = next_reconfigure_epoch_locked();
+    s_usb_reconfigure_in_progress = true;
+    memcpy(&s_reconfigure_profile, profile, sizeof(s_reconfigure_profile));
+    s_reconfigure_transfer_id = transfer_id;
+    s_reconfigure_crc32 = crc32;
+    s_reconfigure_peer_generation = peer_generation;
+    s_reconfigure_failed_transfer_id = 0U;
+    s_reconfigure_failed_crc32 = 0U;
+    s_reconfigure_profile_epoch = operation_epoch;
+    s_reconfigure_waiting_host = false;
+    s_reconfigure_waiting_final_ack = false;
+    s_reconfigure_installed_operation_epoch = 0U;
+    s_profile_final_ack_failed = false;
+    s_profile_last_result = DUAL_P_USB_RESULT_UNKNOWN;
+    s_reconfigure_profile_data_reused = profile_data_reused;
+    s_reconfigure_profile_pending = true;
+    if (operation_epoch_out != NULL) {
+        *operation_epoch_out = operation_epoch;
+    }
+    return ESP_OK;
+}
+
+/* 发布pending/in_progress后统一作废旧vendor事务、释放输入并唤醒唯一USB worker。 */
+static void notify_profile_reconfigure_queued(
+    uint32_t transfer_id, uint32_t operation_epoch, bool profile_data_reused)
+{
+    dual_pc_hid_vendor_link_fault();
+    dual_pc_hid_release_all();
+    /* 队列状态已发布：立即撤销旧的 mounted LED 快照，不等 USB worker。 */
+    update_pc_ready_led();
+    ESP_LOGI(TAG,
+             "Profile重枚举已入队：transfer=%" PRIu32 " epoch=%" PRIu32
+             " 复用缓存Profile数据=%u；等待worker重新枚举并完成mounted ACK",
+             transfer_id, operation_epoch, (unsigned)profile_data_reused);
+    xTaskNotifyGive(s_reconfigure_task);
+}
+
 /*
- * 执行复用：不卸载、不安装、不重枚举，只把本次 clone 会话的 transfer id 登记进来，
- * 作废旧厂商会话、释放按键与按钮，然后立即回最终确认。
- * 返回 ESP_OK 表示"复用已完成"；ESP_ERR_INVALID_STATE 表示复核时前提已不成立，
- * 调用方必须退回完整路径（卸载 + 重装）。
+ * CRC 命中只复用已验证的 Profile 数据；仍排入唯一 reconfigure_task，执行卸载、
+ * 断开等待、安装、mounted 等待和最终 ACK。ESP_OK 只表示成功排队。
  */
 esp_err_t dual_pc_hid_reuse_installed_profile(uint32_t transfer_id, uint32_t crc32)
 {
-    if (s_reconfigure_mutex == NULL) {
+    if (!s_reconfigure_enabled || s_reconfigure_mutex == NULL ||
+        s_reconfigure_task == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    const uint32_t peer_generation = transfer_id == 0U ? 0U :
+        dual_uart1_peer_generation();
+    if (transfer_id != 0U && peer_generation == 0U) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
     const bool reusable = link_profile_reuse_allowed(
-        s_reconfigure_enabled, s_clone_active, tud_mounted(),
+        s_reconfigure_enabled, s_clone_active, s_installed, tud_mounted(),
         s_usb_reconfigure_in_progress, s_reconfigure_profile_pending,
         s_reconfigure_disconnect_requested, s_reconfigure_disconnect_failed,
         crc32, s_reconfigure_installed_crc32);
-    if (!reusable) {
-        xSemaphoreGive(s_reconfigure_mutex);
-        return ESP_ERR_INVALID_STATE;
-    }
-    s_reconfigure_installed_transfer_id = transfer_id;
-    s_reconfigure_failed_transfer_id = 0U;
-    s_reconfigure_failed_crc32 = 0U;
+    uint32_t operation_epoch = 0U;
+    const esp_err_t result = reusable ? queue_profile_reconfigure_locked(
+        &s_active_profile, transfer_id, crc32, peer_generation, true,
+        &operation_epoch) : ESP_ERR_INVALID_STATE;
     xSemaphoreGive(s_reconfigure_mutex);
-
-    /*
-     * 物理设备刚经历过复位/重枚举：旧 HID++ 会话一律作废；克隆保持在位，
-     * 因此必须显式释放按键与按钮，否则目标机会一直认为键还按着（输入安全硬要求）。
-     */
-    dual_pc_hid_vendor_link_fault();
-    dual_pc_hid_release_all();
-
-    /* transfer=0 保留给 UART0 离线注入；没有 M 时无需板间 ACK。 */
-    const esp_err_t ack_result = transfer_id == 0U ? ESP_OK :
-        dual_uart1_send_profile_ack(transfer_id, crc32, 0U);
-    if (transfer_id != 0U) {
-        dual_pc_hid_note_profile_ack_result(
-            transfer_id, crc32, DUAL_PROFILE_ACK_STATUS_MOUNTED, ack_result);
-    } else {
-        s_profile_final_ack_failed = false;
-        s_profile_last_result = DUAL_P_USB_RESULT_MOUNTED_ACKED;
-        dual_uart1_set_usb_state(DUAL_USB_STATE_HID_CONNECTED);
-        dual_status_led_set_flow_error(false);
-        update_pc_ready_led();
+    if (result != ESP_OK) {
+        return result;
     }
-    if (ack_result != ESP_OK) {
-        /*
-         * 最终确认没排上队不改动克隆：M 侧的 COMMIT 重放（1 秒后）会走
-         * "重复 COMMIT"分支，用接收器里的 published transfer/crc 补发同一条确认。
-         */
-        dual_status_led_set_flow_error(true);
-        ESP_LOGW(TAG, "Profile 复用的最终确认入队失败(%s)：保持已挂载克隆，"
-                 "等 M 侧重放 COMMIT 补发；transfer=%" PRIu32,
-                 esp_err_to_name(ack_result), transfer_id);
-        return ESP_OK;
-    }
-    ++s_profile_reused;
-    ESP_LOGW(TAG, "Profile CRC 命中：跳过卸载+重装，沿用已挂载克隆；"
-             "transfer=%" PRIu32 " crc=%08" PRIX32 " reused=%" PRIu32,
-             transfer_id, crc32, s_profile_reused);
-    dual_status_led_set_flow_error(false);
-    update_pc_ready_led();
+
+    notify_profile_reconfigure_queued(transfer_id, operation_epoch, true);
     return ESP_OK;
 }
 
@@ -3174,34 +3174,20 @@ esp_err_t dual_pc_hid_schedule_reconfigure(
         s_reconfigure_task == NULL || profile == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
-    if (s_reconfigure_disconnect_requested || s_reconfigure_disconnect_failed) {
-        xSemaphoreGive(s_reconfigure_mutex);
+    const uint32_t peer_generation = transfer_id == 0U ? 0U :
+        dual_uart1_peer_generation();
+    if (transfer_id != 0U && peer_generation == 0U) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint32_t operation_epoch = next_reconfigure_epoch_locked();
-    s_usb_reconfigure_in_progress = true;
-    memcpy(&s_reconfigure_profile, profile, sizeof(s_reconfigure_profile));
-    s_reconfigure_transfer_id = transfer_id;
-    s_reconfigure_crc32 = crc32;
-    s_reconfigure_failed_transfer_id = 0U;
-    s_reconfigure_failed_crc32 = 0U;
-    s_reconfigure_profile_epoch = operation_epoch;
-    s_reconfigure_waiting_host = false;
-    s_reconfigure_waiting_final_ack = false;
-    s_reconfigure_installed_operation_epoch = 0U;
-    s_profile_final_ack_failed = false;
-    s_profile_last_result = DUAL_P_USB_RESULT_UNKNOWN;
-    s_reconfigure_profile_pending = true;
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    uint32_t operation_epoch = 0U;
+    const esp_err_t result = queue_profile_reconfigure_locked(
+        profile, transfer_id, crc32, peer_generation, false, &operation_epoch);
     xSemaphoreGive(s_reconfigure_mutex);
-    /* 使队列及已 dequeue 的旧厂商事务失效；物理报告热路径不等待此锁。 */
-    dual_pc_hid_vendor_link_fault();
-    dual_pc_hid_release_all();
-    ESP_LOGI(TAG,
-             "收到完整物理HID Profile，已建立重配置epoch并使旧厂商会话失效：transfer=%" PRIu32
-             " epoch=%" PRIu32,
-             transfer_id, operation_epoch);
-    xTaskNotifyGive(s_reconfigure_task);
+    if (result != ESP_OK) {
+        return result;
+    }
+    notify_profile_reconfigure_queued(transfer_id, operation_epoch, false);
     return ESP_OK;
 }
 
@@ -3226,6 +3212,10 @@ esp_err_t dual_pc_hid_schedule_disconnect(
     }
 
     xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    if (!s_reconfigure_enabled) {
+        xSemaphoreGive(s_reconfigure_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (sender_generation != 0U &&
         sender_generation != s_reconfigure_peer_generation) {
         s_reconfigure_peer_generation = sender_generation;
@@ -3344,6 +3334,7 @@ esp_err_t dual_pc_hid_schedule_disconnect(
     /* A pending old Profile is canceled.  An in-flight worker's snapshot is
      * invalidated by operation_epoch and must not install or ACK it. */
     s_reconfigure_profile_pending = false;
+    s_reconfigure_profile_data_reused = false;
     s_reconfigure_profile_epoch = 0U;
     s_reconfigure_transfer_id = 0U;
     s_reconfigure_crc32 = 0U;
@@ -3351,6 +3342,8 @@ esp_err_t dual_pc_hid_schedule_disconnect(
     xSemaphoreGive(s_reconfigure_mutex);
     dual_uart1_set_usb_state(DUAL_USB_STATE_WAITING);
     dual_uart1_set_profile_request_ready(false);
+    /* disconnect barrier 已发布，马上清除旧 mounted ready 与软件闪烁。 */
+    update_pc_ready_led();
     dual_pc_hid_vendor_link_fault();
     dual_pc_hid_release_all();
     ESP_LOGW(TAG, "排队P侧清理屏障：type=%02X flow=%" PRIu32
@@ -3451,5 +3444,44 @@ bool dual_pc_hid_ready(void)
 
 bool dual_pc_hid_usb_attached(void)
 {
-    return s_pc_usb_attached;
+    /* 不能依赖 mounted/旧 ATTACHED latch：外部 UART 供电时 USB 拔出可能
+     * 只触发 suspend，没有 VBUS GPIO 就无法区分拔线和主机主动挂起。 */
+    return dual_role_device_usb_present(s_installed, tud_connected(), tud_suspended());
+}
+
+bool dual_pc_hid_role_probe_needed(void)
+{
+    return !dual_pc_hid_usb_attached() &&
+        esp_timer_get_time() >= s_usb_reconfigure_guard_until_us &&
+        (!s_usb_reconfigure_in_progress || s_reconfigure_waiting_host);
+}
+
+esp_err_t dual_pc_hid_disable_reconfigure(void)
+{
+    dual_uart1_set_profile_request_ready(false);
+    if (s_reconfigure_mutex == NULL || s_reconfigure_task == NULL) {
+        return ESP_OK;
+    }
+    xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+    s_reconfigure_enabled = false;
+    s_reconfigure_quiesced = false;
+    (void)next_reconfigure_epoch_locked();
+    s_reconfigure_disconnect_requested = false;
+    s_reconfigure_profile_pending = false;
+    s_reconfigure_waiting_host = false;
+    xSemaphoreGive(s_reconfigure_mutex);
+    xTaskNotifyGive(s_reconfigure_task);
+    const int64_t deadline = esp_timer_get_time() + 5000000LL;
+    for (;;) {
+        xSemaphoreTake(s_reconfigure_mutex, portMAX_DELAY);
+        const bool idle = s_reconfigure_quiesced;
+        xSemaphoreGive(s_reconfigure_mutex);
+        if (idle) {
+            return ESP_OK;
+        }
+        if (esp_timer_get_time() >= deadline) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }

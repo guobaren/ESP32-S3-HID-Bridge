@@ -141,6 +141,22 @@ void dual_status_led_set_host_mouse_ready(bool ready)
     notify_task();
 }
 
+void dual_status_led_set_host_profile_ready(bool ready)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    dual_status_led_logic_set_host_profile_ready(&s_state, ready);
+    portEXIT_CRITICAL(&s_state_lock);
+    notify_task();
+}
+
+void dual_status_led_set_local_usb_ready(bool ready)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    dual_status_led_logic_set_local_usb_ready(&s_state, ready);
+    portEXIT_CRITICAL(&s_state_lock);
+    notify_task();
+}
+
 void dual_status_led_set_peer_connected(bool connected)
 {
     portENTER_CRITICAL(&s_state_lock);

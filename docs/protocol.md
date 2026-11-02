@@ -1,5 +1,17 @@
 # 主机输入协议（UART / USB CDC）
 
+## 固件刷写结果与控制连接状态（Host v0.1.5）
+
+`GET /api/v1/firmware/status` 的快照保留原 `state` 字段，并新增 `flashVerified:bool` 与 `controlConnectionState:string`。`state=succeeded` 表示固件写入设备校验及 RTS 复位完成，不代表被刷板卡启动、USB 挂载或输入链路验收通过。
+
+- `flashVerified=true`：esptool exit=0、设备哈希校验次数与镜像段数一致、RTS 复位标记存在；缺失或多余校验、非零退出、缺复位仍返回 `state=failed`。
+- `controlConnectionState=not_checked`：尚未检查恢复，或固件写入阶段失败。
+- `controlConnectionState=not_requested`：刷写前没有已连接的 M 控制串口，不执行 15 秒等待；仅接 P 的刷写不要求额外连接 M。
+- `controlConnectionState=restored`：刷写前有 M 控制连接，刷后已恢复。
+- `controlConnectionState=failed`：固件已通过校验，但原 M 控制连接恢复失败；UI 显示“刷写成功；M 控制连接恢复失败”，保留失败原因。不能将该项记为恢复验证通过。
+
+刷写会释放所需串口；控制通道重连结果不改变已写入固件，也不主动切换板端 Makcu 模式。M 自身刷写或复位会回到默认 A5，之后需重新开启所需 Makcu 模式。仅更新 Host v0.1.5 不要求重刷 v0.1.4 同版固件。
+
 > **适用范围**：本文的「帧格式 / 消息类型 / 双板透明代理内部协议 / 有界重试与去重规则 / 双板内存统计快照」适用于当前双板主线 `firmware/`（工程名 `dual_s3_hid_proxy`，由原 `firmware/dual_proxy/` 提升而来）。
 > 主机局域网 UDP/kmboxNet 接口由 Windows Host 接收；Host 可运行于双板模式或**单板兼容模式**（后者对应 `single-board` 分支的固件，本分支不构建单板固件），实际输出条件和路由见本章对应说明。
 > 标注为"早期单板"的段落（原生 USB CDC 探测窗口、BLE 节拍、Wi-Fi TCP）只适用于 `single-board` 分支的单板工程；双板克隆不开 CDC、无 Wi-Fi/BLE。
@@ -57,8 +69,8 @@ CRC 覆盖从 `版本` 到 `Payload` 的全部字节，初值 `0xFFFF`，多项�
 | `0x06` | DeviceProbe | 8 字节随机数；仅用于 COM 输入通道自动发现，不申请输入租约 |
 | `0x07` | DeviceHello | `HIDBRDG2` ASCII 标识、原样返回的 8 字节随机数，以及可选的角色字节（`1=PC_DEVICE`、`2=MOUSE_HOST`）；序号与 DeviceProbe 相同 |
 | `0x1F` | ButtonState | M 上行 1 字节：bit0..4 为原始物理鼠标按钮，bit7 为状态有效；Host 下行 1 字节 `0=取消订阅`、`1=订阅` |
-| `0x37` | MakcuModeRequest | 仅 M：单字节 opcode `0=关闭`、`1=开启`、`2=查询` |
-| `0x38` | MakcuModeStatus | M 返回 6 字节：`status:u8, enabled:u8, baud:u32le`；序号回显请求 |
+| `0x37` | MakcuModeRequest | 仅 M：单字节 opcode `0=关闭`、`1=开启V4`、`2=查询`、`3=开启老版ASCII` |
+| `0x38` | MakcuModeStatus | 基础 6 字节：`status:u8, enabled:u8, baud:u32le`；老版开启状态追加 `version:u8=3`（7 字节）；序号回显请求 |
 
 主机在每次 UART、原生 USB CDC 或 Wi-Fi 连接建立后先发送 `SessionStart`，之后至少每 500 ms 发送一次 `Ping`。固件默认在 1500 ms 内未收到当前会话的有效帧时执行 `ReleaseAll`，避免断线卡键。
 
@@ -78,7 +90,7 @@ UART0 诊断另有 `0x1C DIAG_PROFILE_REFRESH_REQUEST`（可选 1 字节载荷�
 
 | Type | 名称 | Payload |
 |---:|---|---|
-| `0x20` | LINK_HELLO | `role:u8`、`usb_state:u8`、`node_id:6 bytes`、`generation:u32` |
+| `0x20` | LINK_HELLO | `role:u8`、`usb_state:u8`、`node_id:6 bytes`、`generation:u32`、`usb_role:u8` |
 | `0x21` | PHYSICAL_MOUSE | `interface:u8`、`report_id:u8`、`buttons:u8`、`x/y:i16`、`wheel/pan:i8` |
 | `0x22` | PHYSICAL_RELEASE | `reason:u8` |
 | `0x23` | LINK_PING | `generation:u32` |
@@ -100,7 +112,13 @@ UART0 诊断另有 `0x1C DIAG_PROFILE_REFRESH_REQUEST`（可选 1 字节载荷�
 
 一次性申请和提议都要求对端先通过 `LINK_HELLO` 声明互补角色；仅有 UART 字节活动或 `UNRESOLVED` 声明不足以触发申请。
 
-`LINK_HELLO.role` 使用 `0=UNRESOLVED`、`1=PC_DEVICE`、`2=MOUSE_HOST`；`usb_state` 使用 `0=WAITING`、`1=MOUNTED`、`2=HID_CONNECTED`、`3=DISCONNECTED`、`4=ERROR`。双板启动后先通过 UART1 广播未定身份，并各自在 USB Device/Host 间轮换探测，每个角色探测窗口为 3 秒。Device 检测到 USB 主机 attach 或配置完成后确认 `PC_DEVICE`；Host 成功启动至少一个物理 HID 接口后确认 `MOUSE_HOST`。未确认身份时 LED 熄灭；身份确认但板间对端未在线时红色常亮；对端在线时 M 绿色、P 蓝色；本地 Profile 采集或克隆流程失败时红色闪烁。已确认身份通过周期性 `LINK_HELLO` 告知对端，以 `ROLE_ACK` 回确认；未定身份的一侧锁定互补角色。角色只保存在 RAM，每次复位或重新上电均重新从 `UNRESOLVED` 开始，单板复位可从仍在线的对端重新确定。`generation` 是每次启动生成的非零 32 位会话 ID；对端观察到变化时清空旧序号窗口和单次申请状态，不自动重放已确认的旧 Profile。
+`LINK_HELLO` 为 13 bytes：运行角色 `role@0`、`usb_state@1`、`node_id@2..7`、`generation@8..11`、本板 USB 确认身份 `usb_role@12`。`role/usb_role` 均使用 `0=UNRESOLVED`、`1=PC_DEVICE`、`2=MOUSE_HOST`；`usb_state` 使用 `0=WAITING`、`1=MOUNTED`、`2=HID_CONNECTED`、`3=DISCONNECTED`、`4=ERROR`。非零 `usb_role` 必须等于 `role`。没有本板当前 USB 证据时必须填 0，即使运行角色由对端推导为 P/M，也不得用该推导结果为对端背书。12-byte 旧 HELLO 会被拒绝，两板必须一起升级。
+
+双板启动后在 Device/Host 间交替探测，每种窗口 3 秒。本板 USB 证据优先；只有在线对端在最近 750 ms 的 HELLO 中声明的非零 `usb_role` 才能补全互补角色。此 750 ms 是身份声明有效期，独立于 UART 断联超时。`ROLE_ACK` 只确认运行角色握手，不能充当 USB 身份证据；`usb_state=HID_CONNECTED` 仍表示克隆/Profile 就绪，不代表物理 USB 连接证据。
+
+运行期间持续监督 USB：失去本板 USB 证据后，下一份 HELLO 的 `usb_role` 必须为 0；稳定角色连续离线 3 秒后停止旧输入与 USB worker、合作式暂停 UART 收发、发送最终释放并排空后清队，生成新的非零 generation，再回到 `UNRESOLVED`。首轮 P 克隆未见连接时保留 15 秒恢复预算；主动重枚举暂停离线计时，等待主机挂载时允许重新探测。P 使用当前 TinyUSB connected 且非 suspended 的总线状态，M 使用当前 Host 设备在位状态。无独立 VBUS GPIO 时无法区分长时间 USB suspend 与拔线，两者都会撤销身份并最终触发重探测。整个过程不重启 MCU，uptime 与 UART 累计计数保留；Host 后端重新初始化可能重置该后端计数，不能跨角色直接相减。清理或暂停失败时保持输入关闭并重试，不启动另一 USB 角色。
+
+角色只保存在 RAM；启动或角色重探测均生成新的 UART1 generation。对端观察到新会话时重置旧序号窗口及单次申请状态，不自动重放旧 Profile。未确认角色时 LED 熄灭；角色确认后板间未在线时红灯，对端在线时 M 绿、P 蓝，克隆失败时红闪。
 
 P 锁定身份后先完成本地 USB Device 卸载、清空活动 Profile/描述符/报告模板及厂商 HID 会话，成功后才开放并发送本会话唯一一次 `PROFILE_REQUEST`。M generation 变化等同 M 重新上电：P 关闭申请门，重新执行同一套本地清理，完成后再发送新的单次申请。M 收到 REQUEST 后取消尚未完成的旧提议，安排重新读取当前 USB Device/Configuration 描述符并重新发布 HID Profile，同时以 `FLOW_ACK(REQUEST, flow_id, status)` 确认是否接受。
 
@@ -108,7 +126,7 @@ M 每次采集到 Profile 时发起 `PROFILE_OFFER`。该 OFFER 自身也是清�
 
 鼠标物理拔出时，M 生成非零 event ID 并发送 `DEVICE_GONE(sender_generation, target_generation, event_id, reason)`。P 只接受两个 generation 与当前会话匹配的事件，取消任何旧 pending Profile，并用操作 epoch 使已经开始但尚未完成的重配置快照失效。P 必须实际完成 TinyUSB 卸载与旧会话清空后，才回 `FLOW_ACK(DEVICE_GONE, event_id, accepted)`。M 在收到匹配确认前禁止发送 PROFILE_OFFER 和任何 Profile 分片；即使新鼠标已采集到 Profile，也只缓存等待。鼠标重新插入后，顺序为：GONE 清理 ACK → 新 OFFER 清理 ACK（即便清理是幂等的也要执行并确认）→ BEGIN/CHUNK/COMMIT → P 挂载后的最终 PROFILE_ACK。重复/迟到的 GONE 按 peer generation 与 event ID 去重，不得撤销更新会话中的新克隆。清理失败或确认超时按“有界重试与去重规则”处理：先在同一 generation 内重试同一事务，预算耗尽才闪红灯终止本轮；新 peer generation/板复位开启新的恢复流程。M 侧报告的输入异常（`on_mouse_release(false)`，如报告队列满或传输错误）不属于物理拔出，只释放按钮并记录输入错误，不发送 `DEVICE_GONE`。
 
-FLOW_ACK 的字段偏移为：`acknowledged_type@0`、`flow_id@1`、`status@5`、`recipient_generation@6`、`sender_generation@10`。PROFILE_ACK 的字段偏移为：`transfer_id@0`、`crc32@4`、`status@8`、`recipient_generation@9`、`sender_generation@13`。接收方必须同时验证本地 generation、对端 generation 和 flow/event/transfer ID，旧会话或错配 ACK 不得解锁流程；M 只有收到三者全部匹配的成功 `PROFILE_ACK` 才把自己的 `usb_state` 更新为 `HID_CONNECTED`。`LINK_HELLO` 为 12 bytes，`LINK_PING` 为 4 bytes；PROFILE_ACK 由 9 bytes 变为 17 bytes，两板必须同时刷入本协议版本（帧头版本字节与 Host 协议共用，仍为 `02`，因此长度本身就是新旧固件的判别条件）。上述均为 UART1 双板内部消息，不改变 Host C# 所用 UART/USB CDC 输入协议及其帧格式。
+FLOW_ACK 的字段偏移为：`acknowledged_type@0`、`flow_id@1`、`status@5`、`recipient_generation@6`、`sender_generation@10`。PROFILE_ACK 的字段偏移为：`transfer_id@0`、`crc32@4`、`status@8`、`recipient_generation@9`、`sender_generation@13`。接收方必须同时验证本地 generation、对端 generation 和 flow/event/transfer ID，旧会话或错配 ACK 不得解锁流程；M 只有收到三者全部匹配的成功 `PROFILE_ACK` 才把自己的 `usb_state` 更新为 `HID_CONNECTED`。`LINK_HELLO` 为 13 bytes，`LINK_PING` 为 4 bytes；PROFILE_ACK 为 17 bytes，两板必须同时刷入本协议版本（帧头版本字节与 Host 协议共用，仍为 `02`，长度本身是新旧固件的判别条件）。C# 诊断编码器同步为 `LinkHelloCodec`；Host UART0/USB CDC 输入帧格式不变。
 
 ### 有界重试与去重规则
 
@@ -124,7 +142,7 @@ FLOW_ACK 的字段偏移为：`acknowledged_type@0`、`flow_id@1`、`status@5`�
 
 Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`version:u16`、`header_length:u16`、Device descriptor 长度、Configuration descriptor 长度、manufacturer/product/serial UTF-8 长度、报告项数量和 `flags:u8`；随后按长度排列各段数据。每个报告项为 `interface_number:u8`、`subclass:u8`、`protocol:u8`、保留字节、`report_length:u16` 和原始 HID Report descriptor。所有整数均为小端，完整 blob 上限 4096 字节，最多 8 个接口、单份报告描述符 512 字节、每个字符串 128 字节。
 
-接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。若新 Profile CRC 与当前已安装且已挂载的克隆一致，且无在途清理或安装，P 可复用当前克隆而不重新枚举；否则先使旧 vendor HID 会话代号失效、清空输入/控制队列和待处理 GET_REPORT，卸载旧 TinyUSB 设备并清空活动 Profile/报告模板，USB 断开后才构建并安装新描述符。无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许回退呈现旧 Profile 或通用设备冒充物理鼠标。
+接收端要求 BEGIN 合法、CHUNK 的 transfer ID 正确且 offset 严格连续，COMMIT 的总长度/CRC32 与 BEGIN 一致，并在 CRC32 和完整反序列化成功后才发布。若新事务 CRC 与当前已安装且已挂载的克隆一致，且无在途清理或安装，P 可以把当前已验证的活动 Profile 数据复制进新操作缓存；这不复用当前 USB 实例，也不跳过重枚举。发布回调会再次核对该 transfer 对应的已接受 OFFER generation 仍等于当前 peer generation；若会话已变化，则拒绝该 Profile，不能把旧数据绑定到新 peer。新 PROFILE 发布后仍由唯一 `reconfigure_task` 先使旧 vendor HID 会话代号失效、释放输入、卸载旧 TinyUSB 设备并清空活动 Profile/报告模板，再等待 USB 断开、从缓存 Profile 构建并安装新描述符。只有 worker 观察到主机已 mounted 后才发送最终成功 `PROFILE_ACK`；重配置 pending 时重复 COMMIT 只回收件确认，不提前回 mounted。无法取得完整原始描述符、CRC/顺序错误或安全克隆预算不满足时保持 USB 断开，不允许回退呈现旧 Profile 或通用设备冒充物理鼠标。
 
 实体 raw Input 优先于软件输入；软件 move/release 使用独立有界队列；HID 厂商控制使用独立队列；Profile 只在安全/输入队列允许时分片发送。鼠标拔出、UART1 超时、鼠标侧掉电或 Profile 超时都先释放输入，再由电脑侧卸载 USB Device；重新插入后只有完整新 Profile 校验通过才重新枚举。
 **（主机 EXE / 早期单板）** 主机同步程序打开 UART 或原生 USB CDC 对应的 COM 口后，会由同一个 `SerialPort` 实例读取设备日志并缓冲写入 `deviceLogPath` 指定的文件（默认是 EXE 同目录 `log/device/host-serial-{timestamp}.log`），并按 `deviceLogRetentionCount` 清理最旧文件，因此不需要、也不能再同时运行 `idf.py monitor` 独占同一个 COM 口。为避免高频 BLE notify 日志重复触发主机日志落盘和 WinForms 重绘，`showDeviceLogInUi` 默认关闭；该选项只影响窗口镜像，不影响独立设备日志文件。
@@ -152,9 +170,9 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 | `0x37` | MAKCU_MODE_REQUEST | 见上文模式切换 opcode 定义；M 角色支持 |
 | `0x38` | MAKCU_MODE_STATUS | 见上文 6 字节状态响应定义 |
 
-响应 Payload 最长 64 字节，前 12 字节为公共头：`schema:u8, role:u8, kind:u8, page_index:u8, page_count:u8, status:u8, item_count:u8, reserved:u8, uptime_ms:u32`。当前 `schema=1`、`reserved=0`；`role=1` 是 P/PC_DEVICE，`role=2` 是 M/MOUSE_HOST。`kind=1` 表示计数器，`kind=2` 表示队列；页序号从 0 开始，两个 kind 各自编号、分别收齐。所有页来自同一个预先采集的快照，因而同一 role 的 `uptime_ms` 应一致。查询范围是进程当前已打开的所有端口；只返回实际响应且页完整的板卡，不保证一定同时有 P 与 M。非零 `status` 表示板端无法提供完整快照，客户端应判失败。
+响应 Payload 最长 64 字节，前 12 字节为公共头：`schema:u8, role:u8, kind:u8, page_index:u8, page_count:u8, status:u8, item_count:u8, reserved:u8, uptime_ms:u32`。当前 `schema=1`、`reserved=0`；`role=1` 是 P/PC_DEVICE，`role=2` 是 M/MOUSE_HOST。`kind=1` 表示计数器，`kind=2` 表示队列；页序号从 0 开始，两个 kind 各自编号、分别收齐。所有页来自同一个预先采集的快照，因而同一 role 的 `uptime_ms` 应一致。查询范围是进程当前已打开的所有端口；只返回实际响应且页完整的板卡，不保证一定同时有 P 与 M。通常非零 `status` 表示板端无法提供完整快照，客户端应判失败。例外是 `status=2`（role unresolved）：固件返回单个 12-byte 状态头，`role=0, kind=1, page_index=0, page_count=1, item_count=0`，不带计数器记录或队列页；其中 uptime 仍可用于连续性检查，但该响应不是完整统计快照，也不是直接捕获 UART1 HELLO 的 `usb_role` 字段。当前 Host `DeviceStatistics` 解析仅接受 role 1/2，故遇到 role 0 会拒绝响应；应将该情形作为未定身份状态处理，而非完整统计。其他非零状态仍按完整快照失败处理。
 
-计数器记录固定 10 字节：`id:u8, value_type:u8, value:u64`。`value_type=1` 时按无符号小端 `u64` 解码；`value_type=2` 时按有符号二补码小端 `i64` 解码（M 的 `motion_rx_dx/dy` 是有符号累计位移）。每页最多 5 条。当前 M 快照包含计数器 ID 1..36、通用 UART1 ID 49..66 和会话状态 ID 68，共 11 页；P 包含 ID 37..48、通用 UART1 ID 49..66 和 USB 状态 ID 67，共 7 页。
+计数器记录固定 10 字节：`id:u8, value_type:u8, value:u64`。`value_type=1` 时按无符号小端 `u64` 解码；`value_type=2` 时按有符号二补码小端 `i64` 解码（M 的 `motion_rx_dx/dy` 是有符号累计位移）。每页最多 5 条。带 CherryUSB 诊断扩展的 M 额外包含 ID 69..96，共 83 个计数器、17 页；旧 M 固件仍可报告不支持。P 包含 ID 37..48、通用 UART1 ID 49..66 和 USB 状态 ID 67，共 7 页。
 
 | ID | 计数器 |
 |---:|---|
@@ -165,6 +183,24 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 | 67 | P：`p_usb_state`。低位 bit0..7 依次表示 attached、installed、clone_active、mounted、reconfigure_in_progress、waiting_host、final_ack_failed、disconnect_pending；bit8..15 是最近结果码（0 unknown、1 wait_host、2 final_ack_pending、3 mounted_acked、4 install_failed、5 final_ack_failed、6 canceled）；bit16 表示等待最终 ACK；高32位是 operation_epoch。 |
 | 68 | M：`m_vendor_session_state`。bit0..3 依次表示厂商会话有效、已收到首个厂商请求、peer generation 当前、Profile 等待主机；高32位是 vendor session epoch。 |
 
+CherryUSB 只读 Host 诊断扩展使用连续计数器 ID 69..96，不改变 `schema=1`、页头或记录格式。旧 M 或未启用 CherryUSB 的固件没有 ID 69，客户端须返回 `usbHostDiagnostics.available=false`；若快照出现 ID 69，则 ID 69..96 必须齐全，且 flags 必须声明 `available` 和 schema 1，否则拒绝该快照。P 不提供此扩展。
+
+| ID | M：CherryUSB Host 诊断字段 |
+|---:|---|
+| 69 | flags：bit0=available、bit1=CherryUSB backend、bit4..7=schema version；bit8..10 分别表示 DWC2 IRQ、root hub 事件、输入/心跳采集能力；bit11..13 分别表示当前寄存器、生命周期、输入快照有效；bit14..18 分别表示 initialized、stopping、hport 存在、连接、profile ready。有效位未置位时对应状态在 Host/Python 输出为 `null`。 |
+| 70 | 生命周期快照有效时的 device epoch。 |
+| 71..73 | 当前 HPRT、GINTSTS、GINTMSK 的只读寄存器采样；仅 `registerSnapshotValid=true` 时有效。读取不写寄存器、不清除 W1C 位，也不触发 USB 请求。 |
+| 74..78 | PCDET 总数、PCDET 且 PCSTS=1 的 wake 数、DISCINT 总数、最近 PCDET 时间、最近 DISCINT 时间。 |
+| 79..82 | root hub wake 数、root port connection-change 数、最近 `wPortStatus`（高 16 位）与 `wPortChange`（低 16 位）、最近 connection-change 时间。 |
+| 83..85 | enumerate 调用次数、成功次数、失败观察次数。ID 85 是失败阶段/返回值观察条数；同一枚举尝试可能记录多个失败观察，不能将它等同于失败枚举次数。 |
+| 86..88 | 最近诊断阶段 ID、最近 raw error、阶段时间。 |
+| 89..91 | 最近失败阶段 ID、最近失败 raw error、失败时间。成功只更新最近阶段，不清除最近失败记录。 |
+| 92..96 | HID 输入报告数、最后输入距采样时间、heartbeat 成功/失败数、最近一次 PCDET 且 PCSTS=1 的时间。 |
+
+时间值是板端启动后的 32 位毫秒计数，约 49.7 天回绕；0 是有效时间，是否有对应事件由事件计数判定。计数和时间只保存在 RAM，复位会清零，部署前发生的事件不能补录。ID 87/90 按有符号 `i64` 解码，`INT32_MIN` 哨兵表示没有可用 raw error，客户端输出 `null`；没有实际 USB/ESP 返回值的 debounce、enable 等失败只记录阶段，不伪造错误码。阶段 ID 0..32 依次为：`unknown`、`disconnect_event`、`debounce`、`port_reset`、`port_enable_check`、`enumerate_usb`、`enumerate_success`、`hub_port_status_usb`、`hub_clear_feature_usb`、`hub_reset_usb`、`port_enable_failure`、`hid_class_alloc_usb`、`hid_descriptor_validate_usb`、`hid_report_descriptor_header_usb`、`hid_interface_lookup_usb`、`hid_get_report_descriptor_usb`、`hid_init_esp`、`hid_init_urb_raw`、`hid_init_lifecycle_esp`、`hid_init_state_alloc_esp`、`hid_init_full_descriptor_esp`、`hid_init_descriptor_length_esp`、`hid_init_endpoint_esp`、`hid_init_input_buffer_esp`、`hid_init_timer_create_esp`、`hid_init_interface_open_esp`、`hid_init_profile_lock_esp`、`hid_init_profile_add_esp`、`hid_init_timer_start_esp`、`hid_init_arguments_esp`、`hid_init_profile_control_esp`、`hid_init_profile_validate_esp`、`hid_init_profile_build_esp`。同一次 STATS 采样中的计数器和寄存器是近似同时读取，不构成整机原子快照。
+
+若需要检查“是否观察到重连事件”，应对比故障前后 PCDET/connected-wake/DISCINT、hub connection-change 计数与时间，并结合当前 HPRT 的 PCSTS、生命周期和最近阶段；计数没有增加本身不能证明硬件产生了事件但软件漏接。没有用户活动时，输入计数不增长也不能推出鼠标冻结时长。Host loopback `GET /api/v1/serial/stats` 与 Python 结果都把扩展放在 `state.usbHostDiagnostics` 下。
+
 以上 ID 与 `firmware/main/stats_snapshot.h` 的枚举、`host/HidBridge.Host/Transport/DeviceStatistics.cs` 的 `CounterName`、`tools/read_device_stats.py` 的 `COUNTER_NAMES` 一致。Host API 与 Python 同时提供按位解码的 `state` 对象；字段定义与角色分组以三处映射及各自采集代码为准。
 
 队列记录固定 20 字节：`id:u8, unit:u8, capacity:u16, depth:u16, peak:u16, received:u32, rejected:u32, dropped:u32`。`unit=1` 表示队列项，`unit=2` 表示字节；每页最多 2 条。`0xFFFF` 表示未知的 u16 字段，`0xFFFFFFFF` 表示未知的 u32 字段。未知值在主机界面显示为“未采集”，API/Python JSON 输出为 `null`，不得当作零。UART1 RX ring 的队列 ID 13 以字节为单位；UART 硬件 FIFO 事件单独记录在计数器 64/65，不等于软件事件队列容量。
@@ -173,10 +209,12 @@ Profile blob v2 的固定 20 字节头依次为 `magic:u32`（`HIDP`）、`versi
 |---:|---|---|
 | 1..3 | host_hid_event、host_hid_report、host_hid_control | M |
 | 4..9 | UART1.tx、motion_tx、safety_tx、software_tx、vendor_tx、event | M 与 P |
-| 10..12 | vendor_input、motion_input、vendor_control | P |
+| 10 | vendor_input（P raw 输入单一 128 槽 FIFO；历史统计名称保留） | P |
+| 11 | motion_input（退役兼容行；当前无对应队列，capacity/depth/peak/received/rejected/dropped 均为 0） | P |
+| 12 | vendor_control（独立控制队列） | P |
 | 13 | UART1.rx_ring（字节） | M 与 P |
 
-当前 M 包含队列 1..9、13 共 10 条，队列页 5 页；P 包含队列 4..9、10..13 共 10 条，队列页 5 页。UART1 event 队列的 `received/rejected` 若底层无法准确提供则为 UNKNOWN；`dropped` 只表示 reset 时丢弃的事件通知条数。FIFO overflow 与 buffer-full 通知分别由计数器 64 和 65 汇报，单位是事件次数。
+当前 M 发出 ID 1..9、13 共 10 条队列/缓冲区统计记录，队列页 5 页；P 发出 ID 4..13 共 10 条记录、队列页 5 页，其中 ID 11 是全零兼容行，不对应实际队列。P 有 9 条活动队列/缓冲区记录；ID 13 是 UART1 RX 字节环形缓冲，不能将记录条数直接当作应用 FIFO 数量。ID 10 是单一 128 槽 raw 输入 FIFO，ID 12 vendor control 队列仍独立。UART1 event 队列的 `received/rejected` 若底层无法准确提供则为 UNKNOWN；`dropped` 只表示 reset 时丢弃的事件通知条数。FIFO overflow 与 buffer-full 通知分别由计数器 64 和 65 汇报，单位是事件次数。
 
 主机 EXE 的鼠标捕获页提供“读取设备统计”入口；loopback API 可用 `GET /api/v1/serial/stats` 读取同一组两板快照。Python 独立串口读取工具为 `python tools/read_device_stats.py --port COM3`，示例端口为 P 板；只能在该端口未被 EXE 占用时使用，它在打开前将 DTR/RTS 设为低电平。P UART0 固定为 921600；按当前固件源码，M 上电默认也是 921600，只有显式开启 Makcu runtime 才切到 115200。Makcu runtime 开启时，M 仍能接收中性的 A5 `DeviceProbe`、`ButtonState` 退订和模式查询；A5 输入与诊断帧、ButtonState 订阅、`StatsSnapshotRequest` 均被拒绝。统计响应走 A5 专用输出门控，Makcu 占用 UART0 时无法返回，因此应先关闭 Makcu runtime 再读取统计。A5 输入报告会切换到 A5 所有者并清空待处理软件输入、释放按钮。查询应由一个串口客户端独占完成。统计页字段及回归样例见 `tests/fixtures/stats_snapshot_c_frames.txt`。
 
@@ -258,7 +296,11 @@ ASCII 命令以 CR 或 LF 结束，命令必须带 `km.` 前缀；接收器支�
 
 ### 旧 V3 风格 ASCII 子集（可选编译，默认关闭）
 
-`DUAL_PROXY_ENABLE_MAKCU_ASCII_API` 保留为旧实验接口，默认 OFF，并与 V4 互斥。它不是 MAKCU V4，也不应与上面的 V4 命令表混用。启用时它占用 M UART0 的 ASCII 命令口、屏蔽同端口 A5 和 ESP_LOG；现有部署没有使用此模式。本轮 `MakcuModeRequest` 仅由 V4 capability 提供运行时入口；V4=OFF 时即便编译了旧 ASCII parser，也不启用其 runtime，避免进入无法用 A5 命令退出的模式。V4=ON 时其内置 `km.*` ASCII 接口仍可与 V4 二进制 API 一起使用。旧协议实现细节可查 `firmware/main/makcu_ascii_logic.c`，其硬件验收状态未验证。
+`DUAL_PROXY_ENABLE_MAKCU_ASCII_API` 与 `DUAL_PROXY_ENABLE_MAKCU_V4_API` 现均默认 ON，可编入同一镜像，运行时仅选择一套解析器。Host 的 `MakcuProtocolVersion` 设置为 4（默认）或 3（老版兼容子集）。开启 V4 使用 opcode=1，开启老版使用 opcode=3；关闭与查询仍使用 0/2。老版开启时受理 ACK 和后续状态查询均追加第 7 字节 `3`；A5 与 V4 保留原 6 字节状态，Host 将其视为 V4，不能将其误认成老版已启用。旧固件对 opcode=3 返回 INVALID/UNSUPPORTED，Host 不报告成功。C 状态解码器接受 6/7 字节，7 字节必须携带 version=3。
+
+两版均保持 Makcu=115200、A5=921600。A5 控制帧按整包隔离，不把其载荷送入 ASCII 解析器；Makcu 期间仅允许原有中性控制白名单。显式切换先释放软件输入、排空旧速率 ACK、再改变模式，丢弃同批剩余输入，并重置解析器、按钮会话与 V4 订阅。Host 在线切换版本自动执行“关闭并验证 A5 → 选择版本 → 开启并核对实际版本及 M 角色”，中途不恢复宏/Lua。关闭失败不继续切换；开启失败按实际查询结果恢复界面，不伪报成功。旧 ASCII 子集的真实设备验收仍未验证，代码不等同原厂完整协议。V4 capability 关闭时保留既有返回 UNSUPPORTED 的行为；正式双版包启用两项。
+
+历史说明：2026-10-30 以前两项编译互斥，旧 ASCII 默认关闭；当时没有可用的旧版运行时入口，相关历史实机结论不自动扩展到本次双版固件。
 
 ### UART0 实时诊断与手动注入（双板固件）
 

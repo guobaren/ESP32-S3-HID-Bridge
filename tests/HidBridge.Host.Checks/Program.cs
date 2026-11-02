@@ -18,6 +18,68 @@ using HidBridge.Host.Transport;
 using HidBridge.Host.Ui;
 using HidBridge.Protocol;
 
+if (args.Contains("--firmware-flash-result-only"))
+{
+    CheckFirmwareUpdateApiPolicy();
+    CheckFirmwareFlashCompletion();
+    CheckFirmwareUpdateApiLan();
+    return 0;
+}
+
+if (args.Contains("--makcu-version-only"))
+{
+    FrameCodec codec = new();
+    byte[] request = MakcuModeProtocol.CreateRequest(codec, MakcuModeProtocol.EnableLegacyOpcode, out ushort seq);
+    Require(FrameCodec.TryDecode(request, out var decoded) && decoded.Payload.SequenceEqual(new byte[] { 3 }), "老版启用请求编码错误");
+    byte[] payload = [0, 1, 0, 194, 1, 0, 3];
+    Require(MakcuModeProtocol.TryDecodeStatus(new BridgeFrame(MessageType.MakcuModeStatus, seq, payload), seq, out var legacy) && legacy.ProtocolVersion == 3, "老版状态识别失败");
+    Require(MakcuModeProtocol.TryDecodeStatus(new BridgeFrame(MessageType.MakcuModeStatus, seq, payload[..6]), seq, out var v4) && v4.ProtocolVersion == 4, "旧固件六字节状态不兼容");
+    payload[6] = 9;
+    Require(!MakcuModeProtocol.TryDecodeStatus(new BridgeFrame(MessageType.MakcuModeStatus, seq, payload), seq, out _), "接受了未知协议版本");
+    var good = new FakeMakcuModeHandshake { ProtocolVersion = 3 };
+    var result = new MakcuModeCoordinator(good, () => 3).SetEnabledAsync(true, false, 921600, true).GetAwaiter().GetResult();
+    Require(result.Success && result.ActualStateVerified && good.ActualEnabled, "老版握手未验证成功");
+    var wrong = new FakeMakcuModeHandshake();
+    result = new MakcuModeCoordinator(wrong, () => 3).SetEnabledAsync(true, false, 921600, true).GetAwaiter().GetResult();
+    Require(!result.Success, "V4 状态被误判为老版开启成功");
+    List<string> order = [];
+    result = MakcuModeCoordinator.ChangeVersionAsync(3,
+        enabled =>
+        {
+            order.Add(enabled ? "on" : "off");
+            return Task.FromResult(new MakcuModeChangeResult(true, enabled, enabled ? 115200 : 921600, "ok", true));
+        }, version => order.Add($"select:{version}")).GetAwaiter().GetResult();
+    Require(result.Success && order.SequenceEqual(new[] { "off", "select:3", "on" }), "自动切版未按关闭、选版本、开启执行");
+    order.Clear();
+    result = MakcuModeCoordinator.ChangeVersionAsync(4,
+        enabled =>
+        {
+            order.Add("off-failed");
+            return Task.FromResult(new MakcuModeChangeResult(false, true, 115200, "拒绝", true));
+        }, version => order.Add("unexpected")).GetAwaiter().GetResult();
+    Require(!result.Success && order.SequenceEqual(new[] { "off-failed" }), "关闭失败仍继续切版");
+    Console.WriteLine("Makcu 双版请求、状态兼容、未知版本拒绝、握手版本校验、自动切版顺序和失败中止：PASS");
+    return 0;
+}
+
+if (args.Contains("--usb-role-only"))
+{
+    byte[] payload = LinkHelloCodec.Encode(2, 0, new byte[] { 1, 2, 3, 4, 5, 6 }, 0x12345678, 2);
+    byte[] expected = { 2, 0, 1, 2, 3, 4, 5, 6, 0x78, 0x56, 0x34, 0x12, 2 };
+    Require(payload.SequenceEqual(expected), "LINK_HELLO 与 C fixture 字段布局不一致");
+    var frameBytes = new FrameCodec().Encode(MessageType.LinkHello, payload);
+    Require(FrameCodec.TryDecode(frameBytes, out var helloFrame) &&
+        helloFrame.Payload.SequenceEqual(expected), "LINK_HELLO 外层帧编解码结果不一致");
+    Require(LinkHelloCodec.Encode(1, 0, new byte[6], 9, 0)[12] == 0,
+        "无本板 USB 证据时错误声明身份");
+    bool rejected = false;
+    try { LinkHelloCodec.Encode(1, 0, new byte[6], 9, 2); }
+    catch (ArgumentException) { rejected = true; }
+    Require(rejected, "接受了与运行角色不一致的 USB 身份");
+    Console.WriteLine("UART1 LINK_HELLO 13字节、C字段对照、无USB声明及非法身份：PASS");
+    return 0;
+}
+
 if (args.Contains("--firmware-smoothing-only"))
 {
     foreach (byte slots in new byte[] { 0, 5, 10, 15, 20 })
@@ -914,20 +976,41 @@ static void CheckStatsSnapshotProtocol()
         frames.Add((role, kind, index, count, frame));
     }
 
-    Require(frames.Count == 28, $"C fixture 应包含 P/M 两板 28 个实际编码页，实际={frames.Count}");
+    Require(frames.Count == 34, $"C fixture 应包含 P/M 两板 34 个实际编码页，实际={frames.Count}");
     Require(collectors.Count == 2 && collectors[1].IsComplete && collectors[2].IsComplete,
         "实际 C 输出必须完整覆盖 role=1 P 与 role=2 M 的 counters/queues 两组分页");
     DeviceStatisticsSnapshot pc = collectors[1].Build();
     DeviceStatisticsSnapshot mouse = collectors[2].Build();
+    Require(frames.Count(item => item.Role == 2 && item.Kind == 1) == 17 &&
+            mouse.Counters.Count == 83,
+        "M 的 83 个计数器必须跨过64项边界并完整分页");
     Require(pc.RoleName == "P/PC_DEVICE" && mouse.RoleName == "M/MOUSE_HOST",
         "C 角色编号必须是 P=1、M=2");
-    Require(pc.State is { } pcState && mouse.State is { } mouseState &&
-            (bool)pcState["mounted"] &&
+    IReadOnlyDictionary<string, object> pcState = pc.State;
+    IReadOnlyDictionary<string, object> mouseState = mouse.State;
+    Require((bool)pcState["mounted"] &&
             (string)pcState["lastResult"] == "mounted_acked" &&
             (ulong)pcState["operationEpoch"] == 7UL &&
             (bool)mouseState["firstVendorRequestSeen"] &&
             (ulong)mouseState["vendorSessionEpoch"] == 33UL,
         "C 角色状态计数必须正确解码P挂载/最终ACK与M厂商会话字段");
+    IReadOnlyDictionary<string, object?> mouseUsbDiag =
+        (IReadOnlyDictionary<string, object?>)mouseState["usbHostDiagnostics"];
+    IReadOnlyDictionary<string, object?> pcUsbDiag =
+        (IReadOnlyDictionary<string, object?>)pcState["usbHostDiagnostics"];
+    Require((bool)mouseUsbDiag["available"]! &&
+            (int)mouseUsbDiag["schemaVersion"]! == 1 &&
+            (bool)mouseUsbDiag["registerSnapshotValid"]! &&
+            (bool)mouseUsbDiag["connected"]! &&
+            (ulong)mouseUsbDiag["failureObservationCount"]! == 1UL &&
+            (long)mouseUsbDiag["lastRawError"]! == -7L &&
+            (long)mouseUsbDiag["lastFailureRawError"]! == -9L &&
+            (string)mouseUsbDiag["lastStage"]! == "enumerate_success" &&
+            (string)mouseUsbDiag["lastFailureStage"]! == "hid_init_urb_raw" &&
+            (ulong)mouseUsbDiag["lastConnectedPcDetMs"]! == 9600UL,
+        "M USB Host diagnostics 必须解码 live-valid、signed raw error、成功不清失败及 connected-PCDET 时间");
+    Require(!(bool)pcUsbDiag["available"]!,
+        "P/旧固件不支持 USB Host diagnostics 时必须显式返回 available=false");
     foreach ((byte role, byte stateCounterId) in new[] { ((byte)1, (byte)67), ((byte)2, (byte)68) })
     {
         DeviceStatsPageCollector missingStateCollector = new($"COM-missing-state-{role}", 0xA17C);
@@ -959,6 +1042,163 @@ static void CheckStatsSnapshotProtocol()
         }
         Require(missingRequiredStateRejected, $"role={role} 缺少必需状态计数器 id={stateCounterId} 时必须明确失败");
     }
+    DeviceStatsPageCollector missingDiagnosticCollector = new("COM-missing-diagnostics", 0xA17C);
+    foreach (BridgeFrame originalFrame in frames.Where(item => item.Role == 2).Select(item => item.Frame))
+    {
+        byte[] payload = originalFrame.Payload.ToArray();
+        if (payload[2] == 1)
+        {
+            for (int item = 0; item < payload[6]; item++)
+            {
+                int recordOffset = 12 + item * 10;
+                if (payload[recordOffset] == 96)
+                {
+                    payload[recordOffset] = 0xFE;
+                }
+            }
+        }
+        missingDiagnosticCollector.Add(originalFrame with { Payload = payload });
+    }
+    bool missingDiagnosticRejected = false;
+    try
+    {
+        _ = missingDiagnosticCollector.Build();
+    }
+    catch (InvalidDataException)
+    {
+        missingDiagnosticRejected = true;
+    }
+    Require(missingDiagnosticRejected,
+        "设备声明支持诊断但缺少 ID96 时必须拒绝快照");
+    DeviceStatsPageCollector legacyMouseCollector = new("COM-legacy-M", 0xA17C);
+    foreach (BridgeFrame originalFrame in frames.Where(item => item.Role == 2).Select(item => item.Frame))
+    {
+        byte[] payload = originalFrame.Payload.ToArray();
+        if (payload[2] == 1)
+        {
+            for (int item = 0; item < payload[6]; item++)
+            {
+                int recordOffset = 12 + item * 10;
+                byte id = payload[recordOffset];
+                if (id is >= 69 and <= 96)
+                {
+                    payload[recordOffset] = (byte)(id + 28);
+                }
+            }
+        }
+        legacyMouseCollector.Add(originalFrame with { Payload = payload });
+    }
+    DeviceStatisticsSnapshot legacyMouse = legacyMouseCollector.Build();
+    IReadOnlyDictionary<string, object?> legacyDiagnostics =
+        (IReadOnlyDictionary<string, object?>)legacyMouse.State["usbHostDiagnostics"];
+    Require(!(bool)legacyDiagnostics["available"]!,
+        "旧 M 固件缺少 ID69 时必须显式标记 diagnostics unsupported");
+
+    DeviceStatsPageCollector invalidDiagnosticFlagsCollector = new("COM-invalid-diag-flags", 0xA17C);
+    foreach (BridgeFrame originalFrame in frames.Where(item => item.Role == 2).Select(item => item.Frame))
+    {
+        byte[] payload = originalFrame.Payload.ToArray();
+        if (payload[2] == 1)
+        {
+            for (int item = 0; item < payload[6]; item++)
+            {
+                int recordOffset = 12 + item * 10;
+                if (payload[recordOffset] == 69)
+                {
+                    BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), 0UL);
+                }
+            }
+        }
+        invalidDiagnosticFlagsCollector.Add(originalFrame with { Payload = payload });
+    }
+    bool invalidDiagnosticFlagsRejected = false;
+    try
+    {
+        _ = invalidDiagnosticFlagsCollector.Build();
+    }
+    catch (InvalidDataException)
+    {
+        invalidDiagnosticFlagsRejected = true;
+    }
+    Require(invalidDiagnosticFlagsRejected,
+        "ID69 存在但 flags/schema 未声明 supported 时必须拒绝诊断快照");
+
+    DeviceStatsPageCollector noEventCollector = new("COM-no-event", 0xA17C);
+    foreach (BridgeFrame originalFrame in frames.Where(item => item.Role == 2).Select(item => item.Frame))
+    {
+        byte[] payload = originalFrame.Payload.ToArray();
+        if (payload[2] == 1)
+        {
+            for (int item = 0; item < payload[6]; item++)
+            {
+                int recordOffset = 12 + item * 10;
+                byte id = payload[recordOffset];
+                if (id == 69)
+                {
+                    ulong flags = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8));
+                    flags &= ~((1UL << 11) | (1UL << 12) | (1UL << 13));
+                    BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), flags);
+                }
+                else if (id is 74 or 75 or 76 or 80 or 83 or 84 or 85 or 92)
+                {
+                    BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), 0UL);
+                }
+            }
+        }
+        noEventCollector.Add(originalFrame with { Payload = payload });
+    }
+    DeviceStatisticsSnapshot noEventMouse = noEventCollector.Build();
+    IReadOnlyDictionary<string, object?> noEventDiagnostics =
+        (IReadOnlyDictionary<string, object?>)noEventMouse.State["usbHostDiagnostics"];
+    Require(noEventDiagnostics["lastStage"] is null &&
+            noEventDiagnostics["lastConnectedPcDetMs"] is null &&
+            noEventDiagnostics["hprt"] is null &&
+            noEventDiagnostics["connected"] is null &&
+            noEventDiagnostics["inputAgeMs"] is null,
+        "未观察到事件或快照无效时，最新阶段、wake时间、寄存器、生命周期和输入时龄必须为 unknown");
+
+    DeviceStatsPageCollector zeroTimeCollector = new("COM-zero-time-stage", 0xA17C);
+    foreach (BridgeFrame originalFrame in frames.Where(item => item.Role == 2).Select(item => item.Frame))
+    {
+        byte[] payload = originalFrame.Payload.ToArray();
+        if (payload[2] == 1)
+        {
+            for (int item = 0; item < payload[6]; item++)
+            {
+                int recordOffset = 12 + item * 10;
+                byte id = payload[recordOffset];
+                if (id == 80)
+                {
+                    BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), 1UL);
+                }
+                else if (id is 83 or 85)
+                {
+                    BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), 0UL);
+                }
+                else if (id == 86)
+                {
+                    BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), 2UL);
+                }
+                else if (id == 87)
+                {
+                    BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), int.MinValue);
+                }
+                else if (id == 88)
+                {
+                    BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(recordOffset + 2, 8), 0UL);
+                }
+            }
+        }
+        zeroTimeCollector.Add(originalFrame with { Payload = payload });
+    }
+    IReadOnlyDictionary<string, object?> zeroTimeDiagnostics =
+        (IReadOnlyDictionary<string, object?>)zeroTimeCollector.Build().State["usbHostDiagnostics"];
+    Require((ulong)zeroTimeDiagnostics["connectionChangeCount"]! == 1UL &&
+            (string)zeroTimeDiagnostics["lastStage"]! == "debounce" &&
+            (ulong)zeroTimeDiagnostics["lastStageMs"]! == 0UL &&
+            zeroTimeDiagnostics["lastRawError"] is null,
+        "连接事件必须使 time=0 的最新阶段有效，INT32_MIN 哨兵必须解码为 null");
+    Console.WriteLine("USB Host diagnostics boundary check：PASS；未观察事件为 unknown，time=0 阶段有效，INT32_MIN 原始错误为 null。");
     Require((ulong)pc.Counters["attempt"] == 39_000UL &&
             (ulong)mouse.Counters["recover"] == 11_000UL,
         "C 角色计数器 ID 集合映射错误或被对方角色误用");
@@ -1044,7 +1284,7 @@ static void CheckStatsSnapshotProtocol()
         "实时混合日志扫描器必须识别跨读取边界 stats response");
     Require(Encoding.UTF8.GetString(textBytes.ToArray()) == "I (1) realtime log\r\n\r\nW (2) tail\r\n",
         "剥离 stats 二进制帧时不得丢失前后实时日志文本");
-    Console.WriteLine("统计协议回归：PASS；28 页来自 dual_proxy C 序列化器，P/M 角色映射、必需 USB/会话状态及缺项拒绝、signed 位移、20B 队列、未知值、缺页/重复/版本、超时清理后的迟到序号与实时日志混流均符合协议。");
+    Console.WriteLine("统计协议回归：PASS；34 页来自 dual_proxy C 序列化器，M 83 项跨越 64 项边界，P/M 角色映射、USB Host diagnostics 缺项拒绝、signed 位移/错误、20B 队列、未知值、缺页/重复/版本、迟到序号和日志混流均符合协议。");
 }
 
 static void CheckButtonStateSharedMemoryAndExpiry()
@@ -1875,6 +2115,13 @@ static void CheckStatsSnapshotHttpApi()
                     ["peerGenerationCurrent"] = true,
                     ["waitingHost"] = false,
                     ["vendorSessionEpoch"] = 33UL,
+                    ["usbHostDiagnostics"] = new Dictionary<string, object?>
+                    {
+                        ["available"] = true,
+                        ["connected"] = false,
+                        ["lastConnectedPcDetMs"] = 1234UL,
+                        ["lastFailureRawError"] = -17L,
+                    },
                 },
                 [
                     new DeviceQueueStatistics(
@@ -1910,6 +2157,12 @@ static void CheckStatsSnapshotHttpApi()
         Require(board.GetProperty("state").GetProperty("vendorSessionActive").GetBoolean() &&
                 board.GetProperty("state").GetProperty("vendorSessionEpoch").GetUInt64() == 33UL,
             "stats JSON 必须呈现M厂商会话状态");
+        JsonElement diagnostics = board.GetProperty("state").GetProperty("usbHostDiagnostics");
+        Require(diagnostics.GetProperty("available").GetBoolean() &&
+                !diagnostics.GetProperty("connected").GetBoolean() &&
+                diagnostics.GetProperty("lastConnectedPcDetMs").GetUInt64() == 1234UL &&
+                diagnostics.GetProperty("lastFailureRawError").GetInt64() == -17L,
+            "stats JSON 必须保留嵌套 USB Host diagnostics 与 signed raw error");
         JsonElement queue = board.GetProperty("queues")[0];
         Require(queue.GetProperty("unit").GetByte() == 2 &&
                 queue.GetProperty("received").ValueKind == JsonValueKind.Null &&
@@ -3078,6 +3331,52 @@ static uint KmboxMix(uint sum, uint y, uint z, int position, uint e, ReadOnlySpa
     unchecked(((z >> 5 ^ y << 2) + (y >> 3 ^ z << 4)) ^
         ((sum ^ y) + (key[(position & 3) ^ (int)e] ^ z)));
 
+static void CheckFirmwareFlashCompletion()
+{
+    FirmwareFlashService.VerifyFlashOutput(0, 3, 3, true);
+    foreach (var sample in new[] { (1, 3, true), (0, 2, true), (0, 4, true), (0, 3, false) })
+    {
+        bool failed = false;
+        try { FirmwareFlashService.VerifyFlashOutput(sample.Item1, 3, sample.Item2, sample.Item3); }
+        catch (InvalidOperationException) { failed = true; }
+        Require(failed, $"错误刷写输出被接受：{sample}");
+    }
+    int calls = 0;
+    var pOnly = FirmwareFlashService.FinishVerifiedFlashAsync(false, () =>
+    {
+        calls++;
+        throw new IOException("仅 P 时不得尝试连接 M");
+    }).GetAwaiter().GetResult();
+    Require(calls == 0 && pOnly.ControlConnectionState == "not_requested" &&
+        pOnly.Message.Contains("仅接 P") && pOnly.Message.Contains("未验证"),
+        "仅 P 刷写未跳过 M 等待，或错误宣称启动与输入链路通过");
+    var recovered = FirmwareFlashService.FinishVerifiedFlashAsync(true, () =>
+    {
+        calls++;
+        return Task.FromResult(true);
+    }).GetAwaiter().GetResult();
+    Require(calls == 1 && recovered.ControlConnectionState == "restored", "原有 M 连接未执行恢复检查");
+    var timeout = FirmwareFlashService.FinishVerifiedFlashAsync(true, () => Task.FromResult(false))
+        .GetAwaiter().GetResult();
+    Require(timeout.ControlConnectionState == "failed" && timeout.Message.Contains("恢复失败"),
+        "M 超时没有单独记录 Failed");
+    var exception = FirmwareFlashService.FinishVerifiedFlashAsync(true,
+        () => Task.FromException<bool>(new IOException("模拟端口已拔出"))).GetAwaiter().GetResult();
+    Require(exception.ControlConnectionState == "failed" && exception.Message.Contains("模拟端口已拔出"),
+        "恢复异常没有保留真实原因");
+    FirmwareFlashSnapshot snapshot = new("fixture", "succeeded", timeout.Message, null, null, 0, "COM123",
+        FlashVerified: true, ControlConnectionState: timeout.ControlConnectionState);
+    Require(FirmwareFlashDialog.DescribeFinishedStatus(snapshot) == "刷写成功；M 控制连接恢复失败",
+        "UI 仍把 M 重连失败显示为刷写失败");
+    string json = JsonSerializer.Serialize(snapshot);
+    var roundTrip = JsonSerializer.Deserialize<FirmwareFlashSnapshot>(json)!;
+    Require(roundTrip.FlashVerified && roundTrip.ControlConnectionState == "failed" &&
+        roundTrip.State == "succeeded", "API 快照未分别保留写入校验与重连失败结果");
+    Require(FirmwareFlashDialog.DescribeFinishedStatus(snapshot with { State = "failed", FlashVerified = false }) == "刷写失败",
+        "真正刷写失败被 UI 隐藏");
+    Console.WriteLine("固件刷写结果专项：仅P不等待M、M恢复/超时/异常、UI与API分项结果、非零退出/缺失及多余校验/缺复位拒绝：PASS");
+}
+
 static void CheckFirmwareUpdateApiPolicy()
 {
     Require(!new AutomationSettings().FirmwareUpdateApiEnabled, "局域网固件刷写接口必须默认关闭");
@@ -3255,6 +3554,19 @@ static void CheckFirmwareUpdateApiLan()
     Require(started == 1, "合法刷写请求必须且只能启动一次任务");
     Require(requestedManifestPath == manifestPath, "远程刷写 API 未将请求指定的 JSON 路径传给底层刷写工具");
     Require(requestedPortName == "COM7", "远程刷写 API 未使用设置页已选择的串口");
+    snapshot = snapshot with
+    {
+        State = "succeeded",
+        FlashVerified = true,
+        ControlConnectionState = "failed",
+        Message = "固件校验通过，M 控制连接恢复失败",
+    };
+    using JsonDocument finished = JsonDocument.Parse(client.GetStringAsync("/api/v1/firmware/status")
+        .GetAwaiter().GetResult());
+    Require(finished.RootElement.GetProperty("state").GetString() == "succeeded" &&
+        finished.RootElement.GetProperty("flashVerified").GetBoolean() &&
+        finished.RootElement.GetProperty("controlConnectionState").GetString() == "failed",
+        "实际 HTTP 状态响应混淆了固件校验通过与控制重连失败");
     server.SetEnabled(false);
     Require(!server.Enabled, "设置关闭后固件刷写 API 必须停止监听");
 }
@@ -5284,6 +5596,7 @@ internal sealed class FakeMakcuModeHandshake : IMakcuModeHandshake
     internal bool ActualEnabled { get; private set; }
     internal int ActualBaudRate { get; private set; }
     internal int HostBaudRate { get; private set; }
+    internal int ProtocolVersion { get; init; } = 4;
     internal int RequestStatus { get; init; }
     internal bool ApplySwitchOnBaudChange { get; init; } = true;
     internal bool ReaderCanStop { get; init; } = true;
@@ -5313,7 +5626,7 @@ internal sealed class FakeMakcuModeHandshake : IMakcuModeHandshake
         int targetBaud = enabled
             ? MakcuModeCoordinator.MakcuBaudRate
             : MakcuModeCoordinator.A5BaudRate;
-        return Task.FromResult<MakcuModeSnapshot?>(new MakcuModeSnapshot(enabled, targetBaud, 0));
+        return Task.FromResult<MakcuModeSnapshot?>(new MakcuModeSnapshot(enabled, targetBaud, 0, ProtocolVersion));
     }
 
     public Task SetBaudRateAsync(int baudRate, CancellationToken cancellationToken)
@@ -5368,6 +5681,6 @@ internal sealed class FakeMakcuModeHandshake : IMakcuModeHandshake
 
     private MakcuModeSnapshot? StateAtHostBaud() =>
         HostBaudRate == ActualBaudRate
-            ? new MakcuModeSnapshot(ActualEnabled, ActualBaudRate, 0)
+            ? new MakcuModeSnapshot(ActualEnabled, ActualBaudRate, 0, ProtocolVersion)
             : null;
 }

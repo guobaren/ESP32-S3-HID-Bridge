@@ -22,6 +22,7 @@
 #include "uart0_control.h"
 #include "uart0_output.h"
 #include "uart1_link.h"
+#include "usb_role_logic.h"
 
 #define USB_ROLE_PROBE_INTERVAL_MS 3000
 #define PROFILE_TRANSFER_TIMEOUT_MS 1000
@@ -36,12 +37,17 @@ static const char *TAG = "dual_proxy";
 static uint8_t s_node_id[6];
 static volatile uint8_t s_role = DUAL_ROLE_UNRESOLVED;
 static volatile uint8_t s_peer_role_claim = DUAL_ROLE_UNRESOLVED;
+static volatile uint32_t s_peer_role_claim_ms;
 static usb_probe_mode_t s_probe_mode = USB_PROBE_NONE;
 static usb_probe_mode_t s_last_probe_mode = USB_PROBE_NONE;
 static int64_t s_probe_started_us;
 static int64_t s_role_retry_after_us;
 static bool s_host_started;
+/* Host stop errors keep ownership uncertain and forbid Device/PHY startup. */
+static bool s_host_cleanup_pending;
 static bool s_role_initialized;
+static bool s_role_reprobe_pending;
+static dual_role_watch_t s_role_watch;
 static bool s_peer_mouse_usb_state_initialized;
 static uint8_t s_peer_mouse_usb_state = DUAL_USB_STATE_WAITING;
 static bool s_peer_mouse_generation_initialized;
@@ -53,8 +59,8 @@ static uint32_t s_profile_offer_transfer_id;
 static uint32_t s_profile_offer_crc32;
 static bool s_profile_schedule_ok;
 /*
- * Profile CRC 复用（2026-09-28，按用户决策启用）：本次 clone 会话的 CRC32 与本机
- * 已挂载克隆完全一致时置位——OFFER 阶段不排清理屏障，Profile 收全后不卸载不重装。
+ * Profile 数据复用：本次事务CRC与已安装且mounted的克隆一致时置位——OFFER阶段
+ * 不排单独清理屏障；Profile收全后把已验证活动数据复制到worker队列，仍完整重枚举。
  * 每次 OFFER 都会重新赋值，publish 前还会用 dual_pc_hid_installed_profile_matches()
  * 复核，因此不会因为残留标志走进错误路径。
  */
@@ -165,6 +171,7 @@ bool dual_proxy_manual_profile_enabled(void)
 
 static void on_link_fault(void)
 {
+    s_peer_role_claim = DUAL_ROLE_UNRESOLVED;
     if (s_role == DUAL_ROLE_PC_DEVICE) {
         if (__atomic_load_n(&s_manual_profile, __ATOMIC_ACQUIRE)) {
             return;
@@ -199,14 +206,12 @@ static void on_link_frame(const dual_frame_t *frame)
         return;
     }
     if (frame->type == DUAL_MESSAGE_LINK_HELLO) {
-        if (s_role == DUAL_ROLE_UNRESOLVED && frame->payload_length == 12U &&
-            frame->payload[0] != DUAL_ROLE_UNRESOLVED) {
-            s_peer_role_claim = frame->payload[0];
-        } else if (frame->payload_length == 12U &&
-                   frame->payload[0] == DUAL_ROLE_UNRESOLVED) {
-            s_peer_role_claim = DUAL_ROLE_UNRESOLVED;
+        if (frame->payload_length == DUAL_LINK_HELLO_LENGTH) {
+            /* 运行角色可能仅来自本板推导；只有对端自己的 USB 证据可补全身份。 */
+            s_peer_role_claim_ms = (uint32_t)(esp_timer_get_time() / 1000LL);
+            s_peer_role_claim = frame->payload[DUAL_LINK_HELLO_USB_ROLE_OFFSET];
         }
-        if (s_role == DUAL_ROLE_PC_DEVICE && frame->payload_length == 12U &&
+        if (s_role == DUAL_ROLE_PC_DEVICE && frame->payload_length == DUAL_LINK_HELLO_LENGTH &&
             (frame->payload[0] == DUAL_ROLE_MOUSE_HOST ||
              frame->payload[0] == DUAL_ROLE_UNRESOLVED)) {
             const uint8_t peer_usb_state = frame->payload[1];
@@ -403,11 +408,10 @@ static void on_link_frame(const dual_frame_t *frame)
             }
             /* M 发起的新克隆先撤掉旧设备，再确认接收。Profile 的最终
              * 成败仍由安装挂载后的 PROFILE_ACK 报告。
-             * 例外（2026-09-28 用户决策）：本次 Profile 的 CRC32 与本机当前
-             * 已挂载克隆完全一致时**复用**它——不卸载、不重装。实测省时间的
-             * 正是这一步（卸载→安装→Windows 重新枚举 609~962 ms，尾部 2.7 s），
-             * 而板间数据段只有 12~30 ms。判定条件全部在纯函数
-             * link_profile_reuse_allowed() 里，任一条不成立就退回完整路径。 */
+             * CRC32 命中时只复用已验证的 Profile 数据；收到新发布事务后仍走
+             * reconfigure_task 的完整 USB 卸载、断开、安装和重新枚举路径。
+             * 仅在已安装、活动、mounted、CRC 相同且没有在途操作时提前接受 OFFER，
+             * 避免重复清理屏障；最终 ACK 仍由 worker 在 mounted 后发送。 */
             const bool reuse_ok = dual_pc_hid_installed_profile_matches(crc32);
             hid_profile_receiver_init(&s_profile_receiver, on_profile_published,
                                       &s_profile_receiver);
@@ -421,13 +425,14 @@ static void on_link_frame(const dual_frame_t *frame)
             s_profile_offer_valid = true;
             s_profile_reuse_pending = reuse_ok;
             if (reuse_ok) {
-                /* 复用路径没有清理屏障要等，直接确认提议让 M 送完这一小段数据。 */
+                /* CRC命中只省去OFFER阶段的独立清理屏障；此处仅确认M可发送数据，
+                 * 新Profile发布后仍由worker卸载、重装并等待主机mounted。 */
                 const esp_err_t reuse_ack = dual_uart1_send_flow_ack(
                     DUAL_MESSAGE_PROFILE_OFFER, flow_id, DUAL_FLOW_STATUS_ACCEPTED);
                 if (reuse_ack == ESP_OK) {
                     ++s_profile_reuse_hits;
-                    ESP_LOGW(TAG, "Profile CRC 命中：本机已挂载同一份Profile，"
-                             "跳过卸载+重装；flow=%" PRIu32 " transfer=%" PRIu32
+                    ESP_LOGW(TAG, "Profile CRC命中：复用缓存数据；新事务发布后仍完整重枚举；"
+                             "flow=%" PRIu32 " transfer=%" PRIu32
                              " crc=%08" PRIX32 " hits=%" PRIu32,
                              flow_id, transfer_id, crc32, s_profile_reuse_hits);
                     return;
@@ -587,12 +592,19 @@ static void on_link_frame(const dual_frame_t *frame)
 static void on_profile_published(const hid_device_profile_t *profile, void *context)
 {
     const hid_profile_receiver_t *receiver = context;
+    const uint32_t published_transfer_id = receiver != NULL ?
+        receiver->published_transfer_id : 0U;
+    const bool stale_offer_peer = published_transfer_id != 0U &&
+        (!s_offer_seen_valid || s_offer_seen_generation == 0U ||
+         s_offer_seen_generation != dual_uart1_peer_generation());
     if (!s_profile_offer_valid || receiver == NULL ||
-        receiver->published_transfer_id != s_profile_offer_transfer_id ||
-        receiver->published_crc32 != s_profile_offer_crc32) {
+        published_transfer_id != s_profile_offer_transfer_id ||
+        receiver->published_crc32 != s_profile_offer_crc32 || stale_offer_peer) {
         s_profile_schedule_ok = false;
+        s_profile_offer_valid = false;
+        s_profile_reuse_pending = false;
         dual_status_led_set_flow_error(true);
-        ESP_LOGE(TAG, "完整Profile与已确认的克隆提议不匹配");
+        ESP_LOGE(TAG, "完整Profile与已确认的克隆提议不匹配或peer generation已变化");
         return;
     }
     uint16_t vid = 0;
@@ -610,17 +622,16 @@ static void on_profile_published(const hid_device_profile_t *profile, void *cont
              profile != NULL && profile->serial.length != 0 ? "yes" : "no",
              profile != NULL ? profile->report_descriptor_count : 0,
              profile != NULL ? profile->flags : 0);
-    const uint32_t transfer_id = receiver != NULL ? receiver->published_transfer_id : 0U;
+    const uint32_t transfer_id = published_transfer_id;
     const uint32_t crc32 = receiver != NULL ? receiver->published_crc32 : 0U;
     /* 初值故意取失败值：只有复用真正完成才跳过下面的完整安装路径。 */
     esp_err_t result = ESP_ERR_INVALID_STATE;
     if (s_profile_reuse_pending) {
         s_profile_reuse_pending = false;
-        /*
-         * 复用路径（2026-09-28）：Profile 与已挂载克隆完全一致 → 不卸载、不重装。
-         * 这里复核一次，避免 OFFER 与 COMMIT 之间克隆被卸载/换掉的竞态；
-         * 复核不通过时自动退回下面的完整路径。
-         */
+        /* CRC 命中仅复用 Profile 数据，不复用当前USB实例。这里再次复核，避免
+         * OFFER 与 COMMIT 之间克隆被卸载/换掉；复核成功后把活动Profile拷贝入
+         * worker队列，并等待完整USB重枚举及mounted最终ACK。复核不通过时退回
+         * 下面的普通Profile队列路径。 */
         if (dual_pc_hid_installed_profile_matches(crc32)) {
             result = dual_pc_hid_reuse_installed_profile(transfer_id, crc32);
             if (result != ESP_OK) {
@@ -703,6 +714,9 @@ static void on_mouse_release(bool device_gone)
 
 static esp_err_t start_pc_role(void)
 {
+    if (s_host_started || s_host_cleanup_pending) {
+        return ESP_ERR_INVALID_STATE;
+    }
     __atomic_store_n(&s_manual_profile, false, __ATOMIC_RELEASE);
     s_peer_mouse_usb_state_initialized = false;
     s_peer_mouse_usb_state = DUAL_USB_STATE_WAITING;
@@ -774,10 +788,40 @@ static esp_err_t start_mouse_role(void)
      * 这里只注册断开回调会导致描述符虽然克隆成功，但 G HUB 的控制请求
      * 在 UART 解析后被静默丢弃。
      */
+    if (s_host_cleanup_pending) {
+        result = dual_hid_host_stop();
+        if (result != ESP_OK) {
+            return result;
+        }
+        s_host_cleanup_pending = false;
+        s_host_started = false;
+        s_probe_mode = USB_PROBE_NONE;
+    }
+    if (dual_pc_hid_device_cleanup_pending()) {
+        result = dual_pc_hid_prepare_for_profile();
+        if (result != ESP_OK) {
+            s_probe_mode = USB_PROBE_DEVICE;
+            s_last_probe_mode = USB_PROBE_DEVICE;
+            s_probe_started_us = esp_timer_get_time();
+            ESP_LOGE(TAG, "Device探测残留资源尚未回收，阻止启动Host：%s",
+                     esp_err_to_name(result));
+            return result;
+        }
+        s_probe_mode = USB_PROBE_NONE;
+    }
     if (!s_host_started) {
         wait_clone_usb_start_delay();
         result = dual_hid_host_start(on_mouse_report, on_mouse_release);
         if (result != ESP_OK) {
+            const esp_err_t cleanup = dual_hid_host_stop();
+            if (cleanup != ESP_OK) {
+                s_host_cleanup_pending = true;
+                s_probe_mode = USB_PROBE_HOST;
+                s_last_probe_mode = USB_PROBE_HOST;
+                ESP_LOGE(TAG, "鼠标Host启动失败且回收未完成：start=%s stop=%s；禁止启动Device",
+                         esp_err_to_name(result), esp_err_to_name(cleanup));
+                return cleanup;
+            }
             return result;
         }
         s_host_started = true;
@@ -814,6 +858,20 @@ static esp_err_t start_mouse_role(void)
 
 static esp_err_t start_device_probe(void)
 {
+    if (s_host_started || s_host_cleanup_pending) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (dual_pc_hid_device_cleanup_pending()) {
+        const esp_err_t cleanup = dual_pc_hid_prepare_for_profile();
+        if (cleanup != ESP_OK) {
+            s_last_probe_mode = USB_PROBE_DEVICE;
+            s_probe_mode = USB_PROBE_DEVICE;
+            s_probe_started_us = esp_timer_get_time();
+            ESP_LOGE(TAG, "Device探测重试前仍有未回收资源：%s",
+                     esp_err_to_name(cleanup));
+            return cleanup;
+        }
+    }
     s_last_probe_mode = USB_PROBE_DEVICE;
     dual_status_led_set_role(DUAL_STATUS_LED_ROLE_NONE);
     dual_status_led_set_pc_mounted(false);
@@ -825,6 +883,14 @@ static esp_err_t start_device_probe(void)
         ESP_LOGI(TAG, "USB身份未定：Device栈就绪，开始完整 %d ms 探测窗口",
                  USB_ROLE_PROBE_INTERVAL_MS);
     } else {
+        const esp_err_t cleanup = dual_pc_hid_prepare_for_profile();
+        if (cleanup != ESP_OK) {
+            s_probe_started_us = esp_timer_get_time();
+            s_probe_mode = USB_PROBE_DEVICE;
+            ESP_LOGE(TAG, "Device探测安装失败且残留资源回收失败：install=%s cleanup=%s；禁止Host",
+                     esp_err_to_name(result), esp_err_to_name(cleanup));
+            return cleanup;
+        }
         s_probe_mode = USB_PROBE_NONE;
     }
     return result;
@@ -832,6 +898,10 @@ static esp_err_t start_device_probe(void)
 
 static esp_err_t start_host_probe(void)
 {
+    if (s_host_started || s_host_cleanup_pending ||
+        dual_pc_hid_device_cleanup_pending()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     s_last_probe_mode = USB_PROBE_HOST;
     dual_status_led_set_role(DUAL_STATUS_LED_ROLE_NONE);
     dual_status_led_set_pc_mounted(false);
@@ -845,17 +915,28 @@ static esp_err_t start_host_probe(void)
         ESP_LOGI(TAG, "USB身份未定：Host栈就绪，开始完整 %d ms 探测窗口",
                  USB_ROLE_PROBE_INTERVAL_MS);
     } else {
-        s_probe_mode = USB_PROBE_NONE;
+        const esp_err_t cleanup = dual_hid_host_stop();
+        if (cleanup == ESP_OK) {
+            s_host_started = false;
+            s_host_cleanup_pending = false;
+            s_probe_mode = USB_PROBE_NONE;
+        } else {
+            s_host_cleanup_pending = true;
+            s_probe_mode = USB_PROBE_HOST;
+            s_probe_started_us = esp_timer_get_time();
+            ESP_LOGE(TAG, "Host探测启动失败且回收未完成：start=%s stop=%s；暂不切换Device",
+                     esp_err_to_name(result), esp_err_to_name(cleanup));
+            return cleanup;
+        }
     }
     return result;
 }
 
 static uint8_t locally_confirmed_role(void)
 {
-    /* ATTACHED is raised before host SET_CONFIGURATION; green LED reflects
-     * this physical Device-side evidence even while tud_mounted() is false. */
+    /* 首个 SETUP 且总线未挂起即可证明电脑侧连接，不依赖旧 mounted latch。 */
     if (s_probe_mode == USB_PROBE_DEVICE &&
-        (dual_pc_hid_usb_attached() || tud_mounted())) {
+        dual_pc_hid_usb_attached()) {
         return DUAL_ROLE_PC_DEVICE;
     }
     if (s_probe_mode == USB_PROBE_HOST && dual_hid_host_device_present()) {
@@ -864,10 +945,16 @@ static uint8_t locally_confirmed_role(void)
     return DUAL_ROLE_UNRESOLVED;
 }
 
+uint8_t dual_proxy_usb_role_claim(void)
+{
+    return dual_role_usb_claim(s_role, dual_pc_hid_usb_attached(),
+                               dual_hid_host_device_present());
+}
+
 static esp_err_t stop_current_probe(void)
 {
     if (s_probe_mode == USB_PROBE_DEVICE) {
-        if (dual_pc_hid_usb_attached() || tud_mounted()) {
+        if (dual_pc_hid_usb_attached()) {
             return ESP_ERR_INVALID_STATE;
         }
         const esp_err_t result = dual_pc_hid_prepare_for_profile();
@@ -883,7 +970,31 @@ static esp_err_t stop_current_probe(void)
         const esp_err_t result = dual_hid_host_stop();
         if (result == ESP_OK) {
             s_host_started = false;
+            s_host_cleanup_pending = false;
             s_probe_mode = USB_PROBE_NONE;
+        } else {
+            s_host_cleanup_pending = true;
+        }
+        return result;
+    }
+    if (s_host_cleanup_pending) {
+        const esp_err_t result = dual_hid_host_stop();
+        if (result == ESP_OK) {
+            s_host_cleanup_pending = false;
+            s_host_started = false;
+            s_probe_mode = USB_PROBE_NONE;
+        } else {
+            s_probe_mode = USB_PROBE_HOST;
+        }
+        return result;
+    }
+    if (dual_pc_hid_device_cleanup_pending()) {
+        const esp_err_t result = dual_pc_hid_prepare_for_profile();
+        if (result == ESP_OK) {
+            s_probe_mode = USB_PROBE_NONE;
+        } else {
+            s_probe_mode = USB_PROBE_DEVICE;
+            s_last_probe_mode = USB_PROBE_DEVICE;
         }
         return result;
     }
@@ -932,10 +1043,53 @@ static esp_err_t rotate_unresolved_probe(void)
     }
     vTaskDelay(pdMS_TO_TICKS(200));
     result = next_mode == USB_PROBE_HOST ? start_host_probe() : start_device_probe();
-    if (result != ESP_OK) {
+    if (result != ESP_OK && !s_host_cleanup_pending &&
+        !dual_pc_hid_device_cleanup_pending()) {
         s_probe_mode = USB_PROBE_NONE;
     }
     return result;
+}
+
+/* 不复位整板：先等待旧 USB worker/生产者退出，再重新划分 UART 会话和 PHY。 */
+static esp_err_t restart_role_probe(void)
+{
+    esp_err_t result = dual_pc_hid_disable_reconfigure();
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (s_host_started || s_host_cleanup_pending) {
+        result = dual_hid_host_stop_for_role_probe();
+        if (result != ESP_OK) {
+            s_host_cleanup_pending = true;
+            return result;
+        }
+        s_host_started = false;
+        s_host_cleanup_pending = false;
+    }
+    result = dual_pc_hid_prepare_for_profile();
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = dual_uart0_control_start(DUAL_ROLE_UNRESOLVED, NULL, NULL, NULL);
+    if (result != ESP_OK) {
+        return result;
+    }
+    s_peer_role_claim = DUAL_ROLE_UNRESOLVED;
+    result = dual_uart1_begin_role_probe();
+    if (result != ESP_OK) {
+        return result;
+    }
+    __atomic_store_n(&s_manual_profile, false, __ATOMIC_RELEASE);
+    hid_profile_receiver_init(&s_profile_receiver, on_profile_published, &s_profile_receiver);
+    s_profile_started_us = 0;
+    s_profile_offer_valid = false;
+    s_profile_reuse_pending = false;
+    s_probe_mode = USB_PROBE_NONE;
+    s_role_retry_after_us = 0;
+    memset(&s_role_watch, 0, sizeof(s_role_watch));
+    s_role_reprobe_pending = false;
+    dual_status_led_set_role(DUAL_STATUS_LED_ROLE_NONE);
+    return start_device_probe();
 }
 
 void app_main(void)
@@ -972,13 +1126,42 @@ void app_main(void)
     }
 
     while (true) {
+        if (s_role_reprobe_pending) {
+            result = restart_role_probe();
+            if (result != ESP_OK) {
+                dual_status_led_set_flow_error(true);
+                ESP_LOGE(TAG, "角色重探测清理/启动失败：%s；保持输入关闭，1秒后重试",
+                         esp_err_to_name(result));
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            continue;
+        }
         if (s_role != DUAL_ROLE_UNRESOLVED) {
             if (s_role_initialized) {
-                return;
+                const bool connected = dual_proxy_usb_role_claim() != DUAL_ROLE_UNRESOLVED;
+                const bool can_probe = s_role == DUAL_ROLE_PC_DEVICE
+                    ? dual_pc_hid_role_probe_needed() : !connected;
+                const int64_t now_us = esp_timer_get_time();
+                if (dual_role_watch_poll(&s_role_watch, s_role, connected, can_probe, now_us)) {
+                    ESP_LOGW(TAG, "本板USB已离线，撤销旧身份并重新探测 role=%u", (unsigned)s_role);
+                    dual_uart0_control_cancel_software_input();
+                    dual_pc_hid_release_all();
+                    if (s_role == DUAL_ROLE_MOUSE_HOST) {
+                        (void)dual_uart1_send_release(1U);
+                        (void)dual_uart1_send_software_release();
+                    }
+                    s_role = DUAL_ROLE_UNRESOLVED;
+                    s_role_initialized = false;
+                    s_role_reprobe_pending = true;
+                    dual_uart1_set_profile_request_ready(false);
+                    dual_status_led_set_role(DUAL_STATUS_LED_ROLE_NONE);
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
             }
             result = s_role == DUAL_ROLE_PC_DEVICE ? start_pc_role() : start_mouse_role();
             if (result == ESP_OK) {
-                return;
+                continue;
             }
             ESP_LOGE(TAG, "角色已锁定但初始化失败 role=%u error=%s；1 秒后重试",
                      (unsigned)s_role, esp_err_to_name(result));
@@ -987,7 +1170,9 @@ void app_main(void)
         }
 
         const uint8_t local_role = locally_confirmed_role();
-        const uint8_t peer_role = s_peer_role_claim;
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000LL);
+        const uint8_t peer_role = dual_role_fresh_peer_claim(
+            s_peer_role_claim, now_ms - s_peer_role_claim_ms, dual_uart1_peer_online());
         const uint8_t resolved_role = dual_role_resolve(peer_role, local_role);
         bool transition_attempted = false;
         if (resolved_role != DUAL_ROLE_UNRESOLVED &&
@@ -995,14 +1180,15 @@ void app_main(void)
             transition_attempted = true;
             result = enter_locked_role(resolved_role);
             if (result == ESP_OK) {
-                if (peer_role != DUAL_ROLE_UNRESOLVED) {
+                if (local_role == DUAL_ROLE_UNRESOLVED && peer_role != DUAL_ROLE_UNRESOLVED) {
                     ESP_LOGI(TAG, "依据UART1对端身份锁定互补角色：peer=%u local=%u",
                              (unsigned)peer_role, (unsigned)resolved_role);
                 } else {
                     ESP_LOGI(TAG, "依据本地USB连接证据锁定角色：local=%u",
                              (unsigned)resolved_role);
                 }
-                return;
+                memset(&s_role_watch, 0, sizeof(s_role_watch));
+                continue;
             }
             ESP_LOGW(TAG, "启动已判定角色失败 role=%u error=%s",
                      (unsigned)resolved_role, esp_err_to_name(result));

@@ -15,7 +15,11 @@ internal sealed record FirmwareFlashSnapshot(
     DateTimeOffset? StartedAt,
     DateTimeOffset? FinishedAt,
     int? ExitCode,
-    string? PortName);
+    string? PortName,
+    bool FlashVerified = false,
+    string ControlConnectionState = "not_checked");
+
+internal sealed record FirmwareFlashCompletion(string Message, string ControlConnectionState);
 
 internal sealed class FirmwareFlashService : IDisposable
 {
@@ -126,6 +130,8 @@ internal sealed class FirmwareFlashService : IDisposable
         SerialBridge.ExclusivePortLease? lease = null;
         int? exitCode = null;
         string? portName = null;
+        bool flashVerified = false;
+        bool restoreControlConnection = !string.IsNullOrWhiteSpace(_serialBridge.GetConnectedPortName());
         try
         {
             _input.DisableForwarding();
@@ -147,37 +153,32 @@ internal sealed class FirmwareFlashService : IDisposable
                 "Hash of data verified",
                 RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Count;
             bool hardReset = output.Contains("Hard resetting via RTS pin", StringComparison.OrdinalIgnoreCase);
-            if (exitCode != 0)
-            {
-                throw new InvalidOperationException($"esptool 退出码为 {exitCode}。");
-            }
-            if (verifiedImages < plan.Images.Count)
-            {
-                throw new InvalidOperationException(
-                    $"设备端哈希校验不足：期望 {plan.Images.Count} 段，实际 {verifiedImages} 段。");
-            }
-            if (!hardReset)
-            {
-                throw new InvalidOperationException("刷写输出缺少 RTS 硬复位完成标记。");
-            }
+            VerifyFlashOutput(exitCode.Value, plan.Images.Count, verifiedImages, hardReset);
+            flashVerified = true;
             WriteLog(FormatVerificationSummary(plan.Images, verifiedImages, hardReset));
 
             lease.Dispose();
             lease = null;
-            bool reconnected = await _serialBridge.WaitForConnectionAsync(
-                TimeSpan.FromSeconds(15),
-                CancellationToken.None).ConfigureAwait(false);
-            if (!reconnected)
-            {
-                throw new TimeoutException("刷写成功，但控制软件未能在 15 秒内重新连接串口。");
-            }
-            _serialBridge.Send(MessageType.Ping, ReadOnlySpan<byte>.Empty);
-            Complete(jobId, "succeeded", "三段固件哈希校验通过，RTS 复位并恢复串口连接。", exitCode, portName);
+            FirmwareFlashCompletion completion = await FinishVerifiedFlashAsync(
+                restoreControlConnection,
+                () => _serialBridge.WaitForConnectionAsync(
+                    TimeSpan.FromSeconds(15), CancellationToken.None)).ConfigureAwait(false);
+            Complete(jobId, "succeeded", completion.Message, exitCode, portName,
+                flashVerified: true, controlConnectionState: completion.ControlConnectionState);
         }
         catch (Exception exception)
         {
-            WriteLog($"固件刷写任务 {jobId} 失败：{exception.Message}");
-            Complete(jobId, "failed", exception.Message, exitCode, portName);
+            if (flashVerified)
+            {
+                Complete(jobId, "succeeded",
+                    $"固件设备校验通过且 RTS 复位完成；控制连接恢复失败：{exception.Message} 板卡启动与输入链路未验证。",
+                    exitCode, portName, flashVerified: true, controlConnectionState: "failed");
+            }
+            else
+            {
+                WriteLog($"固件刷写任务 {jobId} 失败：{exception.Message}");
+                Complete(jobId, "failed", exception.Message, exitCode, portName);
+            }
         }
         finally
         {
@@ -186,6 +187,47 @@ internal sealed class FirmwareFlashService : IDisposable
             {
                 _input.SetForwardingEnabled(true);
             }
+        }
+    }
+
+    internal static void VerifyFlashOutput(int exitCode, int expectedImages, int verifiedImages, bool hardReset)
+    {
+        if (exitCode != 0) throw new InvalidOperationException($"esptool 退出码为 {exitCode}。");
+        if (expectedImages <= 0 || verifiedImages != expectedImages)
+        {
+            throw new InvalidOperationException(
+                $"设备端哈希校验数量不符：期望 {expectedImages} 段，实际 {verifiedImages} 段。");
+        }
+        if (!hardReset) throw new InvalidOperationException("刷写输出缺少 RTS 硬复位完成标记。");
+    }
+
+    /// <summary>仅在设备校验与复位完成后调用；控制连接恢复与固件写入结果分别报告。</summary>
+    internal static async Task<FirmwareFlashCompletion> FinishVerifiedFlashAsync(
+        bool hadControlConnection,
+        Func<Task<bool>> reconnect)
+    {
+        const string verified = "固件设备校验通过，RTS 复位完成。";
+        if (!hadControlConnection)
+        {
+            return new FirmwareFlashCompletion(
+                $"{verified} 刷写前无 M 控制连接，已跳过重连等待（仅接 P 也可刷写）。板卡启动与输入链路未验证。",
+                "not_requested");
+        }
+        try
+        {
+            if (await reconnect().ConfigureAwait(false))
+            {
+                return new FirmwareFlashCompletion(
+                    $"{verified} M 控制连接已恢复；被刷板卡启动与输入链路仍需另行验证。", "restored");
+            }
+            return new FirmwareFlashCompletion(
+                $"{verified} M 控制连接恢复失败（15 秒内未连接），请检查 M 连接或重开软件；无需因此重复刷写。板卡启动与输入链路未验证。",
+                "failed");
+        }
+        catch (Exception exception)
+        {
+            return new FirmwareFlashCompletion(
+                $"{verified} M 控制连接恢复失败：{exception.Message} 板卡启动与输入链路未验证。", "failed");
         }
     }
 
@@ -300,7 +342,8 @@ internal sealed class FirmwareFlashService : IDisposable
         }
     }
 
-    private void Complete(string jobId, string state, string message, int? exitCode, string? portName)
+    private void Complete(string jobId, string state, string message, int? exitCode, string? portName,
+        bool flashVerified = false, string controlConnectionState = "not_checked")
     {
         lock (_sync)
         {
@@ -313,6 +356,8 @@ internal sealed class FirmwareFlashService : IDisposable
                     FinishedAt = DateTimeOffset.Now,
                     ExitCode = exitCode,
                     PortName = portName,
+                    FlashVerified = flashVerified,
+                    ControlConnectionState = controlConnectionState,
                 };
             }
         }

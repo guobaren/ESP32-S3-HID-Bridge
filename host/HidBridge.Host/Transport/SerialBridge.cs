@@ -94,6 +94,7 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
     private int _outboundQueuePeak;
     private long _backpressureCount;
 
+    internal int ActualMakcuProtocolVersion { get; private set; } = 4;
     internal event Action? VerifiedMakcuModeObserved;
 
     public SerialBridge(
@@ -114,7 +115,7 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
             null,
             Timeout.Infinite,
             Timeout.Infinite);
-        _makcuModeCoordinator = new MakcuModeCoordinator(this);
+        _makcuModeCoordinator = new MakcuModeCoordinator(this, () => _settings.MakcuProtocolVersion);
         _batchStatisticsStartTimestamp = Stopwatch.GetTimestamp();
         _nextBatchStatisticsTimestamp = _batchStatisticsStartTimestamp + Stopwatch.Frequency;
         _writerThread = new Thread(WriterLoop)
@@ -654,7 +655,9 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
         bool enabled,
         CancellationToken cancellationToken)
     {
-        byte opcode = enabled ? MakcuModeProtocol.EnableOpcode : MakcuModeProtocol.DisableOpcode;
+        byte opcode = enabled
+            ? (_settings.MakcuProtocolVersion == 3 ? MakcuModeProtocol.EnableLegacyOpcode : MakcuModeProtocol.EnableOpcode)
+            : MakcuModeProtocol.DisableOpcode;
         SerialPort port = GetPortForModeHandshake();
         byte[] frame = MakcuModeProtocol.CreateRequest(_codec, opcode, out ushort sequence);
         lock (_writeSync)
@@ -667,9 +670,9 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
             port.Write(frame, 0, frame.Length);
         }
         BridgeFrame response = ReadModeStatusFrame(port, sequence, cancellationToken);
-        return MakcuModeProtocol.TryDecodeStatus(response, sequence, out MakcuModeSnapshot snapshot)
-            ? snapshot
-            : null;
+        if (!MakcuModeProtocol.TryDecodeStatus(response, sequence, out MakcuModeSnapshot snapshot)) return null;
+        if (snapshot.Status == 0 && snapshot.Enabled) ActualMakcuProtocolVersion = snapshot.ProtocolVersion;
+        return snapshot;
     }
 
     private MakcuModeSnapshot? QueryMakcuModeBlocking(
@@ -695,9 +698,9 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
             port.Write(frame, 0, frame.Length);
         }
         BridgeFrame response = ReadModeStatusFrame(port, sequence, cancellationToken);
-        return MakcuModeProtocol.TryDecodeStatus(response, sequence, out MakcuModeSnapshot snapshot)
-            ? snapshot
-            : null;
+        if (!MakcuModeProtocol.TryDecodeStatus(response, sequence, out MakcuModeSnapshot snapshot)) return null;
+        if (snapshot.Status == 0 && snapshot.Enabled) ActualMakcuProtocolVersion = snapshot.ProtocolVersion;
+        return snapshot;
     }
 
     private BridgeFrame ReadModeStatusFrame(
@@ -1059,7 +1062,7 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
                 try
                 {
                     candidate = CreatePort(portName, baudRate);
-                    candidate.Open();
+                    NonResettingSerialPort.Open(candidate);
                     bool probeMatched = legacyCompatibility ||
                         SerialDeviceProbe.Probe(candidate, _codec, SerialDeviceProbe.MouseHostRole);
                     bool makcuEnabled = false;

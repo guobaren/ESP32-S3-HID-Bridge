@@ -19,6 +19,7 @@ typedef struct {
     dual_parser_t legacy;
     makcu_v4_stream_parser_t v4;
     makcu_v4_command_callback_t v4_callback;
+    void (*ascii_feed)(const uint8_t *, size_t, void *);
     void *context;
 } uart0_protocol_router_t;
 

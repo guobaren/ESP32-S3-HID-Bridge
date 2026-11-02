@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "bridge_protocol.h"
+#include "usb_role_logic.h"
 #include "dual_input_aggregator.h"
 #include "hid_device_profile.h"
 #include "hid_host_cherryusb_logic.h"
@@ -316,7 +317,10 @@ static void test_bridge_protocol(void)
     assert(dual_makcu_mode_request_decode(enable_request,
         sizeof(enable_request), &opcode));
     assert(opcode == DUAL_MAKCU_MODE_OP_ENABLE);
-    const uint8_t invalid_request[] = {3U};
+    const uint8_t legacy_request[] = {DUAL_MAKCU_MODE_OP_ENABLE_LEGACY};
+    assert(dual_makcu_mode_request_decode(legacy_request, 1U, &opcode));
+    assert(opcode == 3U);
+    const uint8_t invalid_request[] = {4U};
     assert(!dual_makcu_mode_request_decode(invalid_request,
         sizeof(invalid_request), &opcode));
     assert(!dual_makcu_mode_request_decode(enable_request, 0U, &opcode));
@@ -1262,40 +1266,124 @@ static void test_dynamic_mouse_report_layout(void)
         &layout, report, sizeof(report) - 1U, 0, 0, 0, 0, 0));
 }
 
+static void assert_status_led_incomplete_pattern(
+    const dual_status_led_state_t *state,
+    dual_status_led_color_t identity_color,
+    uint32_t phase_start_ms)
+{
+    assert(dual_status_led_logic_color(state, phase_start_ms) == identity_color);
+    assert(dual_status_led_logic_color(
+        state, phase_start_ms + DUAL_STATUS_LED_ERROR_BLINK_MS - 1U) == identity_color);
+    assert(dual_status_led_logic_color(
+        state, phase_start_ms + DUAL_STATUS_LED_ERROR_BLINK_MS) ==
+        DUAL_STATUS_LED_COLOR_RED);
+    assert(dual_status_led_logic_color(
+        state, phase_start_ms + DUAL_STATUS_LED_ERROR_BLINK_MS * 2U) == identity_color);
+}
+
 static void test_status_led_logic(void)
 {
     dual_status_led_state_t state;
     dual_status_led_logic_init(&state);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_OFF);
+    assert(dual_status_led_logic_color(&state, 0U) == DUAL_STATUS_LED_COLOR_OFF);
 
+    /* M 未完成身份、未连 peer 或尚未取得本次 Profile ACK 时交替绿/红。 */
     dual_status_led_logic_set_role(&state, DUAL_STATUS_LED_ROLE_MOUSE_HOST);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_RED);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_GREEN, 1000U);
     dual_status_led_logic_set_peer_connected(&state, true);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_BLUE);
-    dual_status_led_logic_set_flow_error(&state, true);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_RED);
-    assert(dual_status_led_logic_color(&state, 250) == DUAL_STATUS_LED_COLOR_OFF);
-    dual_status_led_logic_set_flow_error(&state, false);
     dual_status_led_logic_set_host_mouse_ready(&state, true);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_BLUE);
     dual_status_led_logic_set_peer_usb_ready(&state, true);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_GREEN);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_GREEN, 1000U);
+    dual_status_led_logic_set_host_profile_ready(&state, true);
+    assert(dual_status_led_logic_color(&state, 1000U) == DUAL_STATUS_LED_COLOR_GREEN);
+    assert(dual_status_led_logic_color(&state, 1250U) == DUAL_STATUS_LED_COLOR_GREEN);
+    dual_status_led_logic_set_role(&state, DUAL_STATUS_LED_ROLE_MOUSE_HOST);
+    assert(state.host_profile_ready);
+    assert(dual_status_led_logic_color(&state, 1250U) == DUAL_STATUS_LED_COLOR_GREEN);
+
+    /* 任意错误、peer USB 尚未就绪或鼠标接口断开都会退回身份色/红色相位灯。 */
+    dual_status_led_logic_set_flow_error(&state, true);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_GREEN, 1000U);
+    dual_status_led_logic_set_flow_error(&state, false);
+    dual_status_led_logic_set_peer_usb_ready(&state, false);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_GREEN, 1000U);
+    dual_status_led_logic_set_peer_usb_ready(&state, true);
     dual_status_led_logic_set_host_mouse_ready(&state, false);
-    assert(dual_status_led_logic_color(&state, 0) == DUAL_STATUS_LED_COLOR_BLUE);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_GREEN, 1000U);
+    dual_status_led_logic_set_host_mouse_ready(&state, true);
+    dual_status_led_logic_set_host_profile_ready(&state, false);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_GREEN, 1000U);
+    dual_status_led_logic_set_host_profile_ready(&state, true);
+    dual_status_led_logic_set_peer_connected(&state, false);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_GREEN, 1000U);
+    dual_status_led_logic_set_peer_connected(&state, true);
+    assert(dual_status_led_logic_color(&state, 1000U) == DUAL_STATUS_LED_COLOR_GREEN);
 
+    /* P 需本机完整 mounted gate、local USB state、peer 与 peer USB 均就绪。 */
     dual_status_led_logic_set_role(&state, DUAL_STATUS_LED_ROLE_PC_DEVICE);
-    assert(dual_status_led_logic_color(&state, 1000) == DUAL_STATUS_LED_COLOR_BLUE);
+    dual_status_led_logic_set_peer_connected(&state, true);
+    dual_status_led_logic_set_peer_usb_ready(&state, true);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_BLUE, 1000U);
     dual_status_led_logic_set_pc_mounted(&state, true);
-    assert(dual_status_led_logic_color(&state, 1000) == DUAL_STATUS_LED_COLOR_BLUE);
-    dual_status_led_logic_notify_software_success(&state, 1000);
-    assert(dual_status_led_logic_color(&state, 1039) == DUAL_STATUS_LED_COLOR_FLASH_OFF);
-    assert(dual_status_led_logic_color(&state, 1040) == DUAL_STATUS_LED_COLOR_BLUE);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_BLUE, 1000U);
+    dual_status_led_logic_set_local_usb_ready(&state, true);
+    assert(dual_status_led_logic_color(&state, 1000U) == DUAL_STATUS_LED_COLOR_BLUE);
+    assert(dual_status_led_logic_color(&state, 1250U) == DUAL_STATUS_LED_COLOR_BLUE);
+    dual_status_led_logic_set_role(&state, DUAL_STATUS_LED_ROLE_PC_DEVICE);
+    assert(state.local_usb_ready && state.pc_mounted);
+    assert(dual_status_led_logic_color(&state, 1250U) == DUAL_STATUS_LED_COLOR_BLUE);
+    dual_status_led_logic_set_peer_usb_ready(&state, false);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_BLUE, 1000U);
+    dual_status_led_logic_set_peer_usb_ready(&state, true);
+    dual_status_led_logic_set_local_usb_ready(&state, false);
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_BLUE, 1000U);
+    dual_status_led_logic_set_local_usb_ready(&state, true);
     dual_status_led_logic_set_pc_mounted(&state, false);
-    assert(dual_status_led_logic_color(&state, 1020) == DUAL_STATUS_LED_COLOR_BLUE);
-
+    assert_status_led_incomplete_pattern(
+        &state, DUAL_STATUS_LED_COLOR_BLUE, 1000U);
     dual_status_led_logic_set_pc_mounted(&state, true);
+    assert(dual_status_led_logic_color(&state, 1250U) == DUAL_STATUS_LED_COLOR_BLUE);
+
+    /* 未 ready 的软件报告不能点灯；ready 时仅熄灭40ms并冷却60ms。 */
+    dual_status_led_logic_set_peer_connected(&state, false);
     dual_status_led_logic_notify_software_success(&state, 2000U);
-    assert(dual_status_led_logic_color(&state, 2010U) == DUAL_STATUS_LED_COLOR_FLASH_OFF);
+    assert(state.flash_until_ms == 0U && state.next_flash_allowed_ms == 0U);
+    dual_status_led_logic_set_peer_connected(&state, true);
+    dual_status_led_logic_notify_software_success(&state, 2000U);
+    assert(dual_status_led_logic_color(&state, 2000U) == DUAL_STATUS_LED_COLOR_FLASH_OFF);
+    assert(dual_status_led_logic_color(&state, 2039U) == DUAL_STATUS_LED_COLOR_FLASH_OFF);
+    assert(dual_status_led_logic_color(&state, 2040U) == DUAL_STATUS_LED_COLOR_BLUE);
+    dual_status_led_logic_notify_software_success(&state, 2050U);
+    assert(state.flash_until_ms == 2040U && state.next_flash_allowed_ms == 2100U);
+    dual_status_led_logic_notify_software_success(&state, 2100U);
+    assert(dual_status_led_logic_color(&state, 2100U) == DUAL_STATUS_LED_COLOR_FLASH_OFF);
+
+    /* 失去 readiness 或报错会取消旧 flash deadline，恢复后不会闪出过期提示。 */
+    dual_status_led_logic_set_peer_connected(&state, false);
+    assert(state.flash_until_ms == 0U && state.next_flash_allowed_ms == 0U);
+    dual_status_led_logic_set_peer_connected(&state, true);
+    assert(dual_status_led_logic_color(&state, 2250U) == DUAL_STATUS_LED_COLOR_BLUE);
+    dual_status_led_logic_notify_software_success(&state, 3000U);
+    dual_status_led_logic_set_flow_error(&state, true);
+    assert(state.flash_until_ms == 0U && state.next_flash_allowed_ms == 0U);
+    assert(dual_status_led_logic_color(&state, 3000U) == DUAL_STATUS_LED_COLOR_BLUE);
+    assert(dual_status_led_logic_color(&state, 3250U) == DUAL_STATUS_LED_COLOR_RED);
+    dual_status_led_logic_notify_software_success(&state, 3250U);
+    assert(state.flash_until_ms == 0U && state.next_flash_allowed_ms == 0U);
+    dual_status_led_logic_set_flow_error(&state, false);
+    assert(dual_status_led_logic_color(&state, 3250U) == DUAL_STATUS_LED_COLOR_BLUE);
+
     dual_status_led_logic_set_role(&state, DUAL_STATUS_LED_ROLE_NONE);
     assert(dual_status_led_logic_color(&state, 20U) == DUAL_STATUS_LED_COLOR_OFF);
 }
@@ -1313,6 +1401,61 @@ static void test_usb_role_claim_complement(void)
     assert(dual_role_resolve(DUAL_ROLE_UNRESOLVED, DUAL_ROLE_PC_DEVICE) == DUAL_ROLE_PC_DEVICE);
     assert(dual_role_resolve(DUAL_ROLE_UNRESOLVED, DUAL_ROLE_MOUSE_HOST) == DUAL_ROLE_MOUSE_HOST);
     assert(dual_role_resolve(DUAL_ROLE_UNRESOLVED, DUAL_ROLE_UNRESOLVED) == DUAL_ROLE_UNRESOLVED);
+}
+
+static void test_usb_role_reprobe(void)
+{
+    assert(dual_role_device_usb_present(true, true, false));
+    assert(!dual_role_device_usb_present(true, true, true));
+    assert(!dual_role_device_usb_present(true, false, false));
+    assert(!dual_role_device_usb_present(false, true, false));
+    uint8_t p_claim = dual_role_usb_claim(DUAL_ROLE_PC_DEVICE, true, false);
+    uint8_t m_claim = dual_role_usb_claim(DUAL_ROLE_MOUSE_HOST, false, true);
+    assert(p_claim == DUAL_ROLE_PC_DEVICE && m_claim == DUAL_ROLE_MOUSE_HOST);
+    /* P 先拔，仍可从有 USB 的 M 推导角色，但 P 不能拿推导角色给 M 背书。 */
+    const uint8_t inferred_p = dual_role_resolve(m_claim, DUAL_ROLE_UNRESOLVED);
+    p_claim = dual_role_usb_claim(inferred_p, false, false);
+    assert(inferred_p == DUAL_ROLE_PC_DEVICE && p_claim == DUAL_ROLE_UNRESOLVED);
+    /* M 后拔：双方都没有可信声明，不得循环锁定旧身份。 */
+    m_claim = dual_role_usb_claim(DUAL_ROLE_MOUSE_HOST, false, false);
+    assert(m_claim == DUAL_ROLE_UNRESOLVED);
+    assert(dual_role_resolve(p_claim, DUAL_ROLE_UNRESOLVED) == DUAL_ROLE_UNRESOLVED);
+    assert(dual_role_resolve(m_claim, DUAL_ROLE_UNRESOLVED) == DUAL_ROLE_UNRESOLVED);
+    /* M 先拔同样不能把旧身份传给随后拔出的 P。 */
+    assert(dual_role_usb_claim(dual_role_resolve(DUAL_ROLE_PC_DEVICE, 0), false, false) == 0);
+    /* 交换后本板新 USB 证据优先于尚未超时的旧对端声明。 */
+    assert(dual_role_resolve(DUAL_ROLE_MOUSE_HOST, DUAL_ROLE_MOUSE_HOST) == DUAL_ROLE_MOUSE_HOST);
+    assert(dual_role_resolve(DUAL_ROLE_PC_DEVICE, DUAL_ROLE_PC_DEVICE) == DUAL_ROLE_PC_DEVICE);
+    assert(dual_role_fresh_peer_claim(DUAL_ROLE_MOUSE_HOST, 750U, true) == DUAL_ROLE_MOUSE_HOST);
+    assert(dual_role_fresh_peer_claim(DUAL_ROLE_MOUSE_HOST, 751U, true) == 0);
+    assert(dual_role_fresh_peer_claim(DUAL_ROLE_PC_DEVICE, 0U, false) == 0);
+
+    dual_role_watch_t watch = {0};
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, true, 1));
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, true, 14000001LL));
+    assert(dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, true, 15000001LL));
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, true, false, 16000000LL));
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, true, 17000000LL));
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, true, 19999999LL));
+    assert(dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, true, 20000000LL));
+    /* 主动重枚举暂停计时，短断连恢复清零；不以连接失败为稳定角色。 */
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, false, 30000000LL));
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, false, true, 40000000LL));
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_PC_DEVICE, true, false, 41000000LL));
+    assert(!dual_role_watch_poll(&watch, DUAL_ROLE_MOUSE_HOST, false, true, 42000000LL));
+    assert(dual_role_watch_poll(&watch, DUAL_ROLE_MOUSE_HOST, false, true, 45000000LL));
+
+    uint8_t hello[] = {2, 0, 1, 2, 3, 4, 5, 6, 0x78, 0x56, 0x34, 0x12, 2};
+    assert(dual_role_hello_valid(hello, sizeof(hello)));
+    hello[12] = 0;
+    assert(dual_role_hello_valid(hello, sizeof(hello)));
+    assert(!dual_role_hello_valid(hello, 12U));
+    hello[12] = 1;
+    assert(!dual_role_hello_valid(hello, sizeof(hello)));
+    hello[12] = 2;
+    hello[1] = 5;
+    assert(!dual_role_hello_valid(hello, sizeof(hello)));
+    puts("USB角色重探测：顺序拔出/无USB不背书/换位/过期/重枚举/HELLO：PASS");
 }
 
 static void test_peer_profile_invalidation(void)
@@ -2033,35 +2176,69 @@ static void test_profile_mount_retry_and_epoch_cancel(void)
 static void test_profile_reuse_predicate(void)
 {
     const uint32_t installed = 0x85A85778U;
-    /* 基准：一切正常且 CRC 一致 → 允许复用。 */
-    assert(link_profile_reuse_allowed(true, true, true, false, false, false, false,
+    /* 基准：克隆运行时已安装、活动、mounted且CRC一致 → 允许复用Profile数据。 */
+    assert(link_profile_reuse_allowed(true, true, true, true, false, false, false, false,
                                       installed, installed));
     /* CRC 不同（换了鼠标/Profile 变了）→ 必须完整卸载+重装。 */
-    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, false,
+    assert(!link_profile_reuse_allowed(true, true, true, true, false, false, false, false,
                                        installed ^ 1U, installed));
     /* 当前没有已安装 Profile（P 刚重启过，缓存为空）→ 完整路径。 */
-    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, false,
+    assert(!link_profile_reuse_allowed(true, true, true, true, false, false, false, false,
                                        installed, 0U));
     /* CRC32 为 0 的提议（离线注入 transfer=0）永不视为命中。 */
-    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, false,
+    assert(!link_profile_reuse_allowed(true, true, true, true, false, false, false, false,
                                        0U, 0U));
-    /* 克隆未活动 / 未真正挂载 → 完整路径（避免把陈旧或已卸载的克隆留下）。 */
-    assert(!link_profile_reuse_allowed(true, false, true, false, false, false, false,
+    /* 克隆未活动 / USB未安装 / 未真正挂载 → 完整路径。 */
+    assert(!link_profile_reuse_allowed(true, false, true, true, false, false, false, false,
                                        installed, installed));
-    assert(!link_profile_reuse_allowed(true, true, false, false, false, false, false,
+    assert(!link_profile_reuse_allowed(true, true, false, true, false, false, false, false,
+                                       installed, installed));
+    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, false, false,
                                        installed, installed));
     /* 有在途操作（安装请求、安装中、卸载请求、卸载失败）→ 完整路径。 */
-    assert(!link_profile_reuse_allowed(true, true, true, true, false, false, false,
+    assert(!link_profile_reuse_allowed(true, true, true, true, true, false, false, false,
                                        installed, installed));
-    assert(!link_profile_reuse_allowed(true, true, true, false, true, false, false,
+    assert(!link_profile_reuse_allowed(true, true, true, true, false, true, false, false,
                                        installed, installed));
-    assert(!link_profile_reuse_allowed(true, true, true, false, false, true, false,
+    assert(!link_profile_reuse_allowed(true, true, true, true, false, false, true, false,
                                        installed, installed));
-    assert(!link_profile_reuse_allowed(true, true, true, false, false, false, true,
+    assert(!link_profile_reuse_allowed(true, true, true, true, false, false, false, true,
                                        installed, installed));
     /* 重配置通道未启用 → 不复用。 */
-    assert(!link_profile_reuse_allowed(false, true, true, false, false, false, false,
+    assert(!link_profile_reuse_allowed(false, true, true, true, false, false, false, false,
                                        installed, installed));
+}
+
+static void test_profile_data_reuse_still_reenumerates(void)
+{
+    const uint32_t crc = 0xA5C31972U;
+    const uint32_t old_transfer = 41U;
+    const uint32_t new_transfer = 42U;
+    const uint32_t queued_epoch = 8U;
+
+    /* 已安装的匹配Profile可作为新操作的数据源；入队后pending/in-progress阻止重排。 */
+    assert(link_profile_reuse_allowed(true, true, true, true, false, false,
+                                      false, false, crc, crc));
+    assert(!link_profile_reuse_allowed(true, true, true, true, true, true,
+                                       false, false, crc, crc));
+    /* 新事务还未挂载时，旧transfer仍是已安装身份；重复COMMIT不得提前成功。 */
+    assert(link_profile_replay_result(new_transfer, crc, old_transfer, crc,
+                                      0U, 0U, true, true, true, true, false) ==
+           LINK_PROFILE_REPLAY_PENDING);
+    assert(dual_profile_operation_is_current(queued_epoch, queued_epoch, false));
+    /* 新epoch或disconnect屏障取消旧worker；它不得继续枚举或发旧ACK。 */
+    assert(!dual_profile_operation_is_current(queued_epoch, queued_epoch + 1U, false));
+    assert(!dual_profile_operation_is_current(queued_epoch, queued_epoch, true));
+    /* worker已安装但仍等主机配置时只回WAIT_HOST；只有真正mounted且操作已结束才成功。 */
+    assert(link_profile_replay_result(new_transfer, crc, new_transfer, crc,
+                                      0U, 0U, true, true, false, true, true) ==
+           LINK_PROFILE_REPLAY_WAIT_HOST);
+    assert(link_profile_replay_result(new_transfer, crc, new_transfer, crc,
+                                      0U, 0U, true, true, true, true, false) ==
+           LINK_PROFILE_REPLAY_PENDING);
+    assert(link_profile_replay_result(new_transfer, crc, new_transfer, crc,
+                                      0U, 0U, true, true, true, false, false) ==
+           LINK_PROFILE_REPLAY_MOUNTED);
 }
 
 static void test_usb_stall_watch_bounds(void)
@@ -2168,7 +2345,11 @@ static void test_vendor_session_barrier_protocol(void)
 }
 
 
-static unsigned route_a5_count, route_v4_count;
+static unsigned route_a5_count, route_v4_count, route_ascii_bytes;
+static void capture_ascii_bytes(const uint8_t *data, size_t length, void *context)
+{
+    (void)data; (void)context; route_ascii_bytes += (unsigned)length;
+}
 static void capture_routed_a5(const dual_frame_t *frame, void *context)
 {
     (void)frame; (void)context; ++route_a5_count;
@@ -2194,6 +2375,15 @@ static void test_uart0_protocol_isolation(void)
     uart0_protocol_router_feed(&router, bytes, length, 2);
     assert(route_a5_count == 1 && route_v4_count == 0);
     bytes[length-1] ^= 1;
+    uart0_protocol_router_t ascii_router;
+    uart0_protocol_router_init(&ascii_router, capture_routed_a5, capture_routed_v4, NULL);
+    ascii_router.ascii_feed = capture_ascii_bytes;
+    route_ascii_bytes = 0;
+    uart0_protocol_router_feed(&ascii_router, bytes, length, 2);
+    assert(route_a5_count == 2 && route_ascii_bytes == 0 && route_v4_count == 0);
+    uart0_protocol_router_feed(&ascii_router, nested, sizeof(nested)-1, 3);
+    assert(route_ascii_bytes == sizeof(nested)-1 && route_v4_count == 0);
+    route_a5_count = 1;
     uint8_t v4[80]; size_t v4_length = 0;
     assert(makcu_v4_encode_frame(0x02, bytes, (uint16_t)length, v4, sizeof(v4), &v4_length));
     uart0_protocol_router_feed(&router, v4, v4_length, 3);
@@ -2456,6 +2646,7 @@ int main(void)
     test_dynamic_mouse_report_layout();
     test_status_led_logic();
     test_usb_role_claim_complement();
+    test_usb_role_reprobe();
     test_peer_profile_invalidation();
     test_vendor_session_invalidates_inflight_work();
     test_device_gone_barrier_and_reconfigure_epoch();
@@ -2479,6 +2670,7 @@ int main(void)
     test_profile_final_ack_requires_mounted_clone();
     test_profile_mount_retry_and_epoch_cancel();
     test_profile_reuse_predicate();
+    test_profile_data_reuse_still_reenumerates();
     test_vendor_session_barrier_protocol();
     test_usb_stall_watch_bounds();
     puts("dual_proxy_logic_test: PASS");

@@ -24,6 +24,8 @@ esp_err_t dual_hid_host_start(
     dual_physical_mouse_callback_t report_callback,
     dual_physical_release_callback_t release_callback);
 esp_err_t dual_hid_host_stop(void);
+/* 角色重探测专用：即使停止瞬间有新设备到达，也完成旧 Host 的合作式卸载。 */
+esp_err_t dual_hid_host_stop_for_role_probe(void);
 bool dual_hid_host_device_present(void);
 bool dual_hid_host_mouse_present(void);
 #if DUAL_PROXY_ENABLE_MAKCU_ASCII_API

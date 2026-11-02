@@ -16,7 +16,7 @@
 #endif
 /* 旧 V3 ASCII 鼠标子集仅在显式启用时构建。 */
 #ifndef DUAL_PROXY_ENABLE_MAKCU_ASCII_API
-#define DUAL_PROXY_ENABLE_MAKCU_ASCII_API 0
+#define DUAL_PROXY_ENABLE_MAKCU_ASCII_API 1
 #endif
 /* Makcu V4 鼠标 ASCII + MAK_API，当前双板构建默认启用。 */
 #ifndef DUAL_PROXY_ENABLE_MAKCU_V4_API

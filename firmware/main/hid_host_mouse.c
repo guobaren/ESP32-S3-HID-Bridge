@@ -25,6 +25,9 @@
 #include "dual_proxy_runtime_config.h"
 #include "uart0_control.h"
 #include "hid_host_cherryusb_backend.h"
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+#include "usb_host_diagnostics.h"
+#endif
 
 /*
  * 厂商控制传输走直连通道（每请求独立 URB + 自定超时 + 孤儿等待回调回收）还是走
@@ -2068,6 +2071,9 @@ void dual_hid_host_collect_stats(dual_stats_snapshot_t *snapshot)
             __atomic_load_n(&metrics[index]->rejected, __ATOMIC_RELAXED),
             __atomic_load_n(&metrics[index]->dropped, __ATOMIC_RELAXED));
     }
+#if CONFIG_DUAL_PROXY_USE_CHERRYUSB
+    dual_usb_host_diag_collect(snapshot);
+#endif
 }
 
 static void hid_interface_callback(
@@ -3314,6 +3320,16 @@ esp_err_t dual_hid_host_stop(void)
 bool dual_hid_host_device_present(void)
 {
     return __atomic_load_n(&s_device_present, __ATOMIC_ACQUIRE);
+}
+
+esp_err_t dual_hid_host_stop_for_role_probe(void)
+{
+    if (!try_lifecycle_lock()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t result = dual_hid_host_stop_internal();
+    release_lifecycle_lock();
+    return result;
 }
 
 bool dual_hid_host_mouse_present(void)

@@ -24,6 +24,7 @@ internal sealed class SettingsPageControl : UserControl
     private readonly CheckBox _legacySingleBoardFirmwareCheckBox;
     private readonly Panel _legacySingleBoardOptionRow;
     private readonly CheckBox _makcuModeCheckBox;
+    private readonly ComboBox _makcuVersionComboBox;
     private readonly CheckBox _buttonStatePublishingCheckBox;
     private readonly Panel _makcuModeOptionRow;
     private readonly Panel _buttonStatePublishingOptionRow;
@@ -85,9 +86,18 @@ internal sealed class SettingsPageControl : UserControl
             "开启后完全使用旧版单板串口通路：跳过新双板角色握手，发送旧版 7 字节鼠标报告。仅在连接旧版单板转发固件时开启。默认关闭。\n开启后无法确认串口设备身份。 ");
         _makcuModeCheckBox = CreateOption(
             "启用 Makcu 运行模式",
-            "先验证 M 板再切至 115200；关闭 EXE 才释放串口。返回 A5 请退出其他客户端、重开 EXE 并手动关闭。",
+            "开启后必须先退出本软件，才能正常使用外部 Makcu 接口（关闭窗口到托盘不算退出）。切换版本自动关闭并重新开启 Makcu。",
             height: 58);
         _makcuModeCheckBox.Enabled = serialBridge is not null;
+        _makcuVersionComboBox = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 220,
+            Dock = DockStyle.Fill,
+            Enabled = serialBridge is not null,
+        };
+        _makcuVersionComboBox.Items.AddRange(["V4（ASCII / MAK_API）", "老版 V3 ASCII（兼容子集）"]);
+        _makcuVersionComboBox.SelectedIndex = _controller.Settings.MakcuProtocolVersion == 3 ? 1 : 0;
         _buttonStatePublishingCheckBox = CreateOption(
             "发布物理鼠标按键状态",
             "订阅 M 板真实鼠标按键并写入下方配置的共享内存；Makcu 模式期间暂停。",
@@ -149,6 +159,19 @@ internal sealed class SettingsPageControl : UserControl
         };
         _legacySingleBoardOptionRow = WrapOption(_legacySingleBoardFirmwareCheckBox);
         _makcuModeOptionRow = WrapOption(_makcuModeCheckBox);
+        _makcuModeOptionRow.Height += 30;
+        TableLayoutPanel makcuLayout = (TableLayoutPanel)_makcuModeOptionRow.Controls[0];
+        makcuLayout.RowCount = 2;
+        makcuLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        makcuLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        makcuLayout.Controls.Add(_makcuVersionComboBox, 0, 1);
+        makcuLayout.Controls.Add(new Label
+        {
+            Text = "Makcu 接口版本；已开启时选择会自动关闭并重新开启。",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = MutedTextColor,
+        }, 1, 1);
         _buttonStatePublishingOptionRow = WrapOption(_buttonStatePublishingCheckBox);
         _simulatedUdpInputOptionRow = WrapSimulatedUdpInputOption(
             _simulatedUdpInputCheckBox,
@@ -246,6 +269,7 @@ internal sealed class SettingsPageControl : UserControl
         _closeToTrayCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _legacySingleBoardFirmwareCheckBox.CheckedChanged += (_, _) => OnLegacyModeChanged();
         _makcuModeCheckBox.CheckedChanged += async (_, _) => await OnMakcuModeChangedAsync();
+        _makcuVersionComboBox.SelectedIndexChanged += async (_, _) => await OnMakcuVersionChangedAsync();
         _buttonStatePublishingCheckBox.CheckedChanged += async (_, _) =>
             await OnButtonStatePublishingChangedAsync();
         _saveButtonStateMappingNameButton.Click += (_, _) => SaveButtonStateMappingName();
@@ -808,6 +832,7 @@ internal sealed class SettingsPageControl : UserControl
         }
 
         _makcuModeCheckBox.Enabled = false;
+        _makcuVersionComboBox.Enabled = false;
         _controller.PrepareMakcuModeTransition();
         try
         {
@@ -840,6 +865,7 @@ internal sealed class SettingsPageControl : UserControl
         finally
         {
             _makcuModeCheckBox.Enabled = true;
+            _makcuVersionComboBox.Enabled = _serialBridge is not null;
         }
     }
 
@@ -903,6 +929,9 @@ internal sealed class SettingsPageControl : UserControl
         }
 
         bool settingsChanged = _controller.Settings.TryEnableVerifiedMakcuMode();
+        settingsChanged |= _controller.Settings.MakcuProtocolVersion != _serialBridge.ActualMakcuProtocolVersion;
+        _controller.Settings.MakcuProtocolVersion = _serialBridge.ActualMakcuProtocolVersion;
+        SetMakcuVersionSelection();
         bool checkBoxChanged = !_makcuModeCheckBox.Checked;
         SetMakcuModeCheckBox(true);
         if (!settingsChanged && !checkBoxChanged)
@@ -953,7 +982,20 @@ internal sealed class SettingsPageControl : UserControl
         _ = SaveSettings();
     }
 
-    private async Task OnMakcuModeChangedAsync()
+    private async Task OnMakcuVersionChangedAsync()
+    {
+        if (_loading || _makcuModeUserTransitionActive) return;
+        int requested = _makcuVersionComboBox.SelectedIndex == 1 ? 3 : 4;
+        if (!_controller.Settings.MakcuEnabled)
+        {
+            _controller.Settings.MakcuProtocolVersion = requested;
+            _ = SaveSettings();
+            return;
+        }
+        await OnMakcuModeChangedAsync(requested);
+    }
+
+    private async Task OnMakcuModeChangedAsync(int? requestedVersion = null)
     {
         if (_loading)
         {
@@ -974,12 +1016,31 @@ internal sealed class SettingsPageControl : UserControl
         }
 
         _makcuModeCheckBox.Enabled = false;
+        _makcuVersionComboBox.Enabled = false;
         _buttonStatePublishingCheckBox.Enabled = false;
         _makcuModeUserTransitionActive = true;
         _controller.PrepareMakcuModeTransition();
         try
         {
-            MakcuModeChangeResult result = await _serialBridge.SetMakcuModeAsync(requestedEnabled);
+            MakcuModeChangeResult result;
+            if (requestedVersion is int version && requestedEnabled)
+            {
+                result = await MakcuModeCoordinator.ChangeVersionAsync(version,
+                    enabled => _serialBridge.SetMakcuModeAsync(enabled),
+                    selected =>
+                    {
+                        _controller.Settings.MakcuEnabled = false;
+                        _controller.Settings.MakcuProtocolVersion = selected;
+                    });
+            }
+            else
+            {
+                result = await _serialBridge.SetMakcuModeAsync(requestedEnabled);
+            }
+            if (result.ActualStateVerified && result.ActualEnabled)
+            {
+                _controller.Settings.MakcuProtocolVersion = _serialBridge.ActualMakcuProtocolVersion;
+            }
             bool settingsSaved = false;
             bool automationResumed = false;
             bool actualSessionReady = IsVerifiedModeSessionReady(result);
@@ -1012,6 +1073,12 @@ internal sealed class SettingsPageControl : UserControl
                 automationResumed,
                 actualSessionReady,
                 startupRestore: false);
+            if (result.Success && actualSessionReady && result.ActualEnabled)
+            {
+                _statusLabel.Text += " 请先退出本软件，才能正常使用外部 Makcu 接口；关闭窗口到托盘不会释放串口。";
+                MessageBox.Show(this, "Makcu 已开启。请先通过托盘菜单退出本软件，再使用外部 Makcu 接口。关闭窗口到托盘不会释放串口。",
+                    "Makcu 使用提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
         }
         catch (Exception exception)
         {
@@ -1021,8 +1088,10 @@ internal sealed class SettingsPageControl : UserControl
         }
         finally
         {
+            SetMakcuVersionSelection();
             _makcuModeUserTransitionActive = false;
             _makcuModeCheckBox.Enabled = true;
+            _makcuVersionComboBox.Enabled = _serialBridge is not null;
             _buttonStatePublishingCheckBox.Enabled = _serialBridge is not null;
         }
     }
@@ -1036,6 +1105,14 @@ internal sealed class SettingsPageControl : UserControl
         (result.ActualEnabled
             ? _serialBridge.IsMakcuModeSessionReady
             : _serialBridge.IsA5ModeReadyForAutomation);
+
+    private void SetMakcuVersionSelection()
+    {
+        bool previous = _loading;
+        _loading = true;
+        _makcuVersionComboBox.SelectedIndex = _controller.Settings.MakcuProtocolVersion == 3 ? 1 : 0;
+        _loading = previous;
+    }
 
     private void SetMakcuModeCheckBox(bool enabled)
     {
@@ -1067,7 +1144,7 @@ internal sealed class SettingsPageControl : UserControl
         }
         if (result.ActualEnabled)
         {
-            return $"{text} 实际模式已核实并已保存。宏/Lua保持停止；关闭 Makcu 并确认恢复 A5 后才会重载。";
+            return $"{text} 实际模式已核实并已保存。请先退出本软件，才能正常使用外部 Makcu 接口；关闭到托盘不算退出。宏/Lua保持停止。";
         }
         if (!automationResumed)
         {

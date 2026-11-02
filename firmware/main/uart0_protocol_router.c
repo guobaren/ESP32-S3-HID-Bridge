@@ -28,7 +28,7 @@ void uart0_protocol_router_feed(uart0_protocol_router_t *s,
         if (s->length == 1U && value != 0x5AU) {
             s->length = 0U;
         }
-        if (s->length != 0U || (s->v4.mode == 0U && value == 0xA5U)) {
+        if (s->length != 0U || ((s->ascii_feed != NULL || s->v4.mode == 0U) && value == 0xA5U)) {
             s->a5[s->length++] = value;
             s->last_byte_ms = now_ms;
             if (s->length == 7U) s->expected = (uint16_t)(9U + s->a5[6]);
@@ -43,6 +43,8 @@ void uart0_protocol_router_feed(uart0_protocol_router_t *s,
                 }
                 s->length = s->expected = 0U;
             }
+        } else if (s->ascii_feed != NULL) {
+            s->ascii_feed(&value, 1U, s->context);
         } else {
             makcu_v4_stream_parser_feed(&s->v4, &value, 1U, now_ms,
                 s->v4_callback, s->context);

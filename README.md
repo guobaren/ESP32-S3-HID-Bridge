@@ -76,7 +76,7 @@ P 板克隆真实鼠标的 USB 描述符（VID/PID、字符串、接口、端点
 | P（电脑侧） | USB Device | 原生 USB 接目标电脑；安装并呈现 M 提供的鼠标克隆；接收并输出 M 转发的输入与厂商 HID 数据 |
 
 - 角色锁定后，USB 或 UART 临时断开不会重新选角色；两板都断电后重新从 `UNRESOLVED` 开始。
-- 板载状态灯：未定身份熄灭；已锁定但对端离线红色常亮；对端在线时 M 绿色、P 蓝色；采集、确认超时或克隆失败红色闪烁。
+- 板载状态灯：身份未定时熄灭；M 未就绪时绿色与红色每 250 ms 交替，就绪后常亮绿；P 未就绪时蓝色与红色每 250 ms 交替，就绪后常亮蓝。P 仅在完整就绪期间，软件输入成功会让蓝灯熄灭 40 ms，随后冷却 60 ms。就绪条件包含板间连接和双方 USB 状态；M 需真实鼠标接口就绪及当前 Profile 确认，P 需本地克隆挂载完成。灯态细节见[连接流程](docs/连接流程.md)。
 - 目标电脑接 P 的原生 USB；真实鼠标接 M 的原生 USB Host 口；不要同时把两板的 5V/3V3 连在一起。
 
 ### 软件输入与平滑
@@ -106,13 +106,14 @@ idf.py -p $port flash
 
 - 只有全新且尚未设置 target 的构建目录才首次执行 `idf.py set-target esp32s3`；日常构建沿用已有 target 与 `sdkconfig`。
 - **两块板必须刷同一版本固件**：`PROFILE_ACK` 长度本身就是新旧判别条件，混刷会因长度不匹配判失败。
+- 当前双板主镜像默认使用 CherryUSB 驱动 M 侧物理鼠标 USB Host；P 侧电脑 USB Device 仍由 TinyUSB 驱动。两板部署时应从同一个默认构建产物 `firmware/build/dual_s3_hid_proxy.bin` 刷入。若要做 ESP-IDF Host 回退对照，可显式关闭 `DUAL_PROXY_USE_CHERRYUSB` 后重新配置并构建；两板仍须使用同一产物。
 - 构建产物在 `firmware/build/`：`flasher_args.json` 与 bootloader、partition table、应用镜像 `dual_s3_hid_proxy.bin`。
 - 双板接口编译选项见下方备注；协议与统计字段见[协议说明](docs/protocol.md)，工程与连接细节见[固件说明](docs/固件.md)。
 
 <details>
 <summary>备注：双板接口构建选项</summary>
 
-默认 CMake 选项 `DUAL_PROXY_ENABLE_MAKCU_V4_API` 为 `ON`，在 M 板 UART0/CH340 提供 Makcu V4 鼠标接口。旧 V3 风格 ASCII 子集由 `DUAL_PROXY_ENABLE_MAKCU_ASCII_API` 控制，默认 `OFF`，且与 V4 在同一 UART0 上互斥。例如只构建不含 V4 的镜像：
+默认固件同时包含 V4 与老版 V3 风格 ASCII 鼠标子集，可在 Host 设置中选择版本。构建裁剪选项见 [固件说明](docs/固件.md)。例如关闭 V4 运行时入口：
 
 ```powershell
 idf.py -D DUAL_PROXY_ENABLE_MAKCU_V4_API=OFF build
@@ -328,13 +329,14 @@ kmNet.wheel(1)
 
 使用注意：
 
-- 开启 Makcu 后，Host 会继续持有 M 串口；关闭主窗口到托盘不会释放串口，必须通过退出命令真正退出 Host 进程。
+- 设置页可选择 V4 或老版 V3 ASCII（兼容子集）。已开启时切换版本会自动关闭 Makcu、确认 A5，再选择版本并重新开启；失败时显示实际状态。
+- 开启 Makcu 后明确提示：**必须先退出本软件，外部程序才能正常使用 Makcu 接口**。Host 会继续持有 M 串口；关闭主窗口到托盘不会释放串口，必须通过退出命令真正退出 Host 进程。
 - 若要由独立 Makcu 客户端发送命令，先在 Host 切换并确认模式，再真正退出 Host 后单独打开客户端；同一串口同一时刻只由一个进程占用。
 - 要恢复 A5/921600：关闭其他占用 M 串口的程序，重新启动 Host，再手动关闭 Makcu 开关。不要让另一个串口客户端与 Host 同时打开该端口。
 - 切换结果以 Host 在新波特率重新查询并确认 M 角色和实际模式为准；收到切换受理响应本身不代表已经切换完成。
 - 当前只实现鼠标功能子集，**不等同于原厂 Makcu 盒子**：不提供键盘、手柄、flick 或设备管理接口，未实现命令会明确拒绝，不会伪造成功。
 - 有效的鼠标设置会续 1500 ms 输入租约；查询不会续租，停止发送后固件会释放注入的按钮。
-- 旧 V3 风格 ASCII 是另一套可选旧接口（默认关闭），与 V4 互斥，不应与本节命令混用。
+- 老版 V3 风格 ASCII 是另一套兼容子集，同版固件已包含；在 Host 中选择运行版本，不应与本节 V4 命令混用。
 - 当前运行模式仅使用 921600（A5）与 115200（Makcu），由 Host 开关切换；不要用 Makcu `baud()` 绕过该模式切换。
 - 只读检查工具（不发送复位命令或鼠标输入）：
 
@@ -445,6 +447,7 @@ Host 在串口模式启动时会检查驱动状态：若找到随包 INF 且确�
 | [docs/dependencies.md](docs/dependencies.md) | 开发环境、官方来源与安装步骤 |
 | [docs/发布.md](docs/发布.md) | 维护者发布入口与版本号同步规则 |
 | [docs/firmware-update-api.md](docs/firmware-update-api.md) | 远程固件刷写 API 的请求格式与边界 |
+| [docs/问题-单击重复.md](docs/问题-单击重复.md) | 单击被上报成两次：根因定位、证据链、修复方案与验收判据 |
 | [docs/交接.md](docs/交接.md) | 当前状态快照、执行路线图与历史索引 |
 | [docs/审计.md](docs/审计.md) | 质量报告、Known Issues、技术债与未验证清单 |
 | [tools/README.md](tools/README.md) | 命令行工具（蓝牙验证、统计读取、延迟测量、注入与探针） |

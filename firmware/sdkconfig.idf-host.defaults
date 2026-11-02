@@ -1,0 +1,3 @@
+# 显式回退配置：与 sdkconfig.defaults 一起按顺序传给 SDKCONFIG_DEFAULTS。
+# 后加载本文件会关闭 CherryUSB Host，恢复 ESP-IDF USB Host 后端。
+CONFIG_DUAL_PROXY_USE_CHERRYUSB=n

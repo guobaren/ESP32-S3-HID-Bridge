@@ -1,5 +1,8 @@
 #include "hid_host_cherryusb_backend.h"
 #include "hid_host_cherryusb_logic.h"
+#include "usb_host_diagnostics.h"
+#include "cherryusb_host_low_level.h"
+#include "cherryusb_report_retry.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -59,6 +62,8 @@ typedef struct {
     uint32_t urb_time_us;
     bool raw_urb_result_valid;
     int32_t raw_urb_result;
+    bool urb_channel_idle_valid;
+    bool urb_channel_idle;
     bool raw_actual_length_valid;
     uint32_t raw_actual_length;
     bool payload_length_valid;
@@ -119,6 +124,94 @@ static int64_t s_last_heartbeat_history_replay_us;
 
 static bool any_hid_state_active(void);
 static void reset_profile_for_device_epoch(void);
+
+bool dual_hid_host_cherryusb_diag_state(
+    dual_usb_host_diag_backend_state_t *state)
+{
+    if (state == NULL) {
+        return false;
+    }
+    memset(state, 0, sizeof(*state));
+    if (s_lifecycle_guard == NULL ||
+        xSemaphoreTake(s_lifecycle_guard, 0U) != pdTRUE) {
+        return false;
+    }
+
+    struct usbh_hubport *hport = s_hport;
+    state->initialized = __atomic_load_n(&s_initialized, __ATOMIC_ACQUIRE);
+    state->stopping = __atomic_load_n(&s_device_stopping, __ATOMIC_ACQUIRE);
+    state->hport_present = hport != NULL;
+    state->connected = hport != NULL && hport->connected;
+    state->device_epoch = __atomic_load_n(&s_device_epoch, __ATOMIC_ACQUIRE);
+    xSemaphoreGive(s_lifecycle_guard);
+
+    if (s_profile_guard == NULL ||
+        xSemaphoreTake(s_profile_guard, 0U) != pdTRUE) {
+        return false;
+    }
+    state->profile_ready = s_profile_ready;
+    xSemaphoreGive(s_profile_guard);
+    state->snapshot_valid = true;
+    return true;
+}
+
+static uint32_t hid_init_failure_stage(const char *stage)
+{
+    if (stage == NULL) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_ESP;
+    }
+    if (strcmp(stage, "run_arguments") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_ARGUMENTS_ESP;
+    }
+    if (strcmp(stage, "lifecycle_register") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_LIFECYCLE_ESP;
+    }
+    if (strcmp(stage, "state_alloc") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_STATE_ALLOC_ESP;
+    }
+    if (strcmp(stage, "report_size_validate") == 0 ||
+        strcmp(stage, "report_descriptor") == 0 ||
+        strcmp(stage, "full_descriptor_fetch") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_FULL_DESCRIPTOR_ESP;
+    }
+    if (strcmp(stage, "full_descriptor_length_validate") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_DESCRIPTOR_LENGTH_ESP;
+    }
+    if (strcmp(stage, "endpoint_packet_validate") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_ENDPOINT_ESP;
+    }
+    if (strcmp(stage, "input_buffer_alloc") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_INPUT_BUFFER_ESP;
+    }
+    if (strcmp(stage, "input_timer_create") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_TIMER_CREATE_ESP;
+    }
+    if (strcmp(stage, "interface_open") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_INTERFACE_OPEN_ESP;
+    }
+    if (strcmp(stage, "profile_lock") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_PROFILE_LOCK_ESP;
+    }
+    if (strcmp(stage, "profile_add") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_PROFILE_ADD_ESP;
+    }
+    if (strcmp(stage, "profile_string_fetch") == 0 ||
+        strcmp(stage, "profile_langid_fetch") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_PROFILE_CONTROL_ESP;
+    }
+    if (strcmp(stage, "profile_string_validate") == 0 ||
+        strcmp(stage, "profile_langid_validate") == 0 ||
+        strcmp(stage, "profile_string_decode") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_PROFILE_VALIDATE_ESP;
+    }
+    if (strncmp(stage, "profile_", sizeof("profile_") - 1U) == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_PROFILE_BUILD_ESP;
+    }
+    if (strcmp(stage, "input_timer_start") == 0) {
+        return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_TIMER_START_ESP;
+    }
+    return DUAL_USB_HOST_DIAG_STAGE_HID_INIT_ESP;
+}
 
 /* EP0 SETUP and data buffers must remain DMA-aligned for the CherryUSB DWC2 port. */
 static struct usb_setup_packet s_setup_storage USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX;
@@ -371,6 +464,19 @@ static void log_hid_init_failure(
     const esp_err_t result = diagnostic != NULL
         ? diagnostic->result : ESP_ERR_INVALID_STATE;
 
+    if (trace != NULL && trace->raw_urb_result_valid &&
+        trace->raw_urb_result < 0 && diagnostic != NULL &&
+        diagnostic->control_stage_valid &&
+        diagnostic->control_stage == CHERRY_CONTROL_STAGE_URB) {
+        dual_usb_host_diag_failure(
+            DUAL_USB_HOST_DIAG_STAGE_HID_INIT_URB_RAW,
+            trace->raw_urb_result);
+    } else {
+        dual_usb_host_diag_failure(
+            hid_init_failure_stage(diagnostic != NULL ? diagnostic->stage : NULL),
+            (int32_t)result);
+    }
+
     ESP_LOGE(TAG,
              "CherryUSB HID init failed: bus=%u addr=%u intf_index=%u intf_num=%u class_index=%u stage=%s field=%s error=%s(%d) report_size=%u endpoint_packet=%u actual_length=%s raw_actual=%s raw_urb=%s control_stage=%s elapsed_us=%" PRId64,
              (unsigned)bus_id, (unsigned)device_address,
@@ -563,12 +669,24 @@ static esp_err_t control_transfer_guarded(
         }
         return ESP_ERR_TIMEOUT;
     }
-    if (!hport->connected || s_shutdown_requested || s_device_stopping) {
+    if (!hport->connected || s_shutdown_requested || s_device_stopping ||
+        dual_cherryusb_hub_is_stopping(hport->bus)) {
         xSemaphoreGive((SemaphoreHandle_t)hport->mutex);
         if (stage != NULL) {
             *stage = CHERRY_CONTROL_STAGE_DEVICE_STATE;
         }
         return ESP_ERR_NOT_FOUND;
+    }
+    if (hport->ep0_urb.hcpriv != NULL) {
+        if (trace != NULL) {
+            trace->urb_channel_idle_valid = true;
+            trace->urb_channel_idle = false;
+        }
+        xSemaphoreGive((SemaphoreHandle_t)hport->mutex);
+        if (stage != NULL) {
+            *stage = CHERRY_CONTROL_STAGE_URB;
+        }
+        return ESP_ERR_INVALID_STATE;
     }
 
     memset(&s_setup_storage, 0, sizeof(s_setup_storage));
@@ -616,8 +734,13 @@ static esp_err_t control_transfer_guarded(
         trace->urb_time_us = (uint32_t)(esp_timer_get_time() - urb_started_us);
         trace->raw_urb_result_valid = true;
         trace->raw_urb_result = raw_result;
+        trace->urb_channel_idle_valid = true;
+        trace->urb_channel_idle = hport->ep0_urb.hcpriv == NULL;
     }
     esp_err_t result = map_usb_result(raw_result);
+    if (hport->ep0_urb.hcpriv != NULL) {
+        result = ESP_ERR_INVALID_STATE;
+    }
     if (stage != NULL) {
         *stage = result == ESP_OK
             ? CHERRY_CONTROL_STAGE_OK : CHERRY_CONTROL_STAGE_URB;
@@ -660,6 +783,73 @@ static esp_err_t control_transfer_guarded(
     }
     xSemaphoreGive((SemaphoreHandle_t)hport->mutex);
     return result;
+}
+
+typedef struct {
+    struct usbh_hubport *hport;
+    uint8_t interface_number;
+    uint16_t requested_length;
+    cherry_control_stage_t stage;
+    cherry_control_trace_t trace;
+    esp_err_t status;
+} report_descriptor_request_t;
+
+static bool report_descriptor_stopping(void *context)
+{
+    const report_descriptor_request_t *request = context;
+    return request == NULL || request->hport == NULL ||
+        !request->hport->connected || s_shutdown_requested || s_device_stopping ||
+        dual_cherryusb_hub_is_stopping(request->hport->bus);
+}
+
+static int report_descriptor_attempt(
+    void *context,
+    uint32_t attempt,
+    int64_t deadline_us,
+    int *raw_result,
+    bool *raw_result_valid,
+    size_t *actual_payload,
+    bool *channel_idle)
+{
+    report_descriptor_request_t *request = context;
+    const int64_t started_us = esp_timer_get_time();
+    size_t payload_length = 0U;
+    request->stage = CHERRY_CONTROL_STAGE_VALIDATION;
+    request->trace = (cherry_control_trace_t){0};
+    request->status = control_transfer_guarded(
+        request->hport,
+        USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_INTERFACE,
+        USB_REQUEST_GET_DESCRIPTOR,
+        (uint16_t)(HID_DESCRIPTOR_TYPE_HID_REPORT << 8U),
+        request->interface_number, request->requested_length,
+        NULL, s_report_descriptor_buffer, sizeof(s_report_descriptor_buffer),
+        &payload_length, deadline_us, &request->stage, &request->trace);
+    if (report_descriptor_stopping(request)) {
+        request->status = ESP_ERR_NOT_FOUND;
+    }
+    /* Report descriptors contain HID items, not a bLength/bDescriptorType header. */
+    request->trace.descriptor_header_valid = false;
+    *raw_result = request->trace.raw_urb_result;
+    *raw_result_valid = request->trace.raw_urb_result_valid;
+    *actual_payload = request->trace.payload_length_valid
+        ? request->trace.payload_length : 0U;
+    *channel_idle = request->trace.urb_channel_idle_valid &&
+        request->trace.urb_channel_idle;
+    const int64_t now_us = esp_timer_get_time();
+    const uint32_t remaining_ms = now_us < deadline_us
+        ? (uint32_t)((deadline_us - now_us + 999LL) / 1000LL) : 0U;
+    ESP_LOGI(TAG, "HID report descriptor attempt=%" PRIu32
+             " wIndex=%u requested=%u remaining_ms=%" PRIu32
+             " status=%" PRId32 " raw_valid=%u raw=%" PRId32
+             " actual_valid=%u actual=%u channel_idle=%u elapsed_us=%" PRId64,
+             attempt, request->interface_number, request->requested_length,
+             remaining_ms, request->status,
+             request->trace.raw_urb_result_valid ? 1U : 0U,
+             request->trace.raw_urb_result,
+             request->trace.payload_length_valid ? 1U : 0U,
+             request->trace.payload_length, *channel_idle ? 1U : 0U,
+             now_us - started_us);
+    return request->status;
 }
 
 static esp_err_t control_transfer(
@@ -1092,7 +1282,9 @@ static void input_completion(void *argument, int nbytes)
     if (nbytes > 0) {
         __atomic_add_fetch(&s_input_reports, 1U, __ATOMIC_RELAXED);
         __atomic_add_fetch(&s_input_bytes, (uint32_t)nbytes, __ATOMIC_RELAXED);
-        __atomic_store_n(&s_last_input_us, esp_timer_get_time(), __ATOMIC_RELEASE);
+        const int64_t now_us = esp_timer_get_time();
+        __atomic_store_n(&s_last_input_us, now_us, __ATOMIC_RELEASE);
+        dual_usb_host_diag_input((uint32_t)(now_us / 1000LL));
         if (!__atomic_load_n(&state->stopping, __ATOMIC_ACQUIRE)) {
             bool queued;
             if (from_isr) {
@@ -1280,31 +1472,65 @@ void usbh_hid_run(struct usbh_hid *hid_class)
                                 result, false, 0U);
         goto fail;
     }
-    size_t descriptor_length = 0U;
-    cherry_control_stage_t control_stage = CHERRY_CONTROL_STAGE_VALIDATION;
-    cherry_control_trace_t control_trace = {0};
-    const int64_t descriptor_deadline = esp_timer_get_time() +
-        (int64_t)CHERRY_HEARTBEAT_TIMEOUT_MS * 1000LL;
-    result = control_transfer_guarded(
-        hport, USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_INTERFACE,
-        USB_REQUEST_GET_DESCRIPTOR,
-        (uint16_t)((HID_DESCRIPTOR_TYPE_HID_REPORT << 8U)),
-        state->interface_number, hid_class->report_size,
-        NULL, s_report_descriptor_buffer, sizeof(s_report_descriptor_buffer),
-        &descriptor_length, descriptor_deadline, &control_stage, &control_trace);
-    if (result != ESP_OK) {
-        set_hid_control_diagnostic(&diagnostic, "full_descriptor_fetch",
-                                   "report_descriptor", result, control_stage,
-                                   &control_trace);
+    report_descriptor_request_t descriptor_request = {
+        .hport = hport,
+        .interface_number = state->interface_number,
+        .requested_length = hid_class->report_size,
+    };
+    cherryusb_report_retry_result_t descriptor_retry = {0};
+    const cherryusb_report_retry_reason_t descriptor_reason =
+        cherryusb_report_descriptor_read_retry(
+            &descriptor_request, hid_class->report_size,
+            report_descriptor_attempt, report_descriptor_stopping,
+            &descriptor_retry);
+    ESP_LOGI(TAG, "HID report descriptor summary wIndex=%u requested=%u attempts=%" PRIu32
+             " actual=%u total_us=%" PRIu32 " budget_ms=%u reason=%s recovered=%u",
+             state->interface_number, hid_class->report_size,
+             descriptor_retry.attempts, (unsigned)descriptor_retry.actual_payload,
+             descriptor_retry.elapsed_us, CHERRYUSB_REPORT_RETRY_BUDGET_MS,
+             cherryusb_report_retry_reason_name(descriptor_reason),
+             descriptor_reason == CHERRYUSB_REPORT_RETRY_SUCCESS &&
+                     descriptor_retry.attempts > 1U ? 1U : 0U);
+    if (descriptor_reason != CHERRYUSB_REPORT_RETRY_SUCCESS) {
+        cherry_control_stage_t failure_stage = descriptor_request.stage;
+        if (descriptor_reason == CHERRYUSB_REPORT_RETRY_SHORT_PAYLOAD) {
+            result = ESP_ERR_INVALID_SIZE;
+            failure_stage = CHERRY_CONTROL_STAGE_VALIDATION;
+            set_hid_control_diagnostic(&diagnostic,
+                                       "full_descriptor_length_validate",
+                                       "report_descriptor", result,
+                                       failure_stage, &descriptor_request.trace);
+        } else if (descriptor_reason == CHERRYUSB_REPORT_RETRY_STOPPED) {
+            result = ESP_ERR_NOT_FOUND;
+            failure_stage = CHERRY_CONTROL_STAGE_DEVICE_STATE;
+            set_hid_control_diagnostic(&diagnostic, "full_descriptor_fetch",
+                                       "report_descriptor", result,
+                                       failure_stage, &descriptor_request.trace);
+        } else if (descriptor_reason == CHERRYUSB_REPORT_RETRY_DEADLINE) {
+            result = descriptor_request.status != ESP_OK
+                ? descriptor_request.status : ESP_ERR_TIMEOUT;
+            failure_stage = descriptor_request.stage == CHERRY_CONTROL_STAGE_VALIDATION
+                ? CHERRY_CONTROL_STAGE_DEADLINE : descriptor_request.stage;
+            set_hid_control_diagnostic(&diagnostic, "full_descriptor_fetch",
+                                       "report_descriptor", result,
+                                       failure_stage, &descriptor_request.trace);
+        } else if (descriptor_reason == CHERRYUSB_REPORT_RETRY_CHANNEL_BUSY) {
+            result = ESP_ERR_INVALID_STATE;
+            set_hid_control_diagnostic(&diagnostic, "full_descriptor_fetch",
+                                       "report_descriptor", result,
+                                       descriptor_request.stage,
+                                       &descriptor_request.trace);
+        } else {
+            result = descriptor_request.status != ESP_OK
+                ? descriptor_request.status : ESP_FAIL;
+            set_hid_control_diagnostic(&diagnostic, "full_descriptor_fetch",
+                                       "report_descriptor", result,
+                                       descriptor_request.stage,
+                                       &descriptor_request.trace);
+        }
         goto fail;
     }
-    if (descriptor_length != hid_class->report_size) {
-        result = ESP_ERR_INVALID_SIZE;
-        set_hid_control_diagnostic(&diagnostic, "full_descriptor_length_validate",
-                                   "report_descriptor", result,
-                                   CHERRY_CONTROL_STAGE_VALIDATION, &control_trace);
-        goto fail;
-    }
+    const size_t descriptor_length = descriptor_retry.actual_payload;
 
     if (hid_class->intin != NULL) {
         const uint16_t max_packet = USB_GET_MAXPACKETSIZE(
@@ -1588,6 +1814,7 @@ static void heartbeat_task(void *argument)
         const uint32_t input_age_ms = input_age_valid
             ? (uint32_t)((ended_us - last_input_us) / 1000LL) : 0U;
         if (result == ESP_OK) {
+            dual_usb_host_diag_heartbeat(true);
             cherry_heartbeat_recovery_t recovery;
             if (cherry_heartbeat_record_success(&s_heartbeat_diagnostics, sequence, ended_us, &recovery)) {
                 ESP_LOGI(TAG, "HB_RECOVER seq=%" PRIu32 " uptime_us=%" PRId64
@@ -1595,6 +1822,7 @@ static void heartbeat_task(void *argument)
                     recovery.sequence, ended_us, recovery.consecutive_failures, recovery.streak_duration_us);
             }
         } else {
+            dual_usb_host_diag_heartbeat(false);
             cherry_heartbeat_failure_t failure = {
                 .sequence = sequence, .uptime_us = ended_us, .stage = stage,
                 .esp_error = result, .total_latency_us = latency_us,
@@ -1665,13 +1893,26 @@ static void heartbeat_task(void *argument)
 
 esp_err_t dual_hid_host_cherryusb_start(void)
 {
-    if (s_initialized || s_lifecycle_guard != NULL) {
+    if (__atomic_load_n(&s_initialized, __ATOMIC_ACQUIRE) ||
+        s_lifecycle_guard != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     s_lifecycle_guard = xSemaphoreCreateMutex();
     s_profile_guard = xSemaphoreCreateMutex();
     s_task_events = xEventGroupCreate();
     if (s_lifecycle_guard == NULL || s_profile_guard == NULL || s_task_events == NULL) {
+        if (s_task_events != NULL) {
+            vEventGroupDelete(s_task_events);
+            s_task_events = NULL;
+        }
+        if (s_profile_guard != NULL) {
+            vSemaphoreDelete(s_profile_guard);
+            s_profile_guard = NULL;
+        }
+        if (s_lifecycle_guard != NULL) {
+            vSemaphoreDelete(s_lifecycle_guard);
+            s_lifecycle_guard = NULL;
+        }
         return ESP_ERR_NO_MEM;
     }
     s_shutdown_requested = false;
@@ -1701,10 +1942,13 @@ esp_err_t dual_hid_host_cherryusb_start(void)
     s_heartbeat_last_latency_us = 0U;
     s_last_input_us = 0;
 
-    if (usbh_initialize(CHERRY_BUS_ID, ESP_USB_FS0_BASE) != 0) {
+    const int init_result = usbh_initialize(CHERRY_BUS_ID, ESP_USB_FS0_BASE);
+    __atomic_store_n(&s_initialized,
+                     dual_cherryusb_bus_is_active(CHERRY_BUS_ID),
+                     __ATOMIC_RELEASE);
+    if (init_result != 0) {
         return ESP_FAIL;
     }
-    s_initialized = true;
     if (xTaskCreate(heartbeat_task, "cherry_hid_heartbeat", 4096, NULL, 2,
                     &s_heartbeat_task) != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -1715,7 +1959,8 @@ esp_err_t dual_hid_host_cherryusb_start(void)
 
 esp_err_t dual_hid_host_cherryusb_stop(void)
 {
-    if (s_lifecycle_guard == NULL) {
+    if (s_lifecycle_guard == NULL &&
+        !dual_cherryusb_bus_is_active(CHERRY_BUS_ID)) {
         return ESP_OK;
     }
     s_shutdown_requested = true;
@@ -1746,12 +1991,15 @@ esp_err_t dual_hid_host_cherryusb_stop(void)
     wait_for_hport_users_and_callbacks();
     kill_active_input_urbs();
     wait_for_input_urbs_and_callbacks();
-    if (s_initialized) {
+    if (__atomic_load_n(&s_initialized, __ATOMIC_ACQUIRE) ||
+        dual_cherryusb_bus_is_active(CHERRY_BUS_ID)) {
         const int result = usbh_deinitialize(CHERRY_BUS_ID);
         if (result != 0) {
+            ESP_LOGE(TAG, "CHERRYUSB_STOP_FAIL stage=usbh_deinitialize raw=%d",
+                     result);
             return ESP_FAIL;
         }
-        s_initialized = false;
+        __atomic_store_n(&s_initialized, false, __ATOMIC_RELEASE);
     }
     reset_profile_for_device_epoch();
     for (size_t index = 0; index < HID_PROFILE_MAX_REPORT_DESCRIPTORS; ++index) {

@@ -136,6 +136,10 @@ try {
         '',
         '固件按 **4 MB Flash** 目标构建，分区表为 `nvs`（24 KB）、`phy_init`（4 KB）与 `factory` 应用（1 MB），表尾 `0x110000`（约 1.06 MB），因此 **4 MB 及以上的 ESP32-S3 板卡都可用**，8 MB 板卡同样可用（更大的 Flash 不会被使用）。板卡不需要 PSRAM。若此前刷过含 4 MB `storage` 分区的旧版本，本次需要整片重刷（bootloader + partition table + app 三段）。',
         '',
+        '## Makcu 版本选择',
+        '',
+        '本包同时包含 V4 与老版 V3 ASCII 鼠标兼容子集。在 Host 设置中选择版本；已开启时切换会自动关闭、切版、重新开启。开启成功后必须从托盘菜单真正退出 Host，外部客户端才能打开 M 板 115200 串口；关闭窗口到托盘不会释放。首次使用双版功能需将本包同版固件分别刷入 P/M。',
+        '',
         '## 校验',
         '',
         '`SHA256SUMS.txt` 包含本发布件内每个文件的 SHA-256。发布件由项目根目录的 `scripts/Prepare-Release.ps1` 生成，根目录也会保留同一份最新 `HidBridge.Host.exe`。'

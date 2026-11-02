@@ -10,6 +10,10 @@
  */
 #include "usbh_core.h"
 #include "usbh_hid.h"
+#include "cherryusb_hid_control.h"
+#include "cherryusb_host_low_level.h"
+#include "cherryusb_report_retry.h"
+#include "usb_host_diagnostics.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -80,40 +84,111 @@ static const char *usbh_hid_diag_report_length(int result, char *buffer,
     return buffer;
 }
 
+typedef struct {
+    struct usbh_hid *hid_class;
+    uint8_t *buffer;
+    uint16_t requested_length;
+} hid_report_request_context_t;
+
+static bool hid_report_request_stopping(void *context)
+{
+    const hid_report_request_context_t *request = context;
+    return request == NULL || request->hid_class == NULL ||
+        request->hid_class->hport == NULL ||
+        !request->hid_class->hport->connected ||
+        dual_cherryusb_hub_is_stopping(request->hid_class->hport->bus);
+}
+
+static int hid_report_request_attempt(
+    void *context,
+    uint32_t attempt,
+    int64_t deadline_us,
+    int *raw_result,
+    bool *raw_result_valid,
+    size_t *actual_payload,
+    bool *channel_idle)
+{
+    hid_report_request_context_t *request = context;
+    struct usbh_hid *hid_class = request->hid_class;
+    const int64_t started_us = esp_timer_get_time();
+    cherryusb_hid_control_trace_t trace = {0};
+    const int ret = cherryusb_hid_control_transfer_until(
+        hid_class->hport,
+        USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_INTERFACE,
+        USB_REQUEST_GET_DESCRIPTOR,
+        HID_DESCRIPTOR_TYPE_HID_REPORT << 8,
+        hid_class->intf, request->requested_length, request->buffer,
+        deadline_us, &trace);
+    *raw_result = trace.raw_result;
+    *raw_result_valid = trace.raw_result_valid;
+    *actual_payload = trace.payload_length;
+    *channel_idle = trace.channel_idle;
+    USB_LOG_INFO("HID request: stage=get_report_descriptor attempt=%" PRIu32
+                 " wIndex=%u requested=%u raw_urb_valid=%u raw_urb=%d actual_payload=%u channel_idle=%u elapsed_us=%" PRId64 "\r\n",
+                 attempt, (unsigned)hid_class->intf,
+                 (unsigned)request->requested_length,
+                 trace.raw_result_valid ? 1U : 0U, trace.raw_result,
+                 (unsigned)trace.payload_length, trace.channel_idle ? 1U : 0U,
+                 esp_timer_get_time() - started_us);
+    return ret < 0 ? ret : 0;
+}
+
 int usbh_hid_get_report_descriptor(struct usbh_hid *hid_class, uint8_t *buffer, uint32_t buflen)
 {
-    struct usb_setup_packet *setup;
-
-    if (!hid_class || !hid_class->hport) {
+    if (!hid_class || !hid_class->hport || buffer == NULL || buflen == 0U ||
+        buflen > UINT16_MAX) {
         return -USB_ERR_INVAL;
     }
-    setup = hid_class->hport->setup;
-
-    setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_INTERFACE;
-    setup->bRequest = USB_REQUEST_GET_DESCRIPTOR;
-    setup->wValue = HID_DESCRIPTOR_TYPE_HID_REPORT << 8;
-    setup->wIndex = hid_class->intf;
-    setup->wLength = buflen;
-
-    return usbh_control_transfer(hid_class->hport, setup, buffer);
+    hid_report_request_context_t request = {
+        .hid_class = hid_class,
+        .buffer = buffer,
+        .requested_length = (uint16_t)buflen,
+    };
+    cherryusb_report_retry_result_t retry = {0};
+    const cherryusb_report_retry_reason_t reason =
+        cherryusb_report_descriptor_read_retry(
+            &request, buflen, hid_report_request_attempt,
+            hid_report_request_stopping, &retry);
+    USB_LOG_INFO("HID descriptor retry summary: wIndex=%u requested=%u attempts=%" PRIu32
+                 " actual_payload=%u total_us=%" PRIu32 " budget_ms=%u reason=%s recovered=%u\r\n",
+                 (unsigned)hid_class->intf, (unsigned)buflen, retry.attempts,
+                 (unsigned)retry.actual_payload, retry.elapsed_us,
+                 CHERRYUSB_REPORT_RETRY_BUDGET_MS,
+                 cherryusb_report_retry_reason_name(reason),
+                 (reason == CHERRYUSB_REPORT_RETRY_SUCCESS && retry.attempts > 1U) ? 1U : 0U);
+    if (reason == CHERRYUSB_REPORT_RETRY_SUCCESS) {
+        return (int)(sizeof(struct usb_setup_packet) + retry.actual_payload);
+    }
+    if (reason == CHERRYUSB_REPORT_RETRY_SHORT_PAYLOAD) {
+        return -USB_ERR_RANGE;
+    }
+    if (reason == CHERRYUSB_REPORT_RETRY_STOPPED) {
+        return -USB_ERR_SHUTDOWN;
+    }
+    if (reason == CHERRYUSB_REPORT_RETRY_DEADLINE) {
+        return -USB_ERR_TIMEOUT;
+    }
+    if (retry.raw_result_valid && retry.raw_result < 0) {
+        return retry.raw_result;
+    }
+    if (retry.status < 0) {
+        return retry.status;
+    }
+    return -USB_ERR_IO;
 }
 
 int usbh_hid_set_idle(struct usbh_hid *hid_class, uint8_t report_id, uint8_t duration)
 {
-    struct usb_setup_packet *setup;
-
     if (!hid_class || !hid_class->hport) {
         return -USB_ERR_INVAL;
     }
-    setup = hid_class->hport->setup;
-
-    setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_INTERFACE;
-    setup->bRequest = HID_REQUEST_SET_IDLE;
-    setup->wValue = (duration << 8) | report_id;
-    setup->wIndex = hid_class->intf;
-    setup->wLength = 0;
-
-    return usbh_control_transfer(hid_class->hport, setup, NULL);
+    const int64_t deadline_us = esp_timer_get_time() +
+        ((int64_t)CONFIG_USBHOST_CONTROL_TRANSFER_TIMEOUT * 1000LL);
+    return cherryusb_hid_control_transfer_until(
+        hid_class->hport,
+        USB_REQUEST_DIR_OUT | USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_INTERFACE,
+        HID_REQUEST_SET_IDLE, (uint16_t)((duration << 8U) | report_id),
+        hid_class->intf, 0U, NULL, deadline_us, NULL);
 }
 
 int usbh_hid_get_idle(struct usbh_hid *hid_class, uint8_t *buffer)
@@ -244,6 +319,8 @@ int usbh_hid_connect(struct usbh_hubport *hport, uint8_t intf)
 
     struct usbh_hid *hid_class = usbh_hid_class_alloc();
     if (hid_class == NULL) {
+        dual_usb_host_diag_failure(
+            DUAL_USB_HOST_DIAG_STAGE_HID_CLASS_ALLOC_USB, -USB_ERR_NOMEM);
         USB_LOG_ERR("HID load failed: stage=class_alloc bus=%u addr=%u intf_index=%u intf_num=%u raw_return=%d report_size=unknown elapsed_us=%" PRId64 "\r\n",
                     (unsigned)bus_id, hport != NULL ? (unsigned)hport->dev_addr : UINT8_MAX,
                     (unsigned)intf, (unsigned)interface_number, -USB_ERR_NOMEM,
@@ -266,6 +343,9 @@ int usbh_hid_connect(struct usbh_hubport *hport, uint8_t intf)
                     struct usb_hid_descriptor *desc = (struct usb_hid_descriptor *)(p + 9);
 
                     if (desc->bDescriptorType != HID_DESCRIPTOR_TYPE_HID) {
+                        dual_usb_host_diag_failure(
+                            DUAL_USB_HOST_DIAG_STAGE_HID_DESCRIPTOR_VALIDATE_USB,
+                            -USB_ERR_INVAL);
                         USB_LOG_ERR("HID load failed: stage=hid_descriptor_validate bus=%u addr=%u intf_index=%u intf_num=%u raw_return=%d report_size=unknown elapsed_us=%" PRId64 "\r\n",
                                     (unsigned)bus_id, (unsigned)hport->dev_addr,
                                     (unsigned)intf, (unsigned)interface_number,
@@ -274,6 +354,9 @@ int usbh_hid_connect(struct usbh_hubport *hport, uint8_t intf)
                     }
 
                     if (desc->subdesc[0].bDescriptorType != HID_DESCRIPTOR_TYPE_HID_REPORT) {
+                        dual_usb_host_diag_failure(
+                            DUAL_USB_HOST_DIAG_STAGE_HID_REPORT_DESCRIPTOR_HEADER_USB,
+                            -USB_ERR_INVAL);
                         USB_LOG_ERR("HID load failed: stage=report_descriptor_header_validate bus=%u addr=%u intf_index=%u intf_num=%u raw_return=%d report_size=unknown elapsed_us=%" PRId64 "\r\n",
                                     (unsigned)bus_id, (unsigned)hport->dev_addr,
                                     (unsigned)intf, (unsigned)interface_number,
@@ -294,6 +377,8 @@ int usbh_hid_connect(struct usbh_hubport *hport, uint8_t intf)
     }
 
     if (found == false) {
+        dual_usb_host_diag_failure(
+            DUAL_USB_HOST_DIAG_STAGE_HID_INTERFACE_LOOKUP_USB, -USB_ERR_INVAL);
         USB_LOG_ERR("HID load failed: stage=interface_descriptor_lookup bus=%u addr=%u intf_index=%u intf_num=%u raw_return=%d report_size=unknown elapsed_us=%" PRId64 "\r\n",
                     (unsigned)bus_id, (unsigned)hport->dev_addr,
                     (unsigned)intf, (unsigned)interface_number,
@@ -338,6 +423,8 @@ found:
         esp_timer_get_time() - request_started_us;
     char actual_report_length[16];
     if (ret < 0) {
+        dual_usb_host_diag_failure(
+            DUAL_USB_HOST_DIAG_STAGE_HID_GET_REPORT_DESCRIPTOR_USB, ret);
         USB_LOG_ERR("HID request failed: stage=get_report_descriptor bus=%u addr=%u intf_index=%u intf_num=%u class_index=%u wIndex=%u requested=%" PRIu32 " raw_return=%d actual_payload=unknown elapsed_us=%" PRId64 "\r\n",
                     (unsigned)bus_id, (unsigned)hport->dev_addr, (unsigned)intf,
                     (unsigned)interface_number, (unsigned)hid_class->minor,

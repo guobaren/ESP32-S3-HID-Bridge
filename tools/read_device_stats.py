@@ -50,6 +50,37 @@ COUNTER_NAMES = {
     63: "uart1_budget_exhausted", 64: "uart_fifo_ovf_events",
     65: "uart_buffer_full_events", 66: "uart_event_reset_dropped",
     67: "p_usb_state", 68: "m_vendor_session_state",
+    69: "usb_host_diag_flags", 70: "usb_host_device_epoch",
+    71: "usb_host_hprt", 72: "usb_host_gintsts", 73: "usb_host_gintmsk",
+    74: "usb_host_pcdet_count", 75: "usb_host_pcdet_connected_wake_count",
+    76: "usb_host_discint_count", 77: "usb_host_last_pcdet_ms",
+    78: "usb_host_last_discint_ms", 79: "usb_host_hub_wake_count",
+    80: "usb_host_connection_change_count", 81: "usb_host_last_port_status_change",
+    82: "usb_host_last_connection_change_ms",
+    83: "usb_host_enumeration_attempt_count", 84: "usb_host_enumeration_success_count",
+    85: "usb_host_failure_observation_count", 86: "usb_host_last_stage",
+    87: "usb_host_last_raw_error", 88: "usb_host_last_stage_ms",
+    89: "usb_host_last_failure_stage", 90: "usb_host_last_failure_raw_error",
+    91: "usb_host_last_failure_ms", 92: "usb_host_input_count",
+    93: "usb_host_input_age_ms", 94: "usb_host_heartbeat_success_count",
+    95: "usb_host_heartbeat_failure_count", 96: "usb_host_last_connected_pcdet_ms",
+}
+
+USB_HOST_DIAG_STAGE_NAMES = {
+    0: "unknown", 1: "disconnect_event", 2: "debounce", 3: "port_reset",
+    4: "port_enable_check", 5: "enumerate_usb", 6: "enumerate_success",
+    7: "hub_port_status_usb", 8: "hub_clear_feature_usb", 9: "hub_reset_usb",
+    10: "port_enable_failure", 11: "hid_class_alloc_usb",
+    12: "hid_descriptor_validate_usb", 13: "hid_report_descriptor_header_usb",
+    14: "hid_interface_lookup_usb", 15: "hid_get_report_descriptor_usb",
+    16: "hid_init_esp", 17: "hid_init_urb_raw", 18: "hid_init_lifecycle_esp",
+    19: "hid_init_state_alloc_esp", 20: "hid_init_full_descriptor_esp",
+    21: "hid_init_descriptor_length_esp", 22: "hid_init_endpoint_esp",
+    23: "hid_init_input_buffer_esp", 24: "hid_init_timer_create_esp",
+    25: "hid_init_interface_open_esp", 26: "hid_init_profile_lock_esp",
+    27: "hid_init_profile_add_esp", 28: "hid_init_timer_start_esp",
+    29: "hid_init_arguments_esp", 30: "hid_init_profile_control_esp",
+    31: "hid_init_profile_validate_esp", 32: "hid_init_profile_build_esp",
 }
 
 QUEUE_NAMES = {
@@ -68,6 +99,7 @@ class SnapshotCollector:
         self.page_counts: dict[int, int] = {}
         self.pages: dict[int, set[int]] = {1: set(), 2: set()}
         self.counters: dict[str, int] = {}
+        self.counter_ids: set[int] = set()
         self.queues: dict[int, dict] = {}
 
     @property
@@ -115,6 +147,7 @@ class SnapshotCollector:
                 if name in self.counters:
                     raise ValueError(f"重复计数器 id={item_id}")
                 self.counters[name] = value
+                self.counter_ids.add(item_id)
             else:
                 unit = record[1]
                 if unit not in (1, 2):
@@ -139,6 +172,10 @@ class SnapshotCollector:
         if not self.complete or self.role is None or self.uptime_ms is None:
             raise ValueError("统计快照缺页")
         common_counters = set(range(49, 67))
+        has_any_host_diagnostics = any(69 <= item_id <= 96 for item_id in self.counter_ids)
+        has_host_diagnostics = self.role == 2 and 69 in self.counter_ids
+        if has_any_host_diagnostics and not has_host_diagnostics:
+            raise ValueError("USB Host 诊断计数必须由 M 板以完整扩展字段提供")
         if self.role == 2:
             required_counters = set(range(1, 37)) | common_counters | {68}
             required_queues = set(range(1, 10)) | {13}
@@ -147,6 +184,8 @@ class SnapshotCollector:
             required_counters = set(range(37, 49)) | common_counters | {67}
             required_queues = set(range(4, 10)) | {10, 11, 12, 13}
             role_name = "P/PC_DEVICE"
+        if has_host_diagnostics:
+            required_counters |= set(range(69, 97))
         # Check by names, keeping the public JSON counter keys human-readable.
         missing = [counter_id for counter_id in required_counters
                    if COUNTER_NAMES[counter_id] not in self.counters]
@@ -186,6 +225,7 @@ class SnapshotCollector:
                 "waitingHost": bool(packed & (1 << 3)),
                 "vendorSessionEpoch": packed >> 32,
             }
+        state["usbHostDiagnostics"] = self._usb_host_diagnostics(has_host_diagnostics)
         return {
             "role": role_name,
             "roleId": self.role,
@@ -193,6 +233,88 @@ class SnapshotCollector:
             "counters": self.counters,
             "state": state,
             "queues": [self.queues[key] for key in sorted(self.queues)],
+        }
+
+    def _usb_host_diagnostics(self, available: bool) -> dict:
+        if not available:
+            return {"available": False, "schemaVersion": None}
+
+        def counter(item_id: int) -> int:
+            return self.counters[COUNTER_NAMES[item_id]]
+
+        def stage_name(stage: int) -> str:
+            return USB_HOST_DIAG_STAGE_NAMES.get(stage, f"unknown_{stage}")
+
+        def raw_error(item_id: int) -> int | None:
+            value = counter(item_id)
+            return None if value == -(1 << 31) else value
+
+        flags = counter(69)
+        if not flags & 1 or (flags >> 4) & 0xF != 1:
+            raise ValueError("USB Host diagnostics 标志未声明支持或 schema 版本不匹配")
+        registers_valid = bool(flags & (1 << 11))
+        lifecycle_valid = bool(flags & (1 << 12))
+        input_valid = bool(flags & (1 << 13))
+        pcdet_count = counter(74)
+        pcdet_wake_count = counter(75)
+        discint_count = counter(76)
+        connection_change_count = counter(80)
+        attempt_count = counter(83)
+        failure_observations = counter(85)
+        input_count = counter(92)
+        last_stage = counter(86)
+        last_failure_stage = counter(89)
+        last_connection = counter(81)
+        has_latest = attempt_count > 0 or failure_observations > 0
+        has_latest = has_latest or connection_change_count > 0
+        return {
+            "available": True,
+            "schemaVersion": (flags >> 4) & 0xF,
+            "backend": "CherryUSB" if flags & (1 << 1) else "unknown",
+            "capabilities": {
+                "dwc2Irq": bool(flags & (1 << 8)),
+                "hubEvents": bool(flags & (1 << 9)),
+                "inputHeartbeat": bool(flags & (1 << 10)),
+            },
+            "flags": flags,
+            "registerSnapshotValid": registers_valid,
+            "lifecycleSnapshotValid": lifecycle_valid,
+            "inputSnapshotValid": input_valid,
+            "initialized": bool(flags & (1 << 14)) if lifecycle_valid else None,
+            "stopping": bool(flags & (1 << 15)) if lifecycle_valid else None,
+            "hportPresent": bool(flags & (1 << 16)) if lifecycle_valid else None,
+            "connected": bool(flags & (1 << 17)) if lifecycle_valid else None,
+            "profileReady": bool(flags & (1 << 18)) if lifecycle_valid else None,
+            "deviceEpoch": counter(70) if lifecycle_valid else None,
+            "hprt": counter(71) if registers_valid else None,
+            "gintsts": counter(72) if registers_valid else None,
+            "gintmsk": counter(73) if registers_valid else None,
+            "pcdetCount": pcdet_count,
+            "pcdetConnectedWakeCount": pcdet_wake_count,
+            "discintCount": discint_count,
+            "lastPcDetMs": counter(77) if pcdet_count else None,
+            "lastDiscintMs": counter(78) if discint_count else None,
+            "hubWakeCount": counter(79),
+            "connectionChangeCount": connection_change_count,
+            "lastPortStatus": last_connection >> 16 if connection_change_count else None,
+            "lastPortChange": last_connection & 0xFFFF if connection_change_count else None,
+            "lastConnectionChangeMs": counter(82) if connection_change_count else None,
+            "enumerationAttemptCount": attempt_count,
+            "enumerationSuccessCount": counter(84),
+            "failureObservationCount": failure_observations,
+            "lastStageId": last_stage if has_latest else None,
+            "lastStage": stage_name(last_stage) if has_latest else None,
+            "lastRawError": raw_error(87) if has_latest else None,
+            "lastStageMs": counter(88) if has_latest else None,
+            "lastFailureStageId": last_failure_stage if failure_observations else None,
+            "lastFailureStage": stage_name(last_failure_stage) if failure_observations else None,
+            "lastFailureRawError": raw_error(90) if failure_observations else None,
+            "lastFailureMs": counter(91) if failure_observations else None,
+            "inputCount": input_count,
+            "inputAgeMs": counter(93) if input_valid else None,
+            "heartbeatSuccessCount": counter(94),
+            "heartbeatFailureCount": counter(95),
+            "lastConnectedPcDetMs": counter(96) if pcdet_wake_count else None,
         }
 
 
@@ -213,6 +335,9 @@ def main() -> int:
     port.port = args.port
     try:
         port.open()
+        # 打开后再次确认低电平，避免驱动在 open() 时恢复默认线路状态。
+        port.dtr = False
+        port.rts = False
     except serial.SerialException as error:
         print(f"打开 {args.port} 失败：{error}", file=sys.stderr)
         return 2

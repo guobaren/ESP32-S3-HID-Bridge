@@ -1,6 +1,6 @@
 namespace HidBridge.Host.Transport;
 
-internal readonly record struct MakcuModeSnapshot(bool Enabled, int BaudRate, byte Status);
+internal readonly record struct MakcuModeSnapshot(bool Enabled, int BaudRate, byte Status, int ProtocolVersion = 4);
 
 internal readonly record struct MakcuModeChangeResult(
     bool Success,
@@ -24,7 +24,7 @@ internal interface IMakcuModeHandshake
 /// <summary>
 /// 将固件“请求已受理”与“新波特率下状态和 M 角色已验证”分开处理。
 /// </summary>
-internal sealed class MakcuModeCoordinator(IMakcuModeHandshake handshake)
+internal sealed class MakcuModeCoordinator(IMakcuModeHandshake handshake, Func<int>? requestedVersion = null)
 {
     internal const int A5BaudRate = 921600;
     internal const int MakcuBaudRate = 115200;
@@ -70,13 +70,15 @@ internal sealed class MakcuModeCoordinator(IMakcuModeHandshake handshake)
                     cancellationToken).ConfigureAwait(false);
                 int targetBaudRate = requestedEnabled ? MakcuBaudRate : A5BaudRate;
                 if (accepted is { Status: 0 } acceptance &&
-                    acceptance.Enabled == requestedEnabled && acceptance.BaudRate == targetBaudRate)
+                    acceptance.Enabled == requestedEnabled && acceptance.BaudRate == targetBaudRate &&
+                    (!requestedEnabled || acceptance.ProtocolVersion == (requestedVersion?.Invoke() ?? 4)))
                 {
                     await Task.Delay(FirmwareSwitchSettleDelay, cancellationToken).ConfigureAwait(false);
                     await handshake.SetBaudRateAsync(targetBaudRate, cancellationToken).ConfigureAwait(false);
                     MakcuModeSnapshot? verified = await handshake.QueryAsync(cancellationToken).ConfigureAwait(false);
                     bool roleVerified = verified is { Status: 0 } state &&
                         state.Enabled == requestedEnabled && state.BaudRate == targetBaudRate &&
+                        (!requestedEnabled || state.ProtocolVersion == (requestedVersion?.Invoke() ?? 4)) &&
                         await handshake.ProbeMouseHostAsync(cancellationToken).ConfigureAwait(false);
                     if (roleVerified && verified is MakcuModeSnapshot verifiedState)
                     {
@@ -200,6 +202,22 @@ internal sealed class MakcuModeCoordinator(IMakcuModeHandshake handshake)
         {
             _gate.Release();
         }
+    }
+
+    internal static async Task<MakcuModeChangeResult> ChangeVersionAsync(
+        int version,
+        Func<bool, Task<MakcuModeChangeResult>> setMode,
+        Action<int> selectVersion)
+    {
+        if (version is not (3 or 4)) throw new ArgumentOutOfRangeException(nameof(version));
+        MakcuModeChangeResult disabled = await setMode(false);
+        if (!disabled.Success || !disabled.ActualStateVerified || disabled.ActualEnabled ||
+            disabled.ActualBaudRate != A5BaudRate)
+        {
+            return disabled with { Success = false, Message = $"切换版本前关闭 Makcu 失败：{disabled.Message}" };
+        }
+        selectVersion(version);
+        return await setMode(true);
     }
 
     private static IEnumerable<int> DistinctBaudRates(int first, int second)

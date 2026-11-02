@@ -486,14 +486,15 @@ static inline bool link_profile_ack_updates_hid_state(bool matched, bool accepte
 }
 
 /*
- * Profile CRC 复用判定（2026-09-28，纯逻辑）。
+ * Profile 数据复用判定（纯逻辑）：复用只避免重新接收/解析相同的Profile数据，
+ * 不复用当前USB实例；接收一个新的published事务后仍须完整USB重枚举并等待mounted。
  *
  * 背景（实测，见 docs/交接.md Next Steps 第 0 条）：板间 Profile 数据段只有 12~30 ms，
  * 而 P 侧"卸载 → 安装 → Windows 重新枚举"要 609~962 ms（典型）、尾部 2.7 s。
- * 因此真正省时间的一步是**跳过卸载+重装**，而不是跳过数据。
+ * 因此CRC命中只复用缓存Profile，仍保持USB重枚举、释放旧会话和最终ACK门控。
  *
- * 只有下列条件全部成立才允许复用当前已挂载的克隆：
- *   - 重配置通道已启用，且克隆处于活动 + 真正挂载状态；
+ * 只有下列条件全部成立才允许复用已安装克隆对应的Profile数据：
+ *   - 重配置通道已启用，且克隆活动、设备已安装并真正挂载；
  *   - 没有在途的卸载请求、卸载失败、安装请求或安装任务；
  *   - 本次提议的 CRC32 与"已安装 Profile"的 CRC32 完全一致且非 0。
  * 任何一条不成立都必须退回完整路径（卸载 + 重装），宁可慢也不把陈旧克隆留给接收端。
@@ -502,6 +503,7 @@ static inline bool link_profile_ack_updates_hid_state(bool matched, bool accepte
 static inline bool link_profile_reuse_allowed(
     bool reconfigure_enabled,
     bool clone_active,
+    bool device_installed,
     bool usb_mounted,
     bool operation_in_progress,
     bool profile_pending,
@@ -510,7 +512,7 @@ static inline bool link_profile_reuse_allowed(
     uint32_t offered_crc32,
     uint32_t installed_crc32)
 {
-    if (!reconfigure_enabled || !clone_active || !usb_mounted ||
+    if (!reconfigure_enabled || !clone_active || !device_installed || !usb_mounted ||
         operation_in_progress || profile_pending ||
         disconnect_requested || disconnect_failed) {
         return false;

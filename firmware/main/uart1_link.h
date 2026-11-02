@@ -22,8 +22,10 @@ esp_err_t dual_uart1_start(
     const uint8_t node_id[6],
     dual_link_frame_callback_t frame_callback,
     dual_link_fault_callback_t fault_callback);
-/* Role may move exactly once from UNRESOLVED to a locked role per boot. */
+/* 每次 USB 探测会话只允许从 UNRESOLVED 锁定一次。 */
 esp_err_t dual_uart1_lock_role(uint8_t role);
+/* 调用前必须停止旧 USB/输入生产者；合作式暂停收发后切换到新 generation。 */
+esp_err_t dual_uart1_begin_role_probe(void);
 void dual_uart1_set_usb_state(uint8_t usb_state);
 bool dual_uart1_peer_online(void);
 bool dual_uart1_peer_hid_ready(void);

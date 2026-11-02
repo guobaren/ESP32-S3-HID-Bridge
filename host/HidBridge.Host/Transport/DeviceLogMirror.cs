@@ -421,7 +421,7 @@ internal sealed class DeviceLogMirror : IDisposable
         };
         try
         {
-            candidate.Open();
+            NonResettingSerialPort.Open(candidate);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
         {

@@ -23,8 +23,14 @@ typedef enum {
 
 typedef struct {
     dual_status_led_role_t role;
+    /* P 的本地完整 USB 克隆就绪门（由 update_pc_ready_led 聚合）。 */
     bool pc_mounted;
+    /* M 的物理鼠标 HID 接口就绪。 */
     bool host_mouse_ready;
+    /* M 收到匹配当前传输/generation 的成功 PROFILE_ACK。 */
+    bool host_profile_ready;
+    /* P 本地 UART1 USB 状态已进入 HID_CONNECTED。 */
+    bool local_usb_ready;
     bool peer_connected;
     bool peer_usb_ready;
     bool flow_error;
@@ -40,6 +46,12 @@ void dual_status_led_logic_set_pc_mounted(
     dual_status_led_state_t *state,
     bool mounted);
 void dual_status_led_logic_set_host_mouse_ready(
+    dual_status_led_state_t *state,
+    bool ready);
+void dual_status_led_logic_set_host_profile_ready(
+    dual_status_led_state_t *state,
+    bool ready);
+void dual_status_led_logic_set_local_usb_ready(
     dual_status_led_state_t *state,
     bool ready);
 void dual_status_led_logic_set_peer_connected(

@@ -115,6 +115,7 @@ typedef enum {
     DUAL_MAKCU_MODE_OP_DISABLE = 0,
     DUAL_MAKCU_MODE_OP_ENABLE = 1,
     DUAL_MAKCU_MODE_OP_QUERY = 2,
+    DUAL_MAKCU_MODE_OP_ENABLE_LEGACY = 3,
 } dual_makcu_mode_opcode_t;
 
 bool dual_makcu_mode_request_decode(
@@ -145,12 +146,15 @@ typedef enum {
     DUAL_DIAG_KIND_P_USB_REPORT_FAILED = 0x87,
 } dual_diag_kind_t;
 
-/* UART1 peer role; unresolved is volatile boot-time discovery only. */
+/* UART1 运行角色；USB 断开后可回到未定身份重新探测。 */
 typedef enum {
     DUAL_ROLE_UNRESOLVED = 0,
     DUAL_ROLE_PC_DEVICE = 1,
     DUAL_ROLE_MOUSE_HOST = 2,
 } dual_device_role_t;
+
+#define DUAL_LINK_HELLO_LENGTH 13U
+#define DUAL_LINK_HELLO_USB_ROLE_OFFSET 12U
 
 static inline uint8_t dual_role_opposite(uint8_t role)
 {
@@ -163,16 +167,25 @@ static inline uint8_t dual_role_opposite(uint8_t role)
     return DUAL_ROLE_UNRESOLVED;
 }
 
-/* A confirmed peer identity wins; local USB evidence is the fallback. */
+/* 只有本地 USB 证据可用于向对端提供身份，推导出的运行角色不能循环背书。 */
+static inline uint8_t dual_role_usb_claim(uint8_t role, bool pc_attached, bool host_present)
+{
+    if (role == DUAL_ROLE_PC_DEVICE && pc_attached) {
+        return role;
+    }
+    if (role == DUAL_ROLE_MOUSE_HOST && host_present) {
+        return role;
+    }
+    return DUAL_ROLE_UNRESOLVED;
+}
+
+/* 本板实际 USB 证据优先；peer_role 必须来自对端当前的 USB 确认身份。 */
 static inline uint8_t dual_role_resolve(uint8_t peer_role, uint8_t local_role)
 {
-    if (peer_role == DUAL_ROLE_PC_DEVICE || peer_role == DUAL_ROLE_MOUSE_HOST) {
-        return dual_role_opposite(peer_role);
-    }
     if (local_role == DUAL_ROLE_PC_DEVICE || local_role == DUAL_ROLE_MOUSE_HOST) {
         return local_role;
     }
-    return DUAL_ROLE_UNRESOLVED;
+    return dual_role_opposite(peer_role);
 }
 
 static inline bool dual_peer_profile_invalidated(

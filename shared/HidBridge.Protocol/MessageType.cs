@@ -24,6 +24,7 @@ public enum MessageType : byte
     StatsSnapshotRequest = 0x1D,
     StatsSnapshotResponse = 0x1E,
     ButtonState = 0x1F,
+    LinkHello = 0x20,
     VendorSessionBegin = 0x35,
     VendorSessionAck = 0x36,
     MakcuModeRequest = 0x37,

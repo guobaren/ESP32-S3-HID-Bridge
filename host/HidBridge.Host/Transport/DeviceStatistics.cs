@@ -262,6 +262,17 @@ internal sealed class DeviceStatsPageCollector(string portName, ushort sequence)
         byte[] requiredQueueIds = _role == 2
             ? [.. Enumerable.Range(1, 9).Select(value => (byte)value), 13]
             : [.. Enumerable.Range(4, 6).Select(value => (byte)value), 10, 11, 12, 13];
+        bool hasHostDiagnostics = _counters.ContainsKey(69);
+        bool hasAnyHostDiagnosticsCounter = _counters.Keys.Any(id => id is >= 69 and <= 96);
+        if (hasAnyHostDiagnosticsCounter && (!hasHostDiagnostics || _role != 2))
+        {
+            throw new InvalidDataException("USB Host 诊断计数必须由 M 板以完整扩展字段提供。");
+        }
+        if (hasHostDiagnostics)
+        {
+            requiredCounterIds = [.. requiredCounterIds,
+                .. Enumerable.Range(69, 28).Select(value => (byte)value)];
+        }
         if (requiredCounterIds.Any(id => !_counters.ContainsKey(id)) ||
             requiredQueueIds.Any(id => !_queues.ContainsKey(id)))
         {
@@ -271,6 +282,7 @@ internal sealed class DeviceStatsPageCollector(string portName, ushort sequence)
         Dictionary<string, object> counters = _counters.ToDictionary(
             item => CounterName(item.Key), item => item.Value, StringComparer.Ordinal);
         Dictionary<string, object> state = BuildBoardState(_role.Value);
+        state["usbHostDiagnostics"] = BuildUsbHostDiagnostics(_role.Value, hasHostDiagnostics);
         return new DeviceStatisticsSnapshot(
             portName,
             _role.Value,
@@ -280,6 +292,139 @@ internal sealed class DeviceStatsPageCollector(string portName, ushort sequence)
             state,
             _queues.Values.OrderBy(queue => queue.Id).ToArray());
     }
+
+    private Dictionary<string, object?> BuildUsbHostDiagnostics(byte role, bool available)
+    {
+        Dictionary<string, object?> result = new(StringComparer.Ordinal)
+        {
+            ["available"] = available,
+        };
+        if (!available || role != 2)
+        {
+            result["schemaVersion"] = null;
+            return result;
+        }
+
+        ulong flags = Counter(69);
+        if ((flags & 1UL) == 0 || ((flags >> 4) & 0xFUL) != 1UL)
+        {
+            throw new InvalidDataException("USB Host diagnostics 标志未声明支持或 schema 版本不匹配。");
+        }
+        bool registersValid = (flags & (1UL << 11)) != 0;
+        bool lifecycleValid = (flags & (1UL << 12)) != 0;
+        bool inputValid = (flags & (1UL << 13)) != 0;
+        ulong pcdetCount = Counter(74);
+        ulong pcdetWakeCount = Counter(75);
+        ulong discintCount = Counter(76);
+        ulong connectionChangeCount = Counter(80);
+        ulong attemptCount = Counter(83);
+        ulong failureObservations = Counter(85);
+        ulong inputCount = Counter(92);
+        ulong lastStage = Counter(86);
+        ulong lastFailStage = Counter(89);
+        ulong connectionLast = Counter(81);
+
+        result["schemaVersion"] = (int)((flags >> 4) & 0x0FUL);
+        result["backend"] = (flags & (1UL << 1)) != 0 ? "CherryUSB" : "unknown";
+        result["capabilities"] = new Dictionary<string, object>(StringComparer.Ordinal)
+        {
+            ["dwc2Irq"] = (flags & (1UL << 8)) != 0,
+            ["hubEvents"] = (flags & (1UL << 9)) != 0,
+            ["inputHeartbeat"] = (flags & (1UL << 10)) != 0,
+        };
+        result["flags"] = flags;
+        result["registerSnapshotValid"] = registersValid;
+        result["lifecycleSnapshotValid"] = lifecycleValid;
+        result["inputSnapshotValid"] = inputValid;
+        result["initialized"] = lifecycleValid ? (flags & (1UL << 14)) != 0 : null;
+        result["stopping"] = lifecycleValid ? (flags & (1UL << 15)) != 0 : null;
+        result["hportPresent"] = lifecycleValid ? (flags & (1UL << 16)) != 0 : null;
+        result["connected"] = lifecycleValid ? (flags & (1UL << 17)) != 0 : null;
+        result["profileReady"] = lifecycleValid ? (flags & (1UL << 18)) != 0 : null;
+        result["deviceEpoch"] = lifecycleValid ? Counter(70) : null;
+        result["hprt"] = registersValid ? Counter(71) : null;
+        result["gintsts"] = registersValid ? Counter(72) : null;
+        result["gintmsk"] = registersValid ? Counter(73) : null;
+        result["pcdetCount"] = pcdetCount;
+        result["pcdetConnectedWakeCount"] = pcdetWakeCount;
+        result["discintCount"] = discintCount;
+        result["lastPcDetMs"] = pcdetCount > 0 ? Counter(77) : null;
+        result["lastDiscintMs"] = discintCount > 0 ? Counter(78) : null;
+        result["hubWakeCount"] = Counter(79);
+        result["connectionChangeCount"] = connectionChangeCount;
+        result["lastPortStatus"] = connectionChangeCount > 0 ? connectionLast >> 16 : null;
+        result["lastPortChange"] = connectionChangeCount > 0 ? connectionLast & 0xFFFFUL : null;
+        result["lastConnectionChangeMs"] = connectionChangeCount > 0 ? Counter(82) : null;
+        result["enumerationAttemptCount"] = attemptCount;
+        result["enumerationSuccessCount"] = Counter(84);
+        result["failureObservationCount"] = failureObservations;
+        bool hasLatestStage = attemptCount > 0 || failureObservations > 0 ||
+            connectionChangeCount > 0;
+        result["lastStageId"] = hasLatestStage ? lastStage : null;
+        result["lastStage"] = hasLatestStage
+            ? DiagnosticStageName(lastStage) : null;
+        result["lastRawError"] = hasLatestStage
+            ? DiagnosticRawError(_counters[87]) : null;
+        result["lastStageMs"] = hasLatestStage ? Counter(88) : null;
+        result["lastFailureStageId"] = failureObservations > 0 ? lastFailStage : null;
+        result["lastFailureStage"] = failureObservations > 0
+            ? DiagnosticStageName(lastFailStage) : null;
+        result["lastFailureRawError"] = failureObservations > 0
+            ? DiagnosticRawError(_counters[90]) : null;
+        result["lastFailureMs"] = failureObservations > 0 ? Counter(91) : null;
+        result["inputCount"] = inputCount;
+        result["inputAgeMs"] = inputValid ? Counter(93) : null;
+        result["heartbeatSuccessCount"] = Counter(94);
+        result["heartbeatFailureCount"] = Counter(95);
+        result["lastConnectedPcDetMs"] = pcdetWakeCount > 0 ? Counter(96) : null;
+        return result;
+
+        ulong Counter(byte id) => (ulong)_counters[id];
+    }
+
+    private static object? DiagnosticRawError(object value)
+    {
+        long signedValue = value is long signed ? signed : unchecked((long)(ulong)value);
+        return signedValue == int.MinValue ? null : signedValue;
+    }
+
+    private static string DiagnosticStageName(ulong stage) => stage switch
+    {
+        0 => "unknown",
+        1 => "disconnect_event",
+        2 => "debounce",
+        3 => "port_reset",
+        4 => "port_enable_check",
+        5 => "enumerate_usb",
+        6 => "enumerate_success",
+        7 => "hub_port_status_usb",
+        8 => "hub_clear_feature_usb",
+        9 => "hub_reset_usb",
+        10 => "port_enable_failure",
+        11 => "hid_class_alloc_usb",
+        12 => "hid_descriptor_validate_usb",
+        13 => "hid_report_descriptor_header_usb",
+        14 => "hid_interface_lookup_usb",
+        15 => "hid_get_report_descriptor_usb",
+        16 => "hid_init_esp",
+        17 => "hid_init_urb_raw",
+        18 => "hid_init_lifecycle_esp",
+        19 => "hid_init_state_alloc_esp",
+        20 => "hid_init_full_descriptor_esp",
+        21 => "hid_init_descriptor_length_esp",
+        22 => "hid_init_endpoint_esp",
+        23 => "hid_init_input_buffer_esp",
+        24 => "hid_init_timer_create_esp",
+        25 => "hid_init_interface_open_esp",
+        26 => "hid_init_profile_lock_esp",
+        27 => "hid_init_profile_add_esp",
+        28 => "hid_init_timer_start_esp",
+        29 => "hid_init_arguments_esp",
+        30 => "hid_init_profile_control_esp",
+        31 => "hid_init_profile_validate_esp",
+        32 => "hid_init_profile_build_esp",
+        _ => $"unknown_{stage}",
+    };
 
     private Dictionary<string, object> BuildBoardState(byte role)
     {
@@ -396,6 +541,34 @@ internal sealed class DeviceStatsPageCollector(string portName, ushort sequence)
         66 => "uart_event_reset_dropped",
         67 => "p_usb_state",
         68 => "m_vendor_session_state",
+        69 => "usb_host_diag_flags",
+        70 => "usb_host_device_epoch",
+        71 => "usb_host_hprt",
+        72 => "usb_host_gintsts",
+        73 => "usb_host_gintmsk",
+        74 => "usb_host_pcdet_count",
+        75 => "usb_host_pcdet_connected_wake_count",
+        76 => "usb_host_discint_count",
+        77 => "usb_host_last_pcdet_ms",
+        78 => "usb_host_last_discint_ms",
+        79 => "usb_host_hub_wake_count",
+        80 => "usb_host_connection_change_count",
+        81 => "usb_host_last_port_status_change",
+        82 => "usb_host_last_connection_change_ms",
+        83 => "usb_host_enumeration_attempt_count",
+        84 => "usb_host_enumeration_success_count",
+        85 => "usb_host_failure_observation_count",
+        86 => "usb_host_last_stage",
+        87 => "usb_host_last_raw_error",
+        88 => "usb_host_last_stage_ms",
+        89 => "usb_host_last_failure_stage",
+        90 => "usb_host_last_failure_raw_error",
+        91 => "usb_host_last_failure_ms",
+        92 => "usb_host_input_count",
+        93 => "usb_host_input_age_ms",
+        94 => "usb_host_heartbeat_success_count",
+        95 => "usb_host_heartbeat_failure_count",
+        96 => "usb_host_last_connected_pcdet_ms",
         _ => $"counter_{id}"
     };
 

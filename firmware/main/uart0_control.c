@@ -40,9 +40,7 @@
 #define CONTROL_TASK_STACK_SIZE 6144
 #define CONTROL_POLL_MS 1U
 
-#if DUAL_PROXY_ENABLE_MAKCU_V4_API && DUAL_PROXY_ENABLE_MAKCU_ASCII_API
-#error "V4 MAK_API and legacy ASCII mode are exclusive on UART0"
-#endif
+static volatile bool s_makcu_legacy_selected;
 
 static const char *TAG = "dual_uart0";
 static dual_software_report_callback_t s_report_callback;
@@ -1522,7 +1520,8 @@ static void send_injection_result(const dual_frame_t *request, uint8_t status)
 
 static void send_stats_response(const dual_frame_t *request)
 {
-    dual_stats_snapshot_t snapshot;
+    /* UART0 控制由单一任务处理；扩展后的统计快照不放在任务栈上。 */
+    static dual_stats_snapshot_t snapshot;
     uint8_t status = 0U;
     if (request->payload_length != 0U) {
         status = 1U; /* bad request */
@@ -1784,6 +1783,10 @@ static void build_makcu_mode_status(
     response->payload_length = DUAL_MAKCU_MODE_STATUS_PAYLOAD_LENGTH;
     (void)dual_makcu_mode_status_encode(
         status, enabled, baud, response->payload, sizeof(response->payload));
+    if (enabled && s_makcu_legacy_selected) {
+        response->payload_length = 7U;
+        response->payload[6] = 3U;
+    }
 }
 
 static void send_makcu_mode_status(
@@ -1814,7 +1817,7 @@ static void release_software_input_for_mode_change(void)
 
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
 static esp_err_t accept_makcu_mode_transition(
-    const dual_frame_t *request, bool target_enabled)
+    const dual_frame_t *request, bool target_enabled, bool target_legacy)
 {
     const uint32_t target_baud = target_enabled
         ? CONTROL_BAUD_MAKCU : CONTROL_BAUD_DEFAULT;
@@ -1823,6 +1826,8 @@ static esp_err_t accept_makcu_mode_transition(
     size_t serialized_length = 0U;
     build_makcu_mode_status(request, DUAL_MAKCU_MODE_STATUS_OK,
                             target_enabled, target_baud, &response);
+    response.payload_length = target_enabled && target_legacy ? 7U : 6U;
+    if (response.payload_length == 7U) response.payload[6] = 3U;
     if (dual_frame_serialize(&response, serialized, sizeof(serialized),
                              &serialized_length) != ESP_OK) {
         return ESP_ERR_INVALID_ARG;
@@ -1849,6 +1854,7 @@ static esp_err_t accept_makcu_mode_transition(
                              __ATOMIC_RELEASE);
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
             s_makcu_v4_baud = target_baud;
+            s_makcu_legacy_selected = target_legacy;
 #endif
             dual_uart0_output_set_makcu_mode(target_enabled);
             if (target_enabled) {
@@ -1908,14 +1914,23 @@ static void handle_makcu_mode_request(const dual_frame_t *request)
                                current_enabled, current_baud);
         return;
     }
-    const bool target_enabled = opcode == DUAL_MAKCU_MODE_OP_ENABLE;
-    if (target_enabled == current_enabled) {
+    const bool target_legacy = opcode == DUAL_MAKCU_MODE_OP_ENABLE_LEGACY;
+#if !DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+    if (target_legacy) {
+        send_makcu_mode_status(request, DUAL_MAKCU_MODE_STATUS_UNSUPPORTED,
+                               current_enabled, current_baud);
+        return;
+    }
+#endif
+    const bool target_enabled = opcode != DUAL_MAKCU_MODE_OP_DISABLE;
+    if (target_enabled == current_enabled &&
+        (!target_enabled || target_legacy == s_makcu_legacy_selected)) {
         send_makcu_mode_status(request, DUAL_MAKCU_MODE_STATUS_OK,
                                current_enabled, current_baud);
         return;
     }
     const esp_err_t result = accept_makcu_mode_transition(
-        request, target_enabled);
+        request, target_enabled, target_legacy);
     if (result != ESP_OK) {
         /* A failed enqueue/drain cannot reliably carry a second status frame. */
         ESP_LOGW(TAG, "Makcu模式切换ACK/发送排空失败，保持当前模式：%s",
@@ -2351,6 +2366,16 @@ static void routed_v4(const makcu_v4_command_t *command, void *context)
 }
 #endif
 
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API && DUAL_PROXY_ENABLE_MAKCU_V4_API
+static void routed_legacy_ascii(const uint8_t *data, size_t length, void *context)
+{
+    if (!s_makcu_mode_enabled || !s_makcu_legacy_selected ||
+        s_uart0_reject_current_buffer_tail) return;
+    makcu_ascii_parser_feed((makcu_ascii_parser_t *)context, data, length,
+                            on_makcu_ascii_command, NULL);
+}
+#endif
+
 static void control_task(void *argument)
 {
     (void)argument;
@@ -2366,6 +2391,9 @@ static void control_task(void *argument)
     makcu_ascii_session_init(&s_makcu_session);
 #endif
     bool makcu_mode_active = false;
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
+    bool legacy_selected = false;
+#endif
     TickType_t last_statistics = xTaskGetTickCount();
     while (true) {
         if (__atomic_exchange_n(&s_legacy_cancel_requested, false, __ATOMIC_ACQ_REL)) {
@@ -2396,13 +2424,23 @@ static void control_task(void *argument)
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
         const bool requested_v4_mode = __atomic_load_n(
             &s_makcu_runtime_requested, __ATOMIC_ACQUIRE);
-        if (requested_v4_mode != makcu_mode_active) {
+        if (requested_v4_mode != makcu_mode_active ||
+            legacy_selected != s_makcu_legacy_selected) {
+            legacy_selected = s_makcu_legacy_selected;
             makcu_mode_active = requested_v4_mode;
             dual_parser_init(&parser, on_control_frame, NULL);
             uart0_protocol_router_init(&router, routed_a5, routed_v4, NULL);
             __atomic_store_n(&s_uart0_reject_current_buffer_tail, false,
                              __ATOMIC_RELEASE);
-            s_v4_owner = makcu_mode_active;
+            s_v4_owner = makcu_mode_active && !legacy_selected;
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+            makcu_ascii_parser_init(&makcu_parser);
+            makcu_ascii_session_init(&s_makcu_session);
+            if (legacy_selected) {
+                router.ascii_feed = routed_legacy_ascii;
+                router.context = &makcu_parser;
+            }
+#endif
             if (makcu_mode_active) {
                 makcu_v4_runtime_init();
                 s_state.active = false;
@@ -2412,7 +2450,7 @@ static void control_task(void *argument)
             }
         }
 #endif
-#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API && !DUAL_PROXY_ENABLE_MAKCU_V4_API
         const bool requested_makcu_mode = __atomic_load_n(
             &s_makcu_runtime_requested, __ATOMIC_ACQUIRE);
         if (requested_makcu_mode != makcu_mode_active) {
@@ -2441,6 +2479,14 @@ static void control_task(void *argument)
             }
             if (received > 0) uart0_protocol_router_feed(
                 &router, buffer, (size_t)received, now_ms);
+#if DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+            if (legacy_selected && makcu_ascii_session_lease_expired(
+                    &s_makcu_session, now_ms)) {
+                makcu_ascii_session_expire(&s_makcu_session);
+                legacy_motion_reset();
+                if (s_release_callback != NULL) s_release_callback();
+            }
+#endif
             if (s_v4_owner) {
                 makcu_v4_advance_jobs(now_ms);
                 makcu_v4_emit_events();
