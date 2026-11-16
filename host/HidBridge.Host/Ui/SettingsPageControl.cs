@@ -96,8 +96,8 @@ internal sealed class SettingsPageControl : UserControl
             Dock = DockStyle.Fill,
             Enabled = serialBridge is not null,
         };
-        _makcuVersionComboBox.Items.AddRange(["V4（ASCII / MAK_API）", "老版 V3 ASCII（兼容子集）"]);
-        _makcuVersionComboBox.SelectedIndex = _controller.Settings.MakcuProtocolVersion == 3 ? 1 : 0;
+        _makcuVersionComboBox.Items.AddRange(["V4（ASCII / MAK_API）", "老版 V3 ASCII（兼容子集）", "V2 二进制（鼠标兼容子集）"]);
+        _makcuVersionComboBox.SelectedIndex = _controller.Settings.MakcuProtocolVersion switch { 3 => 1, 2 => 2, _ => 0 };
         _buttonStatePublishingCheckBox = CreateOption(
             "发布物理鼠标按键状态",
             "订阅 M 板真实鼠标按键并写入下方配置的共享内存；Makcu 模式期间暂停。",
@@ -295,6 +295,7 @@ internal sealed class SettingsPageControl : UserControl
     internal CheckBox CloseToTrayCheckBox => _closeToTrayCheckBox;
     internal CheckBox LegacySingleBoardFirmwareCheckBox => _legacySingleBoardFirmwareCheckBox;
     internal Panel LegacySingleBoardOptionRow => _legacySingleBoardOptionRow;
+    internal ComboBox MakcuVersionComboBox => _makcuVersionComboBox;
     internal CheckBox MakcuModeCheckBox => _makcuModeCheckBox;
     internal CheckBox ButtonStatePublishingCheckBox => _buttonStatePublishingCheckBox;
     internal Panel MakcuModeOptionRow => _makcuModeOptionRow;
@@ -985,7 +986,7 @@ internal sealed class SettingsPageControl : UserControl
     private async Task OnMakcuVersionChangedAsync()
     {
         if (_loading || _makcuModeUserTransitionActive) return;
-        int requested = _makcuVersionComboBox.SelectedIndex == 1 ? 3 : 4;
+        int requested = _makcuVersionComboBox.SelectedIndex switch { 1 => 3, 2 => 2, _ => 4 };
         if (!_controller.Settings.MakcuEnabled)
         {
             _controller.Settings.MakcuProtocolVersion = requested;
@@ -1110,7 +1111,7 @@ internal sealed class SettingsPageControl : UserControl
     {
         bool previous = _loading;
         _loading = true;
-        _makcuVersionComboBox.SelectedIndex = _controller.Settings.MakcuProtocolVersion == 3 ? 1 : 0;
+        _makcuVersionComboBox.SelectedIndex = _controller.Settings.MakcuProtocolVersion switch { 3 => 1, 2 => 2, _ => 0 };
         _loading = previous;
     }
 

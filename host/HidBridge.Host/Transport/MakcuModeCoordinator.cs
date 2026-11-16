@@ -209,7 +209,7 @@ internal sealed class MakcuModeCoordinator(IMakcuModeHandshake handshake, Func<i
         Func<bool, Task<MakcuModeChangeResult>> setMode,
         Action<int> selectVersion)
     {
-        if (version is not (3 or 4)) throw new ArgumentOutOfRangeException(nameof(version));
+        if (version is not (2 or 3 or 4)) throw new ArgumentOutOfRangeException(nameof(version));
         MakcuModeChangeResult disabled = await setMode(false);
         if (!disabled.Success || !disabled.ActualStateVerified || disabled.ActualEnabled ||
             disabled.ActualBaudRate != A5BaudRate)

@@ -656,7 +656,7 @@ internal sealed class SerialBridge : IBridgeTransport, IMakcuModeHandshake
         CancellationToken cancellationToken)
     {
         byte opcode = enabled
-            ? (_settings.MakcuProtocolVersion == 3 ? MakcuModeProtocol.EnableLegacyOpcode : MakcuModeProtocol.EnableOpcode)
+            ? (_settings.MakcuProtocolVersion switch { 2 => MakcuModeProtocol.EnableV2Opcode, 3 => MakcuModeProtocol.EnableLegacyOpcode, _ => MakcuModeProtocol.EnableOpcode })
             : MakcuModeProtocol.DisableOpcode;
         SerialPort port = GetPortForModeHandshake();
         byte[] frame = MakcuModeProtocol.CreateRequest(_codec, opcode, out ushort sequence);

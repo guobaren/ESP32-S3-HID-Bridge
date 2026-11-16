@@ -116,6 +116,7 @@ typedef enum {
     DUAL_MAKCU_MODE_OP_ENABLE = 1,
     DUAL_MAKCU_MODE_OP_QUERY = 2,
     DUAL_MAKCU_MODE_OP_ENABLE_LEGACY = 3,
+    DUAL_MAKCU_MODE_OP_ENABLE_V2 = 4,
 } dual_makcu_mode_opcode_t;
 
 bool dual_makcu_mode_request_decode(

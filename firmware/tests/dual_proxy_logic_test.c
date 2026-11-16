@@ -320,7 +320,9 @@ static void test_bridge_protocol(void)
     const uint8_t legacy_request[] = {DUAL_MAKCU_MODE_OP_ENABLE_LEGACY};
     assert(dual_makcu_mode_request_decode(legacy_request, 1U, &opcode));
     assert(opcode == 3U);
-    const uint8_t invalid_request[] = {4U};
+    const uint8_t v2_request[] = {4U};
+    assert(dual_makcu_mode_request_decode(v2_request, 1U, &opcode) && opcode == 4U);
+    const uint8_t invalid_request[] = {5U};
     assert(!dual_makcu_mode_request_decode(invalid_request,
         sizeof(invalid_request), &opcode));
     assert(!dual_makcu_mode_request_decode(enable_request, 0U, &opcode));
@@ -2621,8 +2623,66 @@ static void test_button_state_subscription_heartbeat_and_generation(void)
     assert(observed.valid);
 }
 
+static makcu_v4_command_t v2_last;
+static unsigned v2_count;
+static void capture_v2(const makcu_v4_command_t *command, void *context)
+{
+    (void)context; v2_last = *command; ++v2_count;
+}
+static void test_makcu_v2(void)
+{
+    uart0_protocol_router_t router;
+    uart0_protocol_router_init(&router, capture_routed_a5, capture_v2, NULL);
+    router.v2_selected = true;
+    v2_count = route_a5_count = 0U;
+    const uint8_t move[] = {0x50, 0x0D, 4, 0, 0xA5, 0x5A, 0xDE, 0xAD};
+    for (size_t i=0; i<sizeof(move); ++i) {
+        uart0_protocol_router_feed(&router, move+i, 1U, 1U);
+        assert(v2_count == (i+1U == sizeof(move) ? 1U : 0U));
+    }
+    assert(route_a5_count == 0U && v2_last.v2_frame && v2_last.v2_opcode == 0x0D && v2_last.opcode == 0x18 && v2_last.error == 0);
+    assert(memcmp(v2_last.payload, move+4, 4U) == 0);
+    const uint8_t batch[] = {0x50,0x18,1,0,0xFF, 0x50,0x08,1,0,2, 0x50,0x08,0,0};
+    uart0_protocol_router_feed(&router,batch,sizeof(batch),2U);
+    assert(v2_count == 4U && v2_last.query && v2_last.opcode == 0x11);
+    const uint8_t silent_release[] = {0x50,0x08,1,0,2};
+    uart0_protocol_router_feed(&router,silent_release,sizeof(silent_release),3U);
+    assert(v2_last.error == 0 && v2_last.payload[0] == 2U);
+    const uint8_t bad[] = {0x50,0x08,1,0,3, 0x50,0xA2,1,0,4};
+    uart0_protocol_router_feed(&router,bad,5U,4U);
+    assert(v2_last.error != 0);
+    uart0_protocol_router_feed(&router,bad+5,5U,4U);
+    assert(v2_last.error != 0 && v2_last.v2_opcode == 0xA2);
+    const uint8_t curve[] = {0x50,0x0D,7,0,1,0,2,0,4,1,1};
+    uart0_protocol_router_feed(&router,curve,sizeof(curve),5U);
+    assert(v2_last.error != 0);
+    uint8_t oversized[69] = {0x50,0x0D,65,0};
+    memcpy(oversized+4,move,sizeof(move));
+    unsigned before = v2_count;
+    uart0_protocol_router_feed(&router,oversized,sizeof(oversized),6U);
+    assert(v2_count == before+1 && v2_last.error == MAKCU_V4_ERROR_TOO_LONG && route_a5_count == 0);
+    const uint8_t truncated[] = {0x50,0x0D,4,0,1};
+    uart0_protocol_router_feed(&router,truncated,sizeof(truncated),7U);
+    const uint8_t baud[] = {0x50,0xB1,0,0};
+    uart0_protocol_router_feed(&router,baud,sizeof(baud),257U);
+    assert(v2_last.error == 0 && v2_last.opcode == 0xA4 && v2_last.query);
+    dual_frame_t neutral = {.version=2,.type=DUAL_MESSAGE_MAKCU_MODE_REQUEST,.payload_length=1};
+    neutral.payload[0] = 2U;
+    uint8_t frame[32]; size_t written;
+    assert(dual_frame_serialize(&neutral,frame,sizeof(frame),&written) == ESP_OK);
+    uart0_protocol_router_feed(&router,frame,written,258U);
+    assert(route_a5_count == 1U);
+    const uint8_t ok = 0U;
+    assert(makcu_v2_encode_frame(0x0D,&ok,1U,frame,sizeof(frame),&written));
+    const uint8_t expected[] = {0x50,0x0D,1,0,0};
+    assert(written == sizeof(expected) && memcmp(frame,expected,written) == 0);
+    assert(!makcu_v2_encode_frame(1U,&ok,1U,frame,4U,&written));
+    puts("Makcu V2 framing/mapping/isolation/errors/timeout: PASS");
+}
+
 int main(void)
 {
+    test_makcu_v2();
     test_button_state_subscription_heartbeat_and_generation();
     test_uart0_protocol_isolation();
     test_uart0_a5_route_policy();

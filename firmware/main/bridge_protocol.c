@@ -8,7 +8,7 @@ bool dual_makcu_mode_request_decode(
 {
     if (payload == NULL || opcode == NULL ||
         payload_length != DUAL_MAKCU_MODE_REQUEST_PAYLOAD_LENGTH ||
-        payload[0] > DUAL_MAKCU_MODE_OP_ENABLE_LEGACY) {
+        payload[0] > DUAL_MAKCU_MODE_OP_ENABLE_V2) {
         return false;
     }
     *opcode = payload[0];
@@ -38,7 +38,7 @@ bool dual_makcu_mode_status_decode(
 {
     if (payload == NULL || status == NULL || enabled == NULL || baud == NULL ||
         (payload_length != DUAL_MAKCU_MODE_STATUS_PAYLOAD_LENGTH && payload_length != 7U) ||
-        (payload_length == 7U && payload[6] != 3U) ||
+        (payload_length == 7U && payload[6] != 3U && payload[6] != 2U) ||
         payload[0] > DUAL_MAKCU_MODE_STATUS_TX_FAILED ||
         payload[DUAL_MAKCU_MODE_STATUS_ENABLED_OFFSET] > 1U) {
         return false;

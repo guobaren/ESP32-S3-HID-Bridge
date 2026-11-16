@@ -1,6 +1,7 @@
 #pragma once
 #include "bridge_protocol.h"
 #include "makcu_v4_logic.h"
+#include "makcu_v2_logic.h"
 
 typedef enum {
     UART0_A5_ROUTE_IGNORE = 0,
@@ -18,6 +19,8 @@ typedef struct {
     uint32_t last_byte_ms;
     dual_parser_t legacy;
     makcu_v4_stream_parser_t v4;
+    makcu_v2_parser_t v2;
+    bool v2_selected;
     makcu_v4_command_callback_t v4_callback;
     void (*ascii_feed)(const uint8_t *, size_t, void *);
     void *context;

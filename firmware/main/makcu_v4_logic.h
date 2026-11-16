@@ -29,6 +29,8 @@ typedef struct {
     makcu_v4_transport_t transport;
     makcu_v4_error_t error;
     uint8_t opcode;
+    bool v2_frame;
+    uint8_t v2_opcode; /* 非零时使用 V2 响应封装。 */
     uint8_t payload_length;
     uint8_t payload[MAKCU_V4_MAX_PAYLOAD];
     int32_t argument[MAKCU_V4_ARGUMENT_MAX];

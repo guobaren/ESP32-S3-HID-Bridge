@@ -17,6 +17,7 @@ void uart0_protocol_router_tick(uart0_protocol_router_t *s, uint32_t now_ms)
         s->length = s->expected = 0U;
     }
     makcu_v4_stream_parser_tick(&s->v4, now_ms);
+    makcu_v2_parser_tick(&s->v2, now_ms);
 }
 
 void uart0_protocol_router_feed(uart0_protocol_router_t *s,
@@ -25,6 +26,11 @@ void uart0_protocol_router_feed(uart0_protocol_router_t *s,
     uart0_protocol_router_tick(s, now_ms);
     for (size_t i = 0; i < length; ++i) {
         const uint8_t value = data[i];
+        /* V2 载荷中的 A5/5A 必须留在 V2 帧内，不得触发控制请求。 */
+        if (s->v2_selected && s->v2.state != 0U) {
+            makcu_v2_parser_feed(&s->v2, value, now_ms, s->v4_callback, s->context);
+            continue;
+        }
         if (s->length == 1U && value != 0x5AU) {
             s->length = 0U;
         }
@@ -43,6 +49,8 @@ void uart0_protocol_router_feed(uart0_protocol_router_t *s,
                 }
                 s->length = s->expected = 0U;
             }
+        } else if (s->v2_selected) {
+            makcu_v2_parser_feed(&s->v2, value, now_ms, s->v4_callback, s->context);
         } else if (s->ascii_feed != NULL) {
             s->ascii_feed(&value, 1U, s->context);
         } else {

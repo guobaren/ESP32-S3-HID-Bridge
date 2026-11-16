@@ -24,6 +24,7 @@ $sources = @(
     'main\usb_cdc_control_logic.c',
     'main\makcu_ascii_logic.c',
     'main\makcu_v4_logic.c',
+    'main\makcu_v2_logic.c',
     'main\uart0_protocol_router.c',
     'main\button_state_logic.c',
     'main\m_udp_smoothing.c',

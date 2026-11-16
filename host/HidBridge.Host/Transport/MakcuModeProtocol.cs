@@ -10,11 +10,12 @@ internal static class MakcuModeProtocol
     internal const byte EnableOpcode = 1;
     internal const byte QueryOpcode = 2;
     internal const byte EnableLegacyOpcode = 3;
+    internal const byte EnableV2Opcode = 4;
 
     internal static byte[] CreateRequest(FrameCodec codec, byte opcode, out ushort sequence)
     {
         ArgumentNullException.ThrowIfNull(codec);
-        if (opcode > EnableLegacyOpcode)
+        if (opcode > EnableV2Opcode)
         {
             throw new ArgumentOutOfRangeException(nameof(opcode));
         }
@@ -34,7 +35,7 @@ internal static class MakcuModeProtocol
             frame.Sequence != expectedSequence ||
             frame.Payload is null ||
             (frame.Payload.Length != StatusPayloadLength && frame.Payload.Length != 7) ||
-            (frame.Payload.Length == 7 && frame.Payload[6] != 3) ||
+            (frame.Payload.Length == 7 && frame.Payload[6] is not (2 or 3)) ||
             frame.Payload[0] > 4 ||
             frame.Payload[1] > 1)
         {
@@ -53,7 +54,7 @@ internal static class MakcuModeProtocol
         }
 
         snapshot = new MakcuModeSnapshot(enabled, (int)baud, frame.Payload[0],
-            frame.Payload.Length == 7 ? 3 : 4);
+            frame.Payload.Length == 7 ? frame.Payload[6] : 4);
         return true;
     }
 

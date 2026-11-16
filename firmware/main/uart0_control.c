@@ -8,6 +8,8 @@
 
 #include "driver/uart.h"
 #include "esp_random.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "esp_timer.h"
 #include "uart0_protocol_router.h"
 #include "esp_log.h"
@@ -41,6 +43,7 @@
 #define CONTROL_POLL_MS 1U
 
 static volatile bool s_makcu_legacy_selected;
+static volatile bool s_makcu_v2_selected;
 
 static const char *TAG = "dual_uart0";
 static dual_software_report_callback_t s_report_callback;
@@ -524,7 +527,10 @@ static void makcu_v4_send_ascii_echo(const makcu_v4_command_t *command);
 
 static void makcu_v4_send_error(const makcu_v4_command_t *command)
 {
-    if (command->transport == MAKCU_V4_TRANSPORT_BINARY) {
+    if (command->v2_frame) {
+        const uint8_t frame[] = {0x50U, command->v2_opcode, 1U, 0U, 1U};
+        (void)makcu_v4_write(frame, sizeof(frame));
+    } else if (command->transport == MAKCU_V4_TRANSPORT_BINARY) {
         uint8_t frame[MAKCU_V4_MAX_PAYLOAD + 5U];
         size_t frame_length = 0U;
         if (makcu_v4_encode_error(command->opcode, frame, sizeof(frame),
@@ -548,8 +554,12 @@ static void makcu_v4_send_binary(const makcu_v4_command_t *command,
 {
     uint8_t frame[MAKCU_V4_MAX_PAYLOAD + 5U];
     size_t frame_length = 0U;
-    if (makcu_v4_encode_frame(command->opcode, payload, payload_length,
-                              frame, sizeof(frame), &frame_length)) {
+    const bool encoded = command->v2_frame
+        ? makcu_v2_encode_frame(command->v2_opcode, payload, payload_length,
+            frame, sizeof(frame), &frame_length)
+        : makcu_v4_encode_frame(command->opcode, payload, payload_length,
+            frame, sizeof(frame), &frame_length);
+    if (encoded) {
         (void)makcu_v4_write(frame, frame_length);
     }
 }
@@ -595,6 +605,11 @@ static void makcu_v4_send_ascii_query(const makcu_v4_command_t *command,
 static void makcu_v4_finish_ascii_setter(const makcu_v4_command_t *command,
                                          bool echo_on_entry)
 {
+    if (command->v2_frame) {
+        const uint8_t ok = 0U;
+        makcu_v4_send_binary(command, &ok, 1U);
+        return;
+    }
     if (echo_on_entry) {
         makcu_v4_send_ascii_echo(command);
         static const uint8_t prompt[] = ">>> ";
@@ -762,7 +777,7 @@ static void makcu_v4_handle_command(const makcu_v4_command_t *command,
             return;
         case 0x02U: /* DEVICE */
             if (binary) {
-                result[0] = 0x01U;
+                result[0] = command->v2_frame ? 2U : 1U;
                 makcu_v4_send_binary(command, result, 1U);
             } else {
                 makcu_v4_send_ascii_query(command, "mouse");
@@ -770,6 +785,11 @@ static void makcu_v4_handle_command(const makcu_v4_command_t *command,
             return;
         case 0x04U: /* text protocol identity; binary version is bridge API level */
             if (binary) {
+                if (command->v2_frame) {
+                    static const uint8_t version[] = "HID-Bridge-V2";
+                    makcu_v4_send_binary(command, version, sizeof(version) - 1U);
+                    return;
+                }
                 makcu_v4_write_u32(result, 4U);
                 makcu_v4_send_binary(command, result, 4U);
             } else {
@@ -829,7 +849,10 @@ static void makcu_v4_handle_command(const makcu_v4_command_t *command,
             const uint8_t button = (uint8_t)(command->opcode - 0x11U);
             if (is_query) {
                 if (binary) {
-                    result[0] = (uint8_t)((makcu_v4_software_buttons() >> button) & 1U);
+                    result[0] = command->v2_frame
+                        ? (uint8_t)(((s_makcu_v4_state.physical_buttons >> button) & 1U) |
+                            (((makcu_v4_software_buttons() >> button) & 1U) << 1U))
+                        : (uint8_t)((makcu_v4_software_buttons() >> button) & 1U);
                     makcu_v4_send_binary(command, result, 1U);
                 } else {
                     makcu_v4_state_t button_state = s_makcu_v4_state;
@@ -843,12 +866,13 @@ static void makcu_v4_handle_command(const makcu_v4_command_t *command,
             }
             const uint8_t value = binary ? command->payload[0]
                                          : (uint8_t)command->argument[0];
-            if (!makcu_v4_state_set_button(&s_makcu_v4_state, button, value)) {
+            if (!makcu_v4_state_set_button(&s_makcu_v4_state, button, command->v2_frame && value == 2U ? 0U : value)) {
                 makcu_v4_send_error(command);
                 return;
             }
             makcu_v4_state_touch(&s_makcu_v4_state, now_ms);
-            makcu_v4_submit_mouse_report(makcu_v4_software_buttons(), 0, 0, 0, 0, 0U);
+            if (!(command->v2_frame && value == 2U))
+                makcu_v4_submit_mouse_report(makcu_v4_software_buttons(), 0, 0, 0, 0, 0U);
             makcu_v4_finish_ascii_setter(command, echo_on_entry);
             return;
         }
@@ -1783,9 +1807,9 @@ static void build_makcu_mode_status(
     response->payload_length = DUAL_MAKCU_MODE_STATUS_PAYLOAD_LENGTH;
     (void)dual_makcu_mode_status_encode(
         status, enabled, baud, response->payload, sizeof(response->payload));
-    if (enabled && s_makcu_legacy_selected) {
+    if (enabled && (s_makcu_legacy_selected || s_makcu_v2_selected)) {
         response->payload_length = 7U;
-        response->payload[6] = 3U;
+        response->payload[6] = s_makcu_v2_selected ? 2U : 3U;
     }
 }
 
@@ -1816,8 +1840,70 @@ static void release_software_input_for_mode_change(void)
 }
 
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
+/* 不自动擦除 NVS：初始化失败时保留其他设置，并拒绝声称保存成功。 */
+static esp_err_t makcu_preference_open(nvs_open_mode_t mode, nvs_handle_t *handle)
+{
+    esp_err_t result = nvs_flash_init();
+    return result == ESP_OK ? nvs_open("hid_bridge", mode, handle) : result;
+}
+
+static esp_err_t save_makcu_preference(bool enabled, bool legacy, bool v2)
+{
+    nvs_handle_t handle;
+    esp_err_t result = makcu_preference_open(NVS_READWRITE, &handle);
+    if (result != ESP_OK) return result;
+    const uint8_t value = enabled ? (v2 ? 2U : (legacy ? 3U : 4U)) : 0U;
+    uint8_t previous = 255U;
+    result = nvs_get_u8(handle, "makcu_mode", &previous);
+    if (result == ESP_ERR_NVS_NOT_FOUND || (result == ESP_OK && previous != value)) {
+        result = nvs_set_u8(handle, "makcu_mode", value);
+        if (result == ESP_OK) result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return result;
+}
+
+static void restore_makcu_preference(void)
+{
+    if (s_role != DUAL_ROLE_MOUSE_HOST) return;
+    nvs_handle_t handle;
+    esp_err_t result = makcu_preference_open(NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return;
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Makcu配置读取失败，保持A5：%s", esp_err_to_name(result));
+        return;
+    }
+    uint8_t value = 0U;
+    result = nvs_get_u8(handle, "makcu_mode", &value);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return;
+    if (result != ESP_OK || (value != 0U && value != 2U && value != 3U && value != 4U)) {
+        ESP_LOGW(TAG, "Makcu配置无效，保持A5");
+        return;
+    }
+#if !DUAL_PROXY_ENABLE_MAKCU_ASCII_API
+    if (value == 3U) return;
+#endif
+    if (value == 0U) return;
+    result = uart_set_baudrate(CONTROL_UART, CONTROL_BAUD_MAKCU);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Makcu启动切速失败：%s", esp_err_to_name(result));
+        return;
+    }
+    s_makcu_legacy_selected = value == 3U;
+    s_makcu_v2_selected = value == 2U;
+    s_makcu_v4_baud = CONTROL_BAUD_MAKCU;
+    __atomic_store_n(&s_uart0_current_baud, CONTROL_BAUD_MAKCU, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_makcu_mode_enabled, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_makcu_runtime_requested, true, __ATOMIC_RELEASE);
+    dual_uart0_output_set_makcu_mode(true);
+    dual_diag_stream_set_enabled(false);
+}
+#endif
+
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
 static esp_err_t accept_makcu_mode_transition(
-    const dual_frame_t *request, bool target_enabled, bool target_legacy)
+    const dual_frame_t *request, bool target_enabled, bool target_legacy, bool target_v2)
 {
     const uint32_t target_baud = target_enabled
         ? CONTROL_BAUD_MAKCU : CONTROL_BAUD_DEFAULT;
@@ -1826,8 +1912,8 @@ static esp_err_t accept_makcu_mode_transition(
     size_t serialized_length = 0U;
     build_makcu_mode_status(request, DUAL_MAKCU_MODE_STATUS_OK,
                             target_enabled, target_baud, &response);
-    response.payload_length = target_enabled && target_legacy ? 7U : 6U;
-    if (response.payload_length == 7U) response.payload[6] = 3U;
+    response.payload_length = target_enabled && (target_legacy || target_v2) ? 7U : 6U;
+    if (response.payload_length == 7U) response.payload[6] = target_v2 ? 2U : 3U;
     if (dual_frame_serialize(&response, serialized, sizeof(serialized),
                              &serialized_length) != ESP_OK) {
         return ESP_ERR_INVALID_ARG;
@@ -1835,6 +1921,13 @@ static esp_err_t accept_makcu_mode_transition(
 
     esp_err_t result = dual_uart0_output_try_lock();
     if (result != ESP_OK) {
+        return result;
+    }
+    result = save_makcu_preference(target_enabled, target_legacy, target_v2);
+    if (result != ESP_OK) {
+        dual_uart0_output_unlock();
+        send_makcu_mode_status(request, DUAL_MAKCU_MODE_STATUS_TX_FAILED,
+            s_makcu_mode_enabled, s_uart0_current_baud);
         return result;
     }
     release_software_input_for_mode_change();
@@ -1855,6 +1948,7 @@ static esp_err_t accept_makcu_mode_transition(
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
             s_makcu_v4_baud = target_baud;
             s_makcu_legacy_selected = target_legacy;
+            s_makcu_v2_selected = target_v2;
 #endif
             dual_uart0_output_set_makcu_mode(target_enabled);
             if (target_enabled) {
@@ -1915,6 +2009,7 @@ static void handle_makcu_mode_request(const dual_frame_t *request)
         return;
     }
     const bool target_legacy = opcode == DUAL_MAKCU_MODE_OP_ENABLE_LEGACY;
+    const bool target_v2 = opcode == DUAL_MAKCU_MODE_OP_ENABLE_V2;
 #if !DUAL_PROXY_ENABLE_MAKCU_ASCII_API
     if (target_legacy) {
         send_makcu_mode_status(request, DUAL_MAKCU_MODE_STATUS_UNSUPPORTED,
@@ -1924,16 +2019,16 @@ static void handle_makcu_mode_request(const dual_frame_t *request)
 #endif
     const bool target_enabled = opcode != DUAL_MAKCU_MODE_OP_DISABLE;
     if (target_enabled == current_enabled &&
-        (!target_enabled || target_legacy == s_makcu_legacy_selected)) {
+        (!target_enabled || (target_legacy == s_makcu_legacy_selected && target_v2 == s_makcu_v2_selected))) {
         send_makcu_mode_status(request, DUAL_MAKCU_MODE_STATUS_OK,
                                current_enabled, current_baud);
         return;
     }
     const esp_err_t result = accept_makcu_mode_transition(
-        request, target_enabled, target_legacy);
+        request, target_enabled, target_legacy, target_v2);
     if (result != ESP_OK) {
         /* A failed enqueue/drain cannot reliably carry a second status frame. */
-        ESP_LOGW(TAG, "Makcu模式切换ACK/发送排空失败，保持当前模式：%s",
+        ESP_LOGW(TAG, "Makcu模式保存或切换失败，请查询实际模式：%s",
                  esp_err_to_name(result));
     }
 #endif
@@ -2393,6 +2488,7 @@ static void control_task(void *argument)
     bool makcu_mode_active = false;
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
     bool legacy_selected = false;
+    bool v2_selected = false;
 #endif
     TickType_t last_statistics = xTaskGetTickCount();
     while (true) {
@@ -2425,13 +2521,15 @@ static void control_task(void *argument)
         const bool requested_v4_mode = __atomic_load_n(
             &s_makcu_runtime_requested, __ATOMIC_ACQUIRE);
         if (requested_v4_mode != makcu_mode_active ||
-            legacy_selected != s_makcu_legacy_selected) {
+            legacy_selected != s_makcu_legacy_selected || v2_selected != s_makcu_v2_selected) {
             legacy_selected = s_makcu_legacy_selected;
+            v2_selected = s_makcu_v2_selected;
             makcu_mode_active = requested_v4_mode;
             dual_parser_init(&parser, on_control_frame, NULL);
             uart0_protocol_router_init(&router, routed_a5, routed_v4, NULL);
             __atomic_store_n(&s_uart0_reject_current_buffer_tail, false,
                              __ATOMIC_RELEASE);
+            router.v2_selected = makcu_mode_active && v2_selected;
             s_v4_owner = makcu_mode_active && !legacy_selected;
 #if DUAL_PROXY_ENABLE_MAKCU_ASCII_API
             makcu_ascii_parser_init(&makcu_parser);
@@ -2595,6 +2693,9 @@ esp_err_t dual_uart0_control_start(
 #else
         (void)physical_buttons_callback;
 #endif
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
+        if (previous_role != role) restore_makcu_preference();
+#endif
         return ESP_OK;
     }
     esp_err_t result = dual_uart0_output_init();
@@ -2653,6 +2754,9 @@ esp_err_t dual_uart0_control_start(
     }
 #if DUAL_PROXY_ENABLE_MAKCU_V4_API
     s_makcu_v4_baud = CONTROL_BAUD_MAKCU;
+#endif
+#if DUAL_PROXY_ENABLE_MAKCU_V4_API
+    restore_makcu_preference();
 #endif
     if (xTaskCreate(control_task, "dual_uart0", CONTROL_TASK_STACK_SIZE,
                     NULL, 7, NULL) != pdPASS) {

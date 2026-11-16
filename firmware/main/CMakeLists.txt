@@ -1,5 +1,5 @@
 set(main_requires
-    esp_driver_uart esp_system esp_timer esp_tinyusb led_strip usb_host_hid)
+    nvs_flash esp_driver_uart esp_system esp_timer esp_tinyusb led_strip usb_host_hid)
 if(CONFIG_DUAL_PROXY_USE_CHERRYUSB)
     list(APPEND main_requires cherryusb)
 endif()
@@ -19,6 +19,7 @@ idf_component_register(
         "m_udp_smoothing.c"
         "makcu_ascii_logic.c"
         "makcu_v4_logic.c"
+        "makcu_v2_logic.c"
         "uart0_output.c"
         "stats_snapshot.c"
         "stats_snapshot_codec.c"

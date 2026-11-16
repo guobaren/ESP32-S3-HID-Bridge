@@ -34,6 +34,15 @@ if (args.Contains("--makcu-version-only"))
     byte[] payload = [0, 1, 0, 194, 1, 0, 3];
     Require(MakcuModeProtocol.TryDecodeStatus(new BridgeFrame(MessageType.MakcuModeStatus, seq, payload), seq, out var legacy) && legacy.ProtocolVersion == 3, "老版状态识别失败");
     Require(MakcuModeProtocol.TryDecodeStatus(new BridgeFrame(MessageType.MakcuModeStatus, seq, payload[..6]), seq, out var v4) && v4.ProtocolVersion == 4, "旧固件六字节状态不兼容");
+    byte[] v2Request = MakcuModeProtocol.CreateRequest(codec, MakcuModeProtocol.EnableV2Opcode, out ushort v2Seq);
+    Require(FrameCodec.TryDecode(v2Request, out var v2Decoded) && v2Decoded.Payload.SequenceEqual(new byte[] { 4 }), "V2 请求编码错误");
+    payload[6] = 2;
+    Require(MakcuModeProtocol.TryDecodeStatus(new BridgeFrame(MessageType.MakcuModeStatus, v2Seq, payload), v2Seq, out var v2) && v2.ProtocolVersion == 2, "V2 状态识别失败");
+    var v2Handshake = new FakeMakcuModeHandshake { ProtocolVersion = 2 };
+    var v2Result = new MakcuModeCoordinator(v2Handshake, () => 2).SetEnabledAsync(true, false, 921600, true).GetAwaiter().GetResult();
+    Require(v2Result.Success && v2Result.ActualStateVerified, "V2 握手失败");
+    var mismatchedV2 = new MakcuModeCoordinator(new FakeMakcuModeHandshake(), () => 2).SetEnabledAsync(true, false, 921600, true).GetAwaiter().GetResult();
+    Require(!mismatchedV2.Success, "V4 状态被当作 V2 成功");
     payload[6] = 9;
     Require(!MakcuModeProtocol.TryDecodeStatus(new BridgeFrame(MessageType.MakcuModeStatus, seq, payload), seq, out _), "接受了未知协议版本");
     var good = new FakeMakcuModeHandshake { ProtocolVersion = 3 };
@@ -51,6 +60,11 @@ if (args.Contains("--makcu-version-only"))
         }, version => order.Add($"select:{version}")).GetAwaiter().GetResult();
     Require(result.Success && order.SequenceEqual(new[] { "off", "select:3", "on" }), "自动切版未按关闭、选版本、开启执行");
     order.Clear();
+    result = MakcuModeCoordinator.ChangeVersionAsync(2,
+        enabled => { order.Add(enabled ? "on" : "off"); return Task.FromResult(new MakcuModeChangeResult(true, enabled, enabled ? 115200 : 921600, "ok", true)); },
+        version => order.Add($"select:{version}")).GetAwaiter().GetResult();
+    Require(result.Success && order.SequenceEqual(new[] { "off", "select:2", "on" }), "V2 自动切版顺序错误");
+    order.Clear();
     result = MakcuModeCoordinator.ChangeVersionAsync(4,
         enabled =>
         {
@@ -58,7 +72,27 @@ if (args.Contains("--makcu-version-only"))
             return Task.FromResult(new MakcuModeChangeResult(false, true, 115200, "拒绝", true));
         }, version => order.Add("unexpected")).GetAwaiter().GetResult();
     Require(!result.Success && order.SequenceEqual(new[] { "off-failed" }), "关闭失败仍继续切版");
-    Console.WriteLine("Makcu 双版请求、状态兼容、未知版本拒绝、握手版本校验、自动切版顺序和失败中止：PASS");
+    Exception? uiFailure = null;
+    Thread uiThread = new(() =>
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-v2-ui-{Guid.NewGuid():N}");
+        try
+        {
+            RecordingTransport transport = new();
+            using InputForwarder input = new(transport);
+            using AutomationController automation = new(new AutomationProfileStore(directory), input, new RecordingAutomationOutput());
+            automation.Settings.MakcuProtocolVersion = 2;
+            using SettingsPageControl page = new(automation);
+            Require(page.MakcuVersionComboBox.Items.Count == 3 && page.MakcuVersionComboBox.SelectedIndex == 2 &&
+                page.MakcuVersionComboBox.Text.StartsWith("V2", StringComparison.Ordinal), "V2 下拉选项或配置加载错误");
+        }
+        catch (Exception ex) { uiFailure = ex; }
+        finally { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
+    });
+    uiThread.SetApartmentState(ApartmentState.STA);
+    uiThread.Start(); uiThread.Join();
+    if (uiFailure is not null) throw new InvalidOperationException("V2 界面检查失败", uiFailure);
+    Console.WriteLine("Makcu V2/V3/V4 请求、状态兼容、未知版本拒绝、握手版本校验、自动切版顺序和失败中止：PASS");
     return 0;
 }
 
