@@ -33,7 +33,11 @@ internal static class SerialDeviceProbe
         return frame;
     }
 
-    internal static bool Probe(SerialPort port, FrameCodec codec, byte? expectedRole = null)
+    internal static bool Probe(
+        SerialPort port,
+        FrameCodec codec,
+        byte? expectedRole = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(port);
         ArgumentNullException.ThrowIfNull(codec);
@@ -49,6 +53,7 @@ internal static class SerialDeviceProbe
         port.DiscardInBuffer();
         while (Stopwatch.GetTimestamp() < deadline)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             long now = Stopwatch.GetTimestamp();
             if (now >= nextProbe)
             {

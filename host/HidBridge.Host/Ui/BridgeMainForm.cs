@@ -30,6 +30,9 @@ internal sealed class BridgeMainForm : Form
     private readonly MouseCaptureSurface _captureSurface;
     private readonly Label _statusLabel;
     private readonly Label _lanEndpointLabel;
+    private readonly Label _endpointLabel;
+    private SerialPortStatus? _pcPortStatus;
+    private SerialPortStatus? _controlPortStatus;
     private readonly Label _homeShortcutLabel;
     private readonly TextBox _logTextBox;
     private readonly ComboBox _logModeComboBox;
@@ -111,14 +114,15 @@ internal sealed class BridgeMainForm : Form
             AccessibleName = "局域网 UDP 监听地址",
         };
 
-        Label endpointLabel = new()
+        _endpointLabel = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleRight,
             AutoEllipsis = true,
             AutoSize = false,
             Margin = new Padding(0),
-            Text = endpointDescription,
+            Text = _serialBridge is null ? endpointDescription : FormatSerialEndpoints(null, null),
+            AccessibleName = "串口连接状态",
             ForeColor = SecondaryTextOnDeepSurface,
         };
 
@@ -163,6 +167,7 @@ internal sealed class BridgeMainForm : Form
         {
             Dock = DockStyle.Fill,
             AutoSize = false,
+            Margin = new Padding(3, 8, 3, 0),
             Minimum = (int)(MouseOutputSensitivity.Minimum * MouseOutputSensitivity.TrackBarScale),
             Maximum = (int)(MouseOutputSensitivity.Maximum * MouseOutputSensitivity.TrackBarScale),
             TickFrequency = 30,
@@ -232,7 +237,7 @@ internal sealed class BridgeMainForm : Form
         TableLayoutPanel shortcutBar = new()
         {
             Dock = DockStyle.Top,
-            Height = 48,
+            Height = 52,
             Padding = new Padding(14, 5, 14, 5),
             ColumnCount = 3,
             RowCount = 1,
@@ -274,12 +279,12 @@ internal sealed class BridgeMainForm : Form
         udpOptionsBar.Controls.Add(_udpSmoothingSlotsBox);
         udpOptionsBar.Controls.Add(_udpSmoothingCheckBox);
         shortcutBar.Controls.Add(udpOptionsBar, 1, 0);
-        shortcutBar.Controls.Add(endpointLabel, 2, 0);
+        shortcutBar.Controls.Add(_endpointLabel, 2, 0);
 
         TableLayoutPanel endingBar = new()
         {
             Dock = DockStyle.Bottom,
-            Height = 70,
+            Height = 92,
             Padding = new Padding(14, 7, 14, 5),
             RowCount = 2,
             ColumnCount = 2,
@@ -288,7 +293,7 @@ internal sealed class BridgeMainForm : Form
         };
         endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
         endingBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
-        endingBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        endingBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
         endingBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         endingBar.Controls.Add(sensitivityControls, 0, 0);
         endingBar.Controls.Add(_outputSensitivityDescriptionLabel, 0, 1);
@@ -309,13 +314,13 @@ internal sealed class BridgeMainForm : Form
             Dock = DockStyle.Fill,
             BackColor = PageBackgroundColor,
             ForeColor = PrimaryTextOnDeepSurface,
-            Padding = new Padding(14, 12, 14, 14),
+            Padding = new Padding(14, 12, 14, 6),
         };
         Panel captureCard = new()
         {
             Dock = DockStyle.Fill,
             BackColor = CardSurfaceColor,
-            Padding = new Padding(16),
+            Padding = new Padding(16, 16, 16, 5),
         };
         captureCard.Paint += (_, eventArgs) =>
         {
@@ -504,6 +509,7 @@ internal sealed class BridgeMainForm : Form
         _logFlushTimer.Tick += (_, _) =>
         {
             FlushPendingLogs();
+            RefreshSerialEndpoints();
             _refreshingSmoothing = true;
             _udpSmoothingCheckBox.Checked = _input.UdpSmoothingEnabled;
             _udpSmoothingSlotsBox.SelectedIndex = _input.UdpSmoothingSlots / 5 - 1;
@@ -533,6 +539,39 @@ internal sealed class BridgeMainForm : Form
         FormClosing += OnFormClosing;
     }
 
+    private void RefreshSerialEndpoints()
+    {
+        if (_serialBridge is null)
+        {
+            return;
+        }
+
+        bool changed = false;
+        if (_serialBridge.TryGetPcPortStatus(out SerialPortStatus? pc) && pc != _pcPortStatus)
+        {
+            _pcPortStatus = pc;
+            changed = true;
+        }
+        if (_serialBridge.TryGetControlPortStatus(out SerialPortStatus? control) && control != _controlPortStatus)
+        {
+            _controlPortStatus = control;
+            changed = true;
+        }
+        if (changed)
+        {
+            _endpointLabel.Text = FormatSerialEndpoints(_pcPortStatus, _controlPortStatus);
+        }
+    }
+
+    internal static string FormatSerialEndpoints(SerialPortStatus? pc, SerialPortStatus? control)
+    {
+        static string Describe(SerialPortStatus? status) =>
+            status is SerialPortStatus port ? $"{port.PortName} @ {port.BaudRate} baud" : "未连接";
+
+        string controlRole = control?.LegacySingleBoard == true ? "单板" : "M";
+        return $"P：{Describe(pc)}\r\n{controlRole}：{Describe(control)}";
+    }
+
     internal TextBox LogTextBox => _logTextBox;
     internal ComboBox LogModeComboBox => _logModeComboBox;
     internal Button StatisticsButton => _statisticsButton;
@@ -540,6 +579,7 @@ internal sealed class BridgeMainForm : Form
     internal CheckBox AlwaysOutputUdpCheckBox => _settingsPage.AlwaysOutputUdpCheckBox;
     internal Label SyncStatusLabel => _statusLabel;
     internal Label LanEndpointLabel => _lanEndpointLabel;
+    internal Label EndpointLabel => _endpointLabel;
     internal TrackBar OutputSensitivityTrackBar => _outputSensitivityTrackBar;
     internal TextBox OutputSensitivityTextBox => _outputSensitivityTextBox;
     internal Label OutputSensitivityDescriptionLabel => _outputSensitivityDescriptionLabel;

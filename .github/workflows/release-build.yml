@@ -9,7 +9,7 @@ on:
       tag:
         description: Release tag to package
         required: true
-        default: v0.1.6
+        default: v0.1.7
       source_ref:
         description: Git ref to build
         required: true
@@ -142,10 +142,21 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           $zip = "dist\ESP32-S3-HID-Bridge-$env:RELEASE_TAG.zip"
-          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          $hash = "$zip.sha256"
+          $assetNames = @(gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_TAG $zip --repo $env:GITHUB_REPOSITORY --clobber
+            if ($env:GITHUB_EVENT_NAME -eq 'push' -and
+                (Split-Path -Leaf $zip) -in $assetNames -and (Split-Path -Leaf $hash) -in $assetNames) {
+              Write-Host '当前 tag 已发布 ZIP 和校验文件，保留已上传的构建。'
+              exit 0
+            }
+            gh release upload $env:RELEASE_TAG $zip $hash --repo $env:GITHUB_REPOSITORY --clobber
           }
           else {
-            gh release create $env:RELEASE_TAG $zip --repo $env:GITHUB_REPOSITORY --title "ESP32-S3 HID Bridge $env:RELEASE_TAG" --generate-notes
+            $notesFile = Join-Path $PWD "docs/releases/$env:RELEASE_TAG.md"
+            $notesArguments = @('--generate-notes')
+            if (Test-Path -LiteralPath $notesFile -PathType Leaf) {
+              $notesArguments = @('--notes-file', $notesFile)
+            }
+            gh release create $env:RELEASE_TAG $zip $hash --repo $env:GITHUB_REPOSITORY --title "ESP32-S3 HID Bridge $env:RELEASE_TAG" @notesArguments
           }

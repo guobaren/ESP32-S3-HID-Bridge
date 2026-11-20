@@ -9,7 +9,7 @@ using System.Text.Json.Serialization;
 
 namespace HidBridge.Host.RemoteInput;
 
-internal readonly record struct RemoteMouseCommand(int DeltaX, int DeltaY, int Wheel, int Pan, int? SmoothingSlots = null);
+internal readonly record struct RemoteMouseCommand(int DeltaX, int DeltaY, int Wheel, int Pan, int? SmoothingSlots = null, bool? Left = null);
 
 internal readonly record struct DisplayAddressCandidate(
     IPAddress Address,
@@ -88,11 +88,12 @@ internal sealed class RemoteInputServer : IDisposable
                         out error);
                     if (parsed && command.SmoothingSlots is int slots)
                         _input.ConfigureUdpSmoothingSlots(slots, fromRemote: true);
-                    accepted = parsed && _input.TryInjectMouseMovement(
+                    accepted = parsed && _input.TryInjectRemoteMouseCommand(
                             command.DeltaX,
                             command.DeltaY,
                             command.Wheel,
-                            command.Pan);
+                            command.Pan,
+                            command.Left);
                     if (parsed && !accepted)
                     {
                         error = "同步和“始终开启 UDP 输出”均已关闭";
@@ -454,6 +455,7 @@ internal sealed class RemoteInputServer : IDisposable
         {
             // 正常取消。
         }
+        _input.ReleaseRemoteInput();
         _cancellation.Dispose();
     }
 }
@@ -466,6 +468,7 @@ internal static class RemoteMouseCommandParser
         public int Dy { get; init; }
         public int Wheel { get; init; }
         public int Pan { get; init; }
+        public JsonElement Left { get; init; }
         [JsonPropertyName("smoothing_slots")]
         public int? SmoothingSlots { get; init; }
     }
@@ -487,6 +490,12 @@ internal static class RemoteMouseCommandParser
                 error = "JSON 内容为空";
                 return false;
             }
+            if (dto.Left.ValueKind is not (JsonValueKind.Undefined or JsonValueKind.True or JsonValueKind.False))
+            {
+                error = "left 必须是 JSON 布尔值";
+                return false;
+            }
+            bool? left = dto.Left.ValueKind == JsonValueKind.Undefined ? null : dto.Left.GetBoolean();
             if (dto.SmoothingSlots is int slots &&
                 (slots < 0 || slots > 20 || !MouseReportCodec.IsValidFirmwareSmoothingSlots((byte)slots)))
             {
@@ -505,13 +514,13 @@ internal static class RemoteMouseCommandParser
                 error = "wheel/pan 必须在 -128..127 范围内";
                 return false;
             }
-            if (dto.Dx == 0 && dto.Dy == 0 && dto.Wheel == 0 && dto.Pan == 0)
+            if (dto.Dx == 0 && dto.Dy == 0 && dto.Wheel == 0 && dto.Pan == 0 && left is null)
             {
                 error = "命令没有任何移动或滚轮增量";
                 return false;
             }
 
-            command = new RemoteMouseCommand(dto.Dx, dto.Dy, dto.Wheel, dto.Pan, dto.SmoothingSlots);
+            command = new RemoteMouseCommand(dto.Dx, dto.Dy, dto.Wheel, dto.Pan, dto.SmoothingSlots, left);
             return true;
         }
         catch (JsonException exception)

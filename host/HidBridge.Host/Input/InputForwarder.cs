@@ -196,6 +196,31 @@ internal sealed class InputForwarder : IDisposable
         return true;
     }
 
+    internal bool TryInjectRemoteMouseCommand(int deltaX, int deltaY, int wheel, int pan, bool? left)
+    {
+        if (!ForwardingEnabled && !AlwaysOutputUdpEnabled)
+        {
+            return false;
+        }
+
+        if (left is bool pressed)
+        {
+            lock (_inputStateLock)
+            {
+                // 仅更新远端左键位，保留其他远端按钮及现有物理/宏合并规则。
+                byte buttons = pressed
+                    ? unchecked((byte)(_remoteMouseButtons | 1))
+                    : unchecked((byte)(_remoteMouseButtons & ~1));
+                SetRemoteMouseButtons(buttons);
+            }
+        }
+        if (deltaX != 0 || deltaY != 0 || wheel != 0 || pan != 0)
+        {
+            _mouseReportPump.AccumulateRemote(deltaX, deltaY, wheel, pan);
+        }
+        return true;
+    }
+
     internal void SetRemoteMouseButtons(byte buttons)
     {
         bool forwarding = PhysicalForwardingEnabled;

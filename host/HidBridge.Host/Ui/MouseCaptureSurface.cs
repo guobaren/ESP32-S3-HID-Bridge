@@ -42,7 +42,6 @@ internal sealed class MouseCaptureSurface : Panel
         DoubleBuffered = true;
         Dock = DockStyle.Fill;
         BackColor = Color.FromArgb(249, 251, 254);
-        MinimumSize = new Size(0, 150);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -69,13 +68,15 @@ internal sealed class MouseCaptureSurface : Panel
                 : "双板实体鼠标由 M→P 硬件直通；EXE 不重复转发，本机光标不锁定";
         SizeF detailSize = e.Graphics.MeasureString(detail, detailFont);
         float centerX = Width / 2f;
-        float centerY = Height / 2f;
         float detailY = Math.Max(12, Height - detailSize.Height - 16);
         e.Graphics.DrawString(detail, detailFont, detailBrush, centerX - detailSize.Width / 2, detailY);
 
+        float crosshairRadius = Math.Min(42f, (detailY - 8f) / 2f);
+        float circleRadius = Math.Min(18f, crosshairRadius);
+        float centerY = Math.Min(Height / 2f, detailY - crosshairRadius - 4f);
         using Pen crosshair = new(_forwarding ? Color.FromArgb(37, 164, 116) : Color.FromArgb(137, 157, 187), 1);
-        e.Graphics.DrawEllipse(crosshair, centerX - 18, centerY - 18, 36, 36);
-        e.Graphics.DrawLine(crosshair, centerX - 42, centerY, centerX + 42, centerY);
-        e.Graphics.DrawLine(crosshair, centerX, centerY - 42, centerX, centerY + 42);
+        e.Graphics.DrawEllipse(crosshair, centerX - circleRadius, centerY - circleRadius, 2 * circleRadius, 2 * circleRadius);
+        e.Graphics.DrawLine(crosshair, centerX - crosshairRadius, centerY, centerX + crosshairRadius, centerY);
+        e.Graphics.DrawLine(crosshair, centerX, centerY - crosshairRadius, centerX, centerY + crosshairRadius);
     }
 }

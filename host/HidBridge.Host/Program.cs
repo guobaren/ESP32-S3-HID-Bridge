@@ -30,6 +30,7 @@ internal static class Program
         FirmwareFlashService? firmwareFlash = null;
         DeviceLogMirror? logMirror = null;
         FirmwareUpdateApiServer? firmwareUpdateApi = null;
+        string? startupError = null;
         try
         {
             BridgeOptions options = BridgeOptions.Load();
@@ -71,10 +72,6 @@ internal static class Program
                     logSettings,
                     () => automationSettings.LegacySingleBoardFirmwareCompatibility,
                     automationSettings);
-                Console.WriteLine(
-                    $"ButtonState 共享区：映射={serialBridge.ButtonStateMappingName}，" +
-                    $"互斥量={serialBridge.ButtonStateMutexName}，" +
-                    $"发布开关={(automationSettings.ButtonStatePublishingEnabled ? "启用" : "停用")}。");
                 transport = serialBridge;
             }
             input = new InputForwarder(
@@ -174,11 +171,7 @@ internal static class Program
         catch (Exception exception)
         {
             Console.Error.WriteLine($"主机程序启动或运行失败：{exception}");
-            MessageBox.Show(
-                exception.Message,
-                "ESP32-S3 HID Bridge",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+            startupError = exception.Message;
         }
         finally
         {
@@ -193,6 +186,16 @@ internal static class Program
             logMirror?.Dispose();
             transport?.Dispose();
             logWriter.Dispose();
+        }
+
+        if (startupError is not null)
+        {
+            // 弹窗可能长时间等待确认，必须先让后续实例能打开串口和监听端口。
+            MessageBox.Show(
+                startupError,
+                "ESP32-S3 HID Bridge",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
         }
     }
 

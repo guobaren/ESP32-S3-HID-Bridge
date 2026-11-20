@@ -82,6 +82,28 @@ internal sealed class DeviceLogMirror : IDisposable
         }
     }
 
+    internal bool TryGetPortStatus(out SerialPortStatus? status)
+    {
+        status = null;
+        if (!Monitor.TryEnter(_sync))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!_stop && Volatile.Read(ref _readerFailed) == 0 && _port?.IsOpen == true)
+            {
+                status = new SerialPortStatus(_port.PortName, _baudRate);
+            }
+            return true;
+        }
+        finally
+        {
+            Monitor.Exit(_sync);
+        }
+    }
+
     /// <summary>
     /// 仅在镜像当前已经持有指定端口时写入；同一把锁与 Suspend/ReleasePort 串行化，
     /// 读线程仍继续从同一个 SerialPort 读取日志。

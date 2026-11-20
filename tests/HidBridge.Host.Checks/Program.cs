@@ -7,7 +7,6 @@ using System.Drawing.Imaging;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using System.IO.MemoryMappedFiles;
 using HidBridge.Host;
 using HidBridge.Host.Automation;
 using HidBridge.Host.Drivers;
@@ -17,6 +16,59 @@ using HidBridge.Host.RemoteInput;
 using HidBridge.Host.Transport;
 using HidBridge.Host.Ui;
 using HidBridge.Protocol;
+
+if (args.Contains("--json-left-only"))
+{
+    foreach (string invalid in new[] { "null", "0", "1", "\"true\"", "[]", "{}" })
+    {
+        Require(!RemoteMouseCommandParser.TryParse(Encoding.UTF8.GetBytes($"{{\"dx\":5,\"left\":{invalid}}}"), out _, out _),
+            $"错误接受 left={invalid}");
+    }
+    Require(RemoteMouseCommandParser.TryParse(Encoding.UTF8.GetBytes("{\"left\":false}"), out var up, out _) && up.Left == false,
+        "纯松开报文解析失败");
+    Require(RemoteMouseCommandParser.TryParse(Encoding.UTF8.GetBytes("{\"dx\":1}"), out var move, out _) && move.Left is null,
+        "旧移动报文未保留缺省左键语义");
+    RecordingTransport transport = new();
+    using InputForwarder input = new(transport, legacyFirmwareCompatibility: () => false);
+    using RemoteInputServer server = new("127.0.0.1", 0, input);
+    using UdpClient udp = new();
+    server.Start();
+    void Send(string json) => udp.Send(Encoding.UTF8.GetBytes(json), new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, server.Port));
+    void WaitButtons(byte buttons) => Require(SpinWait.SpinUntil(() => transport.MouseReports().LastOrDefault().Buttons == buttons, 2000),
+        $"未收到预期按钮状态 {buttons}");
+    input.SetRemoteMouseButtons(2);
+    WaitButtons(2);
+    Send("{\"left\":true}");
+    WaitButtons(3);
+    int start = transport.MouseReports().Length;
+    Send("{\"left\":true}");
+    Send("{\"dx\":7,\"dy\":-3}");
+    Require(SpinWait.SpinUntil(() => transport.MouseReports().Sum(r => (long)r.X) == 7, 2000), "旧移动报文未输出");
+    Require(transport.MouseReports().Skip(start).All(r => r.Buttons == 3), "重复按下或移动错误改变按钮");
+    foreach (string invalid in new[] { "null", "0", "\"false\"" }) Send($"{{\"dx\":100,\"left\":{invalid}}}");
+    Send("{\"dx\":1}");
+    Require(SpinWait.SpinUntil(() => transport.MouseReports().Sum(r => (long)r.X) >= 8, 2000), "拒绝报文后的移动屏障未输出");
+    Require(transport.MouseReports().Sum(r => (long)r.X) == 8 && transport.MouseReports().Last().Buttons == 3,
+        "无效left产生了移动或改变按钮");
+    Send("{\"dx\":2,\"left\":false}");
+    WaitButtons(2);
+    Require(SpinWait.SpinUntil(() => transport.MouseReports().Sum(r => (long)r.X) == 10, 2000), "混合报文移动缺失");
+    Send("{\"left\":false}");
+    Send("{\"left\":true}");
+    WaitButtons(3);
+    Send("{\"left\":false}");
+    WaitButtons(2);
+    Send("{\"left\":true}");
+    WaitButtons(3);
+    server.Dispose();
+    WaitButtons(0);
+    Require(transport.MouseReports().Sum(r => (long)r.Y) == -3, "Y位移与预期不符");
+    using InputForwarder disabled = new(new RecordingTransport(), legacyFirmwareCompatibility: () => true);
+    disabled.ConfigureAlwaysOutputUdp(false);
+    Require(!disabled.TryInjectRemoteMouseCommand(0, 0, 0, 0, true), "关闭输出后仍受理按钮按下");
+    Console.WriteLine("JSON left：类型校验、真实本机UDP收包、按钮保持/重复/合并、无效报文原子拒绝、混合移动、停止释放及输出门控 PASS");
+    return 0;
+}
 
 if (args.Contains("--firmware-flash-result-only"))
 {
@@ -248,29 +300,21 @@ if (args.Any(argument => argument.Equals("--stats-snapshot-only", StringComparis
 
 if (args.Any(argument => argument.Equals("--button-state-only", StringComparison.OrdinalIgnoreCase)))
 {
-    CheckButtonStateSharedMemoryAndExpiry();
     CheckButtonStateScannerFrames();
     CheckDeviceTraceBlockingReadAndCancellation();
     CheckMakcuModeCoordinator();
     CheckMakcuReconnectStateSync();
-    CheckButtonStateSettingsDefaults();
+    CheckMakcuSettingsDefaults();
     CheckMakcuAutomationPauseGate();
-    Console.WriteLine("ButtonState MMF/失效、串口分帧、Makcu模式协调和设置默认专项：PASS");
+    Console.WriteLine("ButtonState 串口分帧、Makcu模式协调和设置默认专项：PASS");
     return 0;
 }
 
 if (args.Any(argument => argument.Equals("--makcu-reconnect-only", StringComparison.OrdinalIgnoreCase)))
 {
     CheckMakcuReconnectStateSync();
+    CheckMakcuStartupKeepsUiResponsive();
     Console.WriteLine("Makcu 重连实态同步专项：PASS");
-    return 0;
-}
-
-if (args.Any(argument => argument.Equals("--button-state-mapping-name-only", StringComparison.OrdinalIgnoreCase)))
-{
-    CheckButtonStateMappingNameSettingsAndPublisher();
-    CheckButtonStateMappingNameUi();
-    Console.WriteLine("ButtonState 名称配置/非默认 MMF 互斥量/UI 保存与重载专项：PASS");
     return 0;
 }
 
@@ -287,6 +331,7 @@ CheckStatisticsActivityGate();
 CheckMouseMovementRecordingAndChart();
 CheckSerialDiscoveryProtocol();
 CheckMakcuReconnectStateSync();
+CheckMakcuStartupKeepsUiResponsive();
 CheckSerialModeSwitchReleaseSequence();
 CheckStatsSnapshotProtocol();
 CheckStatsSnapshotHttpApi();
@@ -1321,123 +1366,6 @@ static void CheckStatsSnapshotProtocol()
     Console.WriteLine("统计协议回归：PASS；34 页来自 dual_proxy C 序列化器，M 83 项跨越 64 项边界，P/M 角色映射、USB Host diagnostics 缺项拒绝、signed 位移/错误、20B 队列、未知值、缺页/重复/版本、迟到序号和日志混流均符合协议。");
 }
 
-static void CheckButtonStateSharedMemoryAndExpiry()
-{
-    string suffix = Guid.NewGuid().ToString("N");
-    string mapName = $"Local\\HidBridge.Buttons.Checks.{suffix}";
-    string mutexName = $"{mapName}.Mutex";
-    using MemoryMappedFile mapping = MemoryMappedFile.CreateOrOpen(
-        mapName, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-    using MemoryMappedViewAccessor view = mapping.CreateViewAccessor(
-        0, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-    using Mutex holderMutex = new(false, mutexName);
-    using ManualResetEventSlim mutexHeld = new(false);
-    using ManualResetEventSlim releaseMutex = new(false);
-    Thread holderThread = new(() =>
-    {
-        holderMutex.WaitOne();
-        mutexHeld.Set();
-        if (!releaseMutex.Wait(TimeSpan.FromSeconds(3)))
-        {
-            throw new TimeoutException("ButtonState mutex 测试持有超时");
-        }
-        holderMutex.ReleaseMutex();
-    });
-    holderThread.Start();
-    Require(mutexHeld.Wait(TimeSpan.FromSeconds(2)), "测试未能占有 ButtonState 跨进程 mutex");
-
-    ButtonStateSnapshot rxSnapshot = new(
-        0x13,
-        MouseValid: true,
-        SubscriptionHealthy: true,
-        ConnectionState: 2,
-        TimestampQpc: Stopwatch.GetTimestamp());
-    using ButtonStateSharedMemory publisher = new(mapName, mutexName);
-    Require(!publisher.TryPublish(rxSnapshot), "mutex 被占用时发布必须零等待失败");
-    Thread.Sleep(250);
-    releaseMutex.Set();
-    Require(holderThread.Join(TimeSpan.FromSeconds(2)), "测试 mutex 持有线程未退出");
-    Require(publisher.TryPublish(rxSnapshot), "mutex 释放后应能发布待重试快照");
-    byte[] stale = ReadButtonStateMapping(view, holderMutex);
-    Require(BinaryPrimitives.ReadUInt32LittleEndian(stale.AsSpan(0, 4)) == ButtonStateSharedMemory.Magic &&
-            BinaryPrimitives.ReadUInt32LittleEndian(stale.AsSpan(4, 4)) == ButtonStateSharedMemory.Version &&
-            BinaryPrimitives.ReadUInt32LittleEndian(stale.AsSpan(8, 4)) == ButtonStateSharedMemory.MappingSize,
-        "ButtonState 固定头字段必须完整写入");
-    Require(stale[32] == 0 && stale[34] == 0x02,
-        "mutex 忙超过 200ms 后重试不能重新发布旧按键为有效状态");
-    ulong firstSequence = BinaryPrimitives.ReadUInt64LittleEndian(stale.AsSpan(16, 8));
-    long publishedTimestamp = checked((long)(BitConverter.Int64BitsToDouble(
-        BinaryPrimitives.ReadInt64LittleEndian(stale.AsSpan(24, 8))) * Stopwatch.Frequency));
-    Require(firstSequence == 1 && publishedTimestamp < Stopwatch.GetTimestamp() - Stopwatch.Frequency / 5,
-        "过期重试必须保留真实 RX 的旧 QPC 时间，且首次 seq 为 1");
-
-    ButtonStateSnapshot fresh = rxSnapshot with { TimestampQpc = Stopwatch.GetTimestamp() };
-    Require(publisher.TryPublish(fresh), "新鲜物理状态应能恢复发布");
-    byte[] current = ReadButtonStateMapping(view, holderMutex);
-    Require(current[32] == 0x13 && current[34] == 0x03,
-        "新鲜物理状态应恢复五位按键值和 valid/healthy 标志");
-    ulong beforeRestart = BinaryPrimitives.ReadUInt64LittleEndian(current.AsSpan(16, 8));
-    publisher.Dispose();
-    using ButtonStateSharedMemory restartedPublisher = new(mapName, mutexName);
-    Require(restartedPublisher.TryPublish(fresh with { TimestampQpc = Stopwatch.GetTimestamp() }),
-        "重启后的 publisher 应继续发布");
-    byte[] restarted = ReadButtonStateMapping(view, holderMutex);
-    Require(BinaryPrimitives.ReadUInt64LittleEndian(restarted.AsSpan(16, 8)) > beforeRestart,
-        "publisher 重启必须承接共享区残留 seq");
-
-    string abandonedSuffix = Guid.NewGuid().ToString("N");
-    string abandonedMapName = $"Local\\HidBridge.Buttons.Checks.{abandonedSuffix}";
-    string abandonedMutexName = $"{abandonedMapName}.Mutex";
-    using MemoryMappedFile abandonedMapping = MemoryMappedFile.CreateOrOpen(
-        abandonedMapName, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-    using MemoryMappedViewAccessor abandonedView = abandonedMapping.CreateViewAccessor(
-        0, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-    using Mutex abandonedMutex = new(false, abandonedMutexName);
-    Thread abandonedWriter = new(() =>
-    {
-        abandonedMutex.WaitOne();
-        abandonedView.Write(0, 0U); // 模拟 Host 半写头部后异常退出。
-        abandonedView.Write(16, 41UL); // Sender 已观察到的 seq floor。
-    });
-    abandonedWriter.Start();
-    Require(abandonedWriter.Join(TimeSpan.FromSeconds(2)), "模拟残留头/seq 的线程未退出");
-    using ButtonStateSharedMemory afterAbandon = new(abandonedMapName, abandonedMutexName);
-    Require(afterAbandon.TryPublish(fresh with { TimestampQpc = Stopwatch.GetTimestamp() }),
-        "新 Host 应能取得 abandoned mutex 并完整重发布");
-    byte[] recovered = ReadButtonStateMapping(abandonedView, abandonedMutex);
-    Require(BinaryPrimitives.ReadUInt32LittleEndian(recovered.AsSpan(0, 4)) == ButtonStateSharedMemory.Magic &&
-            BinaryPrimitives.ReadUInt64LittleEndian(recovered.AsSpan(16, 8)) == 42,
-        "无效残留头部中的非零 seq 仍须承接，越过 Sender 弃锁记录的 floor");
-    Console.WriteLine("ButtonState MMF检查：64字节布局、非阻塞锁、200ms过期、重启seq与弃锁残留seq恢复均通过。");
-}
-
-static byte[] ReadButtonStateMapping(MemoryMappedViewAccessor view, Mutex mutex)
-{
-    bool ownsMutex = false;
-    try
-    {
-        try
-        {
-            ownsMutex = mutex.WaitOne(TimeSpan.FromSeconds(2));
-        }
-        catch (AbandonedMutexException)
-        {
-            ownsMutex = true;
-        }
-        Require(ownsMutex, "读取 ButtonState 时无法取得 mutex");
-        byte[] bytes = new byte[ButtonStateSharedMemory.MappingSize];
-        view.ReadArray(0, bytes, 0, bytes.Length);
-        return bytes;
-    }
-    finally
-    {
-        if (ownsMutex)
-        {
-            mutex.ReleaseMutex();
-        }
-    }
-}
-
 static void CheckButtonStateScannerFrames()
 {
     FrameCodec codec = new();
@@ -1678,6 +1606,88 @@ static void CheckMakcuModeCoordinator()
     Console.WriteLine("Makcu模式协调检查：ACK/实态分离、unsupported恢复、双速率查实和writer epoch门均通过。");
 }
 
+static void CheckMakcuStartupKeepsUiResponsive()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-makcu-startup-{Guid.NewGuid():N}");
+    AutomationSettings settings = new() { MakcuEnabled = true };
+    using SerialBridge serial = new(new BridgeOptions { PortName = "COM2147483647" },
+        new RuntimeLogSettings(RuntimeLogMode.Reduced), settings: settings);
+    object serialLock = typeof(SerialBridge)
+        .GetField("_sync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+        .GetValue(serial)!;
+    Exception? failure = null;
+    TimeSpan elapsed = TimeSpan.Zero;
+    Thread uiThread = new(() =>
+    {
+        try
+        {
+            using InputForwarder input = new(serial);
+            using AutomationController automation = new(
+                new AutomationProfileStore(directory), input, new RecordingAutomationOutput(), settings);
+            using SettingsPageControl page = new(automation, serialBridge: serial);
+            using System.Windows.Forms.Form form = new()
+            {
+                ShowInTaskbar = false,
+                Opacity = 0,
+            };
+            form.Controls.Add(page);
+            form.Shown += async (_, _) =>
+            {
+                try
+                {
+                    Stopwatch timer = Stopwatch.StartNew();
+                    Task restore = page.RestoreMakcuModeOnStartupAsync();
+                    TaskCompletionSource uiMessage = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    form.BeginInvoke(new Action(() => uiMessage.SetResult()));
+                    await uiMessage.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                    Require(!restore.IsCompleted && !page.MakcuVersionComboBox.Enabled,
+                        "界面应在等待串口时继续处理消息，并暂时锁定 Makcu 设置");
+                    await restore.WaitAsync(TimeSpan.FromSeconds(7));
+                    elapsed = timer.Elapsed;
+                    Require(settings.MakcuEnabled && page.MakcuVersionComboBox.Enabled &&
+                        automation.MakcuModeRuntimePaused && elapsed < TimeSpan.FromSeconds(7) &&
+                        page.StatusText.Contains("尚未验证 M 板角色", StringComparison.Ordinal),
+                        "等待串口锁超时后，应恢复设置控件、保留 Makcu 设置并保持宏/Lua 暂停");
+                }
+                catch (Exception exception)
+                {
+                    failure = exception;
+                }
+                finally
+                {
+                    form.Close();
+                }
+            };
+            System.Windows.Forms.Application.Run(form);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+    }) { IsBackground = true };
+    uiThread.SetApartmentState(ApartmentState.STA);
+    try
+    {
+        lock (serialLock)
+        {
+            uiThread.Start();
+            Require(uiThread.Join(TimeSpan.FromSeconds(10)), "启动恢复阻塞了 WinForms 界面线程");
+        }
+    }
+    finally
+    {
+        if (!uiThread.IsAlive && Directory.Exists(directory))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+    if (failure is not null)
+    {
+        throw new InvalidOperationException("Makcu 启动恢复界面检查失败", failure);
+    }
+    Console.WriteLine($"Makcu 启动恢复：串口锁占用时 WinForms 消息已处理，{elapsed.TotalSeconds:F2} 秒后设置恢复可操作，宏/Lua 保持暂停：PASS");
+}
+
 static void CheckMakcuReconnectStateSync()
 {
     Require(
@@ -1731,15 +1741,11 @@ static void CheckMakcuReconnectStateSync()
         AutomationProfileStore store = new(directory);
         AutomationSettings observed = store.LoadSettings();
         observed.AlwaysOutputUdpEnabled = false;
-        observed.ButtonStatePublishingEnabled = false;
-        observed.ButtonStateMappingName = "Local\\HidBridge.Buttons.ReconnectState";
         observed.FirmwareFlashPortName = "COM123";
         Require(observed.TryEnableVerifiedMakcuMode(), "旧 false 与已验证 115200 冲突时必须允许同步为开");
         Require(
             observed.MakcuEnabled &&
             !observed.AlwaysOutputUdpEnabled &&
-            !observed.ButtonStatePublishingEnabled &&
-            observed.ButtonStateMappingName == "Local\\HidBridge.Buttons.ReconnectState" &&
             observed.FirmwareFlashPortName == "COM123",
             "实态同步只能修改 MakcuEnabled，不得覆盖其它共享设置");
         Require(!observed.TryEnableVerifiedMakcuMode(), "相同 Makcu 状态不得重复修改设置");
@@ -1748,8 +1754,6 @@ static void CheckMakcuReconnectStateSync()
         Require(
             restored.MakcuEnabled &&
             !restored.AlwaysOutputUdpEnabled &&
-            !restored.ButtonStatePublishingEnabled &&
-            restored.ButtonStateMappingName == "Local\\HidBridge.Buttons.ReconnectState" &&
             restored.FirmwareFlashPortName == "COM123",
             "已验证 Makcu 开关与无关设置必须一起完整落盘并可重新加载");
 
@@ -1773,126 +1777,27 @@ static void CheckMakcuReconnectStateSync()
         "Makcu重连同步检查：固定921600→115200、仅验证Makcu后置开、旧单板隔离、仅改MakcuEnabled并持久化：PASS");
 }
 
-static void CheckButtonStateSettingsDefaults()
+static void CheckMakcuSettingsDefaults()
 {
     string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-settings-{Guid.NewGuid():N}");
     try
     {
         AutomationProfileStore store = new(directory);
         AutomationSettings defaults = store.LoadSettings();
-        Require(!defaults.MakcuEnabled && defaults.ButtonStatePublishingEnabled &&
-                defaults.ButtonStateMappingName == ButtonStateSharedMemory.DefaultMappingName,
-            "新配置默认必须是Makcu关闭、物理ButtonState发布开启且使用默认映射名");
+        Require(!defaults.MakcuEnabled, "新配置默认必须关闭 Makcu");
         defaults.MakcuEnabled = true;
-        defaults.ButtonStatePublishingEnabled = false;
-        defaults.ButtonStateMappingName = "Local\\HidBridge.Buttons.SettingsRoundTrip";
         store.SaveSettings(defaults);
         AutomationSettings restored = store.LoadSettings();
-        Require(restored.MakcuEnabled && !restored.ButtonStatePublishingEnabled &&
-                restored.ButtonStateMappingName == defaults.ButtonStateMappingName,
-            "Makcu、ButtonState 发布开关和映射名必须在保存与重新加载后保持用户选择");
-    }
-    finally
-    {
-        if (Directory.Exists(directory))
-        {
-            Directory.Delete(directory, recursive: true);
-        }
-    }
-    Console.WriteLine("ButtonState/Makcu设置检查：默认值与JSON持久化读回均通过。");
-}
-
-static void CheckButtonStateMappingNameSettingsAndPublisher()
-{
-    string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-button-map-setting-{Guid.NewGuid():N}");
-    try
-    {
-        AutomationProfileStore store = new(directory);
-        AutomationSettings defaults = store.LoadSettings();
-        Require(defaults.ButtonStateMappingName == ButtonStateSharedMemory.DefaultMappingName,
-            "新配置的共享内存映射名必须为默认名称");
-
+        Require(restored.MakcuEnabled, "Makcu 设置必须在保存与重新加载后保持用户选择");
         string settingsPath = Path.Combine(directory, "automation.settings.json");
-        File.WriteAllText(settingsPath, "{\"MinimizeToTray\":true}");
-        Require(store.LoadSettings().ButtonStateMappingName == ButtonStateSharedMemory.DefaultMappingName,
-            "没有映射名字段的旧配置必须继续使用默认名称");
-        File.WriteAllText(settingsPath, "{\"ButtonStateMappingName\":\"  \"}");
-        Require(store.LoadSettings().ButtonStateMappingName == ButtonStateSharedMemory.DefaultMappingName,
-            "旧配置中的空白映射名必须规范化为默认名称");
-
-        string mappingName = $"Local\\HidBridge.Buttons.MappingChecks.{Guid.NewGuid():N}";
-        AutomationSettings custom = store.LoadSettings();
-        custom.ButtonStateMappingName = mappingName;
-        store.SaveSettings(custom);
-        Require(store.LoadSettings().ButtonStateMappingName == mappingName,
-            "非默认映射名必须持久化并准确读回");
-
-        using ButtonStateSharedMemory publisher = new(mappingName);
-        Require(publisher.MappingName == mappingName &&
-                publisher.MutexName == $"{mappingName}.Mutex",
-            "非默认映射名的发布器必须使用同名派生 .Mutex");
-        Require(publisher.TryPublish(new ButtonStateSnapshot(
-                0x15, MouseValid: true, SubscriptionHealthy: true, ConnectionState: 2,
-                TimestampQpc: Stopwatch.GetTimestamp())),
-            "非默认名称 publisher 必须能发布真实共享区快照");
-        using MemoryMappedFile mapping = MemoryMappedFile.CreateOrOpen(
-            mappingName, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-        using MemoryMappedViewAccessor view = mapping.CreateViewAccessor(
-            0, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-        using Mutex mutex = new(false, $"{mappingName}.Mutex");
-        byte[] published = ReadButtonStateMapping(view, mutex);
-        Require(BinaryPrimitives.ReadUInt32LittleEndian(published.AsSpan(0, 4)) == ButtonStateSharedMemory.Magic &&
-                published[32] == 0x15 && published[34] == 0x03,
-            "以配置名称重新打开映射和派生 mutex 后必须读到 publisher 的完整状态");
-
-        Require(!ButtonStateSharedMemory.TryNormalizeMappingName(" \t ", out _, out string? blankError) &&
-                blankError?.Contains("不能为空", StringComparison.Ordinal) == true,
-            "保存入口必须拒绝空白映射名并给出明确错误");
-        Require(!ButtonStateSharedMemory.TryNormalizeMappingName("bad\0name", out _, out string? nulError) &&
-                nulError?.Contains("NUL", StringComparison.Ordinal) == true,
-            "保存入口必须拒绝包含 NUL 的映射名");
-        Require(!ButtonStateSharedMemory.TryNormalizeMappingName("folder\\child", out _, out string? separatorError) &&
-                separatorError?.Contains("反斜杠", StringComparison.Ordinal) == true,
-            "保存入口必须拒绝命名空间前缀之外的反斜杠");
-        string invalidApiName = $"Local\\HidBridge.Buttons.ApiNameChecks.{Guid.NewGuid():N}\\child";
-        bool apiRejectedInternalSeparator = false;
-        string? apiRejectionType = null;
-        try
-        {
-            using MemoryMappedFile invalidMapping = MemoryMappedFile.CreateOrOpen(
-                invalidApiName, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-        }
-        catch (Exception exception) when (
-            exception is ArgumentException or IOException or UnauthorizedAccessException)
-        {
-            apiRejectedInternalSeparator = true;
-            apiRejectionType = exception.GetType().Name;
-        }
-        Require(apiRejectedInternalSeparator,
-            "Windows 命名 MMF API 必須拒絕 Local\\ 前綴後的內部反斜杠");
-        Console.WriteLine($"Windows MMF 名稱邊界：Local\\ 前綴有效、內部反斜杠由 API 拒絕（{apiRejectionType}）。");
-        string lowerPrefixName = $"local\\HidBridge.Buttons.LowerPrefixChecks.{Guid.NewGuid():N}";
-        bool apiRejectedLowercasePrefix = false;
-        string? lowerPrefixRejectionType = null;
-        try
-        {
-            using MemoryMappedFile lowerPrefixMapping = MemoryMappedFile.CreateOrOpen(
-                lowerPrefixName, ButtonStateSharedMemory.MappingSize, MemoryMappedFileAccess.ReadWrite);
-        }
-        catch (Exception exception) when (
-            exception is ArgumentException or IOException or UnauthorizedAccessException)
-        {
-            apiRejectedLowercasePrefix = true;
-            lowerPrefixRejectionType = exception.GetType().Name;
-        }
-        Require(apiRejectedLowercasePrefix &&
-                !ButtonStateSharedMemory.TryNormalizeMappingName(lowerPrefixName, out _, out _),
-            "Windows MMF 前缀大小写敏感；validator 不得接受小写 local\\");
-        Console.WriteLine($"Windows MMF 大小写边界：小写 local\\ 被 API 拒绝（{lowerPrefixRejectionType}）。");
-        Require(ButtonStateSharedMemory.TryNormalizeMappingName("  Local\\HidBridge.Buttons.Trimmed  ",
-                out string normalized, out _) &&
-                normalized == "Local\\HidBridge.Buttons.Trimmed",
-            "有效映射名保存前必须 Trim，且不施加其他未约定限制");
+        File.WriteAllText(settingsPath, """
+            {"MakcuEnabled":true,"ButtonStatePublishingEnabled":true,"ButtonStateMappingName":"OldMapping"}
+            """);
+        AutomationSettings oldSettings = store.LoadSettings();
+        Require(oldSettings.MakcuEnabled, "旧版共享内存字段不应影响 Makcu 配置加载");
+        store.SaveSettings(oldSettings);
+        string saved = File.ReadAllText(settingsPath);
+        Require(!saved.Contains("ButtonState", StringComparison.Ordinal), "保存时仍写出了已移除的共享内存字段");
     }
     finally
     {
@@ -1901,101 +1806,7 @@ static void CheckButtonStateMappingNameSettingsAndPublisher()
             Directory.Delete(directory, recursive: true);
         }
     }
-
-    Console.WriteLine("ButtonState 名称设置检查：旧配置/空值回退、非默认名称读回、MMF+派生 mutex 实际互通及输入校验均通过。");
-}
-
-static void CheckButtonStateMappingNameUi()
-{
-    Exception? failure = null;
-    Thread thread = new(() =>
-    {
-        string directory = Path.Combine(Path.GetTempPath(), $"hidbridge-button-map-ui-{Guid.NewGuid():N}");
-        try
-        {
-            RecordingTransport transport = new();
-            using InputForwarder input = new(transport);
-            AutomationProfileStore store = new(directory);
-            using AutomationController automation = new(store, input, new RecordingAutomationOutput());
-            using Form form = new()
-            {
-                StartPosition = FormStartPosition.Manual,
-                Location = new Point(-32000, -32000),
-                ClientSize = new Size(1100, 760),
-            };
-            SettingsPageControl page = new(automation) { Dock = DockStyle.Fill };
-            form.Controls.Add(page);
-            form.Show();
-            Application.DoEvents();
-            page.PerformLayout();
-
-            Require(page.ButtonStateMappingNameTextBox.Text == ButtonStateSharedMemory.DefaultMappingName,
-                "设置页必须从旧/默认配置载入默认共享内存名称");
-            Require(page.ButtonStateMappingNameOptionRow.Visible &&
-                    page.ButtonStateMappingNameOptionRow.Parent is FlowLayoutPanel,
-                "设置页必须在启动与托盘选项中显示名称输入行");
-            Label description = page.ButtonStateMappingNameOptionRow.Controls
-                .Cast<Control>()
-                .SelectMany(EnumerateControls)
-                .OfType<Label>()
-                .Single(label => label.AccessibleName == "共享内存名称说明");
-            Require(description.Text.Contains("config.ini [aim] third_party_buttons_map", StringComparison.Ordinal) &&
-                    description.Text.Contains("重启 EXE", StringComparison.Ordinal),
-                "名称说明必须指向 Sender 配置键并明确重启生效");
-
-            string mappingName = $"Local\\HidBridge.Buttons.UiChecks.{Guid.NewGuid():N}";
-            page.ButtonStateMappingNameTextBox.Text = $"  {mappingName}  ";
-            page.MinimizeToTrayCheckBox.Checked = true;
-            Application.DoEvents();
-            Require(store.LoadSettings().ButtonStateMappingName == ButtonStateSharedMemory.DefaultMappingName,
-                "未提交的文本不得被无关开关保存或改变当前 publisher 配置");
-
-            page.SaveButtonStateMappingNameButton.PerformClick();
-            Application.DoEvents();
-            AutomationSettings saved = store.LoadSettings();
-            Require(saved.ButtonStateMappingName == mappingName &&
-                    automation.Settings.ButtonStateMappingName == mappingName &&
-                    page.ButtonStateMappingNameTextBox.Text == mappingName,
-                "点击保存名称后必须 Trim 并持久化配置，不立即替换运行中的 publisher");
-            Require(page.StatusText.Contains("重启 EXE", StringComparison.Ordinal) &&
-                    page.StatusText.Contains("Sender", StringComparison.Ordinal),
-                "成功提示必须说明重启生效且 Sender 名称要一致");
-
-            AutomationSettings reloadedSettings = store.LoadSettings();
-            using AutomationController reloadedAutomation = new(
-                store, input, new RecordingAutomationOutput(), reloadedSettings);
-            using SettingsPageControl reloadedPage = new(reloadedAutomation);
-            Require(reloadedPage.ButtonStateMappingNameTextBox.Text == mappingName,
-                "新 SettingsPage 必须从已保存配置载入自定义共享内存名称");
-
-            page.ButtonStateMappingNameTextBox.Text = "   ";
-            page.SaveButtonStateMappingNameButton.PerformClick();
-            Application.DoEvents();
-            Require(store.LoadSettings().ButtonStateMappingName == mappingName &&
-                    automation.Settings.ButtonStateMappingName == mappingName &&
-                    page.StatusText.Contains("不能为空", StringComparison.Ordinal),
-                "空名称提交必须报错，且不得覆盖内存或磁盘上的已保存名称");
-        }
-        catch (Exception exception)
-        {
-            failure = exception;
-        }
-        finally
-        {
-            if (Directory.Exists(directory))
-            {
-                Directory.Delete(directory, recursive: true);
-            }
-        }
-    });
-    thread.SetApartmentState(ApartmentState.STA);
-    thread.Start();
-    Require(thread.Join(TimeSpan.FromSeconds(20)), "ButtonState 名称 UI 检查超时");
-    if (failure is not null)
-    {
-        throw new InvalidOperationException("ButtonState 名称 UI 检查失败。", failure);
-    }
-    Console.WriteLine("ButtonState 名称 UI 检查：实际控件载入/保存/重载、无关开关隔离、空值拒绝与错误提示均通过。");
+    Console.WriteLine("Makcu 设置默认值、JSON 持久化和忽略旧共享内存字段：PASS");
 }
 
 static void CheckMakcuAutomationPauseGate()
@@ -4953,17 +4764,12 @@ static void CheckWindowLayout()
             Require(form.SettingsPage.MakcuModeCheckBox.Text.StartsWith("启用 Makcu 运行模式", StringComparison.Ordinal) &&
                     form.SettingsPage.MakcuModeCheckBox.Checked == automation.Settings.MakcuEnabled,
                 "设置页必须显示并正确加载 Makcu 运行模式开关");
-            Require(form.SettingsPage.ButtonStatePublishingCheckBox.Text.StartsWith("发布物理鼠标按键状态", StringComparison.Ordinal) &&
-                    form.SettingsPage.ButtonStatePublishingCheckBox.Checked == automation.Settings.ButtonStatePublishingEnabled,
-                "设置页必须显示并正确加载物理按键发布开关");
             form.MainTabs.SelectedTab = form.MainTabs.TabPages[3];
             form.SettingsPage.PerformLayout();
             Application.DoEvents();
             Panel legacyUdpRow = form.SettingsPage.AlwaysOutputUdpOptionRow;
             Panel legacyModeRow = form.SettingsPage.LegacySingleBoardOptionRow;
             Panel makcuModeRow = form.SettingsPage.MakcuModeOptionRow;
-            Panel buttonPublishingRow = form.SettingsPage.ButtonStatePublishingOptionRow;
-            Panel buttonMappingRow = form.SettingsPage.ButtonStateMappingNameOptionRow;
             Panel simulatedUdpRow = form.SettingsPage.SimulatedUdpInputOptionRow;
             CheckBox simulatedUdpCheckBox = form.SettingsPage.SimulatedUdpInputCheckBox;
             ComboBox simulatedUdpFrequency = form.SettingsPage.SimulatedUdpInputFrequencyBox;
@@ -4977,28 +4783,16 @@ static void CheckWindowLayout()
                 legacyUdpRow.Parent is FlowLayoutPanel options &&
                 legacyModeRow.Parent == options &&
                 makcuModeRow.Parent == options &&
-                buttonPublishingRow.Parent == options &&
-                buttonMappingRow.Parent == options &&
                 simulatedUdpRow.Parent == options &&
                 legacyUdpRow.Parent == options &&
                 options.Controls.IndexOf(makcuModeRow) == options.Controls.IndexOf(legacyModeRow) + 1 &&
-                options.Controls.IndexOf(buttonPublishingRow) == options.Controls.IndexOf(makcuModeRow) + 1 &&
-                options.Controls.IndexOf(buttonMappingRow) == options.Controls.IndexOf(buttonPublishingRow) + 1 &&
-                options.Controls.IndexOf(simulatedUdpRow) == options.Controls.IndexOf(buttonMappingRow) + 1 &&
+                options.Controls.IndexOf(simulatedUdpRow) == options.Controls.IndexOf(makcuModeRow) + 1 &&
                 options.Controls.IndexOf(legacyUdpRow) == options.Controls.IndexOf(simulatedUdpRow) + 1 &&
                 makcuModeRow.Top >= legacyModeRow.Bottom &&
-                buttonPublishingRow.Top >= makcuModeRow.Bottom &&
-                buttonMappingRow.Top >= buttonPublishingRow.Bottom &&
-                simulatedUdpRow.Top >= buttonMappingRow.Bottom &&
-                buttonMappingRow.Bottom <= options.ClientSize.Height &&
-                buttonPublishingRow.Bottom <= options.ClientSize.Height &&
-                simulatedUdpRow.Bottom <= options.ClientSize.Height &&
+                simulatedUdpRow.Top >= makcuModeRow.Bottom &&
                 simulatedUdpRow.Top >= legacyModeRow.Bottom &&
                 legacyUdpRow.Top >= simulatedUdpRow.Bottom,
-                "设置项必须依次完整显示旧版单板、Makcu、物理按键发布和UDP模拟/输出，不得裁剪新增行");
-            Require(form.SettingsPage.ButtonStateMappingNameTextBox.Text == ButtonStateSharedMemory.DefaultMappingName &&
-                    form.SettingsPage.SaveButtonStateMappingNameButton.Text == "保存名称",
-                "设置布局必须显示默认共享内存映射名及独立保存按钮");
+                "设置项必须依次完整显示旧版单板、Makcu 和 UDP 模拟/输出选项");
             Require(
                 !automation.Settings.LegacySingleBoardFirmwareCompatibility &&
                 !legacyUdpRow.Visible &&
@@ -5009,6 +4803,11 @@ static void CheckWindowLayout()
                 !form.SettingsPage.AlwaysOutputUdpCheckBox.Visible &&
                 !legacyUdpDescription.Visible,
                 "新双板模式必须隐藏两个旧版选项整行及说明，不能留下可见残余文字");
+            Control startupOptions = makcuModeRow.Parent!;
+            Control startupCard = startupOptions.Parent!;
+            int compactHeight = startupCard.Height;
+            Require(compactHeight == startupOptions.Top + makcuModeRow.Bottom + startupCard.Padding.Bottom,
+                "双板模式下启动卡片应在 Makcu 选项后收起多余空间");
             Require(
                 !automation.Settings.SimulatedUdpInputEnabled &&
                 !input.SimulatedUdpInputEnabled &&
@@ -5028,6 +4827,9 @@ static void CheckWindowLayout()
                 legacyUdpDescription.Visible &&
                 form.SettingsPage.AlwaysOutputUdpCheckBox.Text == "始终开启 UDP 输出",
                 "仅旧版单板模式开启后才显示模拟输入和始终 UDP 输出整行及说明");
+            Require(startupCard.Height > compactHeight &&
+                    startupCard.Height == startupOptions.Top + legacyUdpRow.Bottom + startupCard.Padding.Bottom,
+                "旧版单板模式下启动卡片应展开并完整容纳最后一个选项");
             simulatedUdpCheckBox.Checked = true;
             simulatedUdpFrequency.SelectedItem = 140;
             Require(
@@ -5092,6 +4894,12 @@ static void CheckWindowLayout()
             form.MainTabs.SelectedIndex = 0;
             form.MainTabs.PerformLayout();
             Application.DoEvents();
+            TrackBar sensitivitySlider = form.OutputSensitivityTrackBar;
+            Require(sensitivitySlider.Visible && sensitivitySlider.Top >= 8 &&
+                    sensitivitySlider.Height >= 44 &&
+                    sensitivitySlider.Bottom <= sensitivitySlider.Parent!.ClientSize.Height,
+                $"灵敏度滑条应下移并完整显示刻度：滑条={sensitivitySlider.Bounds}，行={sensitivitySlider.Parent?.ClientSize}");
+            Console.WriteLine($"设置卡片与灵敏度布局：双板卡片高度 {compactHeight}，滑条位置 {sensitivitySlider.Top}、高度 {sensitivitySlider.Height}：PASS");
             Require(
                 form.LanEndpointLabel.Visible &&
                 form.LanEndpointLabel.Text == "UDP 192.168.1.20:24814" &&
@@ -5100,6 +4908,24 @@ static void CheckWindowLayout()
                 form.LanEndpointLabel.Width >= 150,
                 $"左上角必须显示与同步状态同高且未裁切的局域网 UDP 监听 IP 和端口：" +
                 $"status={form.SyncStatusLabel.Bounds},lan={form.LanEndpointLabel.Bounds}");
+            SerialPortStatus pcPort = new("COM9", 921600);
+            SerialPortStatus controlPort = new("COM3", 921600);
+            string a5 = BridgeMainForm.FormatSerialEndpoints(pcPort, controlPort);
+            string makcu = BridgeMainForm.FormatSerialEndpoints(pcPort, controlPort with { BaudRate = 115200 });
+            Require(a5 == "P：COM9 @ 921600 baud\r\nM：COM3 @ 921600 baud" &&
+                    makcu == "P：COM9 @ 921600 baud\r\nM：COM3 @ 115200 baud" &&
+                    BridgeMainForm.FormatSerialEndpoints(null, controlPort) == "P：未连接\r\nM：COM3 @ 921600 baud" &&
+                    BridgeMainForm.FormatSerialEndpoints(pcPort, null) == "P：COM9 @ 921600 baud\r\nM：未连接" &&
+                    BridgeMainForm.FormatSerialEndpoints(null, controlPort with { LegacySingleBoard = true })
+                        == "P：未连接\r\n单板：COM3 @ 921600 baud",
+                "P/M 端口、波特率切换、断开或单板显示不正确");
+            Size endpointTextSize = TextRenderer.MeasureText(makcu, form.EndpointLabel.Font);
+            Require(form.EndpointLabel.Text == "测试端点" &&
+                    form.EndpointLabel.Visible &&
+                    form.EndpointLabel.Width >= endpointTextSize.Width &&
+                    form.EndpointLabel.Height >= endpointTextSize.Height,
+                $"右上角需要容纳两行串口状态：{form.EndpointLabel.Size}，文本需要 {endpointTextSize}");
+            Console.WriteLine("P/M 端点显示：双板 A5、M 切换 115200、独立断开、旧单板及高宽检查：PASS");
             FlowLayoutPanel udpOptionsLayout = EnumerateControls(form)
                 .OfType<FlowLayoutPanel>()
                 .Single(layout => layout.Controls.Contains(form.UdpSmoothingCheckBox));
@@ -5219,6 +5045,23 @@ static void CheckWindowLayout()
             form.Show();
             Application.DoEvents();
             form.MainTabs.SelectedIndex = 0;
+            Size normalWindowSize = form.Size;
+            form.Size = form.MinimumSize;
+            Application.DoEvents();
+            TrackBar slider = form.OutputSensitivityTrackBar;
+            Control footer = slider.Parent!.Parent!;
+            Rectangle captureBounds = form.CaptureSurface.RectangleToScreen(form.CaptureSurface.ClientRectangle);
+            Rectangle footerBounds = footer.RectangleToScreen(footer.ClientRectangle);
+            Rectangle sliderBounds = slider.RectangleToScreen(slider.ClientRectangle);
+            Rectangle panelBounds = form.MainSplit.Panel1.RectangleToScreen(form.MainSplit.Panel1.ClientRectangle);
+            Require(form.Size == form.MinimumSize && captureBounds.Height > 0 &&
+                    captureBounds.Bottom <= footerBounds.Top &&
+                    footerBounds.Contains(sliderBounds) &&
+                    panelBounds.Contains(footerBounds),
+                $"最小窗口中鼠标捕获区、底部栏或滑条发生遮挡：窗口={form.Size}，捕获区={captureBounds}，底部栏={footerBounds}，滑条={sliderBounds}");
+            Console.WriteLine($"最小窗口滑条防遮挡：{form.Size.Width}×{form.Size.Height}，捕获区高度={captureBounds.Height}，滑条高度={sliderBounds.Height}：PASS");
+            RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-capture-minimum.png"));
+            form.Size = normalWindowSize;
             RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-capture.png"));
             form.MainTabs.SelectedIndex = 1;
             RenderControlToPng(form, Path.Combine(artifactDirectory, "automation-ui-macro.png"));

@@ -1,5 +1,4 @@
 using System.Text.Json;
-using HidBridge.Host.Input;
 
 namespace HidBridge.Host.Automation;
 
@@ -40,8 +39,6 @@ internal sealed class AutomationProfileStore
                 AutomationSettings settings = JsonSerializer.Deserialize<AutomationSettings>(
                     File.ReadAllText(_settingsPath),
                     JsonOptions) ?? new AutomationSettings();
-                settings.ButtonStateMappingName = ButtonStateSharedMemory.NormalizeConfiguredMappingName(
-                    settings.ButtonStateMappingName);
                 return settings;
             }
         }

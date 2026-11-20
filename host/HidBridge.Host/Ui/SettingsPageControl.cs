@@ -25,12 +25,7 @@ internal sealed class SettingsPageControl : UserControl
     private readonly Panel _legacySingleBoardOptionRow;
     private readonly CheckBox _makcuModeCheckBox;
     private readonly ComboBox _makcuVersionComboBox;
-    private readonly CheckBox _buttonStatePublishingCheckBox;
     private readonly Panel _makcuModeOptionRow;
-    private readonly Panel _buttonStatePublishingOptionRow;
-    private readonly TextBox _buttonStateMappingNameTextBox;
-    private readonly Button _saveButtonStateMappingNameButton;
-    private readonly Panel _buttonStateMappingNameOptionRow;
     private readonly CheckBox _simulatedUdpInputCheckBox;
     private readonly ComboBox _simulatedUdpInputFrequencyBox;
     private readonly Panel _simulatedUdpInputOptionRow;
@@ -72,7 +67,7 @@ internal sealed class SettingsPageControl : UserControl
         };
         Label description = new()
         {
-            Text = "开关会立即保存；共享内存名称需单独保存并重启 EXE 后生效。托盘菜单中的“退出”始终会真正结束程序。",
+            Text = "开关会立即保存。托盘菜单中的“退出”始终会真正结束程序。",
             Dock = DockStyle.Fill,
             ForeColor = MutedTextColor,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -98,28 +93,6 @@ internal sealed class SettingsPageControl : UserControl
         };
         _makcuVersionComboBox.Items.AddRange(["V4（ASCII / MAK_API）", "老版 V3 ASCII（兼容子集）", "V2 二进制（鼠标兼容子集）"]);
         _makcuVersionComboBox.SelectedIndex = _controller.Settings.MakcuProtocolVersion switch { 3 => 1, 2 => 2, _ => 0 };
-        _buttonStatePublishingCheckBox = CreateOption(
-            "发布物理鼠标按键状态",
-            "订阅 M 板真实鼠标按键并写入下方配置的共享内存；Makcu 模式期间暂停。",
-            height: 58);
-        _buttonStatePublishingCheckBox.Enabled = serialBridge is not null;
-        _buttonStateMappingNameTextBox = new TextBox
-        {
-            Width = 420,
-            Height = 28,
-            AccessibleName = "ButtonState 共享内存名称",
-        };
-        _saveButtonStateMappingNameButton = new Button
-        {
-            Text = "保存名称",
-            AutoSize = true,
-            BackColor = Color.FromArgb(237, 243, 250),
-            ForeColor = PrimaryTextColor,
-            UseVisualStyleBackColor = false,
-        };
-        _buttonStateMappingNameOptionRow = WrapButtonStateMappingNameOption(
-            _buttonStateMappingNameTextBox,
-            _saveButtonStateMappingNameButton);
         _simulatedUdpInputCheckBox = CreateOption(
             "UDP 模拟输入测试",
             "仅旧版单板通路且 HOME 同步开启时生效：将实体鼠标移动按指定频率聚合并写入旧版单板 7 字节鼠标报告；此测试不发送网络 UDP 数据报。");
@@ -151,8 +124,6 @@ internal sealed class SettingsPageControl : UserControl
 
         FlowLayoutPanel startupOptions = new()
         {
-            Dock = DockStyle.Fill,
-            Height = 600,
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
             Padding = new Padding(0, 8, 0, 0),
@@ -172,7 +143,6 @@ internal sealed class SettingsPageControl : UserControl
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = MutedTextColor,
         }, 1, 1);
-        _buttonStatePublishingOptionRow = WrapOption(_buttonStatePublishingCheckBox);
         _simulatedUdpInputOptionRow = WrapSimulatedUdpInputOption(
             _simulatedUdpInputCheckBox,
             _simulatedUdpInputFrequencyBox);
@@ -183,25 +153,34 @@ internal sealed class SettingsPageControl : UserControl
             WrapOption(_closeToTrayCheckBox),
             _legacySingleBoardOptionRow,
             _makcuModeOptionRow,
-            _buttonStatePublishingOptionRow,
-            _buttonStateMappingNameOptionRow,
             _simulatedUdpInputOptionRow,
             _alwaysOutputUdpOptionRow,
         ]);
 
-        Panel startupPanel = CreateCardPanel(700);
+        Panel startupPanel = CreateCardPanel(0);
         Label startupTitle = CreateSectionTitle("启动与托盘");
         startupTitle.Dock = DockStyle.None;
         startupTitle.Location = new Point(16, 10);
         startupTitle.Size = new Size(900, 30);
         startupTitle.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        startupOptions.Dock = DockStyle.None;
         startupOptions.Location = new Point(16, 44);
-        startupOptions.Size = new Size(900, 600);
+        startupOptions.Width = 900;
         startupOptions.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         startupPanel.Controls.Add(startupOptions);
         startupPanel.Controls.Add(startupTitle);
         startupPanel.Controls.SetChildIndex(startupTitle, 0);
+        void ResizeStartupCard()
+        {
+            int optionsHeight = startupOptions.Controls.Cast<Control>().Sum(option => option.Height);
+            if (!_legacySingleBoardFirmwareCheckBox.Checked)
+            {
+                optionsHeight -= _simulatedUdpInputOptionRow.Height + _alwaysOutputUdpOptionRow.Height;
+            }
+            startupOptions.Height = optionsHeight + startupOptions.Padding.Vertical;
+            startupPanel.Height = startupOptions.Bottom + startupPanel.Padding.Bottom;
+        }
+
+        ResizeStartupCard();
         Panel flashPanel = BuildFlashPanel();
 
         _statusLabel = new Label
@@ -267,12 +246,13 @@ internal sealed class SettingsPageControl : UserControl
         _startOnBootCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _minimizeToTrayCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _closeToTrayCheckBox.CheckedChanged += (_, _) => SaveSettings();
-        _legacySingleBoardFirmwareCheckBox.CheckedChanged += (_, _) => OnLegacyModeChanged();
+        _legacySingleBoardFirmwareCheckBox.CheckedChanged += (_, _) =>
+        {
+            OnLegacyModeChanged();
+            ResizeStartupCard();
+        };
         _makcuModeCheckBox.CheckedChanged += async (_, _) => await OnMakcuModeChangedAsync();
         _makcuVersionComboBox.SelectedIndexChanged += async (_, _) => await OnMakcuVersionChangedAsync();
-        _buttonStatePublishingCheckBox.CheckedChanged += async (_, _) =>
-            await OnButtonStatePublishingChangedAsync();
-        _saveButtonStateMappingNameButton.Click += (_, _) => SaveButtonStateMappingName();
         _simulatedUdpInputCheckBox.CheckedChanged += (_, _) => SaveSettings();
         _simulatedUdpInputFrequencyBox.SelectedIndexChanged += (_, _) => SaveSettings();
         _alwaysOutputUdpCheckBox.CheckedChanged += (_, _) => SaveSettings();
@@ -297,12 +277,7 @@ internal sealed class SettingsPageControl : UserControl
     internal Panel LegacySingleBoardOptionRow => _legacySingleBoardOptionRow;
     internal ComboBox MakcuVersionComboBox => _makcuVersionComboBox;
     internal CheckBox MakcuModeCheckBox => _makcuModeCheckBox;
-    internal CheckBox ButtonStatePublishingCheckBox => _buttonStatePublishingCheckBox;
     internal Panel MakcuModeOptionRow => _makcuModeOptionRow;
-    internal Panel ButtonStatePublishingOptionRow => _buttonStatePublishingOptionRow;
-    internal TextBox ButtonStateMappingNameTextBox => _buttonStateMappingNameTextBox;
-    internal Button SaveButtonStateMappingNameButton => _saveButtonStateMappingNameButton;
-    internal Panel ButtonStateMappingNameOptionRow => _buttonStateMappingNameOptionRow;
     internal string StatusText => _statusLabel.Text;
     internal CheckBox SimulatedUdpInputCheckBox => _simulatedUdpInputCheckBox;
     internal ComboBox SimulatedUdpInputFrequencyBox => _simulatedUdpInputFrequencyBox;
@@ -722,57 +697,6 @@ internal sealed class SettingsPageControl : UserControl
         return panel;
     }
 
-    private static Panel WrapButtonStateMappingNameOption(TextBox mappingNameTextBox, Button saveButton)
-    {
-        Panel panel = new()
-        {
-            Width = 900,
-            Height = 86,
-            Margin = new Padding(0),
-            BackColor = CardSurfaceColor,
-        };
-        TableLayoutPanel row = new()
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 2,
-            Padding = new Padding(0),
-        };
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
-        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
-        row.RowStyles.Add(new RowStyle(SizeType.Percent, 54));
-        row.RowStyles.Add(new RowStyle(SizeType.Percent, 46));
-        row.Controls.Add(new Label
-        {
-            Text = "共享内存名称",
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleLeft,
-            ForeColor = PrimaryTextColor,
-        }, 0, 0);
-        FlowLayoutPanel editor = new()
-        {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            Margin = new Padding(0),
-            Padding = new Padding(0),
-        };
-        editor.Controls.Add(mappingNameTextBox);
-        editor.Controls.Add(saveButton);
-        row.Controls.Add(editor, 1, 0);
-        row.Controls.Add(new Label
-        {
-            Text = "与 Sender config.ini [aim] third_party_buttons_map 一致；保存后重启 EXE 生效。",
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleLeft,
-            ForeColor = MutedTextColor,
-            AutoEllipsis = true,
-            AccessibleName = "共享内存名称说明",
-        }, 1, 1);
-        panel.Controls.Add(row);
-        return panel;
-    }
-
     private static Label CreateSectionTitle(string text) => new()
     {
         Text = text,
@@ -826,24 +750,39 @@ internal sealed class SettingsPageControl : UserControl
             return;
         }
 
-        if (_serialBridge.IsMakcuModeSessionReady)
-        {
-            SynchronizeVerifiedMakcuModeFromConnection(reportStatus: true);
-            return;
-        }
-
         _makcuModeCheckBox.Enabled = false;
         _makcuVersionComboBox.Enabled = false;
-        _controller.PrepareMakcuModeTransition();
+        _makcuModeUserTransitionActive = true;
+        _statusLabel.Text = "正在后台验证设备并恢复 Makcu 模式…";
         try
         {
-            MakcuModeChangeResult result = await _serialBridge.SetMakcuModeAsync(true);
+            MakcuModeChangeResult result = await Task.Run(async () =>
+            {
+                if (_serialBridge.IsMakcuModeSessionReady)
+                {
+                    return new MakcuModeChangeResult(
+                        true, true, MakcuModeCoordinator.MakcuBaudRate,
+                        "已验证设备处于 Makcu 模式。", ActualStateVerified: true);
+                }
+
+                _controller.PrepareMakcuModeTransition();
+                return await _serialBridge.SetMakcuModeAsync(true).ConfigureAwait(false);
+            });
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
             bool settingsSaved = false;
             bool automationResumed = false;
             bool actualSessionReady = IsVerifiedModeSessionReady(result);
             if (actualSessionReady)
             {
                 _controller.Settings.MakcuEnabled = result.ActualEnabled;
+                if (result.ActualEnabled)
+                {
+                    _controller.Settings.MakcuProtocolVersion = _serialBridge.ActualMakcuProtocolVersion;
+                    SetMakcuVersionSelection();
+                }
                 SetMakcuModeCheckBox(result.ActualEnabled);
                 settingsSaved = SaveSettings();
                 automationResumed = !result.ActualEnabled && ResumeAutomationOnlyAfterA5Restore();
@@ -859,14 +798,22 @@ internal sealed class SettingsPageControl : UserControl
         }
         catch (Exception exception)
         {
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
             _statusLabel.ForeColor = ErrorColor;
             SetMakcuModeCheckBox(_controller.Settings.MakcuEnabled);
             _statusLabel.Text = $"启动时恢复 Makcu 模式失败：{exception.Message} 当前模式未确认；宏/Lua保持停止，设置未改。";
         }
         finally
         {
-            _makcuModeCheckBox.Enabled = true;
-            _makcuVersionComboBox.Enabled = _serialBridge is not null;
+            _makcuModeUserTransitionActive = false;
+            if (!IsDisposed && !Disposing)
+            {
+                _makcuModeCheckBox.Enabled = true;
+                _makcuVersionComboBox.Enabled = true;
+            }
         }
     }
 
@@ -1018,7 +965,6 @@ internal sealed class SettingsPageControl : UserControl
 
         _makcuModeCheckBox.Enabled = false;
         _makcuVersionComboBox.Enabled = false;
-        _buttonStatePublishingCheckBox.Enabled = false;
         _makcuModeUserTransitionActive = true;
         _controller.PrepareMakcuModeTransition();
         try
@@ -1093,7 +1039,6 @@ internal sealed class SettingsPageControl : UserControl
             _makcuModeUserTransitionActive = false;
             _makcuModeCheckBox.Enabled = true;
             _makcuVersionComboBox.Enabled = _serialBridge is not null;
-            _buttonStatePublishingCheckBox.Enabled = _serialBridge is not null;
         }
     }
 
@@ -1158,78 +1103,6 @@ internal sealed class SettingsPageControl : UserControl
         return startupRestore ? $"{text} A5/921600 与读取器已恢复。" : text;
     }
 
-    private async Task OnButtonStatePublishingChangedAsync()
-    {
-        if (_loading)
-        {
-            return;
-        }
-        bool enabled = _buttonStatePublishingCheckBox.Checked;
-        _controller.Settings.ButtonStatePublishingEnabled = enabled;
-        if (!SaveSettings())
-        {
-            _loading = true;
-            _buttonStatePublishingCheckBox.Checked =
-                _controller.Settings.ButtonStatePublishingEnabled;
-            _loading = false;
-            return;
-        }
-        if (_serialBridge is null)
-        {
-            return;
-        }
-
-        try
-        {
-            bool applied = await _serialBridge.SetButtonStatePublishingEnabledAsync(enabled);
-            _statusLabel.ForeColor = applied ? SuccessColor : ErrorColor;
-            _statusLabel.Text = applied
-                ? _serialBridge.IsMakcuModeEnabled
-                    ? "已保存；Makcu 关闭后会恢复物理按键订阅。"
-                    : "物理按键状态发布设置已保存。"
-                : "设置已保存，但当前串口未能接收订阅命令；重连后会重试。";
-        }
-        catch (Exception exception)
-        {
-            _statusLabel.ForeColor = ErrorColor;
-            _statusLabel.Text = $"物理按键发布设置已保存，应用失败：{exception.Message}";
-        }
-    }
-
-    private void SaveButtonStateMappingName()
-    {
-        if (_loading)
-        {
-            return;
-        }
-
-        if (!ButtonStateSharedMemory.TryNormalizeMappingName(
-                _buttonStateMappingNameTextBox.Text,
-                out string mappingName,
-                out string? error))
-        {
-            _statusLabel.ForeColor = ErrorColor;
-            _statusLabel.Text = error ?? "共享内存名称无效。";
-            return;
-        }
-
-        string previousName = _controller.Settings.ButtonStateMappingName;
-        _controller.Settings.ButtonStateMappingName = mappingName;
-        try
-        {
-            _controller.SaveSettings(updateStartupRegistration: false);
-            _buttonStateMappingNameTextBox.Text = mappingName;
-            _statusLabel.ForeColor = SuccessColor;
-            _statusLabel.Text = "共享内存名称已保存；需重启 EXE 生效，并确保 Sender 名称一致。";
-        }
-        catch (Exception exception)
-        {
-            _controller.Settings.ButtonStateMappingName = previousName;
-            _statusLabel.ForeColor = ErrorColor;
-            _statusLabel.Text = $"共享内存名称保存失败，原设置已保留：{exception.Message}";
-        }
-    }
-
     private void LoadSettings()
     {
         _loading = true;
@@ -1240,10 +1113,6 @@ internal sealed class SettingsPageControl : UserControl
         _legacySingleBoardFirmwareCheckBox.Checked =
             _controller.Settings.LegacySingleBoardFirmwareCompatibility;
         _makcuModeCheckBox.Checked = _controller.Settings.MakcuEnabled;
-        _buttonStatePublishingCheckBox.Checked =
-            _controller.Settings.ButtonStatePublishingEnabled;
-        _buttonStateMappingNameTextBox.Text = ButtonStateSharedMemory.NormalizeConfiguredMappingName(
-            _controller.Settings.ButtonStateMappingName);
         _simulatedUdpInputCheckBox.Checked = _controller.Settings.SimulatedUdpInputEnabled;
         int frequencyIndex = _simulatedUdpInputFrequencyBox.Items.IndexOf(
             _controller.Settings.SimulatedUdpInputFrequencyHz);
@@ -1271,8 +1140,6 @@ internal sealed class SettingsPageControl : UserControl
         _controller.Settings.MinimizeToTray = _minimizeToTrayCheckBox.Checked;
         _controller.Settings.CloseToTray = _closeToTrayCheckBox.Checked;
         _controller.Settings.MakcuEnabled = _makcuModeCheckBox.Checked;
-        _controller.Settings.ButtonStatePublishingEnabled =
-            _buttonStatePublishingCheckBox.Checked;
         ApplyAlwaysOutputUdpSettings();
         _controller.Settings.FirmwareUpdateApiEnabled =
             _firmwareUpdateApi is not null && _firmwareUpdateApiCheckBox.Checked;
